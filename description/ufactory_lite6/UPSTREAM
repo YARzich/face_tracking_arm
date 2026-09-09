@@ -1,0 +1,5 @@
+Repository: https://github.com/xArm-Developer/xarm_ros2.git
+Branch: jazzy
+Commit: 3dc2b5e8294758d96b54b15fa5920d581b7cbb3d
+Source package: xarm_description
+Imported content: UFACTORY Lite 6 description, parameters, and meshes

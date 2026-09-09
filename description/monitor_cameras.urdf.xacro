@@ -1,0 +1,84 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- Gazebo camera axes: +X forward, +Y left, +Z up; ROS optical: right/down/forward. -->
+  <xacro:macro name="monitor_rgb_sensor" params="name lateral frame topic info tx">
+    <link name="${name}_frame"/>
+    <joint name="${name}_mount" type="fixed">
+      <parent link="monitor_camera_bar"/><child link="${name}_frame"/>
+      <origin xyz="0.018 ${lateral} 0"/>
+    </joint>
+    <link name="${frame}"/>
+    <joint name="${name}_optical_joint" type="fixed">
+      <parent link="${name}_frame"/><child link="${frame}"/>
+      <origin rpy="${-pi / 2} 0 ${-pi / 2}"/>
+    </joint>
+    <gazebo reference="monitor_camera_bar">
+      <sensor name="${name}" type="camera">
+        <pose>0.018 ${lateral} 0 0 0 0</pose>
+        <always_on>true</always_on><update_rate>30</update_rate>
+        <topic>${topic}</topic>
+        <camera>
+          <horizontal_fov>${pi / 3}</horizontal_fov>
+          <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+          <clip><near>0.05</near><far>20</far></clip>
+          <camera_info_topic>${info}</camera_info_topic>
+          <optical_frame_id>${frame}</optical_frame_id>
+          <lens>
+            <intrinsics>
+              <fx>${camera_focal}</fx><fy>${camera_focal}</fy><cx>320</cx><cy>240</cy><s>0</s>
+            </intrinsics>
+            <projection>
+              <p_fx>${camera_focal}</p_fx><p_fy>${camera_focal}</p_fy>
+              <p_cx>320</p_cx><p_cy>240</p_cy><tx>${tx}</tx><ty>0</ty>
+            </projection>
+          </lens>
+        </camera>
+      </sensor>
+    </gazebo>
+  </xacro:macro>
+
+  <xacro:macro name="monitor_cameras" params="mode baseline">
+    <xacro:property name="camera_focal" value="554.2562584220407"/>
+    <xacro:property name="stereo" value="${mode == 'stereo'}"/>
+    <xacro:property name="bar_width" value="${baseline + 0.028 if stereo else 0.04}"/>
+    <xacro:property name="bar_mass" value="0.03"/>
+    <link name="monitor_camera_bar">
+      <inertial>
+        <mass value="${bar_mass}"/>
+        <inertia ixx="${bar_mass * (bar_width**2 + 0.028**2) / 12}" ixy="0" ixz="0"
+          iyy="${bar_mass * (0.034**2 + 0.028**2) / 12}" iyz="0"
+          izz="${bar_mass * (0.034**2 + bar_width**2) / 12}"/>
+      </inertial>
+      <visual>
+        <geometry><box size="0.034 ${bar_width} 0.028"/></geometry>
+        <material name="camera_dark"><color rgba="0.04 0.04 0.05 1"/></material>
+      </visual>
+      <collision><geometry><box size="0.036 ${bar_width} 0.028"/></geometry></collision>
+      <visual name="left_lens">
+        <origin xyz="0.017 ${baseline / 2 if stereo else 0} 0" rpy="0 ${pi / 2} 0"/>
+        <geometry><cylinder radius="0.008" length="0.002"/></geometry>
+        <material name="camera_glass"><color rgba="0.1 0.35 0.6 1"/></material>
+      </visual>
+      <xacro:if value="${stereo}">
+        <visual name="right_lens">
+          <origin xyz="0.017 ${-baseline / 2} 0" rpy="0 ${pi / 2} 0"/>
+          <geometry><cylinder radius="0.008" length="0.002"/></geometry>
+          <material name="camera_glass"/>
+        </visual>
+      </xacro:if>
+    </link>
+    <joint name="monitor_camera_mount" type="fixed">
+      <parent link="monitor_link"/><child link="monitor_camera_bar"/>
+      <origin xyz="0 0 0.114"/>
+    </joint>
+    <xacro:monitor_rgb_sensor name="monitor_left_camera"
+      lateral="${baseline / 2 if stereo else 0}" frame="face_test_camera_optical_frame"
+      topic="/face_test/image_raw" info="/face_test/camera_info" tx="0"/>
+    <xacro:if value="${stereo}">
+      <xacro:monitor_rgb_sensor name="monitor_right_camera"
+        lateral="${-baseline / 2}" frame="face_test_right_optical_frame"
+        topic="/face_test/right/image_raw" info="/face_test/right/camera_info"
+        tx="${-camera_focal * baseline}"/>
+    </xacro:if>
+  </xacro:macro>
+</robot>

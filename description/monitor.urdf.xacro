@@ -1,0 +1,74 @@
+<?xml version="1.0"?>
+<!--
+  Responsibility: define the simulated display attached to the Lite 6 flange
+  and expose the center of its front surface as the control frame.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="monitor_model" params="parent prefix:='' thickness:=0.03 width:=0.30
+    height:=0.20 mass:=0.50 mount_xyz:='' mount_rpy:='${pi} ${-pi / 2.0} 0'">
+    <!-- Local axes: +X points out of the screen, +Y spans its width, +Z its height. -->
+    <xacro:property name="monitor_thickness" value="${thickness}"/>
+    <xacro:property name="monitor_width" value="${width}"/>
+    <xacro:property name="monitor_height" value="${height}"/>
+    <xacro:property name="monitor_mass" value="${mass}"/>
+
+    <xacro:property
+      name="monitor_ixx"
+      value="${monitor_mass * (monitor_width * monitor_width + monitor_height * monitor_height) / 12.0}"/>
+    <xacro:property
+      name="monitor_iyy"
+      value="${monitor_mass * (monitor_thickness * monitor_thickness + monitor_height * monitor_height) / 12.0}"/>
+    <xacro:property
+      name="monitor_izz"
+      value="${monitor_mass * (monitor_thickness * monitor_thickness + monitor_width * monitor_width) / 12.0}"/>
+
+    <link name="${prefix}monitor_link">
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <mass value="${monitor_mass}"/>
+        <inertia
+          ixx="${monitor_ixx}"
+          ixy="0"
+          ixz="0"
+          iyy="${monitor_iyy}"
+          iyz="0"
+          izz="${monitor_izz}"/>
+      </inertial>
+      <visual name="${prefix}monitor_visual">
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="${monitor_thickness} ${monitor_width} ${monitor_height}"/>
+        </geometry>
+        <material name="${prefix}monitor_dark">
+          <color rgba="0.08 0.08 0.10 1.0"/>
+        </material>
+      </visual>
+      <collision name="${prefix}monitor_collision">
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="${monitor_thickness} ${monitor_width} ${monitor_height}"/>
+        </geometry>
+      </collision>
+    </link>
+
+    <!--
+      link6 +Z is the outward flange normal. This rotation maps monitor +X to
+      link6 +Z and monitor +Z to link6 +X. The half-thickness translation puts
+      the rear surface exactly on the flange plane.
+    -->
+    <joint name="${prefix}monitor_mount_joint" type="fixed">
+      <origin
+        xyz="${mount_xyz if mount_xyz else '0 0 ' + str(monitor_thickness / 2.0)}"
+        rpy="${mount_rpy}"/>
+      <parent link="${parent}"/>
+      <child link="${prefix}monitor_link"/>
+    </joint>
+
+    <link name="${prefix}monitor_control_frame"/>
+    <joint name="${prefix}monitor_control_joint" type="fixed">
+      <origin xyz="${monitor_thickness / 2.0} 0 0" rpy="0 0 0"/>
+      <parent link="${prefix}monitor_link"/>
+      <child link="${prefix}monitor_control_frame"/>
+    </joint>
+  </xacro:macro>
+</robot>

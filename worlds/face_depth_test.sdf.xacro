@@ -1,0 +1,82 @@
+<?xml version="1.0"?>
+<sdf version="1.9" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="stereo" default="false"/>
+  <xacro:arg name="reference" default="true"/>
+  <xacro:arg name="baseline" default="0.08"/>
+  <xacro:property name="baseline" value="${float('$(arg baseline)')}"/>
+  <xacro:property name="focal" value="554.2562584220407"/>
+  <xacro:macro name="camera" params="name x frame topic info type tx">
+    <model name="${name}">
+      <static>true</static>
+      <pose>${x} -1.2 1.65 0 0 1.5707963267948966</pose>
+      <link name="camera_link">
+        <sensor name="camera" type="${type}">
+          <always_on>true</always_on>
+          <update_rate>30</update_rate>
+          <topic>${topic}</topic>
+          <camera>
+            <horizontal_fov>1.0471975511965976</horizontal_fov>
+            <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+            <clip><near>0.05</near><far>20</far></clip>
+            <camera_info_topic>${info}</camera_info_topic>
+            <optical_frame_id>${frame}</optical_frame_id>
+            <lens>
+              <intrinsics>
+                <fx>${focal}</fx><fy>${focal}</fy><cx>320</cx><cy>240</cy><s>0</s>
+              </intrinsics>
+              <projection>
+                <p_fx>${focal}</p_fx><p_fy>${focal}</p_fy>
+                <p_cx>320</p_cx><p_cy>240</p_cy><tx>${tx}</tx><ty>0</ty>
+              </projection>
+            </lens>
+          </camera>
+        </sensor>
+      </link>
+    </model>
+  </xacro:macro>
+  <world name="face_depth_test">
+    <physics name="default" type="ignored">
+      <max_step_size>0.004</max_step_size><real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <scene>
+      <ambient>0.65 0.65 0.65 1</ambient><background>0.75 0.78 0.82 1</background>
+      <shadows>false</shadows>
+    </scene>
+    <light name="sun" type="directional">
+      <pose>0 -3 5 0 0 0</pose><diffuse>0.7 0.7 0.7 1</diffuse>
+      <specular>0.1 0.1 0.1 1</specular><direction>0 0.5 -1</direction>
+      <cast_shadows>false</cast_shadows>
+    </light>
+    <model name="ground">
+      <static>true</static>
+      <link name="ground">
+        <visual name="ground">
+          <geometry><plane><normal>0 0 1</normal><size>20 20</size></plane></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <include>
+      <uri>model://person_standing</uri><name>person</name>
+      <static>true</static><pose>0 0 0 0 0 0</pose>
+    </include>
+    <xacro:camera name="left_camera" x="0" frame="face_test_camera_optical_frame"
+      topic="/face_test/image_raw" info="/face_test/camera_info" type="camera" tx="0"/>
+    <xacro:if value="$(arg stereo)">
+      <xacro:camera name="right_camera" x="${baseline}" frame="face_test_right_optical_frame"
+        topic="/face_test/right/image_raw" info="/face_test/right/camera_info"
+        type="camera" tx="${-focal * baseline}"/>
+    </xacro:if>
+    <xacro:if value="$(arg reference)">
+      <xacro:camera name="reference_camera" x="0" frame="face_test_camera_optical_frame"
+        topic="/face_test/reference/depth" info="/face_test/reference/camera_info"
+        type="depth_camera" tx="0"/>
+    </xacro:if>
+  </world>
+</sdf>

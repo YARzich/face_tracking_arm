@@ -1,0 +1,32 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Image
+      Name: Face detection
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /face_test/debug_image
+        Depth: 1
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+      Transport Hint: raw
+  Enabled: true
+  Global Options:
+    Fixed Frame: face_test_camera_optical_frame
+    Frame Rate: 30
+  Name: root
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+Window Geometry:
+  Width: 1050
+  Height: 700
+  Hide Left Dock: false
+  Hide Right Dock: false
+Preferences:
+  PromptSaveOnExit: false

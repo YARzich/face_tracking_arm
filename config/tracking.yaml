@@ -1,0 +1,29 @@
+face_tracking_controller:
+  ros__parameters:
+    idle_behavior: rest
+    minimum_face_distance_m: 0.40
+    safe_reach_radius_m: 0.42
+    # Tolerate brief detector / DDS scheduling gaps on modest hardware without
+    # flickering FACE -> HOLD. A genuinely lost target still returns to REST
+    # when the age of the last accepted observation reaches return_to_rest_delay_sec.
+    face_target_freshness_timeout_sec: &face_target_freshness_timeout_sec 0.50
+    return_to_rest_delay_sec: 2.0
+    rest_position_m: [0.20, 0.00, 1.05]
+    planning_frame: &planning_frame world
+    base_frame: link_base
+    reach_center_frame: link1
+    control_frame: monitor_control_frame
+
+robot_state_publisher:
+  ros__parameters:
+    # Tracking rejects TCP transforms older than 30 ms. The ROS default of
+    # 20 Hz produces 50 ms gaps and cannot satisfy that freshness contract.
+    publish_frequency: 100.0
+
+face_target_marker:
+  ros__parameters:
+    face_target_freshness_timeout_sec: *face_target_freshness_timeout_sec
+    planning_frame: *planning_frame
+    marker_entity_name: face_target_marker
+    set_pose_service: /world/lite6_table/set_pose/blocking
+    update_rate_hz: 20.0

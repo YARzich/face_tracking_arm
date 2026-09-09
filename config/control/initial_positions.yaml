@@ -1,0 +1,8 @@
+# Safe startup configuration. It places monitor_control_frame at the REST pose.
+initial_positions:
+  joint1: 0.0
+  joint2: -0.57754821
+  joint3: 0.15413313
+  joint4: 0.0
+  joint5: -0.83912233
+  joint6: 0.0

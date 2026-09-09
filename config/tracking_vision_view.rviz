@@ -1,0 +1,78 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Image
+      Name: Face position
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /face_test/debug_image
+        Depth: 1
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+      Transport Hint: raw
+    - Class: rviz_default_plugins/RobotModel
+      Name: Lite 6 and monitor camera
+      Enabled: true
+      Alpha: 1
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+      Visual Enabled: true
+      Collision Enabled: false
+    - Class: rviz_default_plugins/Grid
+      Name: Floor
+      Enabled: true
+      Cell Size: 0.25
+      Plane Cell Count: 20
+      Reference Frame: world
+    - Class: rviz_default_plugins/Marker
+      Name: Detected face
+      Enabled: true
+      Value: true
+      Topic:
+        Value: /face_test/markers
+        Depth: 10
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+    - Class: rviz_default_plugins/Axes
+      Name: Left camera
+      Enabled: true
+      Reference Frame: face_test_camera_optical_frame
+      Length: 0.2
+      Radius: 0.01
+  Enabled: true
+  Global Options:
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 3.8
+      Focal Point:
+        X: 1.0
+        Y: 0
+        Z: 1.0
+      Pitch: 0.35
+      Yaw: 5.1
+      Target Frame: world
+Window Geometry:
+  Width: 1200
+  Height: 750
+  Hide Left Dock: false
+  Hide Right Dock: false
+Preferences:
+  PromptSaveOnExit: false

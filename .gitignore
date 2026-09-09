@@ -1,0 +1,66 @@
+/build/
+/install/
+/log/
+/compile_commands.json
+*.o
+*.a
+*.so
+*.so.*
+
+# Local editor settings and temporary files.
+/.idea/
+/.vscode/
+/cmake-build-*/
+/.cache/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python environments, caches and test coverage.
+/.venv/
+/venv/
+/env/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+__pycache__/
+*.py[cod]
+.coverage
+.coverage.*
+/htmlcov/
+/coverage.xml
+
+# Credentials and machine-specific configuration.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+/dist/
+/config/calibration/
+/config/*.local.yaml
+
+# External model weights and recorded sensor data.
+/models/
+/datasets/
+/rosbags/
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.engine
+*.bag
+*.db3
+*.mcap
+
+# Local planning and historical measurements are not part of the public sources.
+/ROADMAP.md
+/validation/
+/artifacts/
+/docs/history/
+/docs/*_20??-*.md
+/docs/small_motion_comparison.png

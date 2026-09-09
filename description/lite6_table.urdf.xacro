@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<!--
+  Responsibility: assemble the unchanged upstream Lite 6 geometry and anchor
+  its base at the center of the 0.75 m tabletop.
+-->
+<robot name="lite6" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/ufactory_lite6/urdf/common/common.material.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/ufactory_lite6/urdf/common/common.link.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/generated/lite6.urdf.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/ufactory_lite6/urdf/lite6/lite6.gazebo.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/monitor.urdf.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/monitor_cameras.urdf.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/lite6_ros2_control.xacro"/>
+
+  <xacro:arg name="enable_ros2_control" default="false"/>
+  <xacro:arg name="camera_mode" default="disabled"/>
+  <xacro:arg name="camera_baseline" default="0.08"/>
+  <xacro:arg
+    name="initial_positions_file"
+    default="$(find face_tracking_arm)/config/control/initial_positions.yaml"/>
+  <xacro:arg
+    name="controller_config_file"
+    default="$(find face_tracking_arm)/config/control/controllers.yaml"/>
+
+  <xacro:property name="use_xacro_load_yaml" value="true"/>
+  <xacro:property name="mesh_suffix" value="dae"/>
+  <xacro:property
+    name="mesh_path"
+    value="file://$(find face_tracking_arm)/description/ufactory_lite6/meshes"/>
+
+  <xacro:common_material prefix=""/>
+
+  <link name="world"/>
+  <joint name="world_joint" type="fixed">
+    <parent link="world"/>
+    <child link="link_base"/>
+    <origin xyz="0 0 0.75" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:lite6_urdf
+    prefix=""
+    kinematics_params_filename="$(find face_tracking_arm)/description/ufactory_lite6/config/kinematics/default/lite6_default_kinematics.yaml"/>
+  <xacro:lite6_gazebo prefix=""/>
+  <xacro:monitor_model parent="link6" prefix=""/>
+  <xacro:unless value="${'$(arg camera_mode)' == 'disabled'}">
+    <xacro:monitor_cameras mode="$(arg camera_mode)"
+      baseline="${float('$(arg camera_baseline)')}"/>
+  </xacro:unless>
+  <xacro:if value="$(arg enable_ros2_control)">
+    <xacro:lite6_gazebo_ros2_control
+      initial_positions_file="$(arg initial_positions_file)"
+      controller_config_file="$(arg controller_config_file)"/>
+  </xacro:if>
+</robot>

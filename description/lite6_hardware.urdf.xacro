@@ -1,0 +1,85 @@
+<?xml version="1.0"?>
+<!-- Real and mock ros2_control assembly; no Gazebo tags or sensors. -->
+<robot name="lite6" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="config_file" default=""/>
+  <xacro:arg name="camera_mode" default="mono_cpu"/>
+  <xacro:arg name="mock_hardware" default="false"/>
+  <xacro:property name="hardware" value="${xacro.load_yaml('$(arg config_file)')}"/>
+  <xacro:property name="monitor" value="${hardware['monitor']}"/>
+  <xacro:property name="mount" value="${hardware['camera_mount']}"/>
+  <xacro:property name="cameras" value="${hardware['$(arg camera_mode)']}"/>
+  <xacro:property name="degree_scale" value="${pi / 180.0}"/>
+  <xacro:property name="use_xacro_load_yaml" value="true"/>
+  <xacro:property name="mesh_suffix" value="dae"/>
+  <xacro:property name="mesh_path"
+    value="file://$(find face_tracking_arm)/description/ufactory_lite6/meshes"/>
+  <xacro:include filename="$(find face_tracking_arm)/description/ufactory_lite6/urdf/common/common.material.xacro"/>
+  <xacro:include filename="$(find face_tracking_arm)/description/ufactory_lite6/urdf/common/common.link.xacro"/>
+  <xacro:include filename="$(find face_tracking_arm)/description/generated/lite6.urdf.xacro"/>
+  <xacro:include filename="$(find face_tracking_arm)/description/monitor.urdf.xacro"/>
+  <xacro:common_material prefix=""/>
+  <link name="world"/>
+  <joint name="world_joint" type="fixed">
+    <parent link="world"/><child link="link_base"/>
+    <origin xyz="${' '.join(map(str, hardware['robot']['base_xyz_m']))}"
+      rpy="${' '.join([str(v * degree_scale) for v in hardware['robot']['base_rpy_deg']])}"/>
+  </joint>
+  <xacro:lite6_urdf prefix=""
+    kinematics_params_filename="$(find face_tracking_arm)/description/ufactory_lite6/config/kinematics/default/lite6_default_kinematics.yaml"/>
+  <xacro:monitor_model parent="link6" thickness="${monitor['size_m'][0]}"
+    width="${monitor['size_m'][1]}" height="${monitor['size_m'][2]}" mass="${monitor['mass_kg']}"
+    mount_xyz="${' '.join(map(str, monitor['mount_xyz_m']))}"
+    mount_rpy="${' '.join([str(v * degree_scale) for v in monitor['mount_rpy_deg']])}"/>
+  <link name="${mount['body_frame']}">
+    <visual><geometry><box size="${' '.join(map(str, mount['size_m']))}"/></geometry>
+      <material name="camera_black"><color rgba="0.05 0.05 0.05 1"/></material></visual>
+    <collision><geometry><box size="${' '.join(map(str, mount['size_m']))}"/></geometry></collision>
+    <inertial><mass value="${mount['mass_kg']}"/>
+      <inertia ixx="${mount['mass_kg'] * (mount['size_m'][1]**2 + mount['size_m'][2]**2) / 12}"
+        iyy="${mount['mass_kg'] * (mount['size_m'][0]**2 + mount['size_m'][2]**2) / 12}"
+        izz="${mount['mass_kg'] * (mount['size_m'][0]**2 + mount['size_m'][1]**2) / 12}"
+        ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="hardware_camera_mount" type="fixed">
+    <parent link="monitor_link"/><child link="${mount['body_frame']}"/>
+    <origin xyz="${' '.join(map(str, mount['xyz_m']))}"
+      rpy="${' '.join([str(v * degree_scale) for v in mount['rpy_deg']])}"/>
+  </joint>
+  <xacro:macro name="camera_frame" params="camera side">
+    <link name="${camera['frame_id']}"/>
+    <joint name="hardware_${side}_optical_joint" type="fixed">
+      <parent link="${mount['body_frame']}"/><child link="${camera['frame_id']}"/>
+      <origin xyz="${' '.join(map(str, camera['optical_xyz_m']))}"
+        rpy="${' '.join([str(v * degree_scale) for v in camera['optical_rpy_deg']])}"/>
+    </joint>
+  </xacro:macro>
+  <xacro:if value="${mount['publish_optical_tf']}">
+    <xacro:camera_frame camera="${cameras['left']}" side="left"/>
+    <xacro:if value="${'$(arg camera_mode)' == 'stereo'}">
+      <xacro:camera_frame camera="${cameras['right']}" side="right"/>
+    </xacro:if>
+  </xacro:if>
+  <xacro:unless value="$(arg mock_hardware)">
+    <!-- Use the manufacturer's interface declaration and actual bounded joints. -->
+    <xacro:include filename="$(find xarm_description)/urdf/lite6/lite6.ros2_control.xacro"/>
+    <xacro:lite6_ros2_control prefix="" hw_ns="ufactory" robot_ip="${hardware['robot']['ip']}"
+      report_type="${hardware['robot']['report_type']}" add_gripper="false" velocity_control="false"/>
+  </xacro:unless>
+  <xacro:if value="$(arg mock_hardware)">
+    <xacro:macro name="mock_joint" params="i">
+      <joint name="joint${i}">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${hardware['motion']['rest_joints_deg'][i-1] * degree_scale}</param>
+        </state_interface>
+        <state_interface name="velocity"><param name="initial_value">0.0</param></state_interface>
+      </joint>
+    </xacro:macro>
+    <ros2_control name="Lite6MockSystem" type="system">
+      <hardware><plugin>mock_components/GenericSystem</plugin>
+        <param name="calculate_dynamics">true</param></hardware>
+      <xacro:mock_joint i="${1}"/><xacro:mock_joint i="${2}"/><xacro:mock_joint i="${3}"/>
+      <xacro:mock_joint i="${4}"/><xacro:mock_joint i="${5}"/><xacro:mock_joint i="${6}"/>
+    </ros2_control>
+  </xacro:if>
+</robot>

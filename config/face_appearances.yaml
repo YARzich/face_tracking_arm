@@ -1,0 +1,13 @@
+face_appearances:
+  ros__parameters:
+    visible_sec: 12.0
+    rest_sec: 8.0
+    # 0 repeats indefinitely; 1 presents the three positions once, then stays hidden.
+    cycles: 0
+    # Full-size standing person on the floor. All faces fit the REST camera view.
+    positions_xy: [2.35, 0.0, 2.25, -0.35, 2.60, 0.40]
+    # Smooth movement while visible; zero amplitudes restore stationary targets.
+    motion_lateral_m: 0.14
+    motion_depth_m: 0.07
+    motion_yaw_rad: 0.07
+    motion_period_sec: 6.0

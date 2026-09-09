@@ -1,0 +1,82 @@
+# Task-space behavior. QP and JTC both run at 100 Hz so each controller tick
+# receives one velocity increment instead of alternating a hold and a double step.
+# Hard joint limits are injected from joint_limits.yaml.
+control_period_sec: 0.01
+use_tracking_target: true
+recovery_planner:
+  planner_configs:
+    RRTConnectkConfigDefault:
+      type: geometric::RRTConnect
+  lite6_arm:
+    planner_configs: [RRTConnectkConfigDefault]
+    longest_valid_segment_fraction: 0.005
+trajectory_controller_period_sec: 0.01
+incoming_command_timeout_sec: 0.10
+planning_group_name: lite6_arm
+planning_frame: world
+command_frame: monitor_control_frame
+
+position_gain: 1.5
+orientation_gain: 4.0
+maximum_linear_reference_mps: 0.18
+maximum_angular_reference_radps: 0.70
+# Do not chase visually irrelevant residual error. Both deadbands are applied
+# continuously, so crossing their edge cannot create a command jump.
+position_deadband_m: 0.03
+# Position may remain approximate, while pointing must follow small head motions.
+# This 0.29 degree quiet zone keeps pauses near a target reversal short.
+pointing_deadband_rad: 0.005
+# This is a hierarchy-preservation tolerance, not a target accuracy setting.
+# Keep it tight so the lower-priority position task cannot make the screen drift.
+primary_orientation_tolerance_radps: 0.002
+# Kept under its existing name; roll now shares the primary orientation task.
+secondary_roll_weight: 0.5
+velocity_regularization_weight: 0.0001
+
+# Query nearby pairs before the hard boundary so jerk-aware constraints can react.
+hard_clearance_m: 0.015
+collision_query_distance_m: 0.200
+maximum_collision_constraints: 24
+collision_gradient_epsilon: 1.0e-8
+
+# Robot/monitor-specific invariant established by the offline FCL sweep.
+monitor_guard_joint_name: joint5
+monitor_guard_min_position_rad: -1.60
+monitor_guard_max_position_rad: 1.60
+joint_position_margin_rad: 0.10
+residual_command_latency_sec: 0.020
+state_feedback_timeout_sec: 0.030
+# Gazebo follows the exact JTC reference with a small, normal dynamic lag.
+# This deliberately loose fault threshold avoids reacting to harmless tracking
+# inaccuracy; it is not a target-pose accuracy requirement.
+following_position_tolerance_rad: 0.020
+following_velocity_tolerance_rad_s: 0.25
+
+# The tighter geometric reserve only gates automatic recovery from a transient;
+# actual feedback is collision-checked independently on every control tick.
+collision_tracking_error_bound_rad: 0.006
+
+# Distance sensitivity of the current Lite 6 + monitor geometry.
+# Unknown self/world pairs use the conservative whole-arm bound. The tighter
+# link4-monitor value excludes joints that move both bodies rigidly together;
+# the fixed link5-monitor pair is handled internally with zero sensitivity.
+numerical_distance_reserve_m: 0.0001
+default_distance_lipschitz_m_per_rad: 2.6193
+monitor_near_distance_lipschitz_m_per_rad: 0.4543
+
+# Tracking failures enter constrained braking in the same control tick.
+# Narrow velocity intervals near the joint5 guard sometimes need more than
+# 500 iterations. Keep the same wall-time budget and feasibility tolerances.
+solver_max_iterations: 2000
+solver_absolute_tolerance: 1.0e-5
+solver_relative_tolerance: 1.0e-5
+solver_time_limit_sec: 0.003
+# Sample the complete candidate/braking path only at the physical hard boundary.
+# In normal motion the 100 Hz jerk-aware QP envelope is the collision guard;
+# repeating mesh checks over every future point would starve the command stream.
+segment_validation_distance_m: 0.015
+segment_validation_substeps: 3
+search_speed_rad_s: 0.30
+search_sweep_half_range_rad: 2.80
+search_local_half_range_rad: 0.35
+search_local_duration_sec: 6.0

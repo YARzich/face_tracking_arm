@@ -1,0 +1,136 @@
+# Редактируйте этот файл. Запуск через Docker: ./run cpu или ./run stereo.
+# Для другого файла: ./run cpu --config /путь/hardware.yaml.
+# После правок перезапустите программу; пересборка не нужна.
+# Единицы: _m — метры (0.10 = 10 см); _kg — килограммы; _sec — секунды;
+# _deg — градусы; _rad — радианы (1 рад ≈ 57.3°); _rad_s — радианы в секунду.
+# xyz и size: [X, Y, Z]; rpy: повороты [вокруг X, вокруг Y, вокруг Z].
+# width/height — пиксели; fps — кадры в секунду.
+robot:
+  ip: ''                        # IP Lite 6 из UFACTORY Studio; заполнить для руки.
+  base_xyz_m: [0.0, 0.0, 0.75] # Положение основания в метрах; Z = высота от пола.
+  base_rpy_deg: [0.0, 0.0, 0.0] # Наклон основания, градусы.
+  report_type: normal           # Режим данных драйвера Lite 6; оставьте normal.
+
+# Стол нужен контроллеру для проверки столкновений руки и экрана со столешницей.
+# Камера не измеряет его автоматически: укажите размеры реального стола.
+table:
+  shape: cylinder               # cylinder — круглый стол; box — прямоугольный.
+  dimensions_m: [0.05, 0.50]    # МЕТРЫ. cylinder: [толщина, радиус]; box: [длина X, ширина Y, толщина].
+  center_m: [0.0, 0.0, 0.725]   # Центр объёма столешницы, м. Z = высота верха минус половина толщины.
+  yaw_deg: 0.0                  # Поворот столешницы вокруг вертикали, градусы.
+
+monitor:
+  size_m: [0.03, 0.30, 0.20]    # [Толщина, ширина, высота], МЕТРЫ; измерьте с креплением.
+  mass_kg: 0.50                 # Масса монитора с креплением, кг.
+  mount_xyz_m: [0.0, 0.0, 0.015] # От link6 до центра монитора, в осях фланца.
+  mount_rpy_deg: [180.0, -90.0, 0.0]
+
+# Оси корпуса камеры: X вперёд от экрана, Y влево, Z вверх.
+# xyz_m задаёт центр корпуса относительно центра монитора, в метрах.
+camera_mount:
+  xyz_m: [0.0, 0.0, 0.114]
+  rpy_deg: [0.0, 0.0, 0.0]
+  size_m: [0.04, 0.12, 0.03]    # [Глубина, ширина, высота] всей камеры/пары с креплением, м.
+  mass_kg: 0.10                 # Масса камеры/пары с креплением, кг.
+  body_frame: face_camera_body
+  publish_optical_tf: true      # Для ROS-драйвера с собственным TF см. инструкцию.
+
+# Выбранный launch использует только одну из секций ниже.
+mono_cpu:
+  source: usb                   # usb — программа открывает USB-камеру; ros — драйвер запускаете отдельно.
+  rectification: raw            # raw — исправить искажения по калибровке; rectified — драйвер уже исправил.
+  left:
+    device: /dev/video0         # Лучше постоянный путь /dev/v4l/by-id/...
+    width: 640
+    height: 480
+    fps: 30.0
+    pixel_format: mjpeg2rgb     # Формат из v4l2-ctl --list-formats-ext.
+    driver_parameters: {autofocus: false, autoexposure: true}
+    camera_name: face_left
+    calibration_file: ''       # Путь к YAML на компьютере; пусто — результат ./run calibrate cpu.
+    frame_id: face_camera_optical_frame
+    image_topic: /camera/image_raw
+    info_topic: /camera/camera_info
+    optical_xyz_m: [0.02, 0.0, 0.0] # От центра корпуса до оптического центра.
+    optical_rpy_deg: [-90.0, 0.0, -90.0] # Optical: X вправо, Y вниз, Z вперёд.
+
+stereo:
+  # ros — сначала запустите ROS-драйвер своей камеры отдельно, затем этот проект.
+  # usb — проект сам откроет две обычные USB-камеры, указанные в left/right.
+  source: ros
+  # rectified — драйвер уже исправил искажения и выровнял левое/правое изображения.
+  # raw — это сделает проект по парной калибровке. Для двух USB-камер выберите raw.
+  rectification: rectified
+  # Расстояние между оптическими центрами двух объективов, МЕТРЫ. Например, 8 см = 0.08.
+  # 0.0 — взять расстояние автоматически из калибровки CameraInfo.
+  # Если драйвер не передаёт его, укажите значение из парной калибровки/паспорта камеры.
+  baseline_m: 0.0
+  # Допуск по времени между левым и правым кадрами, СЕКУНДЫ: 0.005 = 5 мс.
+  # Кадры с большим разбросом не образуют пару и не используются вместе.
+  # Для движущихся лиц камеры должны снимать одновременно; этот допуск не синхронизирует съёмку.
+  sync_slop_sec: 0.005
+  # source=usb: заполните device, разрешение, fps и calibration_file у обеих камер.
+  # source=ros: заполните image_topic, info_topic и frame_id; разрешение/FPS задайте в драйвере.
+  left:
+    device: /dev/video0
+    width: 640
+    height: 480
+    fps: 30.0
+    pixel_format: mjpeg2rgb
+    driver_parameters: {autofocus: false, autoexposure: true}
+    camera_name: face_left
+    calibration_file: ''       # Пусто — результат ./run calibrate stereo; либо свой путь к YAML.
+    frame_id: face_left_optical_frame
+    image_topic: /stereo/left/image_rect
+    info_topic: /stereo/left/camera_info
+    optical_xyz_m: [0.02, 0.04, 0.0] # Пример для базы 8 см. Укажите свои значения.
+    optical_rpy_deg: [-90.0, 0.0, -90.0]
+  right:
+    device: /dev/video2
+    width: 640
+    height: 480
+    fps: 30.0
+    pixel_format: mjpeg2rgb
+    driver_parameters: {autofocus: false, autoexposure: true}
+    camera_name: face_right
+    calibration_file: ''       # Пусто — результат ./run calibrate stereo; либо свой путь к YAML.
+    frame_id: face_right_optical_frame
+    image_topic: /stereo/right/image_rect
+    info_topic: /stereo/right/camera_info
+    optical_xyz_m: [0.02, -0.04, 0.0]
+    optical_rpy_deg: [-90.0, 0.0, -90.0]
+
+perception:
+  # В Docker python_executable задаётся образом автоматически.
+  # YuNet входит в образ. Свой model_dir — путь к папке моделей на компьютере.
+  python_executable: ~/.cache/face_tracking_arm/perception_venv/bin/python
+  model_dir: ~/.cache/face_tracking_arm/models
+  detector: yunet               # Маленький детектор на CPU, без GPU.
+  threads: 2                   # Число потоков обработки на CPU.
+  confidence: 0.6              # Порог уверенности детектора: 0..1; выше — строже отбор.
+  face_width_m: 0.16            # Только mono_cpu: предполагаемая ширина лица, м; 0.16 = 16 см.
+  max_processing_fps: 20.0     # Начните с 20; 15 на слабом CPU, 30 если успевает.
+  preview_fps: 5.0            # Только окно просмотра; частоту детекции не меняет.
+  max_frame_age_sec: 0.20       # Старые кадры отбрасываются, а не накапливаются.
+  switch_margin_m: 0.25         # Другое лицо должно быть хотя бы на столько ближе, м.
+  switch_delay_sec: 0.40        # И оставаться ближе столько секунд, чтобы выбрать его.
+
+tracking:
+  # rest — возвращаться в исходную позу; search_sweep — искать по сторонам;
+  # search_local_then_sweep — сначала искать рядом с потерянным лицом, затем шире.
+  idle_behavior: rest
+  minimum_face_distance_m: 0.50 # Желаемый отступ от лица, м; не гарантирует защиту от столкновения.
+  safe_reach_radius_m: 0.38     # Радиус области, куда стремится экран при слежении, м.
+  return_to_rest_delay_sec: 2.0 # Сколько секунд ждать после потери лица перед возвратом/поиском.
+
+motion:
+  # Масштаб рабочих ограничений движения. Для первого запуска оставьте 0.25.
+  # Скорость, ускорение и рывок умножаются на scale. Допустимо 0.1..1.0.
+  speed_scale: 0.25
+  search_speed_rad_s: 0.20      # Скорость обзора, рад/с (0.20 ≈ 11.5°/с).
+  search_sweep_half_range_rad: 2.80 # Широкий обзор: угол в каждую сторону, рад (2.80 ≈ 160°).
+  search_local_half_range_rad: 0.35 # Поиск рядом: угол в каждую сторону, рад (0.35 ≈ 20°).
+  search_local_duration_sec: 6.0 # Время поиска рядом перед широким обзором, секунды.
+  # Углы суставов 1..6 в ГРАДУСАХ. Проверьте позы с установленным экраном.
+  rest_joints_deg: [0.0, -33.091, 8.831, 0.0, -48.077, 0.0]
+  search_joints_deg: [0.0, -33.091, 8.831, 0.0, -68.182, 0.0]
