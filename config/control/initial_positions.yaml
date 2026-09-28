@@ -1,8 +1,8 @@
-# Safe startup configuration. It places monitor_control_frame at the REST pose.
+# xArm6 simulation/mock starting pose; hardware starts from measured angles.
 initial_positions:
-  joint1: 0.0
-  joint2: -0.57754821
-  joint3: 0.15413313
-  joint4: 0.0
-  joint5: -0.83912233
-  joint6: 0.0
+  joint1: 0.000000000
+  joint2: -0.257927549
+  joint3: -0.369630908
+  joint4: 0.000000000
+  joint5: -0.943237870
+  joint6: 0.000000000

@@ -1,0 +1,95 @@
+<?xml version="1.0"?>
+<!--
+  Responsibility: assemble the unchanged upstream xArm6 geometry and anchor
+  its base at the center of the 0.75 m tabletop.
+-->
+<robot name="xarm6" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/ufactory_xarm6/urdf/common/common.material.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/ufactory_xarm6/urdf/common/common.link.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/generated/xarm6.urdf.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/ufactory_xarm6/urdf/xarm6/xarm6.gazebo.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/monitor.urdf.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/monitor_cameras.urdf.xacro"/>
+  <xacro:include
+    filename="$(find face_tracking_arm)/description/xarm6_ros2_control.xacro"/>
+
+  <xacro:arg name="model_num" default="0"/>
+  <xacro:arg name="joint1_lower_limit" default="-6.283185307179586"/>
+  <xacro:arg name="joint1_upper_limit" default="6.283185307179586"/>
+  <xacro:arg name="joint2_lower_limit" default="-2.059488"/>
+  <xacro:arg name="joint2_upper_limit" default="2.094395"/>
+  <xacro:arg name="joint3_lower_limit" default="-3.92699"/>
+  <xacro:arg name="joint3_upper_limit" default="0.191986"/>
+  <xacro:arg name="joint4_lower_limit" default="-6.283185307179586"/>
+  <xacro:arg name="joint4_upper_limit" default="6.283185307179586"/>
+  <xacro:arg name="joint5_lower_limit" default="-1.692969"/>
+  <xacro:arg name="joint5_upper_limit" default="3.141592653589793"/>
+  <xacro:arg name="joint6_lower_limit" default="-6.283185307179586"/>
+  <xacro:arg name="joint6_upper_limit" default="6.283185307179586"/>
+  <xacro:arg name="enable_ros2_control" default="false"/>
+  <xacro:arg name="camera_mode" default="disabled"/>
+  <xacro:arg name="camera_baseline" default="0.08"/>
+  <xacro:arg name="camera_horizontal_fov" default="1.433"/>
+  <xacro:arg name="camera_width" default="1280"/>
+  <xacro:arg name="camera_height" default="720"/>
+  <xacro:arg name="camera_rate" default="30"/>
+  <xacro:arg
+    name="initial_positions_file"
+    default="$(find face_tracking_arm)/config/control/initial_positions.yaml"/>
+  <xacro:arg
+    name="controller_config_file"
+    default="$(find face_tracking_arm)/config/control/controllers.yaml"/>
+
+  <xacro:property name="use_xacro_load_yaml" value="true"/>
+  <xacro:property name="mesh_suffix" value="dae"/>
+  <xacro:property
+    name="mesh_path"
+    value="file://$(find face_tracking_arm)/description/ufactory_xarm6/meshes"/>
+
+  <xacro:common_material prefix=""/>
+
+  <link name="world"/>
+  <joint name="world_joint" type="fixed">
+    <parent link="world"/>
+    <child link="link_base"/>
+    <origin xyz="0 0 0.75" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:xarm6_urdf
+    prefix="" model_num="$(arg model_num)"
+    joint1_lower_limit="$(arg joint1_lower_limit)"
+    joint1_upper_limit="$(arg joint1_upper_limit)"
+    joint2_lower_limit="$(arg joint2_lower_limit)"
+    joint2_upper_limit="$(arg joint2_upper_limit)"
+    joint3_lower_limit="$(arg joint3_lower_limit)"
+    joint3_upper_limit="$(arg joint3_upper_limit)"
+    joint4_lower_limit="$(arg joint4_lower_limit)"
+    joint4_upper_limit="$(arg joint4_upper_limit)"
+    joint5_lower_limit="$(arg joint5_lower_limit)"
+    joint5_upper_limit="$(arg joint5_upper_limit)"
+    joint6_lower_limit="$(arg joint6_lower_limit)"
+    joint6_upper_limit="$(arg joint6_upper_limit)"
+    kinematics_params_filename="$(find face_tracking_arm)/description/ufactory_xarm6/config/kinematics/default/xarm6_default_kinematics.yaml"/>
+  <xacro:xarm6_gazebo prefix=""/>
+  <xacro:monitor_model parent="link6" prefix=""/>
+  <xacro:unless value="${'$(arg camera_mode)' == 'disabled'}">
+    <xacro:monitor_cameras mode="$(arg camera_mode)"
+      baseline="${float('$(arg camera_baseline)')}"
+      horizontal_fov="${float('$(arg camera_horizontal_fov)')}"
+      image_width="${int('$(arg camera_width)')}" image_height="${int('$(arg camera_height)')}"
+      camera_rate="${float('$(arg camera_rate)')}"/>
+  </xacro:unless>
+  <xacro:property name="joint_limits" value="${[[float('$(arg joint1_lower_limit)'), float('$(arg joint1_upper_limit)')], [float('$(arg joint2_lower_limit)'), float('$(arg joint2_upper_limit)')], [float('$(arg joint3_lower_limit)'), float('$(arg joint3_upper_limit)')], [float('$(arg joint4_lower_limit)'), float('$(arg joint4_upper_limit)')], [float('$(arg joint5_lower_limit)'), float('$(arg joint5_upper_limit)')], [float('$(arg joint6_lower_limit)'), float('$(arg joint6_upper_limit)')]]}"/>
+  <xacro:if value="$(arg enable_ros2_control)">
+    <xacro:xarm6_gazebo_ros2_control
+      joint_limits="${joint_limits}"
+      initial_positions_file="$(arg initial_positions_file)"
+      controller_config_file="$(arg controller_config_file)"/>
+  </xacro:if>
+</robot>

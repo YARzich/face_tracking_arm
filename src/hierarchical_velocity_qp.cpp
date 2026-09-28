@@ -278,9 +278,9 @@ InputCheck enforce_braking_invariant(
   constexpr int kBisectionIterations = 32;
   const double interior_margin = 2.0 * config.solution_feasibility_tolerance;
   const double safe_lower_position =
-    limits.lower_position[index] + limits.position_margin[index];
+    limits.lower_position[index];
   const double safe_upper_position =
-    limits.upper_position[index] - limits.position_margin[index];
+    limits.upper_position[index];
 
   const auto safe_upper = [&](const double candidate_velocity) {
       return safe_before_position_limit(
@@ -441,9 +441,9 @@ InputCheck build_constraint_matrix(
       state.velocity[index] + maximum_acceleration * config.period_sec);
 
     const double safe_lower_position =
-      limits.lower_position[index] + limits.position_margin[index];
+      limits.lower_position[index];
     const double safe_upper_position =
-      limits.upper_position[index] - limits.position_margin[index];
+      limits.upper_position[index];
     lower_velocity = std::max(
       lower_velocity,
       (safe_lower_position - state.position[index]) / config.period_sec);

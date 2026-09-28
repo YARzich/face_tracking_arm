@@ -388,9 +388,9 @@ std::optional<moveit_servo::KinematicState> CollisionAwareServoComponent::make_n
 
   const double tolerance = 2.0 * velocity_qp_->config().solution_feasibility_tolerance;
   const Eigen::VectorXd safe_lower =
-    motion_limits_.lower_position + motion_limits_.position_margin;
+    motion_limits_.lower_position;
   const Eigen::VectorXd safe_upper =
-    motion_limits_.upper_position - motion_limits_.position_margin;
+    motion_limits_.upper_position;
   if ((next_state.positions.array() < safe_lower.array() - tolerance).any() ||
     (next_state.positions.array() > safe_upper.array() + tolerance).any() ||
     (next_state.velocities.cwiseAbs().array() >
@@ -619,7 +619,7 @@ void CollisionAwareServoComponent::process_startup_cycle(
       if (bootstrap_failure_kind == BootstrapFailureKind::kRetryableState) {
         enter_startup_retry("Command timeline bootstrap deferred: " + bootstrap_failure);
       } else {
-        enter_latched_halt("Command timeline bootstrap failed: " + bootstrap_failure);
+        enter_safety_wait("Command timeline bootstrap failed: " + bootstrap_failure);
       }
       return;
     }
@@ -630,7 +630,7 @@ void CollisionAwareServoComponent::process_startup_cycle(
       if (publication_status == CommandPublicationStatus::kRecoverableTimingFailure) {
         enter_startup_retry("Command timeline bootstrap retry: " + bootstrap_failure);
       } else {
-        enter_latched_halt("Command timeline bootstrap failed: " + bootstrap_failure);
+        enter_safety_wait("Command timeline bootstrap failed: " + bootstrap_failure);
       }
       return;
     }
@@ -639,7 +639,7 @@ void CollisionAwareServoComponent::process_startup_cycle(
     if (bootstrap_record == nullptr || bootstrap_record->execution_queue.empty() ||
       !active_publication_id_.has_value())
     {
-      enter_latched_halt("Published bootstrap record is unavailable");
+      enter_safety_wait("Published bootstrap record is unavailable");
       return;
     }
     bootstrap_ack_pending_ = true;

@@ -12,3 +12,6 @@ geometry_msgs/Point face
 builtin_interfaces/Time face_stamp
 # Valid only in SEARCH: sweep or local_then_sweep. No synthetic face measurement.
 string search_pattern
+# Perception loss may finish an already adopted, validated joint detour before
+# entering idle. False for explicit pause, missing commands and safety holds.
+bool allow_recovery false

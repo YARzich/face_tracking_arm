@@ -1,0 +1,9 @@
+# All six joint angles are zero; this is a folded mechanical pose on xArm6.
+# All values below are radians in manufacturer joint coordinates.
+initial_positions:
+  joint1: 0.000000000000000
+  joint2: 0.000000000000000
+  joint3: 0.000000000000000
+  joint4: 0.000000000000000
+  joint5: 0.000000000000000
+  joint6: 0.000000000000000

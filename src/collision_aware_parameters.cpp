@@ -17,8 +17,6 @@ namespace
 constexpr double kMaximumControlPeriodSec = 0.020;
 constexpr double kMaximumTrajectoryControllerPeriodSec = 0.010;
 constexpr double kMaximumTargetTimeoutSec = 0.100;
-constexpr double kMaximumLinearReferenceMps = 0.180;
-constexpr double kMaximumAngularReferenceRadps = 0.700;
 constexpr double kMaximumPositionDeadbandM = 0.250;
 constexpr double kMaximumPointingDeadbandRad = 0.500;
 constexpr double kMaximumPrimaryPreservationToleranceRadps = 0.050;
@@ -27,16 +25,8 @@ constexpr double kMinimumCollisionQueryDistanceM = 0.180;
 constexpr std::size_t kMinimumCollisionConstraintRows = 24;
 constexpr int kMaximumCollisionConstraintRows = 64;
 constexpr double kMaximumCollisionGradientEpsilon = 1.0e-8;
-constexpr double kMonitorGuardLowerLimitRad = -1.60;
-constexpr double kMonitorGuardUpperLimitRad = 1.60;
-constexpr double kMinimumJointPositionMarginRad = 0.10;
 constexpr double kMinimumResidualCommandLatencySec = 0.020;
-constexpr double kMaximumFollowingPositionToleranceRad = 0.050;
-constexpr double kMaximumFollowingVelocityToleranceRadps = 0.300;
 constexpr double kMinimumNumericalDistanceReserveM = 0.0001;
-constexpr double kMinimumDefaultDistanceLipschitzMPerRad = 2.6193;
-constexpr double kMinimumMonitorNearDistanceLipschitzMPerRad = 0.4543;
-constexpr double kMaximumJointVelocityRadps = 1.0;
 constexpr double kMaximumSingularityWarningCondition = 40.0;
 constexpr double kMaximumSingularityStopCondition = 80.0;
 constexpr double kMaximumSolverTolerance = 1.0e-5;
@@ -62,6 +52,9 @@ ControllerParameters declareControllerParameters(rclcpp::Node & node)
     "planning_frame", result.planning_frame);
   result.command_frame = node.declare_parameter<std::string>(
     "command_frame", result.command_frame);
+  result.gaze_frame = node.declare_parameter<std::string>("gaze_frame", result.gaze_frame);
+  result.table_collision_enabled = node.declare_parameter<bool>(
+    "table_collision_enabled", result.table_collision_enabled);
 
   result.position_gain = node.declare_parameter<double>("position_gain", result.position_gain);
   result.orientation_gain = node.declare_parameter<double>(
@@ -178,15 +171,13 @@ void validateControllerParameters(const ControllerParameters & parameters)
     !positive(parameters.incoming_command_timeout_sec) ||
     parameters.incoming_command_timeout_sec < parameters.control_period_sec ||
     parameters.incoming_command_timeout_sec > kMaximumTargetTimeoutSec ||
-    parameters.planning_group_name != "lite6_arm" ||
+    parameters.planning_group_name.empty() ||
     parameters.planning_frame != "world" ||
     parameters.command_frame != "monitor_control_frame" ||
     !positive(parameters.position_gain) ||
     !positive(parameters.orientation_gain) ||
     !positive(parameters.maximum_linear_reference_mps) ||
-    parameters.maximum_linear_reference_mps > kMaximumLinearReferenceMps ||
     !positive(parameters.maximum_angular_reference_radps) ||
-    parameters.maximum_angular_reference_radps > kMaximumAngularReferenceRadps ||
     !std::isfinite(parameters.position_deadband_m) ||
     parameters.position_deadband_m < 0.0 ||
     parameters.position_deadband_m > kMaximumPositionDeadbandM ||
@@ -201,13 +192,11 @@ void validateControllerParameters(const ControllerParameters & parameters)
     !positive(parameters.joint_centering_activation_fraction) ||
     parameters.joint_centering_activation_fraction >= 1.0 ||
     !positive(parameters.joint_centering_max_velocity_rad_s) ||
-    parameters.joint_centering_max_velocity_rad_s > kMaximumJointVelocityRadps ||
     !positive(parameters.joint_centering_weight) ||
     !positive(parameters.hard_clearance_m) ||
     !positive(parameters.collision_avoidance_buffer_m) ||
     !positive(parameters.collision_avoidance_max_velocity_mps) ||
     !positive(parameters.collision_avoidance_lookahead_sec) ||
-    parameters.collision_avoidance_max_velocity_mps > kMaximumLinearReferenceMps ||
     !positive(parameters.collision_avoidance_weight) ||
     parameters.hard_clearance_m < kMinimumHardClearanceM ||
     !positive(parameters.collision_query_distance_m) ||
@@ -218,35 +207,26 @@ void validateControllerParameters(const ControllerParameters & parameters)
     parameters.maximum_collision_constraints > kMaximumCollisionConstraintRows ||
     !positive(parameters.collision_gradient_epsilon) ||
     parameters.collision_gradient_epsilon > kMaximumCollisionGradientEpsilon ||
-    parameters.monitor_guard_joint_name != "joint5" ||
     !std::isfinite(parameters.monitor_guard_min_position_rad) ||
     !std::isfinite(parameters.monitor_guard_max_position_rad) ||
     parameters.monitor_guard_min_position_rad >= parameters.monitor_guard_max_position_rad ||
-    parameters.monitor_guard_min_position_rad < kMonitorGuardLowerLimitRad ||
-    parameters.monitor_guard_max_position_rad > kMonitorGuardUpperLimitRad ||
-    !positive(parameters.joint_position_margin_rad) ||
-    parameters.joint_position_margin_rad < kMinimumJointPositionMarginRad ||
+    !std::isfinite(parameters.joint_position_margin_rad) ||
+    parameters.joint_position_margin_rad < 0.0 ||
     !std::isfinite(parameters.residual_command_latency_sec) ||
     parameters.residual_command_latency_sec < kMinimumResidualCommandLatencySec ||
     !positive(parameters.state_feedback_timeout_sec) ||
     parameters.state_feedback_timeout_sec > parameters.incoming_command_timeout_sec ||
     !positive(parameters.following_position_tolerance_rad) ||
-    parameters.following_position_tolerance_rad >
-    kMaximumFollowingPositionToleranceRad ||
     !positive(parameters.following_velocity_tolerance_rad_s) ||
-    parameters.following_velocity_tolerance_rad_s >
-    kMaximumFollowingVelocityToleranceRadps ||
     !positive(parameters.collision_tracking_error_bound_rad) ||
     parameters.collision_tracking_error_bound_rad >
     parameters.following_position_tolerance_rad ||
     !std::isfinite(parameters.numerical_distance_reserve_m) ||
     parameters.numerical_distance_reserve_m < kMinimumNumericalDistanceReserveM ||
     !std::isfinite(parameters.default_distance_lipschitz_m_per_rad) ||
-    parameters.default_distance_lipschitz_m_per_rad <
-    kMinimumDefaultDistanceLipschitzMPerRad ||
+    parameters.default_distance_lipschitz_m_per_rad < 0.0 ||
     !std::isfinite(parameters.monitor_near_distance_lipschitz_m_per_rad) ||
-    parameters.monitor_near_distance_lipschitz_m_per_rad <
-    kMinimumMonitorNearDistanceLipschitzMPerRad ||
+    parameters.monitor_near_distance_lipschitz_m_per_rad < 0.0 ||
     !positive(parameters.lower_singularity_threshold) ||
     !positive(parameters.hard_stop_singularity_threshold) ||
     parameters.lower_singularity_threshold >= parameters.hard_stop_singularity_threshold ||

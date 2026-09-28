@@ -8,7 +8,9 @@
 
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "face_tracking_arm/hierarchical_velocity_qp.hpp"
@@ -17,6 +19,7 @@ namespace moveit::core
 {
 class JointModelGroup;
 class RobotState;
+class RobotModel;
 }  // namespace moveit::core
 
 namespace planning_scene
@@ -56,7 +59,16 @@ struct CollisionConstraintConfig
   double protected_joint_lower_rad{-1.60};
   double protected_joint_upper_rad{1.60};
   double residual_latency_sec{0.020};
+
+  /// Geometry-derived pair bounds; an empty second name denotes a world pair.
+  std::map<std::pair<std::string, std::string>, double> distance_bounds;
 };
+
+/// Derive conservative distance sensitivity from the loaded collision geometry.
+/// Called once at startup, outside the control loop; supports fixed/revolute chains.
+void configureGeometryBounds(
+  CollisionConstraintConfig & config, const moveit::core::RobotModel & model,
+  const moveit::core::JointModelGroup & group);
 
 enum class CollisionPairKind
 {

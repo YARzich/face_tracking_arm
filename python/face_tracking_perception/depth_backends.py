@@ -15,14 +15,28 @@ from .depth_geometry import stereo_baseline
 class StereoDepth:
     """OpenCV SGBM on calibrated rectified pairs; output meters in the left frame."""
 
-    def __init__(self):
+    def __init__(self, num_disparities=128, block_size=5):
+        if type(num_disparities) is not int or num_disparities <= 0 or num_disparities % 16:
+            raise ValueError('stereo_num_disparities must be a positive multiple of 16 pixels')
+        if type(block_size) is not int or block_size < 1 or block_size % 2 != 1:
+            raise ValueError('stereo_block_size must be an odd positive integer in pixels')
+        self.num_disparities = num_disparities
+        self.block_size = block_size
         self.matcher = cv2.StereoSGBM_create(
-            minDisparity=0, numDisparities=128, blockSize=5,
-            P1=8 * 25, P2=32 * 25, disp12MaxDiff=1,
+            minDisparity=0, numDisparities=num_disparities, blockSize=block_size,
+            P1=8 * block_size ** 2, P2=32 * block_size ** 2, disp12MaxDiff=1,
             uniquenessRatio=10, speckleWindowSize=50, speckleRange=2,
             mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
 
     def compute(self, left_image, right_image, left_camera, right_camera):
+        if left_image.shape != right_image.shape:
+            raise ValueError('Stereo images must have the same dimensions')
+        height, width = left_image.shape[:2]
+        if (width <= self.num_disparities + self.block_size // 2 or
+                min(height, width) < self.block_size):
+            raise ValueError('Stereo image width must exceed stereo_num_disparities + '
+                             'stereo_block_size // 2; both dimensions must be at least '
+                             'stereo_block_size pixels')
         baseline = stereo_baseline(left_camera, right_camera)
         left = cv2.cvtColor(left_image, cv2.COLOR_BGR2GRAY)
         right = cv2.cvtColor(right_image, cv2.COLOR_BGR2GRAY)

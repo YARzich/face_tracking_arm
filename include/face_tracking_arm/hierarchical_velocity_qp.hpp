@@ -33,6 +33,7 @@ struct JointMotionLimits
 {
   Eigen::VectorXd lower_position;
   Eigen::VectorXd upper_position;
+  /// Preferred interior margin for posture selection; never a physical startup limit.
   Eigen::VectorXd position_margin;
   Eigen::VectorXd max_velocity;
   Eigen::VectorXd max_acceleration;

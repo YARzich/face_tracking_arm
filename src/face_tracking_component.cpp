@@ -59,8 +59,6 @@ constexpr std::int64_t kJointStateTimeoutNs = 100'000'000;
 constexpr std::int64_t kTcpPoseTimeoutNs = 30'000'000;
 constexpr std::int64_t kServoStatusTimeoutNs = 200'000'000;
 constexpr std::int64_t kMaximumClockSkewNs = 10'000'000;
-constexpr double kSafetyRetargetPositionThresholdM = 0.02;
-constexpr double kSafetyRetargetOrientationThresholdRad = 0.035;
 constexpr std::array<const char *, 6> kArmJoints = {
   "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
 
@@ -80,15 +78,6 @@ bool finite_point(const geometry_msgs::msg::Point & point)
 std::string bool_string(const bool value)
 {
   return value ? "true" : "false";
-}
-
-double quaternion_angular_distance(
-  const Eigen::Quaterniond & first,
-  const Eigen::Quaterniond & second)
-{
-  const double absolute_dot = std::clamp(
-    std::abs(first.normalized().dot(second.normalized())), 0.0, 1.0);
-  return 2.0 * std::acos(absolute_dot);
 }
 
 diagnostic_msgs::msg::KeyValue key_value(std::string key, std::string value)
@@ -403,11 +392,6 @@ private:
       if (!safety_hold_requested_ && !safety_hold_pose_.has_value()) {
         safety_hold_requested_ = true;
         safety_face_sequence_ = accepted_face_count_;
-        if (published_mode_ == "FACE") {
-          unsafe_face_target_ = last_published_face_target_;
-        } else {
-          unsafe_face_target_.reset();
-        }
       }
       if (message.code != last_logged_dangerous_code_) {
         RCLCPP_WARN(
@@ -455,9 +439,8 @@ private:
       if (last_servo_code_ == moveit_msgs::msg::ServoStatus::NO_WARNING &&
         has_safe_retarget(now_ns))
       {
-        RCLCPP_INFO(get_logger(), "Materially changed face target released the safety hold");
+        RCLCPP_INFO(get_logger(), "Fresh safe controller status released the safety hold");
         safety_hold_pose_.reset();
-        unsafe_face_target_.reset();
       } else {
         publish_pose(*safety_hold_pose_, now_ns, "SAFETY_HOLD");
         return;
@@ -628,6 +611,7 @@ private:
       (command.mode == tracking::TargetMode::kHold ? msg::TrackingTarget::HOLD :
       (command.mode == tracking::TargetMode::kSearch ? msg::TrackingTarget::SEARCH :
       msg::TrackingTarget::REST));
+    detailed.allow_recovery = command.mode != tracking::TargetMode::kFace;
     if (command.mode == tracking::TargetMode::kSearch) {
       detailed.search_pattern = idle_behavior_ == "search_local_then_sweep" &&
         last_accepted_face_stamp_ns_ ? "local_then_sweep" : "sweep";
@@ -651,13 +635,6 @@ private:
       last_logical_latency_ms_ = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - *last_face_received_at_).count();
       last_face_received_at_.reset();
-    }
-    if (command.mode == tracking::TargetMode::kFace &&
-      last_accepted_face_target_.has_value() &&
-      last_accepted_face_stamp_ns_.has_value() &&
-      command.source_face_stamp_ns == last_accepted_face_stamp_ns_)
-    {
-      last_published_face_target_ = *last_accepted_face_target_;
     }
   }
 
@@ -745,8 +722,9 @@ private:
         try {
           const auto & scene = future.get()->scene;
           const bool table_present = tracking::has_table(scene, table_);
-          const bool mounting_contact_allowed = collision_pair_allowed(
-            scene.allowed_collision_matrix, base_frame_, kTableId);
+          const bool mounting_contact_allowed =
+          table_.operation == moveit_msgs::msg::CollisionObject::REMOVE ||
+          collision_pair_allowed(scene.allowed_collision_matrix, base_frame_, kTableId);
           scene_ready_ = table_present && mounting_contact_allowed;
           if (!scene_ready_) {
             publish_table_scene(scene.allowed_collision_matrix);
@@ -762,7 +740,9 @@ private:
     if (planning_scene_publisher_->get_subscription_count() == 0) {
       return;
     }
-    allow_collision_pair(collision_matrix, base_frame_, kTableId);
+    if (table_.operation == moveit_msgs::msg::CollisionObject::ADD) {
+      allow_collision_pair(collision_matrix, base_frame_, kTableId);
+    }
 
     moveit_msgs::msg::PlanningScene update;
     update.is_diff = true;
@@ -816,26 +796,17 @@ private:
 
   bool has_safe_retarget(const std::int64_t now_ns) const
   {
-    if (accepted_face_count_ <= safety_face_sequence_ ||
-      !last_accepted_face_stamp_ns_.has_value() ||
-      !last_accepted_face_target_.has_value() ||
-      *last_accepted_face_stamp_ns_ > now_ns ||
-      now_ns - *last_accepted_face_stamp_ns_ >= freshness_timeout_ns_)
-    {
+    // Safety is decided by the controller, which must report a fresh NO_WARNING
+    // before this predicate is used. A new observation of the same person is
+    // enough; requiring changed geometry would latch a static face forever.
+    if (!last_accepted_face_stamp_ns_) {
+      return true;  // Resume the configured idle behavior when no face exists.
+    }
+    if (*last_accepted_face_stamp_ns_ > now_ns) {
       return false;
     }
-    if (!unsafe_face_target_.has_value()) {
-      return true;
-    }
-
-    const double position_delta =
-      (last_accepted_face_target_->monitor_pose.position -
-      unsafe_face_target_->monitor_pose.position).norm();
-    const double orientation_delta = quaternion_angular_distance(
-      last_accepted_face_target_->monitor_pose.orientation,
-      unsafe_face_target_->monitor_pose.orientation);
-    return position_delta >= kSafetyRetargetPositionThresholdM ||
-           orientation_delta >= kSafetyRetargetOrientationThresholdRad;
+    const bool face_fresh = now_ns - *last_accepted_face_stamp_ns_ < freshness_timeout_ns_;
+    return !face_fresh || accepted_face_count_ > safety_face_sequence_;
   }
 
   bool infrastructure_ready(const std::int64_t now_ns) const
@@ -943,8 +914,6 @@ private:
     safety_hold_requested_ = false;
     safety_hold_pose_.reset();
     last_accepted_face_target_.reset();
-    last_published_face_target_.reset();
-    unsafe_face_target_.reset();
     last_adapter_status_ = "clock_reset";
     RCLCPP_WARN(get_logger(), "ROS clock moved backwards; tracking state was reset");
   }
@@ -983,8 +952,6 @@ private:
   moveit_msgs::msg::CollisionObject table_;
   std::optional<tracking::Pose3d> safety_hold_pose_;
   std::optional<tracking::FaceGeometry> last_accepted_face_target_;
-  std::optional<tracking::FaceGeometry> last_published_face_target_;
-  std::optional<tracking::FaceGeometry> unsafe_face_target_;
 
   bool joint_state_complete_{false};
   bool controllers_ready_{false};

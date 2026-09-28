@@ -1722,5 +1722,129 @@ TEST(CollisionConstraints, InvalidActualStateCheckFailsClosed)
   EXPECT_NE(result.failure_reason.find("non-finite"), std::string::npos);
 }
 
+
+TEST(CollisionGeometryBounds, DerivesBoundsAndCancelsCommonAncestorMotion)
+{
+  std::string description = kSliderUrdf;
+  description.replace(description.find("prismatic"), 9U, "revolute");
+  SliderFixture fixture(description);
+  ASSERT_NE(fixture.group, nullptr);
+  auto config = sliderConfig();
+  configureGeometryBounds(config, *fixture.robot_model, *fixture.group);
+  const auto world = std::make_pair(std::string("moving"), std::string());
+  const auto fixed_pair = std::make_pair(std::string("mount_neighbor"), std::string("moving"));
+  const auto relative_pair = std::make_pair(std::string("base"), std::string("moving"));
+  EXPECT_NEAR(config.distance_bounds.at(world), std::sqrt(3.0) * 0.05, 1.0e-9);
+  EXPECT_DOUBLE_EQ(config.distance_bounds.at(fixed_pair), 0.0);
+  EXPECT_NEAR(config.distance_bounds.at(relative_pair), config.distance_bounds.at(world), 1.0e-9);
+}
+
+TEST(CollisionConstraints, MonitorFrameWithoutGeometryKeepsCameraCollisionChecks)
+{
+  std::string description = kSliderUrdf;
+  const auto start = description.find("<link name=\"moving\">");
+  description.replace(start, description.find("</link>", start) + 7U - start,
+    "<link name=\"moving\"/>");
+  description.insert(description.find("</robot>"),
+        R"(
+  <link name="camera">
+    <collision><geometry><box size="0.08 0.08 0.08"/></geometry></collision>
+  </link>
+  <joint name="camera_mount" type="fixed">
+    <parent link="moving"/><child link="camera"/><origin xyz="0 0.5 0"/>
+  </joint>
+)");
+  SliderFixture fixture(description);
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d obstacle_pose = Eigen::Isometry3d::Identity();
+  obstacle_pose.translation() = Eigen::Vector3d(.40, .5, 0);
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(.08, .08, .08), obstacle_pose);
+  moveit::core::RobotState state(fixture.robot_model);
+  state.setToDefaultValues();
+  const auto motion = motionAt(.30);
+  state.setJointGroupPositions(fixture.group, motion.position);
+  state.update(true);
+  const CollisionConstraintBuilder builder(sliderConfig());
+  const auto result = builder.build(
+    *fixture.scene, state, *fixture.group, motion, oneDofLimits(), .01);
+  ASSERT_TRUE(result.diagnostics.valid) << result.diagnostics.failure_reason;
+  const auto * pair = findWorldPair(result, "wall");
+  ASSERT_NE(pair, nullptr);
+  EXPECT_TRUE(pair->first_body == "camera" || pair->second_body == "camera");
+  EXPECT_NEAR(pair->distance_m, .02, 1.0e-9);
+  EXPECT_TRUE(std::isfinite(pair->gradient_norm));
+  for (const auto & constraint : result.constraints) {
+    EXPECT_TRUE(constraint.coefficients.allFinite());
+    EXPECT_FALSE(std::isnan(constraint.lower_bound));
+    EXPECT_FALSE(std::isnan(constraint.upper_bound));
+  }
+  const auto actual = builder.validateActualState(*fixture.scene, state, *fixture.group);
+  EXPECT_TRUE(actual.input_valid) << actual.failure_reason;
+  EXPECT_FALSE(actual.unsafe);
+  // The actual-state check queries only inside hard_clearance_m (15 mm).
+  // Move the obstacle closer to verify that the remaining camera still stops it.
+  fixture.scene->getWorldNonConst()->removeObject("wall");
+  obstacle_pose.translation().x() = .39;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(.08, .08, .08), obstacle_pose);
+  const auto close = builder.validateActualState(*fixture.scene, state, *fixture.group);
+  EXPECT_TRUE(close.input_valid) << close.failure_reason;
+  EXPECT_NEAR(close.minimum_world_distance_m, .01, 1.0e-9);
+  EXPECT_EQ(close.closest_pair, "camera <-> wall");
+  EXPECT_TRUE(close.hard_clearance_violated);
+  EXPECT_TRUE(close.unsafe);
+
+  description.replace(description.find("prismatic"), 9U, "revolute");
+  SliderFixture revolute(description);
+  auto config = sliderConfig();
+  configureGeometryBounds(config, *revolute.robot_model, *revolute.group);
+  EXPECT_EQ(config.distance_bounds.count({"moving", ""}), 0U);
+  EXPECT_GT(config.distance_bounds.at({"camera", ""}), 0.0);
+  for (const auto & entry : config.distance_bounds) {
+    EXPECT_TRUE(std::isfinite(entry.second));
+    EXPECT_GE(entry.second, 0.0);
+  }
+}
+
+TEST(CollisionConstraints, MissingGeometryOnArmLinksIsStillRejected)
+{
+  std::string description = kSliderUrdf;
+  const auto start = description.find("<link name=\"near\">");
+  description.replace(start, description.find("</link>", start) + 7U - start,
+    "<link name=\"near\"/>");
+  SliderFixture fixture(description);
+  ASSERT_NE(fixture.group, nullptr);
+  moveit::core::RobotState state(fixture.robot_model);
+  state.setToDefaultValues();
+  state.update(true);
+  const auto actual = CollisionConstraintBuilder(sliderConfig()).validateActualState(
+    *fixture.scene, state, *fixture.group);
+  EXPECT_FALSE(actual.input_valid);
+  EXPECT_NE(actual.failure_reason.find("'near' has no collision geometry"), std::string::npos);
+}
+
+
+TEST(CollisionConstraints, PhysicalBoundaryStartDoesNotRequireOneTickMarginRecovery)
+{
+  SliderFixture fixture;
+  auto config = sliderConfig();
+  config.protected_joint_lower_rad = -1.0;
+  config.protected_joint_upper_rad = 1.0;
+  auto limits = oneDofLimits();
+  limits.position_margin[0] = 0.1;
+  for (const double position : {-0.999, 0.999}) {
+    auto motion = motionAt(position);
+    moveit::core::RobotState state(fixture.robot_model);
+    state.setToDefaultValues();
+    state.setJointGroupPositions(fixture.group, motion.position);
+    state.update();
+    const auto result = CollisionConstraintBuilder(config).build(
+      *fixture.scene, state, *fixture.group, motion, limits, 0.01);
+    EXPECT_TRUE(result.diagnostics.valid) << result.diagnostics.failure_reason;
+    EXPECT_FALSE(result.diagnostics.protected_joint_corridor_violated);
+  }
+}
+
 }  // namespace
 }  // namespace face_tracking_arm::control

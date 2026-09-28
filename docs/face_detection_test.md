@@ -27,7 +27,7 @@ ros2 launch face_tracking_arm face_detection_test.launch.py detector:=yolov5n_fa
 ros2 launch face_tracking_arm face_detection_test.launch.py detector:=yolo_facev2n
 ```
 
-Предыдущий запуск сначала завершить Ctrl+C. `headless:=true` отключает оба
+Сначала завершите предыдущий запуск через Ctrl+C. `headless:=true` отключает оба
 графических окна, сохраняя рендеринг камеры и ROS-выходы. `show_image:=false`
 отключает только окно изображения. Дополнительные аргументы:
 
@@ -108,7 +108,7 @@ printf '%s  %s\n' \
 ## Ограничения и лицензии
 
 YuNet используется по умолчанию. YOLO-варианты требуют своих ONNX-весов.
-В проверенном checkpoint `yolo-facev2n-preweight.onnx` обнаружения лица
-не подтвердились; снижение порога не считается исправлением качества модели.
+Проверенные веса `yolo-facev2n-preweight.onnx` не дают детекций в этой сцене.
+Для основного запуска используйте YuNet.
 
 [Источники моделей и условия использования](../THIRD_PARTY_NOTICES.md).

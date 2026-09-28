@@ -14,10 +14,10 @@ from ament_index_python.packages import get_package_share_directory
 import pytest
 
 
-MONITOR_THICKNESS = 0.03
-MONITOR_WIDTH = 0.30
-MONITOR_HEIGHT = 0.20
-MONITOR_MASS = 0.50
+MONITOR_THICKNESS = 0.01
+MONITOR_WIDTH = 0.355
+MONITOR_HEIGHT = 0.224
+MONITOR_MASS = 0.692
 ABS_TOL = 1.0e-9
 
 

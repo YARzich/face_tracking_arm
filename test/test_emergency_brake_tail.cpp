@@ -72,10 +72,10 @@ void expectValidTail(
       EXPECT_LE(std::abs(jerk), limits.max_jerk[joint] + kTolerance);
       EXPECT_GE(
         current.position[joint],
-        limits.lower_position[joint] + limits.position_margin[joint] - kTolerance);
+        limits.lower_position[joint] - kTolerance);
       EXPECT_LE(
         current.position[joint],
-        limits.upper_position[joint] - limits.position_margin[joint] + kTolerance);
+        limits.upper_position[joint] + kTolerance);
     }
   }
   for (std::size_t point = tail.first_stationary_point;
@@ -226,7 +226,7 @@ TEST(EmergencyBrakeTail, RejectsAStopThatWouldCrossTheSafePositionBound)
 {
   const EmergencyBrakeTailGenerator generator;
   JointMotionState state = makeState(1);
-  state.position[0] = 1.89;
+  state.position[0] = 1.99;
   state.velocity[0] = 0.4;
   state.acceleration[0] = 0.0;
 
@@ -277,6 +277,19 @@ TEST(EmergencyBrakeTail, RejectsConfigurationsThatCouldHideTheTerminalPoint)
   config = EmergencyBrakeTailConfig{};
   config.period_sec = 0.0;
   EXPECT_THROW(EmergencyBrakeTailGenerator{config}, std::invalid_argument);
+}
+
+
+TEST(EmergencyBrakeTail, StationaryHoldInsidePhysicalBoundsDoesNotRequirePreferredMargin)
+{
+  const EmergencyBrakeTailGenerator generator;
+  auto state = makeState(1);
+  for (const double position : {-1.999, 1.999}) {
+    state.position[0] = position;
+    const auto tail = generator.generate(state, makeLimits(1));
+    ASSERT_TRUE(tail.command_available());
+    EXPECT_DOUBLE_EQ(tail.points.back().position[0], position);
+  }
 }
 
 }  // namespace

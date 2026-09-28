@@ -24,7 +24,7 @@
   <xacro:arg name="camera_baseline" default="0.08"/>
   <xacro:arg
     name="initial_positions_file"
-    default="$(find face_tracking_arm)/config/control/initial_positions.yaml"/>
+    default="$(find face_tracking_arm)/config/control/lite6_initial_positions.yaml"/>
   <xacro:arg
     name="controller_config_file"
     default="$(find face_tracking_arm)/config/control/controllers.yaml"/>

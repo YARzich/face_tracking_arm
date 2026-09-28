@@ -14,8 +14,6 @@ constexpr std::size_t kRequiredStableRearmSamples = 3;
 
 constexpr double kFeedbackLimitTolerance = 1.0e-6;
 
-constexpr double kMaximumRecoverableFollowingVelocityErrorRadps = 0.300;
-
 }  // namespace
 
 std::optional<control_msgs::msg::JointTrajectoryControllerState> CollisionAwareServoComponent::
@@ -540,8 +538,6 @@ predicted_or_measured_state(
     const control::FollowingErrorPolicy following_policy{
       parameters_.following_position_tolerance_rad,
       parameters_.following_velocity_tolerance_rad_s,
-      parameters_.collision_tracking_error_bound_rad,
-      kMaximumRecoverableFollowingVelocityErrorRadps,
     };
     const control::FollowingErrorAction following_action =
       control::classifyFollowingError(position_error, velocity_error, following_policy);
@@ -657,18 +653,13 @@ bool CollisionAwareServoComponent::feedback_motion_within_limits(
   const Eigen::Map<const Eigen::VectorXd> velocity(
     state.feedback.velocities.data(),
     static_cast<Eigen::Index>(state.feedback.velocities.size()));
-  const Eigen::VectorXd physical_position_margin =
-    (motion_limits_.position_margin.array() -
-    parameters_.collision_tracking_error_bound_rad).max(0.0);
-  const Eigen::VectorXd safe_lower =
-    motion_limits_.lower_position + physical_position_margin;
-  const Eigen::VectorXd safe_upper =
-    motion_limits_.upper_position - physical_position_margin;
+  const Eigen::VectorXd & safe_lower = motion_limits_.lower_position;
+  const Eigen::VectorXd & safe_upper = motion_limits_.upper_position;
 
   if ((position.array() < safe_lower.array() - kFeedbackLimitTolerance).any() ||
     (position.array() > safe_upper.array() + kFeedbackLimitTolerance).any())
   {
-    failure_reason = "Measured joint position left the feedback-safe limit corridor";
+    failure_reason = "Measured joint position exceeds the robot joint limits";
     return false;
   }
   if (physical_joint_velocity_limits_.size() != velocity.size() ||

@@ -17,11 +17,15 @@ from std_msgs.msg import Header
 
 from .appearance_motion import AppearanceMotion, companion_center
 from .appearance_sequence import AppearanceSequence
+from .arm_scene import person_entity_name
+from .close_stress_motion import CloseStressMotion
 from .depth_messages import status_message
+from .fast_stress_motion import FastStressMotion
+from .stress_motion import StressMotion
 
 
 class FaceAppearances(Node):
-    """Wait for tracking readiness and the measured SRDF rest pose between people."""
+    """Apply appearance or stress poses; observe the arm without commanding it."""
 
     def __init__(self):
         super().__init__('face_appearances')
@@ -29,19 +33,30 @@ class FaceAppearances(Node):
             ('visible_sec', 12.0), ('rest_sec', 8.0), ('cycles', 0),
             ('motion_lateral_m', 0.14), ('motion_depth_m', 0.07),
             ('motion_yaw_rad', 0.07), ('motion_period_sec', 6.0),
-            ('idle_behavior', 'rest'), ('people_count', 1),
+            ('idle_behavior', 'rest'), ('people_count', 1), ('scenario', 'appearances'),
             ('positions_xy', [2.35, 0.0, 2.25, -0.35, 2.60, 0.40]),
             ('rest_joints', [0.0] * 6)])
         value = lambda name: self.get_parameter(name).value  # noqa: E731
         self.positions = np.asarray(value('positions_xy')).reshape(-1, 2)
         self.rest_joints = np.asarray(value('rest_joints'))
-        if (not np.isfinite(self.positions).all() or (self.positions[:, 0] <= .8).any()
+        if (not np.isfinite(self.positions).all()
+                or (np.linalg.norm(self.positions, axis=1) <= .8).any()
                 or self.rest_joints.shape != (6,) or not np.isfinite(self.rest_joints).all()):
             raise ValueError('Invalid person positions or six-joint rest configuration')
         self.searching = value('idle_behavior') != 'rest'
         self.people_count = value('people_count')
-        if self.people_count not in (1, 2):
-            raise ValueError('people_count must be 1 or 2')
+        self.scenario = value('scenario')
+        counts = {'appearances': (1, 2), 'stress': (1,), 'stress_fast': (3,), 'stress_close': (1,)}
+        if self.scenario not in counts or self.people_count not in counts[self.scenario]:
+            raise ValueError(
+                'Use appearances with 1–2 people, stress/stress_close with 1, '
+                'or stress_fast with 3')
+        self.cycles = value('cycles')
+        profiles = {'stress': StressMotion, 'stress_fast': FastStressMotion,
+                    'stress_close': CloseStressMotion}
+        self.stress = profiles.get(self.scenario, StressMotion)()
+        self.stress_started_at = None
+        self.stress_last_time = None
         self.sequence = AppearanceSequence(len(self.positions), value('visible_sec'),
                                            value('rest_sec'), value('cycles'), self.searching)
         self.motion = AppearanceMotion(value('motion_lateral_m'), value('motion_depth_m'),
@@ -55,6 +70,8 @@ class FaceAppearances(Node):
         self.at_rest = False
         self.pending = None
         self.retry_at = 0.0
+        self.pose_success_at = None
+        self.pose_failures = 0
         self.client = self.create_client(SetEntityPose, '/world/lite6_table/set_pose/blocking')
         self.tracking_sub = self.create_subscription(
             DiagnosticArray, '/tracking/diagnostics', self.on_tracking, 1)
@@ -99,6 +116,9 @@ class FaceAppearances(Node):
 
     def tick(self):
         now = self.seconds()
+        if self.scenario in ('stress', 'stress_fast', 'stress_close'):
+            self.tick_stress(now)
+            return
         fresh = all(stamp is not None and 0 <= now - stamp < .5
                     for stamp in (self.tracking_stamp, self.joint_stamp))
         idle_ready = self.at_rest and self.mode == 'REST'
@@ -120,23 +140,64 @@ class FaceAppearances(Node):
         if (not action or self.pending is not None or now < self.retry_at
                 or not self.client.service_is_ready()):
             return
-        futures = []
+        poses = []
         for index in range(self.people_count):
-            request = SetEntityPose.Request()
-            name = 'face_test_person' + ('_2' if index else '')
-            request.entity = Entity(name=name, type=Entity.MODEL)
-            request.pose.orientation.w = 1.0
-            request.pose.position.z = -10.0
+            pose = (0.0, 0.0, -10.0, 0.0)
             if action in ('show', 'move'):
                 elapsed = now - self.sequence.shown_at if action == 'move' else 0.0
                 center = self.positions[self.sequence.index]
                 if index:
                     center = companion_center(center, elapsed)
                 x, y, yaw = self.motion.pose(center, elapsed)
-                request.pose.position.x, request.pose.position.y = x, y
-                request.pose.position.z = 0.0
-                request.pose.orientation.z, request.pose.orientation.w = (
-                    math.sin(yaw / 2), math.cos(yaw / 2))
+                pose = (x, y, 0.0, yaw)
+            poses.append(pose)
+        self.request_poses(poses, action)
+
+    def tick_stress(self, now):
+        # The person is already in the world before control starts. Run the
+        # schedule from the first feedback, without waiting for REST or FACE.
+        if self.stress_started_at is None and self.joint_stamp is not None:
+            self.stress_started_at = self.joint_stamp
+        if self.stress_last_time is not None and now < self.stress_last_time:
+            self.stress_started_at = now
+            self.retry_at = now
+            self.pose_success_at = None
+        self.stress_last_time = now
+        elapsed = 0.0 if self.stress_started_at is None else now - self.stress_started_at
+        sample = self.stress.sample(elapsed, cycles=self.cycles)
+        if self.scenario == 'stress_fast':
+            poses, visible = sample.poses, True
+        else:
+            poses = [sample.pose if sample.visible else (0.0, 0.0, -10.0, 0.0)]
+            visible = sample.visible
+        fresh = all(stamp is not None and 0 <= now - stamp < .5
+                    for stamp in (self.tracking_stamp, self.joint_stamp))
+        header = Header(stamp=self.get_clock().now().to_msg(), frame_id='world')
+        values = {'scenario': self.scenario, 'elapsed_sec': elapsed,
+                  'people_count': self.people_count,
+                  'duration_sec': self.stress.duration_sec, 'visible': visible,
+                  'complete': sample.complete, 'ready': self.ready and fresh,
+                  'tracking_mode': self.mode, 'pose_request_pending': self.pending is not None,
+                  'pose_failures': self.pose_failures,
+                  'pose_ack_age_sec': (now - self.pose_success_at
+                                       if self.pose_success_at is not None else -1.0)}
+        self.publisher.publish(status_message(
+            header, 'face_appearances', sample.phase, values, fresh))
+        if (self.pending is not None or now < self.retry_at
+                or not self.client.service_is_ready()):
+            return
+        self.request_poses(poses, 'move')
+
+    def request_poses(self, poses, action):
+        """Keep one acknowledged Gazebo request per person in flight."""
+        futures = []
+        for index, (x, y, z, yaw) in enumerate(poses):
+            request = SetEntityPose.Request()
+            name = person_entity_name(index)
+            request.entity = Entity(name=name, type=Entity.MODEL)
+            request.pose.position.x, request.pose.position.y, request.pose.position.z = x, y, z
+            request.pose.orientation.z, request.pose.orientation.w = (
+                math.sin(yaw / 2), math.cos(yaw / 2))
             futures.append(self.client.call_async(request))
         self.pending = futures
         for future in futures:
@@ -153,6 +214,7 @@ class FaceAppearances(Node):
             success = False
         now = self.seconds()
         if success:
+            self.pose_success_at = now
             if action == 'move':
                 return  # Motion must not restart visibility time or advance the person index.
             self.sequence.acknowledge(action, now)
@@ -160,6 +222,7 @@ class FaceAppearances(Node):
                 f'{self.sequence.phase}: appearance {self.sequence.appearances}, '
                 f'next index {self.sequence.index}')
         else:
+            self.pose_failures += 1
             self.retry_at = now + 1
             self.get_logger().warning('Gazebo did not move the person; retrying in one second')
 

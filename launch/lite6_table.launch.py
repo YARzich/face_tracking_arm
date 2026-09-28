@@ -32,7 +32,7 @@ def generate_launch_description() -> LaunchDescription:
         [
             FindPackageShare('face_tracking_arm'),
             'description',
-            'lite6_table.urdf.xacro',
+            'xarm6_table.urdf.xacro',
         ]
     )
     robot_description = ParameterValue(

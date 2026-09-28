@@ -20,9 +20,13 @@ struct ControllerParameters
   double control_period_sec{0.01};
   double trajectory_controller_period_sec{0.01};
   double incoming_command_timeout_sec{0.10};
-  std::string planning_group_name{"lite6_arm"};
+  std::string planning_group_name{"xarm6"};
   std::string planning_frame{"world"};
   std::string command_frame{"monitor_control_frame"};
+  /// Optional optical camera frame: +Z forward. Empty uses the monitor +X axis.
+  std::string gaze_frame;
+  /// Derived from the table dimensions; initialization waits for this scene state.
+  bool table_collision_enabled{true};
 
   double position_gain{1.5};
   double orientation_gain{4.0};
@@ -46,7 +50,7 @@ struct ControllerParameters
   double collision_avoidance_lookahead_sec{0.4};
   double collision_avoidance_weight{4.0};
 
-  std::string monitor_guard_joint_name{"joint5"};
+  std::string monitor_guard_joint_name{};
   double monitor_guard_min_position_rad{-1.60};
   double monitor_guard_max_position_rad{1.60};
   double joint_position_margin_rad{0.10};

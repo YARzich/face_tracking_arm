@@ -96,7 +96,8 @@ ament_target_dependencies(background_path_planner
 add_tracking_library(emergency_brake_tail src/emergency_brake_tail.cpp)
 target_link_libraries(emergency_brake_tail PUBLIC Eigen3::Eigen)
 
-add_tracking_library(collision_constraints src/collision_constraints.cpp)
+add_tracking_library(collision_constraints
+  src/collision_constraints.cpp src/robot_geometry_bounds.cpp)
 target_link_libraries(collision_constraints hierarchical_velocity_qp Eigen3::Eigen)
 ament_target_dependencies(collision_constraints moveit_core)
 
@@ -268,6 +269,16 @@ file(
   "${lite6_integration_xacro}"
 )
 
+# Keep the xArm6 snapshot unmodified and resolve its package references locally.
+file(READ
+  "${CMAKE_CURRENT_SOURCE_DIR}/description/ufactory_xarm6/urdf/xarm6/xarm6.urdf.xacro"
+  xarm6_integration_xacro)
+string(REPLACE "$(find xarm_description)"
+  "$(find face_tracking_arm)/description/ufactory_xarm6"
+  xarm6_integration_xacro "${xarm6_integration_xacro}")
+file(WRITE "${generated_description_directory}/xarm6.urdf.xacro"
+  "${xarm6_integration_xacro}")
+
 install(FILES LICENSE THIRD_PARTY_NOTICES.md DESTINATION share/${PROJECT_NAME})
 
 install(
@@ -291,6 +302,7 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME})
 install(
   FILES "${generated_description_directory}/lite6.urdf.xacro"
+    "${generated_description_directory}/xarm6.urdf.xacro"
   DESTINATION share/${PROJECT_NAME}/description/generated
 )
 install(
@@ -367,9 +379,22 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_face_detection test/test_face_detection.py TIMEOUT 30)
   ament_add_pytest_test(test_face_depth test/test_face_depth.py TIMEOUT 30)
   ament_add_pytest_test(test_face_appearances test/test_face_appearances.py TIMEOUT 30)
+  ament_add_pytest_test(test_stress_motion test/test_stress_motion.py TIMEOUT 30)
+  ament_add_pytest_test(test_fast_stress_motion test/test_fast_stress_motion.py TIMEOUT 30)
+  ament_add_pytest_test(test_simulation_start test/test_simulation_start.py TIMEOUT 60)
   ament_add_pytest_test(test_face_selection test/test_face_selection.py TIMEOUT 30)
+  ament_add_pytest_test(test_point_filter test/test_point_filter.py TIMEOUT 30)
+  ament_add_pytest_test(test_kalman_point_filter test/test_kalman_point_filter.py TIMEOUT 30)
+  ament_add_pytest_test(test_close_stress_motion test/test_close_stress_motion.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_config test/test_hardware_config.py TIMEOUT 30)
+  ament_add_pytest_test(test_hardware_zero_geometry test/test_hardware_zero_geometry.py TIMEOUT 30)
+  ament_add_pytest_test(test_mount_collisions test/test_mount_collisions.py TIMEOUT 30)
   ament_add_pytest_test(test_container_tools test/test_container_tools.py TIMEOUT 30)
+  ament_add_pytest_test(test_camera_controls test/test_camera_controls.py TIMEOUT 30)
+  ament_add_pytest_test(test_robot_profile test/test_robot_profile.py TIMEOUT 30)
+  ament_add_pytest_test(test_hardware_probe test/test_hardware_probe.py TIMEOUT 30)
+  ament_add_pytest_test(test_hardware_activation_guard
+    test/test_hardware_activation_guard.py TIMEOUT 30)
   ament_add_pytest_test(test_controller_shutdown test/test_controller_shutdown.py TIMEOUT 60)
   ament_add_pytest_test(test_rectification test/test_rectification.py TIMEOUT 30)
   ament_add_gtest(test_table_geometry test/test_table_geometry.cpp)
@@ -395,14 +420,14 @@ if(BUILD_TESTING)
   find_program(XACRO_EXECUTABLE xacro REQUIRED)
   add_test(NAME motion_reference_description
     COMMAND "${XACRO_EXECUTABLE}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/description/lite6_table.urdf.xacro"
+      "${CMAKE_CURRENT_SOURCE_DIR}/description/xarm6_table.urdf.xacro"
       -o "${CMAKE_CURRENT_BINARY_DIR}/test_robot.urdf")
   set_tests_properties(motion_reference_description PROPERTIES
     FIXTURES_SETUP motion_reference_description)
   ament_add_gtest(test_motion_reference test/test_motion_reference.cpp)
   target_compile_definitions(test_motion_reference PRIVATE
     TEST_ROBOT_URDF_FILE="${CMAKE_CURRENT_BINARY_DIR}/test_robot.urdf"
-    TEST_ROBOT_SRDF_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/moveit/lite6.srdf")
+    TEST_ROBOT_SRDF_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/moveit/xarm6.srdf")
   target_link_libraries(test_motion_reference collision_aware_servo_component)
   set_tests_properties(test_motion_reference PROPERTIES
     FIXTURES_REQUIRED motion_reference_description)

@@ -10,8 +10,6 @@ namespace
 
 using namespace std::chrono_literals;
 
-constexpr std::size_t kMaximumConsecutiveAutomaticRearms = 3;
-
 constexpr std::size_t kHealthyPublicationsToResetRearmBudget = 100;
 
 }  // namespace
@@ -80,35 +78,27 @@ void CollisionAwareServoComponent::record_healthy_publication() noexcept
   }
 }
 
-void CollisionAwareServoComponent::enter_latched_halt(std::string message)
+void CollisionAwareServoComponent::enter_safety_wait(std::string message)
 {
-  if (halt_latched_.exchange(true, std::memory_order_acq_rel)) {
-    rearm_pending_ = false;
-    published_tail_rearm_pending_ = false;
-    stable_rearm_samples_ = 0;
-    last_rearm_sample_time_.reset();
-    clear_rearm_deadlines();
-    clear_bootstrap_ack_state();
-    publish_status(
-      moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION,
-      latched_halt_reason_.empty() ? message : latched_halt_reason_);
-    return;
-  }
-  // Do not replace the active JTC command here. Every successful publication
-  // already contains a checked jerk-limited suffix to a stationary hold, so
-  // silence is the only transport-independent way to preserve that stop.
-  controller_mode_ = ControllerMode::kLatchedHalt;
-  latched_halt_reason_ = message;
+  // Keep the last checked stop on the controller. Reconsider fresh feedback
+  // continuously; this software wait never clears a drive fault or an E-stop.
+  halt_latched_.store(true, std::memory_order_release);
+  controller_mode_ = ControllerMode::kWaitingForSafeState;
+  latched_halt_reason_ = std::move(message);
+  const auto * record = active_published_record();
+  const auto current_time = now();
+  published_tail_rearm_pending_ = record && current_time < record->stationary_time;
   command_queue_.clear();
   control_time_grid_->resetCommandEpoch();
   command_epoch_active_ = false;
   command_epoch_has_published_ = false;
   clear_bootstrap_ack_state();
-  rearm_pending_ = false;
-  published_tail_rearm_pending_ = false;
+  rearm_pending_ = true;
   stable_rearm_samples_ = 0;
   last_rearm_sample_time_.reset();
-  clear_rearm_deadlines();
+  start_rearm_deadline(current_time);
+  reset_feedback_derivative_history();
+  motion_reference_->reset();
   publish_status(moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION, latched_halt_reason_);
 }
 
@@ -163,13 +153,7 @@ void CollisionAwareServoComponent::enter_controlled_rearm(std::string message)
   if (!command_epoch_has_published_ || published_record == nullptr ||
     published_record->execution_queue.empty())
   {
-    enter_latched_halt(std::move(message));
-    return;
-  }
-  if (consecutive_automatic_rearms_ >= kMaximumConsecutiveAutomaticRearms) {
-    ++rearm_budget_exhaustion_count_;
-    enter_latched_halt(
-      "Automatic recovery budget exhausted after repeated control gaps: " + message);
+    enter_safety_wait(std::move(message));
     return;
   }
   ++consecutive_automatic_rearms_;

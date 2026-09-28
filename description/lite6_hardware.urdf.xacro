@@ -1,6 +1,18 @@
 <?xml version="1.0"?>
 <!-- Real and mock ros2_control assembly; no Gazebo tags or sensors. -->
 <robot name="lite6" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="joint1_lower_limit" default="-6.283185307179586"/>
+  <xacro:arg name="joint1_upper_limit" default="6.283185307179586"/>
+  <xacro:arg name="joint2_lower_limit" default="-2.6179938779914944"/>
+  <xacro:arg name="joint2_upper_limit" default="2.6179938779914944"/>
+  <xacro:arg name="joint3_lower_limit" default="-0.061086523819801536"/>
+  <xacro:arg name="joint3_upper_limit" default="5.235987755982989"/>
+  <xacro:arg name="joint4_lower_limit" default="-6.283185307179586"/>
+  <xacro:arg name="joint4_upper_limit" default="6.283185307179586"/>
+  <xacro:arg name="joint5_lower_limit" default="-2.1642082724729685"/>
+  <xacro:arg name="joint5_upper_limit" default="2.1642082724729685"/>
+  <xacro:arg name="joint6_lower_limit" default="-6.283185307179586"/>
+  <xacro:arg name="joint6_upper_limit" default="6.283185307179586"/>
   <xacro:arg name="config_file" default=""/>
   <xacro:arg name="camera_mode" default="mono_cpu"/>
   <xacro:arg name="mock_hardware" default="false"/>
@@ -25,6 +37,18 @@
       rpy="${' '.join([str(v * degree_scale) for v in hardware['robot']['base_rpy_deg']])}"/>
   </joint>
   <xacro:lite6_urdf prefix=""
+    joint1_lower_limit="$(arg joint1_lower_limit)"
+    joint1_upper_limit="$(arg joint1_upper_limit)"
+    joint2_lower_limit="$(arg joint2_lower_limit)"
+    joint2_upper_limit="$(arg joint2_upper_limit)"
+    joint3_lower_limit="$(arg joint3_lower_limit)"
+    joint3_upper_limit="$(arg joint3_upper_limit)"
+    joint4_lower_limit="$(arg joint4_lower_limit)"
+    joint4_upper_limit="$(arg joint4_upper_limit)"
+    joint5_lower_limit="$(arg joint5_lower_limit)"
+    joint5_upper_limit="$(arg joint5_upper_limit)"
+    joint6_lower_limit="$(arg joint6_lower_limit)"
+    joint6_upper_limit="$(arg joint6_upper_limit)"
     kinematics_params_filename="$(find face_tracking_arm)/description/ufactory_lite6/config/kinematics/default/lite6_default_kinematics.yaml"/>
   <xacro:monitor_model parent="link6" thickness="${monitor['size_m'][0]}"
     width="${monitor['size_m'][1]}" height="${monitor['size_m'][2]}" mass="${monitor['mass_kg']}"
@@ -59,10 +83,30 @@
       <xacro:camera_frame camera="${cameras['right']}" side="right"/>
     </xacro:if>
   </xacro:if>
+  <xacro:unless value="${mount['publish_optical_tf']}">
+    <link name="tracking_gaze_optical"/>
+    <joint name="tracking_gaze_joint" type="fixed">
+      <parent link="${mount['body_frame']}"/><child link="tracking_gaze_optical"/>
+      <origin xyz="${' '.join(map(str, cameras['left']['optical_xyz_m']))}"
+        rpy="${' '.join([str(v * degree_scale) for v in cameras['left']['optical_rpy_deg']])}"/>
+    </joint>
+  </xacro:unless>
   <xacro:unless value="$(arg mock_hardware)">
     <!-- Use the manufacturer's interface declaration and actual bounded joints. -->
     <xacro:include filename="$(find xarm_description)/urdf/lite6/lite6.ros2_control.xacro"/>
     <xacro:lite6_ros2_control prefix="" hw_ns="ufactory" robot_ip="${hardware['robot']['ip']}"
+      joint1_lower_limit="$(arg joint1_lower_limit)"
+    joint1_upper_limit="$(arg joint1_upper_limit)"
+    joint2_lower_limit="$(arg joint2_lower_limit)"
+    joint2_upper_limit="$(arg joint2_upper_limit)"
+    joint3_lower_limit="$(arg joint3_lower_limit)"
+    joint3_upper_limit="$(arg joint3_upper_limit)"
+    joint4_lower_limit="$(arg joint4_lower_limit)"
+    joint4_upper_limit="$(arg joint4_upper_limit)"
+    joint5_lower_limit="$(arg joint5_lower_limit)"
+    joint5_upper_limit="$(arg joint5_upper_limit)"
+    joint6_lower_limit="$(arg joint6_lower_limit)"
+    joint6_upper_limit="$(arg joint6_upper_limit)"
       report_type="${hardware['robot']['report_type']}" add_gripper="false" velocity_control="false"/>
   </xacro:unless>
   <xacro:if value="$(arg mock_hardware)">

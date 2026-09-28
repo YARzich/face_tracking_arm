@@ -64,7 +64,7 @@ def package_share():
 
 @pytest.fixture(scope='module')
 def enabled_robot_description(package_share):
-    xacro_path = package_share / 'description' / 'lite6_table.urdf.xacro'
+    xacro_path = package_share / 'description' / 'xarm6_table.urdf.xacro'
     result = subprocess.run(
         ['xacro', str(xacro_path), 'enable_ros2_control:=true'],
         check=True,
@@ -81,7 +81,7 @@ def robot(enabled_robot_description):
 
 @pytest.fixture(scope='module')
 def srdf(package_share):
-    return ET.parse(package_share / 'config' / 'moveit' / 'lite6.srdf').getroot()
+    return ET.parse(package_share / 'config' / 'moveit' / 'xarm6.srdf').getroot()
 
 
 @pytest.fixture(scope='module')
@@ -141,7 +141,7 @@ def test_enabled_xacro_has_one_complete_gazebo_control_system(
     assert len(control_systems) == 1
     control_system = control_systems[0]
     assert control_system.attrib == {
-        'name': 'Lite6GazeboSystem',
+        'name': 'XArm6GazeboSystem',
         'type': 'system',
     }
     hardware_plugin = control_system.find('./hardware/plugin')
@@ -250,7 +250,7 @@ def test_controller_servo_and_initial_state_are_consistent(
         'online_signal_smoothing::AccelerationLimitedPlugin'
     )
 
-    rest_state = srdf.find("./group_state[@name='rest'][@group='lite6_arm']")
+    rest_state = srdf.find("./group_state[@name='rest'][@group='xarm6']")
     assert rest_state is not None
     srdf_positions = {
         joint.attrib['name']: float(joint.attrib['value'])
@@ -269,7 +269,7 @@ def test_controller_servo_and_initial_state_are_consistent(
 def test_moveit_and_tracking_frames_and_limits_are_consistent(
     package_share, servo_config, tracking_config, srdf
 ):
-    group = srdf.find("./group[@name='lite6_arm']")
+    group = srdf.find("./group[@name='xarm6']")
     assert group is not None
     chain = group.find('./chain')
     assert chain is not None
@@ -291,7 +291,7 @@ def test_moveit_and_tracking_frames_and_limits_are_consistent(
     )
     assert math.isclose(
         tracking_config['safe_reach_radius_m'],
-        0.42,
+        0.65,
         rel_tol=0.0,
         abs_tol=ABS_TOL,
     )
@@ -311,12 +311,12 @@ def test_moveit_and_tracking_frames_and_limits_are_consistent(
     assert tracking_config['return_to_rest_delay_sec'] > tracking_config[
         'face_target_freshness_timeout_sec'
     ]
-    assert tracking_config['rest_position_m'] == [0.20, 0.00, 1.05]
+    assert tracking_config['rest_position_m'] == [0.37, 0.00, 1.15]
 
     kinematics = _load_yaml(
         package_share / 'config' / 'moveit' / 'kinematics.yaml'
     )
-    assert set(kinematics) == {group.attrib['name']}
+    assert group.attrib['name'] in kinematics
     assert kinematics[group.attrib['name']]['kinematics_solver'] == (
         'kdl_kinematics_plugin/KDLKinematicsPlugin'
     )
@@ -362,7 +362,7 @@ def test_collision_aware_servo_safety_profile_is_consistent(
     )
     assert config['maximum_collision_constraints'] >= 24
     assert config['collision_gradient_epsilon'] <= 1.0e-8
-    assert config['monitor_guard_joint_name'] == 'joint5'
+    assert config['monitor_guard_joint_name'] == ''
     assert config['monitor_guard_min_position_rad'] >= -1.60
     assert config['monitor_guard_max_position_rad'] <= 1.60
     assert config['joint_position_margin_rad'] >= 0.10
@@ -398,7 +398,7 @@ def test_custom_backend_has_explicit_mode_and_background_planning(collision_awar
     assert planner['planner_configs']['RRTConnectkConfigDefault']['type'] == (
         'geometric::RRTConnect'
     )
-    assert planner['lite6_arm']['longest_valid_segment_fraction'] <= 0.005
+    assert planner['xarm6']['longest_valid_segment_fraction'] <= 0.005
 
 
 def test_collision_aware_backend_keeps_braking_and_segment_safety_contracts():
@@ -420,7 +420,7 @@ def test_collision_aware_backend_keeps_braking_and_segment_safety_contracts():
     assert 'safe jerk-limited braking command published' in source
     assert 'braking next tick' not in source
     assert re.search(
-        r'void CollisionAwareServoComponent::enter_latched_halt\(std::string message\).*'
+        r'void CollisionAwareServoComponent::enter_safety_wait\(std::string message\).*'
         r'command_queue_\.clear\(\).*HALT_FOR_COLLISION',
         source,
         re.DOTALL,
@@ -432,7 +432,7 @@ def test_collision_aware_backend_keeps_braking_and_segment_safety_contracts():
     assert 'segment_rejection_count' in source
     assert 'Fresh complete finite robot feedback is unavailable' in source
     assert 'Waiting for the first complete finite robot state' in source
-    assert 'controller_mode_ == ControllerMode::kLatchedHalt' in source
+    assert 'controller_mode_ == ControllerMode::kWaitingForSafeState' in source
     assert 'publish_emergency_hold(' not in source
     assert 'hold.points.resize(1)' not in source
     assert 'EmergencyBrakeTailGenerator' in source

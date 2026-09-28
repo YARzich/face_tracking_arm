@@ -1,11 +1,11 @@
 <?xml version="1.0"?>
 <!--
-  Responsibility: define the simulated display attached to the Lite 6 flange
+  Responsibility: define the display attached to the robot flange
   and expose the center of its front surface as the control frame.
 -->
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-  <xacro:macro name="monitor_model" params="parent prefix:='' thickness:=0.03 width:=0.30
-    height:=0.20 mass:=0.50 mount_xyz:='' mount_rpy:='${pi} ${-pi / 2.0} 0'">
+  <xacro:macro name="monitor_model" params="parent prefix:='' thickness:=0.010 width:=0.355
+    height:=0.224 mass:=0.692 mount_xyz:='' mount_rpy:='${pi} ${-pi / 2.0} 0'">
     <!-- Local axes: +X points out of the screen, +Y spans its width, +Z its height. -->
     <xacro:property name="monitor_thickness" value="${thickness}"/>
     <xacro:property name="monitor_width" value="${width}"/>
@@ -23,32 +23,35 @@
       value="${monitor_mass * (monitor_thickness * monitor_thickness + monitor_width * monitor_width) / 12.0}"/>
 
     <link name="${prefix}monitor_link">
-      <inertial>
-        <origin xyz="0 0 0" rpy="0 0 0"/>
-        <mass value="${monitor_mass}"/>
-        <inertia
-          ixx="${monitor_ixx}"
-          ixy="0"
-          ixz="0"
-          iyy="${monitor_iyy}"
-          iyz="0"
-          izz="${monitor_izz}"/>
-      </inertial>
-      <visual name="${prefix}monitor_visual">
-        <origin xyz="0 0 0" rpy="0 0 0"/>
-        <geometry>
-          <box size="${monitor_thickness} ${monitor_width} ${monitor_height}"/>
-        </geometry>
-        <material name="${prefix}monitor_dark">
-          <color rgba="0.08 0.08 0.10 1.0"/>
-        </material>
-      </visual>
-      <collision name="${prefix}monitor_collision">
-        <origin xyz="0 0 0" rpy="0 0 0"/>
-        <geometry>
-          <box size="${monitor_thickness} ${monitor_width} ${monitor_height}"/>
-        </geometry>
-      </collision>
+      <!-- All-zero dimensions retain the mount/TF chain without a physical box. -->
+      <xacro:unless value="${monitor_thickness == 0 and monitor_width == 0 and monitor_height == 0}">
+        <inertial>
+          <origin xyz="0 0 0" rpy="0 0 0"/>
+          <mass value="${monitor_mass}"/>
+          <inertia
+            ixx="${monitor_ixx}"
+            ixy="0"
+            ixz="0"
+            iyy="${monitor_iyy}"
+            iyz="0"
+            izz="${monitor_izz}"/>
+        </inertial>
+        <visual name="${prefix}monitor_visual">
+          <origin xyz="0 0 0" rpy="0 0 0"/>
+          <geometry>
+            <box size="${monitor_thickness} ${monitor_width} ${monitor_height}"/>
+          </geometry>
+          <material name="${prefix}monitor_dark">
+            <color rgba="0.08 0.08 0.10 1.0"/>
+          </material>
+        </visual>
+        <collision name="${prefix}monitor_collision">
+          <origin xyz="0 0 0" rpy="0 0 0"/>
+          <geometry>
+            <box size="${monitor_thickness} ${monitor_width} ${monitor_height}"/>
+          </geometry>
+        </collision>
+      </xacro:unless>
     </link>
 
     <!--

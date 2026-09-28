@@ -27,5 +27,26 @@ TEST(TableGeometry, RejectsInvalidGeometry)
 {
   EXPECT_THROW(make_table("box", {.05, .5}, {0, 0, .725}, 0), std::invalid_argument);
   EXPECT_THROW(make_table("cylinder", {-.05, .5}, {0, 0, .725}, 0), std::invalid_argument);
+  EXPECT_THROW(make_table("cylinder", {0, .5}, {0, 0, .725}, 0), std::invalid_argument);
+  EXPECT_THROW(make_table("box", {1, 1, 0}, {0, 0, .725}, 0), std::invalid_argument);
+  EXPECT_THROW(make_table("box", {}, {0, 0, .725}, 0), std::invalid_argument);
+}
+
+TEST(TableGeometry, ZeroDimensionsRemoveTheObjectAndWaitForItsAbsence)
+{
+  for (const auto & shape : {"box", "cylinder"}) {
+    const auto disabled = make_table(
+      shape, std::vector<double>(std::string(shape) == "box" ? 3U : 2U, 0.0),
+      {0, 0, .725}, 0);
+    EXPECT_EQ(disabled.operation, moveit_msgs::msg::CollisionObject::REMOVE);
+    EXPECT_TRUE(disabled.primitives.empty());
+    EXPECT_TRUE(disabled.primitive_poses.empty());
+    moveit_msgs::msg::PlanningScene scene;
+    EXPECT_TRUE(has_table(scene, disabled));
+    scene.world.collision_objects.push_back(make_table("cylinder", {.05, .5}, {0, 0, .725}, 0));
+    EXPECT_FALSE(has_table(scene, disabled));
+    scene.world.collision_objects[0].id = "another_obstacle";
+    EXPECT_TRUE(has_table(scene, disabled));
+  }
 }
 }  // namespace face_tracking_arm::tracking

@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!-- Gazebo ros2_control integration; all position bounds come from the robot model. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="xarm6_gazebo_ros2_control"
+    params="initial_positions_file controller_config_file joint_limits">
+    <xacro:property name="initial_positions"
+      value="${xacro.load_yaml(initial_positions_file)['initial_positions']}"/>
+    <xacro:macro name="sim_joint" params="i">
+      <joint name="joint${i}">
+        <command_interface name="position">
+          <param name="min">${joint_limits[i-1][0]}</param>
+          <param name="max">${joint_limits[i-1][1]}</param>
+        </command_interface>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['joint' + str(i)]}</param>
+        </state_interface>
+        <state_interface name="velocity"><param name="initial_value">0.0</param></state_interface>
+      </joint>
+    </xacro:macro>
+    <ros2_control name="XArm6GazeboSystem" type="system">
+      <hardware><plugin>gz_ros2_control/GazeboSimSystem</plugin></hardware>
+      <xacro:sim_joint i="${1}"/><xacro:sim_joint i="${2}"/><xacro:sim_joint i="${3}"/>
+      <xacro:sim_joint i="${4}"/><xacro:sim_joint i="${5}"/><xacro:sim_joint i="${6}"/>
+    </ros2_control>
+    <gazebo>
+      <plugin filename="gz_ros2_control-system"
+        name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+        <parameters>${controller_config_file}</parameters>
+        <position_proportional_gain>0.5</position_proportional_gain>
+      </plugin>
+    </gazebo>
+  </xacro:macro>
+</robot>

@@ -13,6 +13,8 @@
 #include <thread>
 #include <utility>
 
+#include "face_tracking_arm/pointing_geometry.hpp"
+
 #include <moveit/kinematic_constraints/utils.hpp>
 #include <moveit/planning_interface/planning_interface.hpp>
 #include <moveit/planning_pipeline/planning_pipeline.hpp>
@@ -28,29 +30,24 @@ namespace
 using ErrorCode = moveit_msgs::msg::MoveItErrorCodes;
 using SteadyClock = std::chrono::steady_clock;
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kRecoveryEndpointMaximumOffsetRad = 3.5;
 
 bool positiveFinite(double value)
 {
   return std::isfinite(value) && value > 0.0;
 }
 
-bool unwoundRecoveryEndpoint(
-  const moveit::core::RobotModel & model, const moveit::core::JointModelGroup & group,
-  const moveit::core::RobotState & state)
+// Deterministic low-discrepancy samples keep retries diverse without shared RNG
+// state or an unbounded sampling loop in the real-time thread.
+double radicalInverse(std::uint64_t index, unsigned int base)
 {
-  for (const auto & name : group.getVariableNames()) {
-    const auto & bounds = model.getVariableBounds(name);
-    if (model.getJointOfVariable(name)->getType() == moveit::core::JointModel::REVOLUTE &&
-      bounds.position_bounded_ && bounds.max_position_ - bounds.min_position_ > 2.0 * kPi)
-    {
-      const double center = 0.5 * (bounds.min_position_ + bounds.max_position_);
-      if (std::abs(state.getVariablePosition(name) - center) > kRecoveryEndpointMaximumOffsetRad) {
-        return false;
-      }
-    }
+  double value = 0.0;
+  double scale = 1.0 / static_cast<double>(base);
+  while (index != 0) {
+    value += static_cast<double>(index % base) * scale;
+    index /= base;
+    scale /= static_cast<double>(base);
   }
-  return true;
+  return value;
 }
 
 // This changes only an IK initial guess. The measured start and returned IK
@@ -232,6 +229,7 @@ struct BackgroundPathPlanner::Impl
         seeds.push_back(centeredSeed(*robot_model, *group, std::move(seed)));
       }
     }
+    seeds.push_back(start_positions);
     seeds.push_back(centeredSeed(*robot_model, *group, start_positions));
     // Two additional elbow seeds for the Lite6 chain; they are guesses, never
     // imposed goals. Different groups still have the default/current seeds.
@@ -261,7 +259,6 @@ struct BackgroundPathPlanner::Impl
         candidate->setJointGroupPositions(candidate_group, values);
         candidate->update();
         return candidate->satisfiesBounds(candidate_group) &&
-               unwoundRecoveryEndpoint(*robot_model, *candidate_group, *candidate) &&
                scene.isStateValid(*candidate, config.move_group_name);
       };
     double best_score = std::numeric_limits<double>::infinity();
@@ -287,7 +284,7 @@ struct BackgroundPathPlanner::Impl
       }
       Eigen::VectorXd positions;
       candidate.copyJointGroupPositions(group, positions);
-      if (!positions.allFinite() || !unwoundRecoveryEndpoint(*robot_model, *group, candidate)) {
+      if (!positions.allFinite()) {
         continue;
       }
       double score = goalScore(*robot_model, *group, positions, start_positions);
@@ -298,6 +295,148 @@ struct BackgroundPathPlanner::Impl
       if (score < best_score) {
         best_score = score;
         best = std::move(positions);
+      }
+    }
+    return best;
+  }
+
+  std::optional<Eigen::VectorXd> selectPointingGoal(
+    const Request & request, const planning_scene::PlanningScene & scene)
+  {
+    const auto & target = *request.pose_goal;
+    Eigen::Isometry3d monitor_to_gaze = Eigen::Isometry3d::Identity();
+    if (!target.gaze_link_name.empty()) {
+      monitor_to_gaze = request.start.getGlobalLinkTransform(target.link_name).inverse() *
+        request.start.getGlobalLinkTransform(target.gaze_link_name);
+      monitor_to_gaze.linear() *= opticalToPointingRotation();
+    }
+    const auto deadline = SteadyClock::now() +
+      std::chrono::duration<double>(config.ik_time_budget_s);
+    const bool detour = target.relaxation >= 2;
+    const double pointing_tolerance = target.relaxation == 0 ? 0.025 : 0.40;
+    Eigen::VectorXd start_positions;
+    request.start.copyJointGroupPositions(group, start_positions);
+    moveit::core::RobotState rest(request.start);
+    if (!rest.setToDefaultValues(group, config.ik_rest_state_name)) {
+      std::vector<double> defaults;
+      group->getVariableDefaultPositions(defaults);
+      rest.setJointGroupPositions(group, defaults);
+    }
+    Eigen::VectorXd rest_positions;
+    rest.copyJointGroupPositions(group, rest_positions);
+    const auto & names = group->getVariableNames();
+    const auto base = std::find(names.begin(), names.end(), config.ik_base_joint_name);
+    if (base != names.end()) {
+      rest_positions[std::distance(names.begin(), base)] = target.preferred_base_angle_rad;
+    }
+    rest_positions = centeredSeed(*robot_model, *group, rest_positions);
+    const Eigen::VectorXd centered = centeredSeed(*robot_model, *group, start_positions);
+    const auto valid = [this, &scene, &request, deadline](
+      moveit::core::RobotState * candidate, const moveit::core::JointModelGroup * candidate_group,
+      const double * values)
+      {
+        if (obsolete(request.generation) || SteadyClock::now() >= deadline) {
+          return false;
+        }
+        candidate->setJointGroupPositions(candidate_group, values);
+        candidate->update();
+        return candidate->satisfiesBounds(candidate_group) &&
+               scene.isStateValid(*candidate, config.move_group_name);
+      };
+    const bool has_ik = group->getSolverInstance() && group->canSetStateFromIK(target.link_name);
+    std::optional<Eigen::VectorXd> best;
+    double best_score = std::numeric_limits<double>::infinity();
+    constexpr unsigned int primes[] = {2, 3, 5, 7, 11, 13, 17, 19};
+    const auto consider = [&](moveit::core::RobotState & candidate, std::uint64_t sample_index) {
+        Eigen::VectorXd positions;
+        candidate.copyJointGroupPositions(group, positions);
+        if (!positions.allFinite() || (positions - start_positions).norm() < 0.08 ||
+          !candidate.satisfiesBounds(group))
+        {
+          return;
+        }
+        const auto & pose = candidate.getGlobalLinkTransform(target.link_name);
+        const Eigen::Isometry3d gaze_pose = pose * monitor_to_gaze;
+        const Eigen::Vector3d ray = *target.face_position - gaze_pose.translation();
+        if (ray.norm() <= 1.0e-6) {
+          return;
+        }
+        const double angle = std::acos(std::clamp(gaze_pose.linear().col(0).dot(ray.normalized()),
+          -1.0, 1.0));
+        if ((!detour && angle > pointing_tolerance) ||
+          !scene.isStateValid(candidate, config.move_group_name))
+        {
+          return;
+        }
+        // Pointing dominates position preference. The small rotating score
+        // breaks ties on repeated attempts without forcing complete unwinding.
+        double score = goalScore(*robot_model, *group, positions, start_positions) +
+          (detour ? 0.1 : 10.0) * angle * angle +
+          0.1 * (pose.translation() - target.pose.translation()).squaredNorm() +
+          0.25 * radicalInverse(sample_index + target.attempt, 23);
+        if (score < best_score) {
+          best_score = score;
+          best = std::move(positions);
+        }
+      };
+    for (unsigned int index = 0; index < 32; ++index) {
+      if (obsolete(request.generation) || SteadyClock::now() >= deadline) {
+        break;
+      }
+      const std::uint64_t sample_index = 1 + target.attempt * 32 + index;
+      Eigen::VectorXd seed = index == 0 ? rest_positions : centered;
+      if (index >= 2 || target.attempt % 3 == 2) {
+        for (Eigen::Index joint = 0; joint < seed.size(); ++joint) {
+          const auto & bounds = robot_model->getVariableBounds(names[joint]);
+          const double fraction = radicalInverse(sample_index, primes[joint % 8]);
+          if (bounds.position_bounded_) {
+            seed[joint] = bounds.min_position_ + fraction *
+              (bounds.max_position_ - bounds.min_position_);
+          } else {
+            seed[joint] += (2.0 * fraction - 1.0) * kPi;
+          }
+        }
+      }
+      moveit::core::RobotState candidate(request.start);
+      candidate.setJointGroupPositions(group, seed);
+      candidate.update();
+      consider(candidate, sample_index);
+      if (!has_ik || detour) {
+        continue;
+      }
+      // Reachable FK positions, the current TCP and the preferred position are
+      // inexpensive workspace samples. Each IK query is ordinary MoveIt IK;
+      // no exact XYZ/roll is required of the final recovery task.
+      Eigen::Isometry3d pose = candidate.getGlobalLinkTransform(target.link_name);
+      if (index == 0) {
+        pose.translation() = target.pose.translation();
+      } else if (index == 1) {
+        pose.translation() = request.start.getGlobalLinkTransform(target.link_name).translation();
+      }
+      Eigen::Matrix3d roll = Eigen::AngleAxisd(
+        (2.0 * radicalInverse(sample_index, 29) - 1.0) * kPi,
+        Eigen::Vector3d::UnitX()).toRotationMatrix();
+      if (target.relaxation > 0) {
+        roll *= Eigen::AngleAxisd(
+          0.35 * (2.0 * radicalInverse(sample_index, 31) - 1.0),
+          Eigen::Vector3d::UnitY()).toRotationMatrix();
+      }
+      // Four cheap fixed-point updates include the camera's actual mount offset;
+      // FK below verifies the resulting line of sight before accepting the IK.
+      for (int iteration = 0; iteration < 4; ++iteration) {
+        const Eigen::Isometry3d gaze_pose = pose * monitor_to_gaze;
+        const auto orientation = pointingRotation(*target.face_position - gaze_pose.translation());
+        if (!orientation) {
+          break;
+        }
+        pose.linear() = *orientation * roll * monitor_to_gaze.linear().transpose();
+      }
+      const double remaining = std::chrono::duration<double>(deadline - SteadyClock::now()).count();
+      if (remaining > 0.0 && candidate.setFromIK(
+          group, pose, target.link_name, std::min(0.006, remaining), valid))
+      {
+        candidate.update();
+        consider(candidate, sample_index);
       }
     }
     return best;
@@ -344,10 +483,12 @@ struct BackgroundPathPlanner::Impl
     }
     moveit::core::RobotState goal(start);
     if (request.pose_goal) {
-      const auto positions = selectPoseGoal(request, *scene);
+      const auto positions = request.pose_goal->face_position ?
+        selectPointingGoal(request, *scene) : selectPoseGoal(request, *scene);
       if (!positions) {
         result.error_code = ErrorCode::NO_IK_SOLUTION;
-        result.message = "No valid endpoint IK solution within the bounded candidate search";
+        result.message =
+          "No valid endpoint within this bounded candidate search; a later attempt may retry";
         return result;
       }
       result.goal_positions = *positions;
@@ -551,7 +692,9 @@ std::uint64_t BackgroundPathPlanner::submit(
     !impl_->robot_model->hasLinkModel(goal.link_name) || !goal.pose.matrix().allFinite() ||
     !goal.pose.linear().isUnitary(1.0e-6) || goal.pose.linear().determinant() < 0.0 ||
     !goal.pose.matrix().row(3).isApprox(Eigen::RowVector4d(0.0, 0.0, 0.0, 1.0)) ||
-    !std::isfinite(goal.preferred_base_angle_rad))
+    !std::isfinite(goal.preferred_base_angle_rad) ||
+    (goal.face_position && !goal.face_position->allFinite()) ||
+    (!goal.gaze_link_name.empty() && !impl_->robot_model->hasLinkModel(goal.gaze_link_name)))
   {
     throw std::invalid_argument("Background planner pose goal has an invalid model, link or pose");
   }

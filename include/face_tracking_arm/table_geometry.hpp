@@ -23,9 +23,11 @@ inline moveit_msgs::msg::CollisionObject make_table(
 {
   const auto positive = [](double x) {return std::isfinite(x) && x > 0.0;};
   const auto finite = [](double x) {return std::isfinite(x);};
+  const bool disabled = std::all_of(
+    dimensions.begin(), dimensions.end(), [](double x) {return x == 0.0;});
   if ((shape != "box" && shape != "cylinder") ||
     dimensions.size() != (shape == "box" ? 3U : 2U) || center.size() != 3 ||
-    !std::all_of(dimensions.begin(), dimensions.end(), positive) ||
+    (!disabled && !std::all_of(dimensions.begin(), dimensions.end(), positive)) ||
     !std::all_of(center.begin(), center.end(), finite) || !std::isfinite(yaw))
   {
     throw std::invalid_argument("Invalid table shape, dimensions or pose");
@@ -33,8 +35,12 @@ inline moveit_msgs::msg::CollisionObject make_table(
   moveit_msgs::msg::CollisionObject table;
   table.header.frame_id = "world";
   table.id = "round_table";  // Preserve the public collision-object identifier.
-  table.operation = moveit_msgs::msg::CollisionObject::ADD;
   table.pose.orientation.w = 1.0;
+  if (disabled) {
+    table.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+    return table;
+  }
+  table.operation = moveit_msgs::msg::CollisionObject::ADD;
   shape_msgs::msg::SolidPrimitive primitive;
   primitive.type = shape == "box" ? primitive.BOX : primitive.CYLINDER;
   primitive.dimensions.assign(dimensions.begin(), dimensions.end());
@@ -65,6 +71,11 @@ inline bool has_table(
   const moveit_msgs::msg::PlanningScene & scene,
   const moveit_msgs::msg::CollisionObject & expected)
 {
+  if (expected.operation == moveit_msgs::msg::CollisionObject::REMOVE) {
+    return std::none_of(
+      scene.world.collision_objects.begin(), scene.world.collision_objects.end(),
+      [&expected](const auto & object) {return object.id == expected.id;});
+  }
   for (const auto & object : scene.world.collision_objects) {
     if (object.id != expected.id || object.header.frame_id != expected.header.frame_id ||
       object.primitives.size() != 1 || object.primitive_poses.size() != 1 ||

@@ -35,7 +35,7 @@ void CollisionAwareServoComponent::control_loop()
       control_tick();
     } catch (const std::exception & error) {
       if (rclcpp::ok()) {
-        enter_latched_halt(
+        enter_safety_wait(
           std::string("Collision-aware control exception: ") + error.what());
       }
     }
@@ -114,10 +114,11 @@ void CollisionAwareServoComponent::control_tick()
       std::lock_guard<std::mutex> lock(controller_state_mutex_);
       latest_controller_state_.reset();
     }
-    controller_mode_ = ControllerMode::kLatchedHalt;
+    controller_mode_ = ControllerMode::kWaitingForSafeState;
     halt_latched_.store(true, std::memory_order_release);
+    rearm_pending_ = true;
     latched_halt_reason_ =
-      "ROS time rewound; the published safety timeline is invalid and requires re-arm";
+      "ROS time rewound; waiting for fresh feedback and a settled controller";
     publish_status(
       moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION, latched_halt_reason_);
     return;
@@ -141,7 +142,7 @@ void CollisionAwareServoComponent::control_tick()
     consecutive_automatic_rearms_ = 0U;
     healthy_publications_since_rearm_ = 0U;
     reset_feedback_derivative_history();
-    if (controller_mode_ != ControllerMode::kLatchedHalt) {
+    if (controller_mode_ != ControllerMode::kWaitingForSafeState) {
       controller_mode_ = ControllerMode::kBraking;
     }
   }
@@ -154,18 +155,18 @@ void CollisionAwareServoComponent::control_tick()
       rearm_deadline_expired(current_time, current_wall_time))
     {
       ++rearm_timeout_count_;
-      enter_latched_halt(
+      enter_safety_wait(
         bootstrap_ack_pending_ ?
         "Trajectory controller bootstrap acknowledgement timed out while ROS time was frozen" :
         "Safe re-arm timed out while ROS time was frozen");
       return;
     }
     publish_status(
-      controller_mode_ == ControllerMode::kLatchedHalt ?
+      controller_mode_ == ControllerMode::kWaitingForSafeState ?
       moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION :
       moveit_msgs::msg::ServoStatus::NO_WARNING,
-      controller_mode_ == ControllerMode::kLatchedHalt ?
-      (latched_halt_reason_.empty() ? "Collision-aware Servo is latched" :
+      controller_mode_ == ControllerMode::kWaitingForSafeState ?
+      (latched_halt_reason_.empty() ? "Waiting for a safe controller state" :
       latched_halt_reason_) : "ROS time is not advancing");
     return;
   }
@@ -174,7 +175,7 @@ void CollisionAwareServoComponent::control_tick()
       rearm_deadline_expired(current_time, current_wall_time))
     {
       ++rearm_timeout_count_;
-      enter_latched_halt(
+      enter_safety_wait(
         bootstrap_ack_pending_ ?
         "Trajectory controller bootstrap acknowledgement timed out in wall time" :
         "Safe re-arm timed out in wall time");
@@ -184,10 +185,10 @@ void CollisionAwareServoComponent::control_tick()
   skipped_control_periods_ += time_observation.skipped_periods;
 
   reset_tick_telemetry();
-  if (!rearm_pending_ && controller_mode_ == ControllerMode::kLatchedHalt) {
+  if (!rearm_pending_ && controller_mode_ == ControllerMode::kWaitingForSafeState) {
     publish_status(
       moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION,
-      latched_halt_reason_.empty() ? "Collision-aware Servo is latched" :
+      latched_halt_reason_.empty() ? "Waiting for a safe controller state" :
       latched_halt_reason_);
     return;
   }
@@ -203,11 +204,11 @@ void CollisionAwareServoComponent::control_tick()
   {
     if (rearm_pending_) {
       if (published_tail_rearm_pending_) {
-        enter_latched_halt(
+        enter_safety_wait(
           "Trajectory controller was lost while a published braking tail was in flight");
       } else if (rearm_deadline_expired(current_time, current_wall_time)) {
         ++rearm_timeout_count_;
-        enter_latched_halt(
+        enter_safety_wait(
           "Safe re-arm timed out waiting for an active subscribed trajectory controller");
       } else {
         publish_status(
@@ -217,7 +218,7 @@ void CollisionAwareServoComponent::control_tick()
           "Safe re-arm is waiting for an active subscribed trajectory controller");
       }
     } else {
-      enter_latched_halt("Trajectory controller is not active and subscribed");
+      enter_safety_wait("Trajectory controller is not active and subscribed");
     }
     return;
   }
@@ -228,7 +229,7 @@ void CollisionAwareServoComponent::control_tick()
       last_validated_scene_revision_)
     {
       ++planning_scene_invalidation_count_;
-      enter_latched_halt(
+      enter_safety_wait(
         "PlanningScene collision geometry changed while a published braking tail was in flight");
       return;
     }
@@ -236,13 +237,13 @@ void CollisionAwareServoComponent::control_tick()
     const RearmReadiness rearm_readiness = safe_rearm_ready(
       current_time, rearm_reason);
     if (rearm_readiness == RearmReadiness::kUnsafe) {
-      enter_latched_halt(std::move(rearm_reason));
+      enter_safety_wait(std::move(rearm_reason));
       return;
     }
     if (rearm_readiness == RearmReadiness::kWaiting) {
       if (rearm_deadline_expired(current_time, current_wall_time)) {
         ++rearm_timeout_count_;
-        enter_latched_halt(
+        enter_safety_wait(
           "Safe re-arm timed out after its bounded settle window: " + rearm_reason);
         return;
       }
@@ -278,7 +279,7 @@ void CollisionAwareServoComponent::control_tick()
     if (timeline_recovery_status == TimelineRecoveryStatus::kExhaustedPublishedSuffix) {
       enter_controlled_rearm(std::move(message));
     } else {
-      enter_latched_halt(std::move(message));
+      enter_safety_wait(std::move(message));
     }
     return;
   }
@@ -291,13 +292,13 @@ void CollisionAwareServoComponent::control_tick()
     rearm_deadline_expired(current_time, current_wall_time))
   {
     ++rearm_timeout_count_;
-    enter_latched_halt(
+    enter_safety_wait(
       "Trajectory controller did not acknowledge the stationary bootstrap in time");
     return;
   }
   if (!state.has_value()) {
     if (requires_latched_halt) {
-      enter_latched_halt(std::move(state_failure_reason));
+      enter_safety_wait(std::move(state_failure_reason));
     } else {
       if (state_failure_reason.empty()) {
         state_failure_reason = initial_state_received_ ?
@@ -322,7 +323,7 @@ void CollisionAwareServoComponent::control_tick()
     std::memory_order_acquire);
   if (command_epoch_active_ && collision_scene_revision != last_validated_scene_revision_) {
     ++planning_scene_invalidation_count_;
-    enter_latched_halt(
+    enter_safety_wait(
       "PlanningScene collision geometry changed while commands were buffered");
     return;
   }
@@ -347,7 +348,7 @@ void CollisionAwareServoComponent::control_tick()
     const std::string reason = !actual_state_validation.input_valid ?
       actual_state_validation.failure_reason :
       "hard-clearance/corridor violation for " + last_actual_closest_pair_;
-    enter_latched_halt("Measured robot state is unsafe: " + reason);
+    enter_safety_wait("Measured robot state is unsafe: " + reason);
     return;
   }
 
@@ -408,7 +409,7 @@ void CollisionAwareServoComponent::control_tick()
       collision_result.diagnostics.failure_reason.c_str(),
       collision_result.diagnostics.minimum_distance_m,
       collision_result.diagnostics.closest_pair.c_str());
-    enter_latched_halt(
+    enter_safety_wait(
       "Collision constraints unavailable: " + collision_result.diagnostics.failure_reason);
     return;
   }
@@ -510,7 +511,7 @@ void CollisionAwareServoComponent::control_tick()
     if (publication_status == CommandPublicationStatus::kRecoverableTimingFailure) {
       enter_controlled_rearm(std::move(publication_failure));
     } else {
-      enter_latched_halt(std::move(publication_failure));
+      enter_safety_wait(std::move(publication_failure));
     }
     return;
   }

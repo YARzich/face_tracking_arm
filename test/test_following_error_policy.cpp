@@ -15,8 +15,6 @@ namespace
 constexpr FollowingErrorPolicy kPolicy{
   0.020,
   0.250,
-  0.006,
-  0.300,
 };
 
 TEST(FollowingErrorPolicy, ContinuesInsideNormalTrackingTolerance)
@@ -33,25 +31,36 @@ TEST(FollowingErrorPolicy, RecoversBoundedVelocityTransientInsideCollisionTube)
     FollowingErrorAction::kControlledRearm);
 }
 
-TEST(FollowingErrorPolicy, LatchesOutsideCollisionTrackingTube)
+TEST(FollowingErrorPolicy, RecoversFinitePositionLagAfterIndependentSafetyValidation)
 {
   EXPECT_EQ(
     classifyFollowingError(0.020001, 0.100, kPolicy),
-    FollowingErrorAction::kLatchedHalt);
+    FollowingErrorAction::kControlledRearm);
   EXPECT_EQ(
     classifyFollowingError(0.006001, 0.251, kPolicy),
-    FollowingErrorAction::kLatchedHalt);
+    FollowingErrorAction::kControlledRearm);
 }
 
-TEST(FollowingErrorPolicy, LatchesExcessiveVelocityAndInvalidInput)
+TEST(FollowingErrorPolicy, RecoversFiniteVelocityLagButRejectsInvalidInput)
 {
   EXPECT_EQ(
     classifyFollowingError(0.003, 0.300001, kPolicy),
-    FollowingErrorAction::kLatchedHalt);
+    FollowingErrorAction::kControlledRearm);
   EXPECT_EQ(
     classifyFollowingError(
       std::numeric_limits<double>::quiet_NaN(), 0.1, kPolicy),
     FollowingErrorAction::kLatchedHalt);
+}
+
+
+TEST(FollowingErrorPolicy, RepeatedRecordedLagHasNoAttemptBudget)
+{
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    EXPECT_EQ(
+      classifyFollowingError(0.020285, 0.057148, kPolicy),
+      FollowingErrorAction::kControlledRearm);
+    EXPECT_EQ(classifyFollowingError(0.0, 0.0, kPolicy), FollowingErrorAction::kContinue);
+  }
 }
 
 }  // namespace

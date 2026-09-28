@@ -53,5 +53,32 @@ TEST(PostureRecoveryPolicy, IgnoresNarrowRangesAndInvalidInput)
   EXPECT_FALSE(needs(std::numeric_limits<double>::quiet_NaN(), 0.13));
   EXPECT_FALSE(needs(5.0, std::numeric_limits<double>::infinity()));
 }
+TEST(PointingProgressMonitor, StaticMisalignmentRetriesWithoutAFiniteAttemptBudget)
+{
+  PointingProgressMonitor monitor;
+  EXPECT_FALSE(monitor.update(0.4, 0.0));
+  EXPECT_FALSE(monitor.update(0.4, 1.4));
+  EXPECT_TRUE(monitor.update(0.4, 1.5));
+  EXPECT_TRUE(monitor.update(0.4, 300.0));
+  EXPECT_EQ(recoveryRelaxation(0), 0U);
+  EXPECT_EQ(recoveryRelaxation(2), 1U);
+  EXPECT_EQ(recoveryRelaxation(4), 2U);
+  EXPECT_EQ(recoveryRelaxation(100000), 2U);
+}
+
+TEST(PointingProgressMonitor, ProgressAlignmentAndClockResetRestartTheWindow)
+{
+  PointingProgressMonitor monitor;
+  EXPECT_FALSE(monitor.update(0.4, 0.0));
+  EXPECT_FALSE(monitor.update(0.35, 1.0));
+  EXPECT_FALSE(monitor.update(0.35, 2.0));
+  EXPECT_TRUE(monitor.update(0.35, 2.5));
+  EXPECT_FALSE(monitor.update(0.01, 2.6));
+  EXPECT_FALSE(monitor.update(0.35, 3.0));
+  EXPECT_FALSE(monitor.update(0.35, 0.0));
+  EXPECT_FALSE(monitor.update(std::numeric_limits<double>::quiet_NaN(), 5.0));
+  EXPECT_FALSE(monitor.update(0.35, 6.0));
+}
+
 }  // namespace
 }  // namespace face_tracking_arm::control

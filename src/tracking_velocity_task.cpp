@@ -7,6 +7,8 @@
 #include <cmath>
 #include <optional>
 
+#include "face_tracking_arm/pointing_geometry.hpp"
+
 namespace face_tracking_arm::control
 {
 namespace
@@ -82,7 +84,8 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
   const Eigen::Matrix3d & target_rotation,
   const TrackingVelocityTaskConfig & config,
   const Eigen::Vector3d & face_velocity,
-  const Eigen::Vector3d & target_position_velocity)
+  const Eigen::Vector3d & target_position_velocity,
+  const std::optional<GazeKinematics> & gaze)
 {
   if (!valid_config(config) || !current.matrix().allFinite() ||
     !valid_rotation(current.rotation()) || !target_position.allFinite() ||
@@ -94,7 +97,8 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
 
   Eigen::Matrix3d desired_rotation = target_rotation;
   double face_distance = 0.0;
-  double up_projection_norm = 0.0;
+  double up_projection_norm = 1.0;
+  double roll_authority = 1.0;
   if (face_position.has_value()) {
     if (!face_position->allFinite()) {
       return std::nullopt;
@@ -105,15 +109,11 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
       return std::nullopt;
     }
     const Eigen::Vector3d direction = ray / face_distance;
-    const Eigen::Vector3d projected_up =
-      Eigen::Vector3d::UnitZ() - direction.z() * direction;
-    up_projection_norm = projected_up.norm();
-    if (up_projection_norm <= kGeometryEpsilon) {
-      return std::nullopt;
-    }
-    desired_rotation.col(0) = direction;
-    desired_rotation.col(2) = projected_up / up_projection_norm;
-    desired_rotation.col(1) = desired_rotation.col(2).cross(direction);
+    up_projection_norm = std::sqrt(std::max(0.0, 1.0 - direction.z() * direction.z()));
+    // Upright roll becomes unobservable at a vertical ray. Fade that preference
+    // out rather than dropping a perfectly valid pointing target or amplifying noise.
+    roll_authority = std::min(1.0, up_projection_norm / 0.10);
+    desired_rotation = *pointingRotation(ray);
   } else if (!valid_rotation(desired_rotation)) {
     return std::nullopt;
   }
@@ -152,19 +152,25 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
     // equal TCP translation. Its upright-frame spin also contributes to roll.
     const Eigen::Vector3d desired_angular_velocity =
       skew(normal) * face_velocity / face_distance + normal *
-      (normal.z() / (up_projection_norm * face_distance) * left.dot(face_velocity));
+      (normal.z() / (std::max(0.10, up_projection_norm) * face_distance) *
+      left.dot(face_velocity));
     angular_reference += Eigen::Vector3d(
       left.dot(desired_angular_velocity), up.dot(desired_angular_velocity),
       normal.dot(desired_angular_velocity));
   }
-  angular_reference = limit_norm(angular_reference, config.maximum_angular_reference_radps);
+  const double pointing_speed = angular_reference.head<2>().norm();
+  if (pointing_speed > config.maximum_angular_reference_radps) {
+    angular_reference.head<2>() *= config.maximum_angular_reference_radps / pointing_speed;
+  }
+  angular_reference[2] = roll_authority * std::clamp(angular_reference[2],
+    -config.maximum_angular_reference_radps, config.maximum_angular_reference_radps);
   const Eigen::Vector3d linear_reference = limit_norm(
     config.position_gain * outside_deadband(position_error, config.position_deadband_m) +
     target_position_velocity,
     config.maximum_linear_reference_mps);
   result.accepted = result.position_error_m <= config.position_deadband_m &&
     result.pointing_error_rad <= config.pointing_deadband_rad &&
-    result.roll_error_rad <= config.roll_deadband_rad &&
+    (roll_authority <= kGeometryEpsilon || result.roll_error_rad <= config.roll_deadband_rad) &&
     angular_reference.isZero(0.0) && linear_reference.isZero(0.0);
 
   const auto linear_jacobian = jacobian.topRows(3);
@@ -176,22 +182,47 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
     // Subtracting that motion from Jw gives the positive translation terms.
     relative_angular_jacobian += skew(normal) * linear_jacobian / face_distance;
     relative_angular_jacobian += normal *
-      (normal.z() / (up_projection_norm * face_distance) * left.transpose() * linear_jacobian);
+      (normal.z() / (std::max(0.10, up_projection_norm) * face_distance) *
+      left.transpose() * linear_jacobian);
   }
 
-  result.task.primary_matrix.resize(3, jacobian.cols());
+  result.task.primary_matrix.resize(2, jacobian.cols());
   result.task.primary_matrix.row(0) = left.transpose() * relative_angular_jacobian;
   result.task.primary_matrix.row(1) = up.transpose() * relative_angular_jacobian;
-  result.task.primary_matrix.row(2) = normal.transpose() * relative_angular_jacobian;
-  result.task.primary_reference = angular_reference;
-  result.task.primary_weights = Eigen::Vector3d(1.0, 1.0, config.roll_weight);
-  result.task.secondary_matrix = linear_jacobian;
-  result.task.secondary_reference = linear_reference;
-  result.task.secondary_weights = Eigen::Vector3d::Ones();
-  if (!result.task.primary_matrix.allFinite() || !angular_reference.allFinite() ||
+  result.task.primary_reference = angular_reference.head<2>();
+  result.task.primary_weights = Eigen::Vector2d::Ones();
+  result.task.secondary_matrix.resize(4, jacobian.cols());
+  result.task.secondary_matrix.topRows(3) = linear_jacobian;
+  result.task.secondary_matrix.row(3) =
+    roll_authority * normal.transpose() * relative_angular_jacobian;
+  result.task.secondary_reference.resize(4);
+  result.task.secondary_reference.head<3>() = linear_reference;
+  result.task.secondary_reference[3] = angular_reference[2];
+  result.task.secondary_weights = Eigen::Vector4d(1.0, 1.0, 1.0, config.roll_weight);
+  if (!result.task.primary_matrix.allFinite() || !result.task.secondary_matrix.allFinite() ||
+    !angular_reference.allFinite() ||
     !linear_reference.allFinite())
   {
     return std::nullopt;
+  }
+  if (gaze && face_position) {
+    if (gaze->jacobian.cols() != jacobian.cols()) {
+      return std::nullopt;
+    }
+    const auto pointing = makeTrackingVelocityTask(
+      gaze->pose, gaze->jacobian, gaze->pose.translation(), face_position,
+      target_rotation, config, face_velocity);
+    if (!pointing) {
+      return std::nullopt;
+    }
+    result.task.primary_matrix = pointing->task.primary_matrix;
+    result.task.primary_reference = pointing->task.primary_reference;
+    result.task.primary_weights = pointing->task.primary_weights;
+    result.pointing_error_rad = pointing->pointing_error_rad;
+    result.accepted = result.position_error_m <= config.position_deadband_m &&
+      result.pointing_error_rad <= config.pointing_deadband_rad &&
+      (roll_authority <= kGeometryEpsilon || result.roll_error_rad <= config.roll_deadband_rad) &&
+      result.task.primary_reference.isZero(0.0) && result.task.secondary_reference.isZero(0.0);
   }
   return result;
 }

@@ -13,6 +13,7 @@ from launch import LaunchDescription, LaunchService
 from launch.actions import EmitEvent, RegisterEventHandler, TimerAction
 from launch.event_handlers import OnProcessExit, OnProcessIO
 from launch.events import Shutdown
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +21,10 @@ sys.path.insert(0, str(ROOT / 'python'))
 from face_tracking_bringup.hardware_launch import robot_actions  # noqa: E402, I100
 
 
-def test_initialized_components_exit_without_retained_plugin_objects(monkeypatch, tmp_path):
+@pytest.mark.parametrize('omit_monitor,table_shape', [
+    (False, None), (True, None), (False, 'cylinder'), (True, 'cylinder'), (True, 'box')])
+def test_initialized_components_exit_without_retained_plugin_objects(
+        monkeypatch, tmp_path, omit_monitor, table_shape):
     # Use the real launch assembly with GenericSystem, without cameras or a robot connection.
     monkeypatch.setenv('ROS_DOMAIN_ID', str(101 + os.getpid() % 90))
     monkeypatch.setenv('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST')
@@ -51,6 +55,11 @@ def test_initialized_components_exit_without_retained_plugin_objects(monkeypatch
     share = Path(get_package_share_directory('face_tracking_arm'))
     config = yaml.safe_load((ROOT / 'config/hardware.yaml').read_text())
     config['robot']['ip'] = ''
+    if omit_monitor:
+        config['monitor'].update(size_m=[0., 0., 0.], mass_kg=0.)
+    if table_shape:
+        config['table'].update(
+            shape=table_shape, dimensions_m=[0.] * (3 if table_shape == 'box' else 2))
     directory = tempfile.TemporaryDirectory(dir=tmp_path)
     with directory:
         config_path = Path(directory.name) / 'hardware.yaml'

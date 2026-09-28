@@ -26,6 +26,14 @@ struct TrackingVelocityTaskConfig
   double roll_weight{0.5};
 };
 
+struct GazeKinematics
+{
+  /// World pose with +X forward, +Y left, +Z up (convert optical axes before use).
+  Eigen::Isometry3d pose{Eigen::Isometry3d::Identity()};
+  /// World [linear; angular] Jacobian at the gaze origin, in the same joint order.
+  Eigen::MatrixXd jacobian;
+};
+
 struct TrackingVelocityTaskResult
 {
   HierarchicalVelocityTask task;
@@ -45,9 +53,12 @@ struct TrackingVelocityTaskResult
 /// Optional velocities are expressed in the same planning frame. Face velocity
 /// adds the desired look-at frame's angular motion; target-position velocity adds
 /// translational feed-forward. Speed caps apply after adding feedback and feed-forward.
-/// The primary stage combines pointing and roll, the secondary stage translation.
+/// An optional gaze frame replaces only the primary pointing task. Secondary
+/// translation and roll always refer to the monitor, including a displaced camera.
+/// The primary stage contains two pointing rows; translation and soft roll are secondary.
 /// No joint posture or collision-separation preference is introduced here.
-/// Returns nullopt for invalid input or undefined look-at geometry (vertical ray).
+/// Vertical rays remain valid: upright roll fades out near the pole.
+/// Returns nullopt for invalid input or coincident face and TCP.
 [[nodiscard]] std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
   const Eigen::Isometry3d & current,
   const Eigen::MatrixXd & jacobian,
@@ -56,7 +67,8 @@ struct TrackingVelocityTaskResult
   const Eigen::Matrix3d & target_rotation,
   const TrackingVelocityTaskConfig & config = {},
   const Eigen::Vector3d & face_velocity = Eigen::Vector3d::Zero(),
-  const Eigen::Vector3d & target_position_velocity = Eigen::Vector3d::Zero());
+  const Eigen::Vector3d & target_position_velocity = Eigen::Vector3d::Zero(),
+  const std::optional<GazeKinematics> & gaze = std::nullopt);
 
 /// Track a joint-path lookahead point without wrapping bounded revolute joints.
 /// The reference is scaled uniformly to preserve its joint-space direction.

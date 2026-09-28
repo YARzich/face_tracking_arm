@@ -17,10 +17,85 @@ ros2 launch face_tracking_arm tracking_sim.launch.py
 - `headless:=true` — симуляция без графического клиента;
 - `test_face_scenario:=stationary|circle|people|walk_around|disabled` — источник точки;
 - `visualize_target:=false` — отключение визуального маркера;
-- `servo_backend:=standard` — MoveIt Servo для отдельного сравнения.
+- `servo_backend:=standard` — MoveIt Servo для отдельного сравнения;
+- `robot_model:=xarm6|lite6` — модель руки, по умолчанию `xarm6`;
+- `start_pose:=rest|zero|folded|joint1_limit|incident` — начальная поза,
+  по умолчанию `rest`;
+- `initial_positions_file:=/полный/путь/angles.yaml` — начальные измеряемые углы
+  выбранной руки; значения в радианах. Файл имеет приоритет над `start_pose`.
 
-По умолчанию выбраны `people` и собственный `collision_aware` контроллер.
+По умолчанию выбраны сценарий `people` и контроллер `collision_aware`.
 Каждый запуск должен иметь единственный источник `/face/center`.
+
+## Начальная поза
+
+Для старта с шестью нулевыми углами:
+
+```bash
+ros2 launch face_tracking_arm tracking_sim.launch.py start_pose:=zero
+```
+
+Варианты сложного старта:
+
+```bash
+ros2 launch face_tracking_arm tracking_sim.launch.py start_pose:=folded
+
+ros2 launch face_tracking_arm tracking_sim.launch.py start_pose:=joint1_limit
+```
+
+`folded` — сложенная xArm6 с углами
+`[354.3, −67.5, −15, −100.4, −60, 117.8]°`, без пересечений с заданной
+в сцене геометрией экрана.
+`joint1_limit` — обычная поза выбранной модели с J1 = +359.9°.
+Углы сохраняют фактический оборот: +359.9° не заменяется на −0.1°.
+
+Поза `incident` для проверки столкновений на Lite6:
+
+```bash
+ros2 launch face_tracking_arm tracking_sim.launch.py \
+  robot_model:=lite6 start_pose:=incident
+```
+
+При заданной геометрии экрана P16 звенья `link1` и `monitor_link` пересекаются.
+Ожидаемый результат — обнаружение столкновения и удержание руки.
+Для проверки выхода из допустимой сложенной позы используйте `folded` на xArm6.
+
+Для своих углов создайте `angles.yaml`, указав ровно J1–J6 **в радианах**:
+
+```yaml
+initial_positions:
+  joint1: 0.0
+  joint2: 0.0
+  joint3: 0.0
+  joint4: 0.0
+  joint5: 0.0
+  joint6: 0.0
+```
+
+```bash
+ros2 launch face_tracking_arm tracking_sim.launch.py \
+  initial_positions_file:=/полный/путь/angles.yaml
+```
+
+Те же `robot_model`, `start_pose` и `initial_positions_file` принимают
+`tracking_cpu.launch.py` и `tracking_stereo.launch.py`. Для сложной проверки
+с изображениями лица вместо искусственной точки:
+
+```bash
+ros2 launch face_tracking_arm tracking_cpu.launch.py scenario:=stress cycles:=1
+```
+
+Этот вариант по умолчанию стартует из нулей, включает поиск при отсутствии
+лица и выполняет 134-секундный маршрут с изменением высоты, боковыми дугами
+и исчезновением человека. Полное расписание и параметры —
+[в описании зрительных сценариев](tracking_vision.md#сложный-маршрут-и-стартовые-позы).
+Окончание расписания не завершает GUI и само по себе не означает успешного
+сопровождения.
+
+Для быстрых смен направления, приближения/удаления и выбора лица среди
+трёх людей используйте `scenario:=stress_fast`. Этот профиль длится 96 с
+и по умолчанию начинается из `rest`.
+[Команды и расписание](tracking_vision.md#быстрые-движения-и-фоновые-лица).
 
 ## Тестовые цели
 

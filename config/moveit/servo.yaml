@@ -2,7 +2,7 @@
 thread_priority: 40
 publish_period: 0.01
 max_expected_latency: 0.05
-move_group_name: lite6_arm
+move_group_name: xarm6
 
 pose_command_in_topic: ~/pose_target_cmds
 cartesian_command_in_topic: ~/delta_twist_cmds
@@ -37,8 +37,7 @@ check_collisions: true
 collision_check_rate: 10.0
 self_collision_proximity_threshold: 0.01
 scene_collision_proximity_threshold: 0.02
-# The exact REST IK has a measured Jacobian condition number of 31.71 on Lite 6.
-# A sampled +/- 5 cm workspace around it supports this robot-specific warning band.
+# Parameters for the optional standard MoveIt Servo comparison.
 lower_singularity_threshold: 40.0
 hard_stop_singularity_threshold: 80.0
 leaving_singularity_threshold_multiplier: 2.0

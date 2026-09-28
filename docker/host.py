@@ -13,20 +13,27 @@ import os
 from pathlib import Path
 import platform
 import re
+import shlex
 import shutil
 import socket
 import stat
 import subprocess
 import sys
 
+from image_manifest import source_fingerprint
+
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGE = 'face-tracking-arm:jazzy-v1'
+IMAGE = 'face-tracking-arm:jazzy-v2'
 CONTAINER = 'face-tracking-arm'
 MODES = {'cpu': 'mono_cpu', 'stereo': 'stereo'}
 MODELS = {'yunet': 'face_detection_yunet_2023mar.onnx',
           'yolov5n_face': 'yolov5n-face.onnx',
           'yolo_facev2n': 'yolo-facev2n-preweight.onnx'}
+
+
+class ImageCompatibilityError(ValueError):
+    """An installed image must be replaced by one for this checkout and architecture."""
 
 
 def capture(command):
@@ -70,26 +77,40 @@ def image_exists(docker):
         return False
     image = json.loads(result.stdout)[0]
     if image['Architecture'] != architecture():
-        raise ValueError('Образ для другой архитектуры. Выполните ./run build на этом компьютере')
-    if (image['Config'].get('Labels') or {}).get('io.face_tracking_arm.launch-schema') != '1':
-        raise ValueError('Образ несовместим со скриптом. Выполните ./run build')
+        raise ImageCompatibilityError(
+            'Образ для другой архитектуры. Выполните ./run build на этом компьютере')
+    labels = image['Config'].get('Labels') or {}
+    if labels.get('io.face_tracking_arm.launch-schema') != '2':
+        raise ImageCompatibilityError('Образ несовместим со скриптом. Выполните ./run build')
+    if labels.get('io.face_tracking_arm.source-sha256') != source_fingerprint(ROOT):
+        raise ImageCompatibilityError(
+            'Docker-образ содержит другую или непроверенную версию программы. '
+            'Выполните ./run build либо загрузите готовый образ для этой версии проекта. '
+            'Изменения hardware.yaml и калибровок пересборки не требуют.')
     return True
 
 
 def archive_path():
-    return ROOT / 'dist' / f'face-tracking-arm-{architecture()}.tar.gz'
+    return ROOT / 'dist' / f'face-tracking-arm-v2-{architecture()}.tar.gz'
 
 
 def build(docker):
+    source_argument = 'FACE_TRACKING_SOURCE_SHA256=' + source_fingerprint(ROOT)
     subprocess.run(docker + ['build', '--platform', 'linux/' + architecture(),
+                             '--build-arg', source_argument,
                              '-f', str(ROOT / 'docker/Dockerfile'), '-t', IMAGE, str(ROOT)],
                    check=True)
 
 
 def prepare(docker):
-    if image_exists(docker):
-        print('Образ готов. Заполните config/hardware.yaml и запустите ./run cpu или ./run stereo')
-        return
+    incompatible = None
+    try:
+        if image_exists(docker):
+            print('Образ готов. Заполните config/hardware.yaml '
+                  'и запустите ./run cpu или ./run stereo')
+            return
+    except ImageCompatibilityError as error:
+        incompatible = error
     archive = archive_path()
     if archive.is_file():
         checksum = archive.with_suffix(archive.suffix + '.sha256')
@@ -97,6 +118,8 @@ def prepare(docker):
         if not expected or digest(archive) != expected[0]:
             raise ValueError('Архив повреждён или отсутствует файл .sha256 рядом с ним')
         subprocess.run(docker + ['image', 'load', '-i', str(archive)], check=True)
+    elif incompatible:
+        raise incompatible
     else:
         print('Готового архива нет. Собираю образ; первая сборка требует интернета.', flush=True)
         build(docker)
@@ -167,8 +190,9 @@ def resources(data, config, mode, *, calibration=False):
     flags = mount(config, '/input/hardware.yaml')
     groups = set()
     devices = set()
+    video_devices = {}
     if data['source'] == 'usb':
-        for index, (side, camera) in enumerate(data['cameras'].items()):
+        for side, camera in data['cameras'].items():
             device = host_path(camera['device'], config)
             if not device.exists() or not stat.S_ISCHR(device.stat().st_mode):
                 raise ValueError(f'Нет устройства камеры {device}. Посмотрите ./run devices')
@@ -176,13 +200,17 @@ def resources(data, config, mode, *, calibration=False):
                 raise ValueError('Для стерео нужны два разных устройства камеры')
             devices.add(device)
             groups.add(device.stat().st_gid)
-            flags += ['--device', f'{device}:/dev/video{index}:rw']
+            # Vendor UVC controls identify hardware through the matching sysfs videoN.
+            flags += ['--device', f'{device}:{device}:rw']
+            video_devices[side] = str(device)
             if not calibration:
                 value = camera['calibration_file'] or f'calibration/{MODES[mode]}/{side}.yaml'
                 path = host_path(value, config)
                 if not path.is_file():
-                    raise ValueError(f'Нет калибровки {path}. Выполните ./run calibrate {mode}')
+                    command = shlex.join(['./run', 'calibrate', mode, '--config', str(config)])
+                    raise ValueError(f'Нет калибровки {path}. Выполните {command}')
                 flags += mount(path, f'/calibration/{side}.yaml')
+        flags += ['--env', 'FACE_TRACKING_VIDEO_DEVICES=' + json.dumps(video_devices)]
     if calibration:
         if data['source'] != 'usb':
             raise ValueError('Для source=ros используйте калибровку драйвера камеры')
@@ -245,14 +273,23 @@ def execute(docker, args):
     for option in ('camera_only', 'show_image', 'mock'):
         if getattr(args, option):
             command.append('--' + option.replace('_', '-'))
+    if args.point_filter is not None:
+        command += ['--point-filter', args.point_filter]
     # Handle Ctrl+C once here; the Docker client must not proxy the same signal again.
     process = subprocess.Popen(command, start_new_session=True)
+    interrupted = False
     try:
-        return process.wait()
+        returncode = process.wait()
     except KeyboardInterrupt:
         capture(docker + ['stop', '--time', '20', CONTAINER])
-        process.wait(timeout=25)
-        return 130
+        returncode = process.wait(timeout=25)
+        interrupted = True
+    if calibration and returncode == 0:
+        print('Файлы калибровки: ' + str(output), flush=True)
+        if any(camera.get('calibration_file') for camera in data['cameras'].values()):
+            print('В конфиге уже указан calibration_file. Очистите его для новой '
+                  'калибровки по умолчанию либо укажите путь к полученному файлу.', flush=True)
+    return 130 if interrupted else returncode
 
 
 def list_devices():
@@ -275,9 +312,13 @@ def main():
     parser.add_argument('--camera-only', action='store_true', help='Проверить камеру без руки')
     parser.add_argument('--show-image', action='store_true', help='Открыть изображение камеры')
     parser.add_argument('--mock', action='store_true', help='Программный контроллер вместо руки')
+    parser.add_argument('--point-filter', choices=['off', 'kalman', 'one_euro'],
+                        help='Фильтр точки на этот запуск; без аргумента — из YAML')
     parser.add_argument('--size', default='8x6', help='Внутренние углы шахматной доски')
     parser.add_argument('--square', type=float, default=.025, help='Размер клетки доски в метрах')
     args = parser.parse_args()
+    if args.point_filter is not None and args.operation not in MODES:
+        parser.error('--point-filter используется только с cpu или stereo')
     if not 0 <= args.domain <= 101:
         parser.error('--domain должен быть от 0 до 101')
     if (not re.fullmatch(r'[0-9]+x[0-9]+', args.size)

@@ -63,9 +63,9 @@ namespace
 
   for (Eigen::Index index = 0; index < joint_count; ++index) {
     const double safe_lower =
-      limits.lower_position[index] + limits.position_margin[index];
+      limits.lower_position[index];
     const double safe_upper =
-      limits.upper_position[index] - limits.position_margin[index];
+      limits.upper_position[index];
     if (limits.lower_position[index] >= limits.upper_position[index] ||
       limits.position_margin[index] < 0.0 || safe_lower > safe_upper ||
       limits.max_velocity[index] <= 0.0 ||
@@ -147,9 +147,9 @@ EmergencyBrakeTail EmergencyBrakeTailGenerator::generate(
     }
 
     const double safe_lower =
-      limits.lower_position[index] + limits.position_margin[index];
+      limits.lower_position[index];
     const double safe_upper =
-      limits.upper_position[index] - limits.position_margin[index];
+      limits.upper_position[index];
     if (rollout.minimum_position < safe_lower - config_.comparison_tolerance ||
       rollout.maximum_position > safe_upper + config_.comparison_tolerance)
     {

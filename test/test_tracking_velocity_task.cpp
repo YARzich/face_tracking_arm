@@ -10,6 +10,7 @@
 #include <optional>
 
 #include "face_tracking_arm/tracking_velocity_task.hpp"
+#include "face_tracking_arm/pointing_geometry.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -47,8 +48,8 @@ TEST(TrackingVelocityTask, AcceptedStaticPoseHasNoBackgroundMotionPreference)
     Eigen::Matrix3d::Identity());
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->accepted);
-  EXPECT_EQ(result->task.primary_matrix.rows(), 3);
-  EXPECT_EQ(result->task.secondary_matrix.rows(), 3);
+  EXPECT_EQ(result->task.primary_matrix.rows(), 2);
+  EXPECT_EQ(result->task.secondary_matrix.rows(), 4);
   EXPECT_TRUE(result->task.primary_reference.isZero(kTolerance));
   EXPECT_TRUE(result->task.secondary_reference.isZero(kTolerance));
   EXPECT_NEAR(result->position_error_m, 0.0, kTolerance);
@@ -90,9 +91,10 @@ TEST(TrackingVelocityTask, PointingAndUprightRollJacobiansMatchFiniteDifference)
     const Eigen::AngleAxisd residual(moved_rotation * moved_goal.transpose());
     const Eigen::Vector3d derivative =
       basis * (residual.axis() * (residual.angle() / delta));
-    EXPECT_TRUE(result->task.primary_matrix.col(column).isApprox(derivative, 2.0e-6)) <<
+    EXPECT_TRUE(result->task.primary_matrix.col(column).isApprox(derivative.head<2>(), 2.0e-6)) <<
       "column " << column << ": expected " << derivative.transpose() <<
       ", actual " << result->task.primary_matrix.col(column).transpose();
+    EXPECT_NEAR(result->task.secondary_matrix(3, column), derivative[2], 2.0e-6);
   }
 }
 
@@ -108,7 +110,7 @@ TEST(TrackingVelocityTask, MovingFaceFeedForwardMatchesPointingAndRollFiniteDiff
     Eigen::Matrix3d::Identity(), TrackingVelocityTaskConfig{}, face_velocity);
   ASSERT_TRUE(result.has_value());
   EXPECT_FALSE(result->accepted);
-  EXPECT_TRUE(result->task.secondary_reference.isZero(kTolerance));
+  EXPECT_TRUE(result->task.secondary_reference.head<3>().isZero(kTolerance));
 
   constexpr double delta = 1.0e-6;
   const Eigen::Matrix3d earlier = upright_rotation(
@@ -122,9 +124,10 @@ TEST(TrackingVelocityTask, MovingFaceFeedForwardMatchesPointingAndRollFiniteDiff
     current.rotation().col(1).dot(angular_velocity),
     current.rotation().col(2).dot(angular_velocity),
     current.rotation().col(0).dot(angular_velocity));
-  EXPECT_TRUE(result->task.primary_reference.isApprox(expected, 1.0e-8)) <<
+  EXPECT_TRUE(result->task.primary_reference.isApprox(expected.head<2>(), 1.0e-8)) <<
     "expected " << expected.transpose() <<
     ", actual " << result->task.primary_reference.transpose();
+  EXPECT_NEAR(result->task.secondary_reference[3], expected[2], 1.0e-8);
   EXPECT_GT(std::abs(expected[2]), 0.01);
 
   // Equal face and TCP translations preserve their relative ray with no
@@ -145,7 +148,7 @@ TEST(TrackingVelocityTask, PositionFeedForwardRemainsActiveInsideGeometricDeadba
   ASSERT_TRUE(result.has_value());
   EXPECT_FALSE(result->accepted);
   EXPECT_TRUE(result->task.primary_reference.isZero(kTolerance));
-  EXPECT_TRUE(result->task.secondary_reference.isApprox(goal_velocity, kTolerance));
+  EXPECT_TRUE(result->task.secondary_reference.head<3>().isApprox(goal_velocity, kTolerance));
   EXPECT_NEAR(result->position_error_m, 0.0, kTolerance);
 }
 
@@ -182,11 +185,12 @@ TEST(TrackingVelocityTask, CombinedFeedbackAndFeedForwardRespectSpeedCaps)
   ASSERT_TRUE(result.has_value());
   EXPECT_NEAR(result->task.primary_reference.norm(), config.maximum_angular_reference_radps,
     kTolerance);
-  EXPECT_NEAR(result->task.secondary_reference.norm(), config.maximum_linear_reference_mps,
+  EXPECT_NEAR(result->task.secondary_reference.head<3>().norm(),
+        config.maximum_linear_reference_mps,
     kTolerance);
   const Eigen::Vector3d combined(config.position_gain * (2.0 - config.position_deadband_m),
     2.0, 0.0);
-  EXPECT_TRUE(result->task.secondary_reference.isApprox(
+  EXPECT_TRUE(result->task.secondary_reference.head<3>().isApprox(
       combined.normalized() * config.maximum_linear_reference_mps, kTolerance));
 }
 
@@ -217,7 +221,8 @@ TEST(TrackingVelocityTask, FixedPoseDoesNotCoupleTranslationIntoOrientation)
   EXPECT_TRUE(result->task.primary_matrix.leftCols(3).isZero(kTolerance));
   EXPECT_NEAR(result->pointing_error_rad, 0.0, kTolerance);
   EXPECT_NEAR(result->roll_error_rad, 0.2, kTolerance);
-  EXPECT_LT(result->task.primary_reference[2], 0.0);
+  EXPECT_TRUE(result->task.primary_reference.isZero(kTolerance));
+  EXPECT_LT(result->task.secondary_reference[3], 0.0);
   EXPECT_FALSE(result->accepted);
 }
 
@@ -247,7 +252,8 @@ TEST(TrackingVelocityTask, ReferencesAreBoundedAndDeadbandBoundaryIsContinuous)
     std::nullopt, Eigen::Matrix3d::Identity(), config);
   ASSERT_TRUE(large.has_value());
   EXPECT_LE(large->task.primary_reference.norm(), config.maximum_angular_reference_radps + 1.e-12);
-  EXPECT_LE(large->task.secondary_reference.norm(), config.maximum_linear_reference_mps + 1.e-12);
+  EXPECT_LE(large->task.secondary_reference.head<3>().norm(),
+        config.maximum_linear_reference_mps + 1.e-12);
 
   current = Eigen::Isometry3d::Identity();
   for (const double displacement : {config.position_deadband_m - 1.e-8,
@@ -290,7 +296,7 @@ TEST(TrackingVelocityTask, RejectsInvalidAndUndefinedGeometry)
   EXPECT_TRUE(invalid(Eigen::MatrixXd::Zero(5, 6), std::nullopt, Eigen::Matrix3d::Identity()));
   EXPECT_TRUE(invalid(Eigen::MatrixXd::Zero(6, 0), std::nullopt, Eigen::Matrix3d::Identity()));
   EXPECT_TRUE(invalid(jacobian, Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity()));
-  EXPECT_TRUE(invalid(jacobian, Eigen::Vector3d::UnitZ(), Eigen::Matrix3d::Identity()));
+  EXPECT_FALSE(invalid(jacobian, Eigen::Vector3d::UnitZ(), Eigen::Matrix3d::Identity()));
   EXPECT_TRUE(invalid(jacobian, std::nullopt, Eigen::Matrix3d::Zero()));
   Eigen::MatrixXd nonfinite = jacobian;
   nonfinite(0, 0) = std::numeric_limits<double>::quiet_NaN();
@@ -307,6 +313,89 @@ TEST(TrackingVelocityTask, RejectsInvalidAndUndefinedGeometry)
       current, jacobian, Eigen::Vector3d::Zero(), Eigen::Vector3d::UnitX(),
       Eigen::Matrix3d::Identity(), TrackingVelocityTaskConfig{}, Eigen::Vector3d::Zero(),
       invalid_velocity).has_value());
+}
+
+TEST(TrackingVelocityTask, VerticalFaceKeepsPointingAndDisablesUnobservableUprightRoll)
+{
+  for (const double x : {-1.0e-9, 0.0, 1.0e-9}) {
+    const auto result = makeTrackingVelocityTask(
+      Eigen::Isometry3d::Identity(), Eigen::MatrixXd::Identity(6, 6), Eigen::Vector3d::Zero(),
+      Eigen::Vector3d(x, 0.0, 1.0), Eigen::Matrix3d::Identity(),
+      TrackingVelocityTaskConfig{}, Eigen::Vector3d(0.1, 0.1, 0.0));
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->task.primary_matrix.rows(), 2);
+    EXPECT_TRUE(result->task.primary_matrix.allFinite());
+    EXPECT_LE(result->task.primary_matrix.norm(), 3.0);
+    EXPECT_GT(result->task.primary_reference.norm(), 0.1);
+    EXPECT_TRUE(result->task.secondary_matrix.row(3).isZero(1.0e-6));
+    EXPECT_NEAR(result->task.secondary_reference[3], 0.0, 1.0e-6);
+  }
+}
+
+TEST(TrackingVelocityTask, OffsetAndRotatedCameraCentersFaceWithoutMovingMonitorPositionGoal)
+{
+  Eigen::Isometry3d monitor = Eigen::Isometry3d::Identity();
+  monitor.translation() = Eigen::Vector3d(0.2, 0.0, 1.0);
+  const Eigen::Vector3d offset(0.0, 0.03, 0.125);
+  Eigen::Isometry3d optical = monitor;
+  optical.translation() += offset;
+  optical.linear() = Eigen::AngleAxisd(0.12, Eigen::Vector3d::UnitY()).toRotationMatrix() *
+    opticalToPointingRotation().transpose();
+  GazeKinematics gaze;
+  gaze.pose = optical;
+  gaze.pose.linear() *= opticalToPointingRotation();
+  gaze.jacobian = Eigen::MatrixXd::Identity(6, 6);
+  for (Eigen::Index axis = 0; axis < 3; ++axis) {
+    gaze.jacobian.block<3, 1>(0, axis + 3) = Eigen::Vector3d::Unit(axis).cross(offset);
+  }
+  const Eigen::Vector3d face = optical.translation() + optical.linear().col(2);
+  const auto result = makeTrackingVelocityTask(
+    monitor, Eigen::MatrixXd::Identity(6, 6), monitor.translation(), face,
+    Eigen::Matrix3d::Identity(), TrackingVelocityTaskConfig{},
+    Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), gaze);
+  ASSERT_TRUE(result);
+  EXPECT_NEAR(result->pointing_error_rad, 0.0, kTolerance);
+  EXPECT_TRUE(result->task.primary_reference.isZero(kTolerance));
+  EXPECT_TRUE(result->task.secondary_reference.head<3>().isZero(kTolerance));
+  EXPECT_TRUE(result->task.secondary_matrix.topRows(3).isApprox(
+      Eigen::MatrixXd::Identity(6, 6).topRows(3), kTolerance));
+  EXPECT_TRUE(result->accepted);
+
+  const auto monitor_only = makeTrackingVelocityTask(
+    monitor, Eigen::MatrixXd::Identity(6, 6), monitor.translation(), face,
+    Eigen::Matrix3d::Identity());
+  ASSERT_TRUE(monitor_only);
+  EXPECT_GT(monitor_only->pointing_error_rad, 0.02);
+  EXPECT_FALSE(monitor_only->accepted);
+
+  // Independent finite difference includes camera translation induced by a
+  // rotation about the monitor origin; using the monitor Jacobian would fail.
+  Eigen::Matrix<double, 2, 3> basis;
+  basis.row(0) = gaze.pose.linear().col(1).transpose();
+  basis.row(1) = gaze.pose.linear().col(2).transpose();
+  constexpr double delta = 1.0e-6;
+  for (Eigen::Index column = 0; column < 6; ++column) {
+    const Eigen::Vector3d w = gaze.jacobian.col(column).tail<3>();
+    const auto residual_at = [&](double step) {
+        Eigen::Matrix3d moved_rotation = gaze.pose.linear();
+        if (w.norm() > 0.0) {
+          moved_rotation = Eigen::AngleAxisd(step * w.norm(), w.normalized()) * moved_rotation;
+        }
+        const Eigen::Vector3d moved_position = gaze.pose.translation() +
+          step * gaze.jacobian.col(column).head<3>();
+        const Eigen::AngleAxisd residual(
+          moved_rotation * upright_rotation(face - moved_position).transpose());
+        return Eigen::Vector3d(residual.axis() * residual.angle());
+      };
+    const Eigen::Vector2d derivative = basis *
+      (residual_at(delta) - residual_at(-delta)) / (2.0 * delta);
+    EXPECT_LT((result->task.primary_matrix.col(column) - derivative).norm(), 1.0e-8) << column;
+  }
+  gaze.jacobian.resize(5, 6);
+  EXPECT_FALSE(makeTrackingVelocityTask(
+      monitor, Eigen::MatrixXd::Identity(6, 6), monitor.translation(), face,
+      Eigen::Matrix3d::Identity(), TrackingVelocityTaskConfig{},
+      Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), gaze));
 }
 
 TEST(JointPathVelocityTask, PreservesPathDirectionAndRealBoundedAngles)

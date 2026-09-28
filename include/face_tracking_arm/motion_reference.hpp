@@ -14,6 +14,7 @@
 #include "face_tracking_arm/collision_constraints.hpp"
 #include "face_tracking_arm/joint_path_follower.hpp"
 #include "face_tracking_arm/idle_search.hpp"
+#include "face_tracking_arm/posture_recovery_policy.hpp"
 #include "face_tracking_arm/msg/tracking_target.hpp"
 #include "face_tracking_arm/target_motion_estimator.hpp"
 #include "face_tracking_arm/tracking_velocity_task.hpp"
@@ -40,6 +41,7 @@ struct MotionReferenceDiagnostics
   double last_plan_wall_ms{0.0};
   double path_progress_rad{0.0};
   double path_distance_rad{0.0};
+  unsigned int recovery_relaxation{0};
 };
 
 /// Thread-confined task selection; the planner alone owns a background worker.
@@ -69,6 +71,7 @@ private:
   CollisionConstraintBuilder collision_validator_;
   const moveit::core::JointModelGroup * group_;
   const moveit::core::LinkModel * command_link_;
+  const moveit::core::LinkModel * gaze_link_{nullptr};
   Eigen::VectorXd rest_positions_;
   Eigen::VectorXd search_positions_;
   Eigen::Index search_base_index_{0};
@@ -85,6 +88,12 @@ private:
   bool rest_completed_{false};
   bool rest_settling_{false};
   bool acquisition_planning_{false};
+  bool recovery_requested_{false};
+  unsigned int recovery_failures_{0};
+  unsigned int pending_relaxation_{0};
+  unsigned int path_relaxation_{0};
+  std::uint64_t recovery_attempt_{0};
+  PointingProgressMonitor pointing_progress_;
   std::optional<Eigen::Vector3d> planned_face_;
 };
 

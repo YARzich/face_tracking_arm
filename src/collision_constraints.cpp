@@ -192,6 +192,18 @@ void appendDistanceCandidates(
 [[nodiscard]] double pairDistanceLipschitz(
   const DistanceCandidate & candidate, const CollisionConstraintConfig & config)
 {
+  if (!config.distance_bounds.empty()) {
+    std::pair<std::string, std::string> key;
+    if (candidate.kind == CollisionPairKind::kSelf) {
+      key = std::minmax(candidate.body_names[0], candidate.body_names[1]);
+    } else {
+      key.first = candidate.body_types[0] == BodyTypes::WORLD_OBJECT ?
+        candidate.body_names[1] : candidate.body_names[0];
+    }
+    const auto bound = config.distance_bounds.find(key);
+    return bound == config.distance_bounds.end() ?
+           config.default_distance_lipschitz_m_per_rad : bound->second;
+  }
   if (isInvariantPair(candidate, config)) {
     return 0.0;
   }
@@ -428,9 +440,9 @@ struct ReachableApproachInterval
       state.acceleration[index] + limits.max_jerk[index] * period_sec);
 
     const double safe_lower_position =
-      limits.lower_position[index] + limits.position_margin[index];
+      limits.lower_position[index];
     const double safe_upper_position =
-      limits.upper_position[index] - limits.position_margin[index];
+      limits.upper_position[index];
     interval.lower[index] = std::max({
           -limits.max_velocity[index],
           state.velocity[index] + minimum_acceleration * period_sec,
@@ -679,7 +691,8 @@ void validateConfig(const CollisionConstraintConfig & config)
       error = "safety-profile link '" + required_link_name + "' is absent from RobotModel";
       return false;
     }
-    if (required_link->getShapes().empty()) {
+    // A disabled display remains as a fixed control/camera mount frame.
+    if (required_link_name != config.monitor_link_name && required_link->getShapes().empty()) {
       error = "safety-profile link '" + required_link_name + "' has no collision geometry";
       return false;
     }
@@ -853,9 +866,9 @@ double jerkLimitedCollisionStoppingDistance(
   const Eigen::VectorXd candidate_position =
     motion_state.position + candidate_joint_velocity * period_sec;
   const Eigen::VectorXd minimum_position =
-    motion_limits.lower_position + motion_limits.position_margin;
+    motion_limits.lower_position;
   const Eigen::VectorXd maximum_joint_position =
-    motion_limits.upper_position - motion_limits.position_margin;
+    motion_limits.upper_position;
   if (!isFinite(candidate_acceleration) || !isFinite(candidate_position) ||
     (candidate_joint_velocity.cwiseAbs().array() >
     motion_limits.max_velocity.array() + kComparisonTolerance).any() ||

@@ -314,6 +314,54 @@ TEST_F(BackgroundPathPlannerTest, RejectsPoseWhenIkCannotSatisfyAdditionalCleara
   EXPECT_TRUE(result->path.empty());
 }
 
+TEST_F(BackgroundPathPlannerTest, PointingGoalDoesNotRequireThePreferredCartesianPosition)
+{
+  BackgroundPathPlanner planner(node_, model_, monitor_, config_);
+  BackgroundPathPlanner::PoseGoal goal;
+  goal.link_name = "tip";
+  goal.pose.translation() = Eigen::Vector3d(10.0, 10.0, 10.0);
+  goal.face_position = Eigen::Vector3d(2.0, 0.0, 0.0);
+  static_cast<void>(planner.submit(state(-0.6, 0.2), goal, 70));
+  const auto result = waitResult(planner);
+  ASSERT_TRUE(result);
+  ASSERT_TRUE(result->success) << result->message;
+  auto achieved = state(result->goal_positions[0], result->goal_positions[1]);
+  const auto & pose = achieved.getGlobalLinkTransform("tip");
+  const Eigen::Vector3d direction = (*goal.face_position - pose.translation()).normalized();
+  EXPECT_GT(pose.linear().col(0).dot(direction), std::cos(0.025));
+  EXPECT_GT((pose.translation() - goal.pose.translation()).norm(), 10.0);
+}
+
+TEST_F(BackgroundPathPlannerTest, FailedPointingMayRelaxToDiverseCheckedJointDetours)
+{
+  BackgroundPathPlanner planner(node_, model_, monitor_, config_);
+  BackgroundPathPlanner::PoseGoal goal;
+  goal.link_name = "tip";
+  goal.face_position = Eigen::Vector3d(0.0, 0.0, 2.0);
+  const auto start = state(-0.6, 0.2);
+  static_cast<void>(planner.submit(start, goal, 71));
+  auto result = waitResult(planner);
+  ASSERT_TRUE(result);
+  EXPECT_FALSE(result->success);  // The slider cannot point upward.
+  goal.relaxation = 2;
+  Eigen::VectorXd first_goal;
+  for (const std::uint64_t attempt : {2U, 5U}) {
+    goal.attempt = attempt;
+    static_cast<void>(planner.submit(start, goal, 72));
+    result = waitResult(planner);
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->success) << result->message;
+    EXPECT_GT((result->goal_positions - result->start_positions).norm(), 0.08);
+    if (first_goal.size() != 0) {
+      EXPECT_GT((first_goal - result->goal_positions).norm(), 0.01);
+    }
+    first_goal = result->goal_positions;
+    for (const auto & waypoint : result->path) {
+      EXPECT_LE(waypoint.cwiseAbs().maxCoeff(), 1.0);
+    }
+  }
+}
+
 class BackgroundRevolutePlannerTest : public BackgroundPathPlannerTest
 {
 protected:
@@ -356,7 +404,7 @@ TEST_F(BackgroundRevolutePlannerTest, CentersOnlyIkSeedsAndPlansFromTheActualWou
   EXPECT_NEAR(result->path.back()[0], 0.2, 0.002);
 }
 
-TEST_F(BackgroundRevolutePlannerTest, RejectsRecoveryWhenOnlyAWoundIkBranchIsSafe)
+TEST_F(BackgroundRevolutePlannerTest, AllowsSafeEndpointWithoutMandatoryCompleteUnwinding)
 {
   BackgroundPathPlanner planner(
     node_, model_, monitor_, config_,
@@ -377,9 +425,11 @@ TEST_F(BackgroundRevolutePlannerTest, RejectsRecoveryWhenOnlyAWoundIkBranchIsSaf
   static_cast<void>(planner.submit(start, goal, 55));
   const auto result = waitResult(planner);
   ASSERT_TRUE(result);
-  EXPECT_FALSE(result->success);
-  EXPECT_EQ(result->error_code, moveit_msgs::msg::MoveItErrorCodes::NO_IK_SOLUTION);
-  EXPECT_TRUE(result->path.empty());
+  ASSERT_TRUE(result->success) << result->message;
+  EXPECT_NEAR(result->goal_positions[0], 2.0 * M_PI - 0.2, 0.001);
+  for (const auto & waypoint : result->path) {
+    EXPECT_GT(waypoint[0], 4.0);
+  }
   EXPECT_DOUBLE_EQ(result->start_positions[0], 5.9);
 }
 

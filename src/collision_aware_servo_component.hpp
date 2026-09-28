@@ -63,7 +63,7 @@ enum class ControllerMode
 {
   kTracking,
   kBraking,
-  kLatchedHalt,
+  kWaitingForSafeState,
 };
 
 enum class CommandAttempt
@@ -334,7 +334,7 @@ private:
 
   void publish_status(const std::int8_t code, std::string message);
 
-  void enter_latched_halt(std::string message);
+  void enter_safety_wait(std::string message);
 
   void reset_feedback_derivative_history();
 

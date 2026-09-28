@@ -69,6 +69,15 @@ public:
     Eigen::Isometry3d pose{Eigen::Isometry3d::Identity()};
     std::string link_name;
     double preferred_base_angle_rad{0.0};
+    /// When set, pose.translation() is only a preference: sample reachable
+    /// positions and free roll, keeping the link's +X directed toward this point.
+    std::optional<Eigen::Vector3d> face_position;
+    /// Optional optical camera link; look-at includes its fixed mounting transform.
+    std::string gaze_link_name;
+    /// 0: pointing, 1: relaxed pointing cone, 2: safe joint detour.
+    unsigned int relaxation{0};
+    /// Advances across retries to avoid repeatedly selecting the same endpoint.
+    std::uint64_t attempt{0};
   };
 
   /// Additional geometric safety predicate, on the worker's private scene.
@@ -98,10 +107,9 @@ public:
     const Eigen::VectorXd & goal_positions, std::uint64_t scene_revision);
 
   /// Selects a collision/clearance-valid joint goal using the configured MoveIt
-  /// IK plugin in the worker. Recovery endpoints require wide bounded revolute
-  /// joints to be within 3.5 rad of their range center. The start and intermediate
-  /// path states retain their full bounds. This is an endpoint, not a path constraint:
-  /// orientation toward the face is not guaranteed during the planned detour.
+  /// IK plugin and bounded candidate sampling. With face_position, translation
+  /// and roll are free; relaxation can eventually admit a checked joint detour.
+  /// The caller determines whether pointing is retained along the executed path.
   [[nodiscard]] std::uint64_t submit(
     const moveit::core::RobotState & start,
     const PoseGoal & goal, std::uint64_t scene_revision);

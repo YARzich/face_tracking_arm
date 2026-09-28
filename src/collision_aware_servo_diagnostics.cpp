@@ -17,8 +17,8 @@ const char * controller_mode_name(const ControllerMode mode)
       return "TRACKING";
     case ControllerMode::kBraking:
       return "BRAKING";
-    case ControllerMode::kLatchedHalt:
-      return "LATCHED_HALT";
+    case ControllerMode::kWaitingForSafeState:
+      return "WAITING_FOR_SAFE_STATE";
   }
   return "UNKNOWN";
 }
@@ -42,7 +42,7 @@ void CollisionAwareServoComponent::observe_controller_mode() noexcept
 {
   if (controller_mode_ == ControllerMode::kBraking) {
     ++braking_tick_count_;
-  } else if (controller_mode_ == ControllerMode::kLatchedHalt) {
+  } else if (controller_mode_ == ControllerMode::kWaitingForSafeState) {
     ++emergency_tick_count_;
   }
 
@@ -51,7 +51,7 @@ void CollisionAwareServoComponent::observe_controller_mode() noexcept
   {
     if (controller_mode_ == ControllerMode::kBraking) {
       ++braking_event_count_;
-    } else if (controller_mode_ == ControllerMode::kLatchedHalt) {
+    } else if (controller_mode_ == ControllerMode::kWaitingForSafeState) {
       ++emergency_event_count_;
     }
     last_observed_controller_mode_ = controller_mode_;
@@ -122,8 +122,8 @@ void CollisionAwareServoComponent::publish_runtime_diagnostics()
   array.header.stamp = current_time;
   diagnostic_msgs::msg::DiagnosticStatus status;
   status.name = "face_tracking_arm/collision_aware_servo";
-  status.hardware_id = "lite6_gazebo";
-  if (controller_mode_ == ControllerMode::kLatchedHalt) {
+  status.hardware_id = parameters_.planning_group_name;
+  if (controller_mode_ == ControllerMode::kWaitingForSafeState) {
     status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
   } else if (last_servo_status_code_ == moveit_msgs::msg::ServoStatus::NO_WARNING) {
     status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
@@ -138,6 +138,8 @@ void CollisionAwareServoComponent::publish_runtime_diagnostics()
   status.values.push_back(key_value("servo_status_message", last_servo_status_message_));
   const auto & reference = motion_reference_->diagnostics();
   status.values.push_back(key_value("motion_reference_state", reference.state));
+  status.values.push_back(key_value(
+    "recovery_relaxation", std::to_string(reference.recovery_relaxation)));
   status.values.push_back(key_value("last_plan_message", reference.last_plan_message));
   status.values.push_back(key_value("plans_requested", std::to_string(reference.plans_requested)));
   status.values.push_back(key_value("plans_accepted", std::to_string(reference.plans_accepted)));

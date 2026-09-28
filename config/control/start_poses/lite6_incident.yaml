@@ -1,0 +1,9 @@
+# Recorded Lite6 incident. Degrees: 354.3, -67.5, 20.3, -100.4, -91.6, 117.8.
+# All values below are radians in manufacturer joint coordinates.
+initial_positions:
+  joint1: 6.183701539815909
+  joint2: -1.178097245096172
+  joint3: 0.354301838154849
+  joint4: -1.752310569002307
+  joint5: -1.598721594826806
+  joint6: 2.055997858849320

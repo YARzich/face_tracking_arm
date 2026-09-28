@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "face_tracking_arm/posture_recovery_policy.hpp"
+#include "face_tracking_arm/pointing_geometry.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -19,6 +20,17 @@ JointMotionState stationaryState(const Eigen::VectorXd & position)
 {
   return {position, Eigen::VectorXd::Zero(position.size()),
     Eigen::VectorXd::Zero(position.size())};
+}
+
+const moveit::core::LinkModel * rigidRoot(const moveit::core::LinkModel * link)
+{
+  while (link->getParentJointModel() &&
+    link->getParentJointModel()->getType() == moveit::core::JointModel::FIXED &&
+    link->getParentLinkModel())
+  {
+    link = link->getParentLinkModel();
+  }
+  return link;
 }
 
 }  // namespace
@@ -38,6 +50,13 @@ MotionReference::MotionReference(
   if (!group_ || !command_link_ || !rest.setToDefaultValues(group_, "rest")) {
     throw std::invalid_argument(
             "Motion reference requires the group, control frame and named rest");
+  }
+  if (!parameters_.gaze_frame.empty()) {
+    gaze_link_ = scene_monitor->getRobotModel()->getLinkModel(parameters_.gaze_frame);
+    if (!gaze_link_ || rigidRoot(gaze_link_) != rigidRoot(command_link_)) {
+      throw std::invalid_argument(
+          "gaze_frame must be a camera optical link rigidly fixed to the screen");
+    }
   }
   rest.copyJointGroupPositions(group_, rest_positions_);
   if (!rest.setToDefaultValues(group_, "search")) {
@@ -74,8 +93,8 @@ MotionReference::MotionReference(
     {
       Eigen::VectorXd position;
       state.copyJointGroupPositions(group, position);
-      if ((position.array() < (limits.lower_position + limits.position_margin).array()).any() ||
-      (position.array() > (limits.upper_position - limits.position_margin).array()).any())
+      if ((position.array() < limits.lower_position.array()).any() ||
+      (position.array() > limits.upper_position.array()).any())
       {
         return false;
       }
@@ -87,6 +106,9 @@ MotionReference::MotionReference(
 
 void MotionReference::reset()
 {
+  if (mode_ == msg::TrackingTarget::FACE && (pending_generation_ || follower_.active())) {
+    recovery_failures_ = std::min(1000u, recovery_failures_ + 1);
+  }
   planner_->cancel();
   follower_.reset();
   target_motion_estimator_.reset();
@@ -97,6 +119,8 @@ void MotionReference::reset()
   rest_completed_ = false;
   rest_settling_ = false;
   acquisition_planning_ = false;
+  recovery_requested_ = false;
+  pointing_progress_.reset();
   planned_face_.reset();
   diagnostics_.state = "HOLD";
 }
@@ -105,6 +129,7 @@ void MotionReference::rejectPath()
 {
   if (follower_.active() || rest_settling_) {
     ++diagnostics_.paths_abandoned;
+    recovery_failures_ = std::min(1000u, recovery_failures_ + 1);
     follower_.reset();
     rest_settling_ = false;
   }
@@ -122,7 +147,13 @@ MotionReferenceResult MotionReference::update(
   const double time_sec, const std::uint64_t scene_revision)
 {
   MotionReferenceResult result;
-  const std::uint8_t mode = target ? target->mode : msg::TrackingTarget::HOLD;
+  const bool live_face = target && target->mode == msg::TrackingTarget::FACE;
+  // Only a positively identified perception loss may finish an adopted detour.
+  // Missing commands, explicit HOLD and safety/pause commands always cancel it.
+  const bool finishing_detour = target && target->allow_recovery && !live_face &&
+    mode_ == msg::TrackingTarget::FACE && follower_.active() && path_relaxation_ >= 2;
+  const std::uint8_t mode = finishing_detour ? msg::TrackingTarget::FACE :
+    (target ? target->mode : msg::TrackingTarget::HOLD);
   if (!mode_ || mode != *mode_ ||
     (mode == msg::TrackingTarget::SEARCH && search_pattern_ != target->search_pattern))
   {
@@ -155,7 +186,7 @@ MotionReferenceResult MotionReference::update(
     }
   }
   TargetMotionEstimate target_motion;
-  if (mode == msg::TrackingTarget::FACE) {
+  if (live_face) {
     const double measurement_time_sec = static_cast<double>(target->face_stamp.sec) +
       1.0e-9 * static_cast<double>(target->face_stamp.nanosec);
     target_motion = target_motion_estimator_.update(
@@ -163,20 +194,52 @@ MotionReferenceResult MotionReference::update(
       Eigen::Vector3d(target->pose.position.x, target->pose.position.y, target->pose.position.z),
       measurement_time_sec, time_sec);
   }
-  if (mode == msg::TrackingTarget::FACE &&
-    (pending_generation_ || acquisition_planning_) && planned_face_ &&
-    (Eigen::Vector3d(target->face.x, target->face.y, target->face.z) -
-    *planned_face_).norm() > 0.50)
-  {
-    // Refresh a pending endpoint for a substantially moved face. Once adopted,
-    // the posture maneuver must finish: canceling it on every short face arc
-    // repeatedly re-enters the same winding branch. HOLD/mode changes still cancel.
-    planner_->cancel();
-    pending_generation_.reset();
-    rejectPath();
-    planned_face_.reset();
-    acquisition_planning_ = false;
-    next_plan_time_sec_ = time_sec;
+  if (live_face || mode == msg::TrackingTarget::POSE) {
+    Eigen::MatrixXd jacobian;
+    if (state.getJacobian(group_, command_link_, Eigen::Vector3d::Zero(), jacobian, false)) {
+      // MoveIt returns the Jacobian in the group's root-link frame. References
+      // and optical extrinsics use the planning/world frame, including tilted bases.
+      const auto * root = group_->getJointModels().front()->getParentLinkModel();
+      if (root) {
+        const Eigen::Matrix3d rotation = state.getGlobalLinkTransform(root).linear();
+        jacobian.topRows(3) = (rotation * jacobian.topRows(3)).eval();
+        jacobian.bottomRows(3) = (rotation * jacobian.bottomRows(3)).eval();
+      }
+      TrackingVelocityTaskConfig config;
+      config.position_gain = parameters_.position_gain;
+      config.orientation_gain = parameters_.orientation_gain;
+      config.position_deadband_m = parameters_.position_deadband_m;
+      config.pointing_deadband_rad = follower_.active() && path_relaxation_ == 1 ?
+        0.35 : parameters_.pointing_deadband_rad;
+      config.maximum_linear_reference_mps = parameters_.maximum_linear_reference_mps;
+      config.maximum_angular_reference_radps = parameters_.maximum_angular_reference_radps;
+      config.roll_weight = parameters_.secondary_roll_weight;
+      const Eigen::Quaterniond orientation(target->pose.orientation.w,
+        target->pose.orientation.x, target->pose.orientation.y, target->pose.orientation.z);
+      std::optional<Eigen::Vector3d> face;
+      if (live_face) {
+        face = Eigen::Vector3d(target->face.x, target->face.y, target->face.z);
+      }
+      std::optional<GazeKinematics> gaze;
+      if (live_face && gaze_link_) {
+        gaze.emplace();
+        gaze->pose = state.getGlobalLinkTransform(gaze_link_);
+        gaze->pose.linear() *= opticalToPointingRotation();
+        gaze->jacobian = jacobian;
+        const Eigen::Vector3d offset = gaze->pose.translation() -
+          state.getGlobalLinkTransform(command_link_).translation();
+        // The rigid mount changes only Jv: v_camera = v_screen + omega x offset.
+        for (Eigen::Index joint = 0; joint < jacobian.cols(); ++joint) {
+          gaze->jacobian.col(joint).head<3>() +=
+            Eigen::Vector3d(jacobian.col(joint).tail<3>()).cross(offset);
+        }
+      }
+      result.tracking = makeTrackingVelocityTask(
+        state.getGlobalLinkTransform(command_link_), jacobian,
+        Eigen::Vector3d(target->pose.position.x, target->pose.position.y, target->pose.position.z),
+        face, orientation.normalized().toRotationMatrix(), config,
+        target_motion.face_velocity, target_motion.goal_velocity, gaze);
+    }
   }
 
   if (auto plan = planner_->takeResult()) {
@@ -188,12 +251,16 @@ MotionReferenceResult MotionReference::update(
     bool accepted = current && plan->success && follower_.setPath(plan->path, position, time_sec);
     if (accepted) {
       acquisition_planning_ = false;
+      path_relaxation_ = pending_relaxation_;
+      diagnostics_.recovery_relaxation = path_relaxation_;
       ++diagnostics_.plans_accepted;
     } else {
       follower_.reset();
       ++diagnostics_.plans_rejected;
+      recovery_failures_ = std::min(1000u, recovery_failures_ + 1);
     }
-    next_plan_time_sec_ = time_sec + 0.75;
+    next_plan_time_sec_ = time_sec + (accepted ? 0.75 :
+      std::min(3.0, 0.75 + 0.25 * recovery_failures_));
   }
 
   if (follower_.active()) {
@@ -210,6 +277,25 @@ MotionReferenceResult MotionReference::update(
       result.task = makeJointPathVelocityTask(
         position, path.reference_position, returning_to_rest ? 3.0 : 6.0,
         searching ? search_config_.speed_rad_s : (returning_to_rest ? 0.35 : 0.70));
+      if (mode == msg::TrackingTarget::FACE && path_relaxation_ < 2 && !result.tracking) {
+        result.task.reset();
+        diagnostics_.state = "INVALID_TASK";
+        return result;
+      }
+      const bool retain_pointing = path_relaxation_ == 0 ||
+        (path_relaxation_ == 1 && result.tracking && result.tracking->pointing_error_rad >= 0.35);
+      if (mode == msg::TrackingTarget::FACE && retain_pointing && result.task) {
+        // Stage 1 is a soft cone, not a hard angular constraint: inside it the
+        // joint path has priority, outside it pointing correction returns.
+        // Unlike a zero pointing reference, omitting those rows actually frees
+        // the two directions. The executor still bounds q/v/a and collisions.
+        result.task->secondary_matrix = result.task->primary_matrix;
+        result.task->secondary_reference = result.task->primary_reference;
+        result.task->secondary_weights = result.task->primary_weights;
+        result.task->primary_matrix = result.tracking->task.primary_matrix;
+        result.task->primary_reference = result.tracking->task.primary_reference;
+        result.task->primary_weights = result.tracking->task.primary_weights;
+      }
       result.follows_path = true;
       return result;
     }
@@ -217,11 +303,18 @@ MotionReferenceResult MotionReference::update(
       ++diagnostics_.paths_completed;
       rest_settling_ = mode == msg::TrackingTarget::REST || searching;
       next_plan_time_sec_ = time_sec + 1.0;
+      recovery_requested_ = false;
+      pointing_progress_.reset();
     } else {
       ++diagnostics_.paths_abandoned;
+      recovery_failures_ = std::min(1000u, recovery_failures_ + 1);
       next_plan_time_sec_ = time_sec + 0.75;
     }
     follower_.reset();
+  }
+  if (finishing_detour) {
+    reset();
+    return update(state, target, scene, time_sec, scene_revision);
   }
 
   const Eigen::VectorXd & idle_goal = searching ? search_.goal() : rest_positions_;
@@ -260,19 +353,24 @@ MotionReferenceResult MotionReference::update(
     return result;
   }
   bool posture_needed = false;
-  if (mode == msg::TrackingTarget::FACE) {
-    const auto & screen = state.getGlobalLinkTransform(command_link_);
-    const Eigen::Vector3d to_face = Eigen::Vector3d(
-      target->face.x, target->face.y, target->face.z) - screen.translation();
-    // A local pointing correction can fold the elbow into the base when the
-    // first observation is behind the screen. Select a global configuration
-    // before moving locally; ordinary tracking keeps its immediate response.
-    if (to_face.norm() > 1.0e-6 &&
-      screen.linear().col(0).dot(to_face.normalized()) < std::cos(2.0))
+  if (live_face) {
+    if (result.tracking && pointing_progress_.update(
+        result.tracking->pointing_error_rad, time_sec))
     {
+      recovery_requested_ = true;
+    }
+    if (result.tracking && result.tracking->pointing_error_rad <= 0.03 &&
+      !pending_generation_ && !recovery_requested_)
+    {
+      recovery_requested_ = false;
+      recovery_failures_ = 0;
+    }
+    // A large initial pointing error needs a global posture before local motion.
+    if (result.tracking && result.tracking->pointing_error_rad > 2.0) {
       // Keep waiting through small changes near the entry threshold. A new
       // face, mode change or accepted plan ends this acquisition request.
       acquisition_planning_ = true;
+      recovery_requested_ = true;
     }
     for (Eigen::Index joint = 0; joint < position.size(); ++joint) {
       if (needsPostureRecovery(
@@ -284,8 +382,11 @@ MotionReferenceResult MotionReference::update(
       }
     }
   }
+  const bool requires_settled_start = mode == msg::TrackingTarget::FACE &&
+    (acquisition_planning_ || (recovery_requested_ && recoveryRelaxation(recovery_failures_) >= 2));
   if (((mode == msg::TrackingTarget::REST && !rest_completed_) || searching ||
-    posture_needed || acquisition_planning_) &&
+    posture_needed || acquisition_planning_ || recovery_requested_) &&
+    (!requires_settled_start || settled) &&
     !pending_generation_ && !planner_->isBusy() && time_sec >= next_plan_time_sec_)
   {
     if (mode == msg::TrackingTarget::FACE) {
@@ -293,17 +394,23 @@ MotionReferenceResult MotionReference::update(
       planned_face_ = Eigen::Vector3d(target->face.x, target->face.y, target->face.z);
       BackgroundPathPlanner::PoseGoal goal;
       goal.link_name = parameters_.command_frame;
+      goal.gaze_link_name = parameters_.gaze_frame;
       goal.preferred_base_angle_rad = std::atan2(
         target->face.y - base.y(), target->face.x - base.x());
       goal.pose.translation() = Eigen::Vector3d(
         target->pose.position.x, target->pose.position.y, target->pose.position.z);
-      const Eigen::Vector3d direction = (*planned_face_ - goal.pose.translation()).normalized();
-      const Eigen::Vector3d left = Eigen::Vector3d::UnitZ().cross(direction).normalized();
-      goal.pose.linear().col(0) = direction;
-      goal.pose.linear().col(1) = left;
-      goal.pose.linear().col(2) = direction.cross(left);
+      goal.face_position = planned_face_;
+      goal.relaxation = recoveryRelaxation(recovery_failures_);
+      goal.attempt = recovery_attempt_++;
+      pending_relaxation_ = goal.relaxation;
+      diagnostics_.recovery_relaxation = goal.relaxation;
+      recovery_requested_ = true;
+      if (const auto orientation = pointingRotation(*planned_face_ - goal.pose.translation())) {
+        goal.pose.linear() = *orientation;
+      }
       pending_generation_ = planner_->submit(state, goal, scene_revision);
     } else {
+      pending_relaxation_ = 2;
       pending_generation_ = planner_->submit(state, idle_goal, scene_revision);
     }
     ++diagnostics_.plans_requested;
@@ -314,38 +421,14 @@ MotionReferenceResult MotionReference::update(
       (rest_completed_ ? "REST_HOLD" : "REST_PLANNING");
     return result;
   }
-  if (acquisition_planning_) {
-    // An empty objective asks the same executor to brake along its existing
-    // timeline while the worker plans; it never resets position or derivatives.
-    diagnostics_.state = "ACQUIRE_PLANNING";
+  if (requires_settled_start) {
+    // After less disruptive attempts failed, settle the planning start instead
+    // of repeatedly outrunning path attachment. The same executor brakes its
+    // existing q/v/a timeline; diagnostics retain the live pointing error.
+    diagnostics_.state = acquisition_planning_ ? "ACQUIRE_PLANNING" : "RECOVERY_PLANNING";
     return result;
   }
 
-  Eigen::MatrixXd jacobian;
-  if (!state.getJacobian(group_, command_link_, Eigen::Vector3d::Zero(), jacobian, false)) {
-    diagnostics_.state = "INVALID_TASK";
-    return result;
-  }
-  TrackingVelocityTaskConfig config;
-  config.position_gain = parameters_.position_gain;
-  config.orientation_gain = parameters_.orientation_gain;
-  config.position_deadband_m = parameters_.position_deadband_m;
-  config.pointing_deadband_rad = parameters_.pointing_deadband_rad;
-  config.maximum_linear_reference_mps = parameters_.maximum_linear_reference_mps;
-  config.maximum_angular_reference_radps = parameters_.maximum_angular_reference_radps;
-  config.roll_weight = parameters_.secondary_roll_weight;
-  const Eigen::Quaterniond orientation(
-    target->pose.orientation.w, target->pose.orientation.x,
-    target->pose.orientation.y, target->pose.orientation.z);
-  std::optional<Eigen::Vector3d> face;
-  if (mode == msg::TrackingTarget::FACE) {
-    face = Eigen::Vector3d(target->face.x, target->face.y, target->face.z);
-  }
-  result.tracking = makeTrackingVelocityTask(
-    state.getGlobalLinkTransform(command_link_), jacobian,
-    Eigen::Vector3d(target->pose.position.x, target->pose.position.y, target->pose.position.z),
-    face, orientation.normalized().toRotationMatrix(), config,
-    target_motion.face_velocity, target_motion.goal_velocity);
   diagnostics_.state = "FACE";
   if (result.tracking && !result.tracking->accepted) {
     result.task = result.tracking->task;

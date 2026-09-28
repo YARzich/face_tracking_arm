@@ -34,6 +34,7 @@ struct FaceSample
 
 struct TrackingGeometryConfig
 {
+  /// Preferred screen-to-face distance; never a reason to discard a detected face.
   double minimum_face_distance_m{0.40};
   double safe_reach_radius_m{0.42};
   double direction_epsilon_m{1.0e-6};
@@ -131,8 +132,8 @@ struct TickResult
 /// TrackingCore refines this direction from the measured TCP to the face on every
 /// tick. Local +Z is the projection of world +Z onto the screen plane. The target
 /// is the closest point to the face inside the sphere centered at reach_center,
-/// subject to the minimum face distance. The base retains its too-close rejection
-/// check. This geometric envelope does not guarantee IK or collision feasibility.
+/// preferring the configured screen-to-face distance. Unattainable distance is
+/// clamped to the envelope without discarding the face. IK/collisions are checked later.
 [[nodiscard]] GeometryResult compute_face_geometry(
   const Eigen::Vector3d & face_in_planning_frame,
   const Eigen::Vector3d & base_in_planning_frame,

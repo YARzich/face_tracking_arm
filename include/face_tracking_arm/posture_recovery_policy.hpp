@@ -4,7 +4,9 @@
 #ifndef FACE_TRACKING_ARM__POSTURE_RECOVERY_POLICY_HPP_
 #define FACE_TRACKING_ARM__POSTURE_RECOVERY_POLICY_HPP_
 
+#include <algorithm>
 #include <cmath>
+#include <optional>
 
 namespace face_tracking_arm::control
 {
@@ -34,6 +36,39 @@ inline bool needsPostureRecovery(
   return outward_velocity >= -1.0e-6 &&
          (remaining < 0.25 || (outward_velocity > 0.02 &&
          remaining < 1.0 + 2.0 * outward_velocity));
+}
+
+/// Detect a stalled pointing objective, including static targets and narrow
+/// joints. Distance/roll errors alone do not justify a disruptive detour.
+class PointingProgressMonitor
+{
+public:
+  bool update(double error_rad, double time_sec)
+  {
+    if (!std::isfinite(error_rad) || !std::isfinite(time_sec) || error_rad <= 0.03) {
+      reset();
+      return false;
+    }
+    if (!since_ || time_sec < *since_ || error_rad + 0.015 < best_error_) {
+      since_ = time_sec;
+      best_error_ = error_rad;
+      return false;
+    }
+    return time_sec - *since_ >= 1.5;
+  }
+
+  void reset() {since_.reset();}
+
+private:
+  std::optional<double> since_;
+  double best_error_{0.0};
+};
+
+/// Two bounded attempts per level: retain pointing, then permit a modest cone,
+/// finally permit a checked joint detour. This is not a retry limit.
+inline unsigned int recoveryRelaxation(unsigned int failed_attempts)
+{
+  return std::min(2u, failed_attempts / 2u);
 }
 
 }  // namespace face_tracking_arm::control

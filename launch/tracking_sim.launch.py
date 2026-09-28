@@ -1,11 +1,14 @@
 # Copyright 2026 YARzich
 # SPDX-License-Identifier: MIT
 
-"""Run the reactive Lite 6 tracking scenario in Gazebo Sim."""
+"""Run reactive tracking with model-specific startup poses in Gazebo Sim."""
 
 from functools import partial
+import math
 import os
 from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
 
 from ament_index_python.packages import (
     get_package_prefix,
@@ -103,6 +106,10 @@ def _shutdown_on_exit(target_action, process_name):
 
 def _launch_setup(context):
     """Create Gazebo, controllers, and the continuously running Servo loop."""
+    from face_tracking_bringup.mount_collisions import allow_fixed_mount_collisions
+    from face_tracking_bringup.robot_profile import get_robot_profile
+    from face_tracking_bringup.simulation_start import resolve_simulation_start
+
     package_share = Path(get_package_share_directory('face_tracking_arm'))
     headless = LaunchConfiguration('headless')
     servo_backend = LaunchConfiguration('servo_backend')
@@ -124,13 +131,27 @@ def _launch_setup(context):
         if path
     )
 
-    initial_positions_path = (
-        package_share / 'config' / 'control' / 'initial_positions.yaml'
+    robot_model = LaunchConfiguration('robot_model').perform(context)
+    robot_profile = get_robot_profile(robot_model)
+    planning_group = robot_profile['planning_group']
+    initial_positions_path = resolve_simulation_start(
+        package_share,
+        robot_model=robot_model,
+        start_pose=LaunchConfiguration('start_pose').perform(context),
+        initial_positions_file=LaunchConfiguration('initial_positions_file').perform(context),
     )
     controller_config_path = (
         package_share / 'config' / 'control' / 'controllers.yaml'
     )
     camera_mode = LaunchConfiguration('camera_mode').perform(context)
+    camera_width = int(LaunchConfiguration('camera_width').perform(context))
+    camera_height = int(LaunchConfiguration('camera_height').perform(context))
+    camera_rate = float(LaunchConfiguration('camera_rate').perform(context))
+    camera_fov = float(LaunchConfiguration('camera_horizontal_fov').perform(context))
+    if (camera_width <= 0 or camera_height <= 0 or not math.isfinite(camera_rate)
+            or camera_rate <= 0 or not 0 < camera_fov < math.pi):
+        raise ValueError(
+            'Camera dimensions/rate must be positive; horizontal FOV is radians (0, pi)')
     idle_behavior = LaunchConfiguration('idle_behavior').perform(context)
     if idle_behavior != 'rest' and servo_backend.perform(context) != 'collision_aware':
         raise ValueError('Search requires the collision_aware backend')
@@ -139,26 +160,24 @@ def _launch_setup(context):
         raise ValueError('camera_baseline must be 0.02..0.25 meters')
     world_path = LaunchConfiguration('world_file').perform(context)
     robot_description_xml = xacro.process_file(
-        str(package_share / 'description' / 'lite6_table.urdf.xacro'),
+        str(package_share / 'description' / f'{robot_model}_table.urdf.xacro'),
         mappings={
             'enable_ros2_control': 'true',
             'camera_mode': camera_mode,
             'camera_baseline': str(camera_baseline),
+            'camera_width': str(camera_width),
+            'camera_height': str(camera_height),
+            'camera_rate': str(camera_rate),
+            'camera_horizontal_fov': str(camera_fov),
             'initial_positions_file': str(initial_positions_path),
             'controller_config_file': str(controller_config_path),
         },
     ).toxml()
     robot_description = {'robot_description': robot_description_xml}
+    semantic = ET.parse(package_share / robot_profile['srdf_file']).getroot()
+    allow_fixed_mount_collisions(ET.fromstring(robot_description_xml), semantic)
     robot_description_semantic = {
-        'robot_description_semantic': (
-            package_share / 'config' / 'moveit' / 'lite6.srdf'
-        ).read_text(encoding='utf-8')
-    }
-    if camera_mode != 'disabled':
-        semantic = robot_description_semantic['robot_description_semantic']
-        robot_description_semantic['robot_description_semantic'] = semantic.replace(
-            '</robot>', '<disable_collisions link1="monitor_link" '
-            'link2="monitor_camera_bar" reason="Adjacent"/></robot>')
+        'robot_description_semantic': ET.tostring(semantic, encoding='unicode')}
     robot_description_kinematics = {
         'robot_description_kinematics': _load_yaml(
             package_share / 'config' / 'moveit' / 'kinematics.yaml'
@@ -173,6 +192,7 @@ def _launch_setup(context):
     standard_servo_parameters = _load_yaml(
         package_share / 'config' / 'moveit' / 'servo.yaml'
     )
+    standard_servo_parameters['move_group_name'] = planning_group
     standard_servo_parameters['smoothing_filter_plugin_name'] = ParameterValue(
         smoothing_plugin, value_type=str
     )
@@ -196,6 +216,12 @@ def _launch_setup(context):
     collision_aware_parameters = _load_yaml(
         package_share / 'config' / 'moveit' / 'collision_aware_servo.yaml'
     )
+    collision_aware_parameters['planning_group_name'] = planning_group
+    recovery_planner = collision_aware_parameters['recovery_planner']
+    recovery_group = recovery_planner.pop('xarm6')
+    recovery_planner[planning_group] = recovery_group
+    if camera_mode != 'disabled':
+        collision_aware_parameters['gaze_frame'] = 'face_test_camera_optical_frame'
     ordered_joint_limits = joint_limits_config['joint_limits']
     joint_names = list(ordered_joint_limits)
     collision_aware_parameters.update(
@@ -324,7 +350,7 @@ def _launch_setup(context):
             {'moveit_servo': standard_servo_parameters},
             {
                 'update_period': 0.01,
-                'planning_group_name': 'lite6_arm',
+                'planning_group_name': planning_group,
                 'use_sim_time': True,
             },
             robot_description,
@@ -456,6 +482,10 @@ def _launch_setup(context):
 
 
 def generate_launch_description() -> LaunchDescription:
+    scripts = Path(get_package_prefix('face_tracking_arm')) / 'lib/face_tracking_arm'
+    sys.path.insert(0, str(scripts))
+    from face_tracking_bringup.simulation_start import START_POSES
+
     headless_argument = DeclareLaunchArgument(
         'headless',
         default_value='false',
@@ -493,12 +523,28 @@ def generate_launch_description() -> LaunchDescription:
         description='Optional monitor-mounted RGB sensor assembly.')
     camera_baseline_argument = DeclareLaunchArgument(
         'camera_baseline', default_value='0.08', description='Stereo baseline in meters.')
+    camera_arguments = [DeclareLaunchArgument(name, default_value=default, description=description)
+                        for name, default, description in (
+                            ('camera_width', '1280', 'Image width in pixels.'),
+                            ('camera_height', '720', 'Image height in pixels.'),
+                            ('camera_rate', '30', 'Camera frames per second.'),
+                            ('camera_horizontal_fov', '1.433', 'Horizontal FOV in radians.'))]
     idle_argument = DeclareLaunchArgument(
         'idle_behavior', default_value='rest',
         choices=['rest', 'search_sweep', 'search_local_then_sweep'],
         description='Behavior without a visible face, chosen once at startup.')
     share = Path(get_package_share_directory('face_tracking_arm'))
     default_world = share / 'worlds/lite6_table.sdf'
+    initial_argument = DeclareLaunchArgument(
+        'initial_positions_file',
+        default_value='',
+        description='Optional YAML with six angles in radians; overrides start_pose.')
+    robot_model_argument = DeclareLaunchArgument(
+        'robot_model', default_value='xarm6', choices=['xarm6', 'lite6'],
+        description='Simulated robot; lite6 reproduces the recorded incident pose.')
+    start_pose_argument = DeclareLaunchArgument(
+        'start_pose', default_value='rest', choices=list(START_POSES),
+        description='Initial joint pose: rest, zero, xArm6 folded, joint1_limit, Lite6 incident.')
     world_argument = DeclareLaunchArgument(
         'world_file', default_value=str(default_world),
         description='Gazebo world file, retaining world name lite6_table.')
@@ -506,4 +552,5 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         headless_argument, servo_backend_argument, test_face_scenario_argument,
         visualize_target_argument, smoothing_plugin_argument, camera_mode_argument,
-        camera_baseline_argument, idle_argument, world_argument, setup])
+        camera_baseline_argument, *camera_arguments, idle_argument, world_argument,
+        initial_argument, robot_model_argument, start_pose_argument, setup])

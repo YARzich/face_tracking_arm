@@ -18,15 +18,12 @@ struct FollowingErrorPolicy final
 {
   double position_tolerance_rad{0.0};
   double velocity_tolerance_rad_s{0.0};
-  double recoverable_position_error_rad{0.0};
-  double recoverable_velocity_error_rad_s{0.0};
 };
 
 /// Classify controller lag without treating every transient as a permanent halt.
 ///
-/// Automatic recovery is allowed only when the measured position remains inside
-/// the collision model's reserved tracking-error tube and the velocity mismatch
-/// remains inside a separately bounded transient window.
+/// Finite lag requests braking and renewed state validation, never a permanent
+/// halt. Collision and physical motion checks are performed by the caller.
 [[nodiscard]] FollowingErrorAction classifyFollowingError(
   double position_error_rad, double velocity_error_rad_s,
   const FollowingErrorPolicy & policy) noexcept;

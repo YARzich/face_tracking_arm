@@ -5,6 +5,7 @@
 #include <geometric_shapes/shapes.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
@@ -39,7 +40,7 @@ std::string readModelFile(const std::string & path)
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-/// The real Lite6 description is expanded by CMake, never by a running test.
+/// The real xArm6 description is expanded by CMake, never by a running test.
 /// No controller, sensor, simulator or robot command publisher is started here.
 class MotionReferenceTest : public ::testing::Test
 {
@@ -58,30 +59,41 @@ protected:
   {
     rclcpp::NodeOptions options;
     options.automatically_declare_parameters_from_overrides(true);
+    std::string urdf = readModelFile(TEST_ROBOT_URDF_FILE);
+    const auto closing_robot = urdf.rfind("</robot>");
+    ASSERT_NE(closing_robot, std::string::npos);
+    urdf.insert(closing_robot,
+          R"(
+      <link name="test_camera_optical"/>
+      <joint name="test_camera_mount" type="fixed">
+        <parent link="monitor_control_frame"/><child link="test_camera_optical"/>
+        <origin xyz="0 0 0.125" rpy="-1.57079632679 0 -1.57079632679"/>
+      </joint>)");
     options.parameter_overrides({
-          rclcpp::Parameter("robot_description", readModelFile(TEST_ROBOT_URDF_FILE)),
+          rclcpp::Parameter("robot_description", urdf),
           rclcpp::Parameter("robot_description_semantic", readModelFile(TEST_ROBOT_SRDF_FILE)),
           rclcpp::Parameter(
-        "robot_description_kinematics.lite6_arm.kinematics_solver",
+        "robot_description_kinematics.xarm6.kinematics_solver",
         "kdl_kinematics_plugin/KDLKinematicsPlugin"),
           rclcpp::Parameter(
-        "robot_description_kinematics.lite6_arm.kinematics_solver_timeout", 0.01),
+        "robot_description_kinematics.xarm6.kinematics_solver_timeout", 0.01),
           rclcpp::Parameter(
         "recovery_planner.planner_configs.RRTConnectkConfigDefault.type", "geometric::RRTConnect"),
           rclcpp::Parameter(
-        "recovery_planner.lite6_arm.planner_configs",
+        "recovery_planner.xarm6.planner_configs",
         std::vector<std::string>{"RRTConnectkConfigDefault"}),
-          rclcpp::Parameter("recovery_planner.lite6_arm.longest_valid_segment_fraction", 0.005),
+          rclcpp::Parameter("recovery_planner.xarm6.longest_valid_segment_fraction", 0.005),
     });
     node_ = std::make_shared<rclcpp::Node>("motion_reference_test", options);
     monitor_ = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(
       node_, "robot_description");
     model_ = monitor_->getRobotModel();
     ASSERT_TRUE(model_);
-    group_ = model_->getJointModelGroup("lite6_arm");
+    group_ = model_->getJointModelGroup("xarm6");
     ASSERT_NE(group_, nullptr);
     ASSERT_EQ(group_->getVariableCount(), 6U);
     parameters_.joint_names = group_->getVariableNames();
+    parameters_.gaze_frame = gazeFrame();
     limits_.lower_position.resize(6);
     limits_.upper_position.resize(6);
     limits_.position_margin = Eigen::VectorXd::Constant(6, 0.10);
@@ -92,11 +104,6 @@ protected:
       const auto & bounds = model_->getVariableBounds(parameters_.joint_names[joint]);
       limits_.lower_position[joint] = bounds.min_position_;
       limits_.upper_position[joint] = bounds.max_position_;
-      if (parameters_.joint_names[joint] == "joint5") {
-        limits_.lower_position[joint] = -1.60;
-        limits_.upper_position[joint] = 1.60;
-        limits_.position_margin[joint] = 0.0;
-      }
     }
     {
       planning_scene_monitor::LockedPlanningSceneRW scene(monitor_);
@@ -108,10 +115,16 @@ protected:
       ASSERT_TRUE(scene->getCurrentStateNonConst().setToDefaultValues(group_, "rest"));
       scene->getCurrentStateNonConst().update();
     }
+    collision_config_.protected_joint_lower_rad = limits_.lower_position[4];
+    collision_config_.protected_joint_upper_rad = limits_.upper_position[4];
+    collision_config_.invariant_mount_neighbor_name = "link6";
+    configureGeometryBounds(collision_config_, *model_, *group_);
     reference_ = std::make_unique<MotionReference>(
       node_, monitor_, parameters_, limits_, collision_config_);
     clock_origin_ = std::chrono::steady_clock::now();
   }
+
+  virtual std::string gazeFrame() const {return "";}
 
   moveit::core::RobotState state(const double base_angle = 0.0) const
   {
@@ -191,6 +204,30 @@ protected:
     EXPECT_EQ(reference_->diagnostics().plans_requested, 1U);
   }
 
+  bool adoptRelaxedDetour(
+    const moveit::core::RobotState & start, double & now, unsigned int desired_level = 2)
+  {
+    auto command = target(msg::TrackingTarget::FACE);
+    command.face.x = -0.85;
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      now += 0.02;
+      command.face_stamp = rclcpp::Time(static_cast<int64_t>(now * 1.0e9));
+      planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
+      const planning_scene::PlanningSceneConstPtr planning_scene = scene;
+      const auto result = reference_->update(start, command, *planning_scene, now, kSceneRevision);
+      if (result.follows_path) {
+        if (reference_->diagnostics().recovery_relaxation >= desired_level) {
+          return reference_->diagnostics().recovery_relaxation == desired_level;
+        }
+        // Exercise the same escalation used when the executor rejects a path.
+        reference_->rejectPath();
+      }
+      std::this_thread::sleep_for(2ms);
+    }
+    return false;
+  }
+
   rclcpp::Node::SharedPtr node_;
   planning_scene_monitor::PlanningSceneMonitorPtr monitor_;
   moveit::core::RobotModelConstPtr model_;
@@ -201,6 +238,33 @@ protected:
   std::unique_ptr<MotionReference> reference_;
   std::chrono::steady_clock::time_point clock_origin_;
 };
+
+class MotionReferenceCameraTest : public MotionReferenceTest
+{
+protected:
+  std::string gazeFrame() const override {return "test_camera_optical";}
+};
+
+TEST_F(MotionReferenceCameraTest, OpticalFaceCenterUsesTheMountedCameraOrigin)
+{
+  const auto start = state();
+  const auto & camera = start.getGlobalLinkTransform("test_camera_optical");
+  const auto & monitor = start.getGlobalLinkTransform("monitor_control_frame");
+  const Eigen::Vector3d face = camera.translation() + 0.8 * camera.linear().col(2);
+  auto command = target(msg::TrackingTarget::FACE);
+  command.face.x = face.x();
+  command.face.y = face.y();
+  command.face.z = face.z();
+  command.pose.position.x = monitor.translation().x();
+  command.pose.position.y = monitor.translation().y();
+  command.pose.position.z = monitor.translation().z();
+  const auto result = update(start, command);
+  ASSERT_TRUE(result.tracking);
+  EXPECT_NEAR(result.tracking->pointing_error_rad, 0.0, 1.0e-6);
+  EXPECT_TRUE(result.tracking->task.primary_reference.isZero(1.0e-6));
+  EXPECT_GT(std::acos(std::clamp(monitor.linear().col(0).dot(
+      (face - monitor.translation()).normalized()), -1.0, 1.0)), 0.10);
+}
 
 TEST_F(MotionReferenceTest, HoldAndMissingTargetProduceNoTaskOrPlanning)
 {
@@ -217,6 +281,126 @@ TEST_F(MotionReferenceTest, HoldAndMissingTargetProduceNoTaskOrPlanning)
   }
 }
 
+TEST_F(MotionReferenceTest, PerceptionLossMayFinishDetourButExplicitHoldAndPauseCancel)
+{
+  const auto start = state();
+  double now = 0.0;
+  ASSERT_TRUE(adoptRelaxedDetour(start, now)) << reference_->diagnostics().last_plan_message;
+  auto lost = target(msg::TrackingTarget::HOLD);
+  lost.allow_recovery = true;
+  const auto selected = [&](const std::optional<msg::TrackingTarget> & command) {
+      planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
+      const planning_scene::PlanningSceneConstPtr planning_scene = scene;
+      return reference_->update(start, command, *planning_scene, now += 0.01, kSceneRevision);
+    };
+  const auto continued = selected(lost);
+  ASSERT_TRUE(continued.follows_path);
+  ASSERT_TRUE(continued.task);
+  EXPECT_TRUE(continued.task->primary_matrix.isIdentity());
+  EXPECT_FALSE(continued.tracking);  // Stale face is never a new observation.
+  EXPECT_FALSE(selected(std::nullopt).follows_path);
+  EXPECT_EQ(reference_->diagnostics().state, "HOLD");
+
+  ASSERT_TRUE(adoptRelaxedDetour(start, now)) << reference_->diagnostics().last_plan_message;
+  lost.allow_recovery = false;
+  EXPECT_FALSE(selected(lost).follows_path);
+  EXPECT_EQ(reference_->diagnostics().state, "HOLD");
+  auto reacquired = target(msg::TrackingTarget::FACE);
+  reacquired.face.x = -0.85;
+  (void)selected(reacquired);
+  // Pause stops motion, but does not repeat already unsuccessful restrictive
+  // recovery levels after every intermittent observation or feedback rearm.
+  EXPECT_EQ(reference_->diagnostics().recovery_relaxation, 2U);
+}
+
+TEST_F(MotionReferenceTest, IntermediateRecoveryFreesMotionInsideItsSoftPointingCone)
+{
+  const auto start = state();
+  double now = 0.0;
+  ASSERT_TRUE(adoptRelaxedDetour(start, now, 1)) << reference_->diagnostics().last_plan_message;
+  const auto plans_accepted = reference_->diagnostics().plans_accepted;
+  const auto & tcp = start.getGlobalLinkTransform("monitor_control_frame");
+  for (const double angle : {0.20, 0.50, 0.20}) {
+    const Eigen::Vector3d face = tcp.translation() + 0.8 *
+      (Eigen::AngleAxisd(angle, tcp.linear().col(2)) * tcp.linear().col(0));
+    auto command = target(msg::TrackingTarget::FACE);
+    command.face.x = face.x();
+    command.face.y = face.y();
+    command.face.z = face.z();
+    planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
+    const planning_scene::PlanningSceneConstPtr planning_scene = scene;
+    const auto result = reference_->update(start, command, *planning_scene, now += 0.01,
+          kSceneRevision);
+    ASSERT_TRUE(result.task);
+    ASSERT_TRUE(result.follows_path);
+    EXPECT_EQ(reference_->diagnostics().plans_accepted, plans_accepted);
+    if (angle < 0.35) {
+      EXPECT_TRUE(result.task->primary_matrix.isIdentity());
+      EXPECT_GT(result.task->primary_reference.norm(), 0.0);
+    } else {
+      EXPECT_EQ(result.task->primary_matrix.rows(), 2);
+      EXPECT_TRUE(result.task->secondary_matrix.isIdentity());
+      EXPECT_GT(result.task->primary_reference.norm(), 0.0);
+    }
+  }
+}
+
+TEST_F(MotionReferenceTest, LastRecoveryLevelPlansOnlyAfterVelocityAndAccelerationSettle)
+{
+  auto start = state();
+  double now = 0.0;
+  ASSERT_TRUE(adoptRelaxedDetour(start, now)) << reference_->diagnostics().last_plan_message;
+  reference_->rejectPath();
+  const auto requests_before = reference_->diagnostics().plans_requested;
+  const auto & tcp = start.getGlobalLinkTransform("monitor_control_frame");
+  const Eigen::Vector3d face = tcp.translation() + 0.8 *
+    (Eigen::AngleAxisd(0.3, tcp.linear().col(2)) * tcp.linear().col(0));
+  auto command = target(msg::TrackingTarget::FACE);
+  command.face.x = face.x();
+  command.face.y = face.y();
+  command.face.z = face.z();
+  // Move past the retry cooldown. Neither ongoing motion nor zero velocity
+  // with remaining acceleration is an appropriate start for a geometric path.
+  for (const Eigen::Vector2d derivatives : {Eigen::Vector2d(0.12, 0.0),
+      Eigen::Vector2d(0.0, 0.04), Eigen::Vector2d::Zero().eval()})
+  {
+    start.setJointGroupVelocities(group_, Eigen::VectorXd::Constant(6, derivatives[0]));
+    start.setJointGroupAccelerations(group_, Eigen::VectorXd::Constant(6, derivatives[1]));
+    planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
+    const planning_scene::PlanningSceneConstPtr planning_scene = scene;
+    const auto result = reference_->update(start, command, *planning_scene, now += 2.0,
+          kSceneRevision);
+    ASSERT_TRUE(result.tracking);
+    EXPECT_NEAR(result.tracking->pointing_error_rad, 0.3, 1.0e-6);
+    EXPECT_FALSE(result.task);
+    EXPECT_FALSE(result.follows_path);
+    EXPECT_EQ(reference_->diagnostics().state, "RECOVERY_PLANNING");
+    EXPECT_EQ(reference_->diagnostics().plans_requested,
+      requests_before + (derivatives.isZero() ? 1U : 0U));
+  }
+}
+
+TEST_F(MotionReferenceTest, StaticMisalignmentEventuallyRequestsRecovery)
+{
+  const auto start = state();
+  const auto & tcp = start.getGlobalLinkTransform("monitor_control_frame");
+  const Eigen::Vector3d face = tcp.translation() + 0.8 *
+    (Eigen::AngleAxisd(0.3, tcp.linear().col(2)) * tcp.linear().col(0));
+  auto command = target(msg::TrackingTarget::FACE);
+  command.face.x = face.x();
+  command.face.y = face.y();
+  command.face.z = face.z();
+  for (const double now : {0.0, 1.0, 1.6}) {
+    command.face_stamp = rclcpp::Time(static_cast<int64_t>(now * 1.0e9));
+    planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
+    const planning_scene::PlanningSceneConstPtr planning_scene = scene;
+    const auto result = reference_->update(start, command, *planning_scene, now, kSceneRevision);
+    EXPECT_TRUE(result.tracking);
+    EXPECT_TRUE(result.task);  // The initial recovery level keeps live tracking.
+  }
+  EXPECT_EQ(reference_->diagnostics().plans_requested, 1U);
+}
+
 TEST_F(MotionReferenceTest, NamedRestPoseHoldsWithoutRequestingAPlan)
 {
   const auto result = update(state(), target(msg::TrackingTarget::REST));
@@ -230,9 +414,9 @@ TEST_F(MotionReferenceTest, FaceBehindRestRequiresAPathBeforeAnyLocalMotion)
 {
   auto start = state();
   const Eigen::VectorXd velocity =
-    (Eigen::VectorXd(6) << 0.02, -0.01, 0.0, 0.0, 0.0, 0.0).finished();
+    (Eigen::VectorXd(6) << 0.005, -0.002, 0.0, 0.0, 0.0, 0.0).finished();
   const Eigen::VectorXd acceleration =
-    (Eigen::VectorXd(6) << 0.03, 0.0, 0.0, 0.0, 0.0, 0.0).finished();
+    (Eigen::VectorXd(6) << 0.015, 0.0, 0.0, 0.0, 0.0, 0.0).finished();
   start.setJointGroupVelocities(group_, velocity);
   start.setJointGroupAccelerations(group_, acceleration);
   Eigen::VectorXd position_before;
@@ -278,7 +462,12 @@ TEST_F(MotionReferenceTest, FaceBehindRestRequiresAPathBeforeAnyLocalMotion)
   ASSERT_TRUE(adopted->task);
   EXPECT_EQ(reference_->diagnostics().state, "POSTURE_PATH");
   EXPECT_EQ(reference_->diagnostics().plans_accepted, 1U);
-  EXPECT_TRUE(adopted->task->primary_matrix.isIdentity());
+  if (reference_->diagnostics().recovery_relaxation < 2) {
+    EXPECT_EQ(adopted->task->primary_matrix.rows(), 2);
+    EXPECT_TRUE(adopted->task->secondary_matrix.isIdentity());
+  } else {
+    EXPECT_TRUE(adopted->task->primary_matrix.isIdentity());
+  }
   EXPECT_GT(adopted->task->primary_reference.norm(), 0.0);
 
   Eigen::VectorXd position_after;
@@ -316,7 +505,7 @@ TEST_F(MotionReferenceTest, AcquisitionRemainsLatchedAcrossThePointingThreshold)
   command.face.y = second_face.y();
   command.face.z = second_face.z();
   const auto second = update(start, command);
-  EXPECT_FALSE(second.tracking);
+  EXPECT_TRUE(second.tracking);
   EXPECT_EQ(reference_->diagnostics().plans_requested, 1U);
   if (second.follows_path) {
     // A fast worker may already have completed the original request. Only its
@@ -547,7 +736,8 @@ TEST_F(MotionReferenceTest, AdoptedPosturePathSurvivesFaceMotionButYieldsToHold)
   ASSERT_TRUE(adopted->task);
   ASSERT_EQ(reference_->diagnostics().state, "POSTURE_PATH");
   ASSERT_EQ(reference_->diagnostics().plans_accepted, 1U);
-  ASSERT_GT(adopted->task->primary_reference.norm(), 0.0);
+  ASSERT_GT(adopted->task->primary_reference.norm() +
+    adopted->task->secondary_reference.norm(), 0.0);
   const auto requests_before = reference_->diagnostics().plans_requested;
   const auto abandoned_before = reference_->diagnostics().paths_abandoned;
 
@@ -562,8 +752,11 @@ TEST_F(MotionReferenceTest, AdoptedPosturePathSurvivesFaceMotionButYieldsToHold)
   EXPECT_EQ(reference_->diagnostics().plans_requested, requests_before);
   EXPECT_EQ(reference_->diagnostics().plans_accepted, 1U);
   EXPECT_EQ(reference_->diagnostics().paths_abandoned, abandoned_before);
-  EXPECT_TRUE(continued.task->primary_reference.isApprox(
-      adopted->task->primary_reference, 1.0e-12));
+  // The path remains adopted while its pointing rows follow the fresh face.
+  if (reference_->diagnostics().recovery_relaxation < 2) {
+    EXPECT_TRUE(continued.task->secondary_reference.isApprox(
+        adopted->task->secondary_reference, 1.0e-12));
+  }
 
   const auto held = update(start, target(msg::TrackingTarget::HOLD));
   EXPECT_FALSE(held.task);

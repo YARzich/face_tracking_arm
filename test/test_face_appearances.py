@@ -141,6 +141,99 @@ def test_search_scenario_reports_a_person_never_discovered():
     assert sequence.discovery_timeouts == 1
 
 
+@pytest.mark.parametrize('scenario', ['stress', 'stress_fast', 'stress_close'])
+def test_stress_starts_without_rest_readiness_or_face_and_reports_completion(scenario):
+    from builtin_interfaces.msg import Time
+
+    from face_tracking_perception.appearance_node import FaceAppearances
+    from face_tracking_perception.close_stress_motion import CloseStressMotion
+    from face_tracking_perception.fast_stress_motion import FastStressMotion
+    from face_tracking_perception.stress_motion import StressMotion
+
+    profiles = {'stress': StressMotion, 'stress_fast': FastStressMotion,
+                'stress_close': CloseStressMotion}
+    motion = profiles[scenario]()
+    initial = motion.initial_poses if scenario == 'stress_fast' else [motion.initial_pose]
+    published, poses = [], []
+    node = SimpleNamespace(
+        scenario=scenario, people_count=len(initial),
+        stress=motion, stress_started_at=None, stress_last_time=None,
+        joint_stamp=2.0, tracking_stamp=None, cycles=1, ready=False, mode='',
+        pending=None, retry_at=0.0, pose_success_at=None, pose_failures=0,
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: Time())),
+        publisher=SimpleNamespace(publish=published.append),
+        client=SimpleNamespace(service_is_ready=lambda: True),
+        request_poses=lambda value, action: poses.append((value, action)))
+    FaceAppearances.tick_stress(node, 2.1)
+    assert node.stress_started_at == 2.0
+    assert poses[-1][0] == initial
+    assert published[-1].status[0].message != 'WAIT_REST'
+    FaceAppearances.tick_stress(node, 2.0 + node.stress.duration_sec + 1)
+    values = {v.key: v.value for v in published[-1].status[0].values}
+    assert values['complete'] == 'True'
+    assert values['scenario'] == scenario
+    assert values['people_count'] == str(len(initial))
+    # Any backward clock jump restarts the profile, even above the old start time.
+    node.retry_at = 300.0
+    FaceAppearances.tick_stress(node, 30.0)
+    assert node.stress_started_at == 30.0
+    assert node.retry_at == 30.0
+    assert poses[-1][0] == initial
+
+
+@pytest.mark.parametrize('scenario', ['stress', 'stress_fast', 'stress_close'])
+def test_stress_does_not_queue_pose_updates_while_gazebo_request_is_pending(scenario):
+    from builtin_interfaces.msg import Time
+
+    from face_tracking_perception.appearance_node import FaceAppearances
+    from face_tracking_perception.close_stress_motion import CloseStressMotion
+    from face_tracking_perception.fast_stress_motion import FastStressMotion
+    from face_tracking_perception.stress_motion import StressMotion
+
+    profiles = {'stress': StressMotion, 'stress_fast': FastStressMotion,
+                'stress_close': CloseStressMotion}
+    node = SimpleNamespace(
+        scenario=scenario, people_count=3 if scenario == 'stress_fast' else 1,
+        stress=profiles[scenario](),
+        stress_started_at=0.0, stress_last_time=0.0,
+        joint_stamp=10.0, tracking_stamp=10.0, cycles=0, ready=True, mode='FACE',
+        pending=object(), retry_at=0.0, pose_success_at=9.0, pose_failures=0,
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: Time())),
+        publisher=SimpleNamespace(publish=lambda _: None))
+    # There is intentionally no client/request_poses: the pending request must
+    # prevent accessing transport or replacing its in-flight pose.
+    FaceAppearances.tick_stress(node, 10.0)
+
+
+def test_three_people_wait_for_all_gazebo_acknowledgements_and_retry_failure():
+    from rclpy.task import Future
+
+    from face_tracking_perception.appearance_node import FaceAppearances
+
+    requests, futures = [], []
+
+    def call_async(request):
+        requests.append(request)
+        future = Future()
+        futures.append(future)
+        return future
+
+    node = SimpleNamespace(
+        pending=None, pose_success_at=None, pose_failures=0, retry_at=0.,
+        client=SimpleNamespace(call_async=call_async), seconds=lambda: 5.,
+        get_logger=lambda: SimpleNamespace(warning=lambda _: None))
+    node.on_pose_result = lambda batch, action: FaceAppearances.on_pose_result(node, batch, action)
+    FaceAppearances.request_poses(node, [(2., 0., 0., 0.)] * 3, 'move')
+    assert [r.entity.name for r in requests] == [
+        'face_test_person', 'face_test_person_2', 'face_test_person_3']
+    futures[0].set_result(SimpleNamespace(success=True))
+    futures[1].set_result(SimpleNamespace(success=True))
+    assert node.pending is not None and node.pose_success_at is None
+    futures[2].set_result(SimpleNamespace(success=False))
+    assert node.pending is None and node.pose_success_at is None
+    assert node.pose_failures == 1 and node.retry_at == 6.
+
+
 @pytest.mark.parametrize('options', [
     {'lateral_m': -1}, {'depth_m': math.nan}, {'period_sec': 0}, {'yaw_rad': math.inf}])
 def test_invalid_motion_is_rejected(options):

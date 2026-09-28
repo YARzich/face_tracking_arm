@@ -14,12 +14,6 @@ using namespace std::chrono_literals;
 
 constexpr double kMaximumExpectedCommandLatencySec = 0.070;
 
-constexpr double kMaximumJointVelocityRadps = 1.0;
-
-constexpr double kMaximumJointAccelerationRadps2 = 2.0;
-
-constexpr double kMaximumJointJerkRadps3 = 20.0;
-
 constexpr char kTableCollisionObjectName[] = "round_table";
 
 bool finite_pose(const geometry_msgs::msg::Pose & pose)
@@ -217,10 +211,19 @@ void CollisionAwareServoComponent::initialize()
     parameters_.default_distance_lipschitz_m_per_rad;
   collision_config.monitor_near_distance_lipschitz_m_per_rad =
     parameters_.monitor_near_distance_lipschitz_m_per_rad;
-  collision_config.protected_joint_name = parameters_.monitor_guard_joint_name;
-  collision_config.protected_joint_lower_rad = parameters_.monitor_guard_min_position_rad;
-  collision_config.protected_joint_upper_rad = parameters_.monitor_guard_max_position_rad;
+  // The generic joint braking envelope covers every axis. Keep the collision
+  // builder's selected-axis row consistent with that same physical interval.
+  const std::string guarded_joint = parameters_.monitor_guard_joint_name.empty() ?
+    parameters_.joint_names.at(4) : parameters_.monitor_guard_joint_name;
+  const auto guarded_index = static_cast<Eigen::Index>(std::distance(
+    parameters_.joint_names.begin(), std::find(
+      parameters_.joint_names.begin(), parameters_.joint_names.end(), guarded_joint)));
+  collision_config.protected_joint_name = guarded_joint;
+  collision_config.protected_joint_lower_rad = motion_limits_.lower_position[guarded_index];
+  collision_config.protected_joint_upper_rad = motion_limits_.upper_position[guarded_index];
+  collision_config.invariant_mount_neighbor_name = "link6";
   collision_config.residual_latency_sec = parameters_.residual_command_latency_sec;
+  control::configureGeometryBounds(collision_config, *robot_model, *joint_model_group_);
   collision_constraint_builder_ =
     std::make_unique<control::CollisionConstraintBuilder>(collision_config);
 
@@ -270,7 +273,8 @@ void CollisionAwareServoComponent::complete_initialization_when_ready()
     planning_scene_monitor::LockedPlanningSceneRO locked_scene(planning_scene_monitor_);
     const planning_scene::PlanningSceneConstPtr planning_scene = locked_scene;
     if (!planning_scene || !planning_scene->getWorld() ||
-      !planning_scene->getWorld()->hasObject(kTableCollisionObjectName))
+      planning_scene->getWorld()->hasObject(kTableCollisionObjectName) !=
+      parameters_.table_collision_enabled)
     {
       return;
     }
@@ -383,15 +387,13 @@ void CollisionAwareServoComponent::initialize_motion_limits(
               "all controlled joints require finite positive planning and URDF velocity limits");
     }
     if (!std::isfinite(maximum_velocity) || maximum_velocity <= 0.0 ||
-      maximum_velocity > kMaximumJointVelocityRadps ||
       maximum_velocity > bounds.max_velocity_ ||
       !std::isfinite(maximum_acceleration) || maximum_acceleration <= 0.0 ||
-      maximum_acceleration > kMaximumJointAccelerationRadps2 ||
       !std::isfinite(maximum_jerk) || maximum_jerk <= 0.0 ||
-      maximum_jerk > kMaximumJointJerkRadps3)
+      maximum_velocity > urdf_joint->limits->velocity)
     {
       throw std::invalid_argument(
-          "joint limits must be positive and may not exceed the Lite 6 safety profile");
+          "joint limits must be positive; velocity may not exceed the robot model");
     }
     motion_limits_.lower_position[static_cast<Eigen::Index>(index)] = bounds.min_position_;
     motion_limits_.upper_position[static_cast<Eigen::Index>(index)] = bounds.max_position_;
@@ -402,6 +404,9 @@ void CollisionAwareServoComponent::initialize_motion_limits(
       urdf_joint->limits->velocity;
   }
 
+  if (parameters_.monitor_guard_joint_name.empty()) {
+    return;
+  }
   const auto guard_iterator = std::find(
     group_variables.begin(), group_variables.end(), parameters_.monitor_guard_joint_name);
   if (guard_iterator == group_variables.end()) {

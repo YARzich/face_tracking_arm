@@ -48,25 +48,43 @@ def describe(config, mode):
             'detector': config['perception']['detector']}
 
 
-def resolved_config(config, mode, *, calibration=False, external_models=False):
+def resolved_config(config, mode, *, calibration=False, external_models=False,
+                    video_devices=None, point_filter=None):
     """Map host resources to their explicit container mounts."""
     config = copy.deepcopy(config)
+    if point_filter is not None:
+        if point_filter not in ('off', 'kalman', 'one_euro'):
+            raise ValueError('point_filter: ожидается off, kalman или one_euro')
+        filtering = config.setdefault('point_filter', {})
+        if not isinstance(filtering, dict):
+            raise ValueError('point_filter: ожидается раздел настроек')
+        filtering['enabled'] = point_filter != 'off'
+        if point_filter != 'off':
+            filtering['method'] = point_filter
     config['perception']['python_executable'] = '/opt/face_tracking_venv/bin/python'
     config['perception']['model_dir'] = (
         '/models' if external_models else '/opt/face_tracking_models')
     section = config[MODES[mode]]
-    for index, side in enumerate(['left', 'right'] if mode == 'stereo' else ['left']):
+    for side in ['left', 'right'] if mode == 'stereo' else ['left']:
         if section['source'] == 'usb':
-            section[side]['device'] = f'/dev/video{index}'
+            if video_devices is None or side not in video_devices:
+                raise ValueError('USB device mapping missing; start through ./run')
+            device = video_devices[side]
+            if not isinstance(device, str) or not device.startswith('/dev/'):
+                raise ValueError('Invalid USB device mapping')
+            section[side]['device'] = device
             section[side]['calibration_file'] = (
                 '' if calibration else f'/calibration/{side}.yaml')
     return config
 
 
-def write_config(config, mode, *, calibration=False):
+def write_config(config, mode, *, calibration=False, point_filter=None):
     path = Path('/tmp/hardware_resolved.yaml')
     resolved = resolved_config(config, mode, calibration=calibration,
-                               external_models=Path('/models').is_dir())
+                               point_filter=point_filter,
+                               external_models=Path('/models').is_dir(),
+                               video_devices=json.loads(os.environ.get(
+                                   'FACE_TRACKING_VIDEO_DEVICES', '{}')))
     path.write_text(yaml.safe_dump(resolved))
     return path
 
@@ -142,7 +160,7 @@ def calibrate(config, args):
     if not archive.exists():
         raise ValueError('Калибровка не сохранена: нажмите CALIBRATE, затем SAVE')
     save_calibration(archive, Path('/output'), args.mode)
-    print('Калибровка сохранена в папке config/calibration/' + MODES[args.mode], flush=True)
+    print('Калибровка сохранена.', flush=True)
 
 
 def main():
@@ -152,9 +170,12 @@ def main():
     parser.add_argument('--camera-only', action='store_true')
     parser.add_argument('--show-image', action='store_true')
     parser.add_argument('--mock', action='store_true')
+    parser.add_argument('--point-filter', choices=['off', 'kalman', 'one_euro'])
     parser.add_argument('--size', default='8x6')
     parser.add_argument('--square', type=float, default=.025)
     args = parser.parse_args()
+    if args.point_filter is not None and args.operation != 'launch':
+        parser.error('--point-filter используется только с launch')
     if args.operation == 'shell':
         os.execvp('bash', ['bash', '--noprofile', '--norc'])
     if args.operation == 'help':
@@ -166,7 +187,7 @@ def main():
     elif args.operation == 'calibrate':
         calibrate(config, args)
     else:
-        path = write_config(config, args.mode)
+        path = write_config(config, args.mode, point_filter=args.point_filter)
         os.execvp('ros2', [
             'ros2', 'launch', 'face_tracking_arm',
             'tracking_hardware_' + args.mode + '.launch.py', f'config_file:={path}',

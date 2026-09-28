@@ -196,7 +196,7 @@ TEST(TrackingGeometry, ChoosesClosestPointInsideRealOffsetReachSphere)
     kTolerance);
 }
 
-TEST(TrackingGeometry, RejectsDegenerateTooCloseAndVerticalDirections)
+TEST(TrackingGeometry, KeepsCloseAndVerticalFacesButRejectsCoincidentDirection)
 {
   const TrackingGeometryConfig config;
   const Eigen::Vector3d origin = Eigen::Vector3d::Zero();
@@ -205,14 +205,14 @@ TEST(TrackingGeometry, RejectsDegenerateTooCloseAndVerticalDirections)
     rejection(compute_face_geometry(
       Eigen::Vector3d{1.0e-7, 0.0, 0.0}, origin, origin, config)),
     RejectReason::kDegenerateDirection);
-  EXPECT_EQ(
-    rejection(compute_face_geometry(
-      Eigen::Vector3d{0.30, 0.0, 0.0}, origin, origin, config)),
-    RejectReason::kFaceInsideMinimumDistance);
-  EXPECT_EQ(
-    rejection(compute_face_geometry(
-      Eigen::Vector3d{0.0, 0.0, 1.0}, origin, origin, config)),
-    RejectReason::kDegenerateUpProjection);
+  for (const Eigen::Vector3d face : {Eigen::Vector3d(0.30, 0.0, 0.0),
+      Eigen::Vector3d(0.0, 0.0, 1.0)})
+  {
+    const auto target = geometry(compute_face_geometry(face, origin, origin, config));
+    EXPECT_TRUE(target.monitor_pose.orientation.coeffs().allFinite());
+    EXPECT_TRUE((target.monitor_pose.orientation * Eigen::Vector3d::UnitX()).isApprox(
+        (face - target.monitor_pose.position).normalized(), kTolerance));
+  }
 }
 
 TEST(TrackingGeometry, OffsetSphereDoesNotRequireAnIntersectionWithBaseRay)
@@ -232,15 +232,19 @@ TEST(TrackingGeometry, OffsetSphereDoesNotRequireAnIntersectionWithBaseRay)
     kTolerance);
 }
 
-TEST(TrackingGeometry, RejectsEnvelopeEntirelyInsideFaceExclusionDistance)
+TEST(TrackingGeometry, KeepsPointingWhenPreferredDistanceIsUnreachable)
 {
   TrackingGeometryConfig config;
   config.safe_reach_radius_m = 0.1;
   const Eigen::Vector3d base{-1.0, 0.0, 0.0};
   const Eigen::Vector3d center = Eigen::Vector3d::Zero();
-  EXPECT_EQ(
-    rejection(compute_face_geometry(Eigen::Vector3d{0.15, 0.0, 0.0}, base, center, config)),
-    RejectReason::kReachEnvelopeUnavailable);
+  const auto target = geometry(compute_face_geometry(
+      Eigen::Vector3d{0.15, 0.0, 0.0}, base, center, config));
+  EXPECT_TRUE(target.reach_limited);
+  EXPECT_NEAR(target.monitor_pose.position.x(), -0.1, kTolerance);
+  EXPECT_NEAR(target.face_distance_m, 0.25, kTolerance);
+  EXPECT_TRUE((target.monitor_pose.orientation * Eigen::Vector3d::UnitX()).isApprox(
+      Eigen::Vector3d::UnitX(), kTolerance));
   EXPECT_EQ(
     rejection(compute_face_geometry(center, base, center, config)),
     RejectReason::kDegenerateDirection);

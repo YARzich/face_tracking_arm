@@ -1,0 +1,9 @@
+# Rest posture with J1 at +359.9 degrees, close to its physical +360 degree limit.
+# All values below are radians; no angle wrapping is applied.
+initial_positions:
+  joint1: 6.281439977927592
+  joint2: -0.257927549
+  joint3: -0.369630908
+  joint4: 0.0
+  joint5: -0.94323787
+  joint6: 0.0

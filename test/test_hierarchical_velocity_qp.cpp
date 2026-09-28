@@ -331,11 +331,11 @@ TEST(HierarchicalVelocityQp, BrakingRetainsExternalSafetyRows)
   EXPECT_NEAR(result.joint_velocity[0], 0.25, kTolerance);
 }
 
-TEST(HierarchicalVelocityQp, PositionMarginPreventsACommandFurtherIntoTheLimit)
+TEST(HierarchicalVelocityQp, PhysicalPositionBoundPreventsACommandFurtherIntoTheLimit)
 {
   const HierarchicalVelocityQp solver{make_config()};
   JointMotionState state = make_state(1);
-  state.position[0] = 0.9;
+  state.position[0] = 1.0;
   JointMotionLimits limits = make_limits(1);
   limits.lower_position[0] = -1.0;
   limits.upper_position[0] = 1.0;
@@ -358,7 +358,7 @@ TEST(HierarchicalVelocityQp, BrakingEnvelopeActsBeforeTheOneStepPositionBound)
   config.residual_command_latency_sec = 0.02;
   const HierarchicalVelocityQp solver{config};
   JointMotionState state = make_state(1);
-  state.position[0] = 0.785;
+  state.position[0] = 0.885;
   state.velocity[0] = 0.5;
   JointMotionLimits limits = make_limits(1);
   limits.lower_position[0] = -1.0;
@@ -382,7 +382,7 @@ TEST(HierarchicalVelocityQp, BrakingEnvelopeActsBeforeTheOneStepPositionBound)
   EXPECT_GE(result.joint_velocity[0], 0.498 - kTolerance);
   EXPECT_LT(
     state.position[0] + result.joint_velocity[0] * config.period_sec,
-    limits.upper_position[0] - limits.position_margin[0]);
+    limits.upper_position[0]);
 }
 
 TEST(HierarchicalVelocityQp, VelocityEnvelopePreventsTheObservedRecursiveFailure)
@@ -555,9 +555,9 @@ TEST(HierarchicalVelocityQp, ProductionToleranceNeverExpandsPhysicalJointLimits)
       std::abs(next_acceleration - state.acceleration[0]),
       limits.max_jerk[0] * config.period_sec + 1.0e-10);
     EXPECT_GE(
-      next_position, limits.lower_position[0] + limits.position_margin[0] - 1.0e-12);
+      next_position, limits.lower_position[0] - 1.0e-12);
     EXPECT_LE(
-      next_position, limits.upper_position[0] - limits.position_margin[0] + 1.0e-12);
+      next_position, limits.upper_position[0] + 1.0e-12);
 
     state.position[0] = next_position;
     state.velocity[0] = next_velocity;
@@ -677,8 +677,8 @@ TEST(HierarchicalVelocityQp, DiscretePositionEnvelopeProtectsBothJointLimits)
       state.position[0], state.velocity[0], result.joint_velocity[0], direction,
       limits.max_acceleration[0], limits.max_jerk[0], config);
     const double signed_safe_limit = direction > 0.0 ?
-      limits.upper_position[0] - limits.position_margin[0] :
-      -(limits.lower_position[0] + limits.position_margin[0]);
+      limits.upper_position[0] :
+      -(limits.lower_position[0]);
     EXPECT_LE(
       envelope.maximum_position,
       signed_safe_limit + config.solution_feasibility_tolerance);
@@ -983,10 +983,46 @@ TEST(HierarchicalVelocityQp, RandomCommandsRespectAllDiscreteJointLimits)
       EXPECT_LE(std::abs(acceleration), limits.max_acceleration[joint] + 1.0e-8);
       EXPECT_LE(std::abs(jerk), limits.max_jerk[joint] + 1.0e-6);
       EXPECT_GE(next_position,
-        limits.lower_position[joint] + limits.position_margin[joint] - 1.0e-10);
+        limits.lower_position[joint] - 1.0e-10);
       EXPECT_LE(next_position,
-        limits.upper_position[joint] - limits.position_margin[joint] + 1.0e-10);
+        limits.upper_position[joint] + 1.0e-10);
     }
+  }
+}
+
+
+TEST(HierarchicalVelocityQp, EscapesPreferredMarginGraduallyWithAValidStopAtEveryStep)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  const EmergencyBrakeTailGenerator brake;
+  auto limits = make_limits(1);
+  limits.lower_position[0] = -1.0;
+  limits.upper_position[0] = 1.0;
+  limits.position_margin[0] = 0.1;
+  limits.max_velocity[0] = 0.25;
+  limits.max_acceleration[0] = 0.5;
+  limits.max_jerk[0] = 5.0;
+  for (const double direction : {-1.0, 1.0}) {
+    auto state = make_state(1);
+    state.position[0] = direction * 0.999;
+    const auto task = make_task(
+      Eigen::MatrixXd::Identity(1, 1), Eigen::VectorXd::Constant(1, -direction * 0.2),
+      Eigen::MatrixXd{0, 1}, Eigen::VectorXd{0});
+    for (int step = 0; step < 250; ++step) {
+      const auto command = solver.solve(task, state, limits);
+      ASSERT_TRUE(command.command_available()) << "step " << step;
+      const auto acceleration = ((command.joint_velocity - state.velocity) /
+        config.period_sec).eval();
+      EXPECT_LE(std::abs(acceleration[0] - state.acceleration[0]),
+        limits.max_jerk[0] * config.period_sec + kTolerance);
+      state.acceleration = acceleration;
+      state.velocity = command.joint_velocity;
+      state.position += state.velocity * config.period_sec;
+      EXPECT_LE(std::abs(state.position[0]), 1.0 + kTolerance);
+      ASSERT_TRUE(brake.generate(state, limits).command_available());
+    }
+    EXPECT_LT(std::abs(state.position[0]), 0.9);
   }
 }
 

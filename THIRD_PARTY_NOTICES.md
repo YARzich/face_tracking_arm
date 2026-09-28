@@ -8,12 +8,19 @@
 | Компонент | Источник и версия | Лицензия и расположение |
 | --- | --- | --- |
 | Геометрия и параметры UFACTORY Lite 6 | [xarm_ros2, commit 3dc2b5e](https://github.com/xArm-Developer/xarm_ros2/tree/3dc2b5e8294758d96b54b15fa5920d581b7cbb3d/xarm_description) | BSD-3-Clause; [LICENSE](description/ufactory_lite6/LICENSE), [состав импорта](description/ufactory_lite6/UPSTREAM) |
+| Геометрия и параметры UFACTORY xArm6 | [xarm_ros2, commit 3dc2b5e](https://github.com/xArm-Developer/xarm_ros2/tree/3dc2b5e8294758d96b54b15fa5920d581b7cbb3d/xarm_description) | BSD-3-Clause; [LICENSE](description/ufactory_xarm6/LICENSE), [состав импорта](description/ufactory_xarm6/UPSTREAM) |
+| cameractrls (отдельный CLI) | [commit 6f388257](https://github.com/soyersoyer/cameractrls/tree/6f388257ac21a0e91b143ad11cb2457036fa2c27) | LGPL-3.0-or-later; исходники и тексты лицензий сохраняются в `/usr/share/doc/face_tracking_arm/third_party/` внутри образа |
 | Драйвер xarm_ros2 и его C++ SDK | Тот же закреплённый commit и его submodule | Лицензии копируются из исходников в `/usr/share/doc/face_tracking_arm/third_party/` внутри образа |
+| xArm Python SDK (проверка перед запуском) | [commit d911319c](https://github.com/xArm-Developer/xArm-Python-SDK/tree/d911319cebc45142613e18086aabb8067b18ab7f) | BSD-3-Clause; `/opt/face_tracking_sdk/LICENSE.xarm-python-sdk` внутри образа |
 | YuNet `face_detection_yunet_2023mar.onnx` | [OpenCV Zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) | MIT; [копия лицензии](docker/licenses/YuNet-MIT.txt). Веса загружаются при сборке образа, SHA-256 проверяется в Dockerfile |
 
 Исходные модели Lite 6 сохранены без изменений. При сборке из копий двух
 collision-mesh удаляются только одинаковые треугольники; координаты и поверхность
 сохраняются. Производные файлы также относятся к BSD-3-Clause ресурсам UFACTORY.
+
+Docker применяет [патч запуска драйвера](docker/patches/xarm-readiness.patch)
+и добавляет проверку готовности из `hardware_activation_guard.hpp` (MIT).
+Эти изменения сохраняются в образе рядом с лицензиями сторонних компонентов.
 
 ROS, MoveIt, OpenCV и остальные системные зависимости устанавливаются пакетным
 менеджером со своими лицензиями. Список прямых зависимостей — [package.xml](package.xml),

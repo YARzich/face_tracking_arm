@@ -27,7 +27,9 @@ from .depth_geometry import sample_face_depth, size_depth, visible_face
 from .depth_messages import point_marker, stamped_point, status_message
 from .detectors import create_detector
 from .face_selection import NearestFaceSelector
+from .kalman_point_filter import KalmanPointFilter
 from .node import detection_message
+from .point_filter import PointFilter
 from .rectification import Rectification
 
 
@@ -41,21 +43,31 @@ class FacePositionNode(Node):
             'confidence': 0.6, 'face_width_m': 0.16, 'depth_input_size': 280,
             'depth_weights': '', 'depth_source': '', 'depth_scale': 1.0,
             'selection_frame': 'world', 'switch_margin_m': .25, 'switch_delay_sec': .4,
+            'point_smoothing': False, 'point_smoothing_method': 'one_euro',
+            'point_smoothing_min_cutoff_hz': 1.5,
+            'point_smoothing_beta': 32.0, 'point_smoothing_derivative_cutoff_hz': 1.0,
+            'point_smoothing_reset_after_sec': .25,
+            'point_kalman_measurement_std_m': .02,
+            'point_kalman_acceleration_std_mps2': 1.5,
             'rectification': 'none', 'sync_slop_sec': 0.0, 'stereo_baseline_m': 0.0,
+            'stereo_num_disparities': 128, 'stereo_block_size': 5,
             'max_processing_fps': 0.0, 'max_frame_age_sec': .2,
             'preview_fps': 5.0,
             'input_left_frame': '', 'input_right_frame': '', 'world_frame': 'world',
         }
         self.declare_parameters('', list(defaults.items()))
         self.options = {k: self.get_parameter(k).value for k in defaults}
-        for name, low, high in (
-                ('sync_slop_sec', 0, .02), ('stereo_baseline_m', 0, 1),
-                ('max_processing_fps', 0, 120), ('max_frame_age_sec', .02, .5),
-                ('preview_fps', 1, 30)):
-            if not low <= self.options[name] <= high:
-                raise ValueError(f'{name} must be {low}..{high}')
+        for name in ('sync_slop_sec', 'stereo_baseline_m', 'max_processing_fps',
+                     'max_frame_age_sec', 'preview_fps'):
+            value = self.options[name]
+            if (not np.isfinite(value) or value < 0 or
+                    (name in ('max_frame_age_sec', 'preview_fps') and value == 0)):
+                raise ValueError(f'{name} must be finite and '
+                                 'positive (zero is allowed for synchronization/FPS limits)')
         if self.options['rectification'] not in ('none', 'raw', 'rectified'):
             raise ValueError('Unknown rectification mode')
+        if self.options['point_smoothing_method'] not in ('one_euro', 'kalman'):
+            raise ValueError('point_smoothing_method must be one_euro or kalman')
         self.rectifiers = (Rectification(), Rectification())
         self.last_processed_at = None
         self.last_preview_at = -float('inf')
@@ -71,12 +83,25 @@ class FacePositionNode(Node):
             self.options['confidence'], threads=self.options['threads'])
         self.backend = None
         if self.mode == 'stereo':
-            self.backend = StereoDepth()
+            self.backend = StereoDepth(
+                num_disparities=self.options['stereo_num_disparities'],
+                block_size=self.options['stereo_block_size'])
         elif self.mode == 'mono_gpu':
             self.backend = MetricDepth(self.options['depth_weights'], self.options['depth_source'],
                                        self.options['depth_input_size'])
         self.selector = NearestFaceSelector(
             self.options['switch_margin_m'], self.options['switch_delay_sec'])
+        if self.options['point_smoothing_method'] == 'kalman':
+            self.point_filter = KalmanPointFilter(
+                measurement_std_m=self.options['point_kalman_measurement_std_m'],
+                acceleration_std_mps2=self.options['point_kalman_acceleration_std_mps2'],
+                reset_after_sec=self.options['point_smoothing_reset_after_sec'])
+        else:
+            self.point_filter = PointFilter(
+                min_cutoff_hz=self.options['point_smoothing_min_cutoff_hz'],
+                beta=self.options['point_smoothing_beta'],
+                derivative_cutoff_hz=self.options['point_smoothing_derivative_cutoff_hz'],
+                reset_after_sec=self.options['point_smoothing_reset_after_sec'])
         self.pending_observation = None
         self.observation_drops = 0
         self.bridge = CvBridge()
@@ -99,9 +124,9 @@ class FacePositionNode(Node):
         if self.mode == 'stereo':
             inputs += [(Image, '/face_test/right/image_raw'),
                        (CameraInfo, '/face_test/right/camera_info')]
-        # CameraInfo and a large image can arrive at different times. Keep a small
-        # matching buffer; output queues still contain only the newest result.
-        input_qos = QoSProfile(depth=4, reliability=ReliabilityPolicy.BEST_EFFORT)
+        # DDS keeps only the latest input while inference runs. The synchronizer's
+        # separate small cache still matches images and CameraInfo arriving apart.
+        input_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.subscribers = [message_filters.Subscriber(self, kind, topic, qos_profile=input_qos)
                             for kind, topic in inputs]
         slop = self.options['sync_slop_sec']
@@ -113,6 +138,25 @@ class FacePositionNode(Node):
         self.last_report = time.monotonic()
 
     def on_frame(self, image_msg, info, right_msg=None, right_info=None):
+        # A previously computed result may now have its exact TF. Give it a chance
+        # before the next inference blocks this executor or replaces the result.
+        self.flush_observation()
+        now = self.get_clock().now()
+        inputs = (image_msg, info, right_msg, right_info)
+        ages = [(now - Time.from_msg(message.header.stamp)).nanoseconds / 1e9
+                for message in inputs if message is not None]
+        if any(age > self.options.get('max_frame_age_sec', .2) or age < -.05 for age in ages):
+            self.observation_drops += 1
+            self.status_pub.publish(status_message(
+                image_msg.header, 'face_depth', 'STALE_OBSERVATION',
+                {'mode': self.mode, 'processing_ms': 0.0, 'frame_age_ms': ages[0] * 1000,
+                 'oldest_input_age_ms': max(ages) * 1000, 'point_valid': False,
+                 'observation_drops': self.observation_drops}, False))
+            return
+        if self.pending_observation is not None:
+            # Let TF callbacks catch up instead of repeatedly replacing a result
+            # whose transform cannot arrive while this executor runs inference.
+            return
         started = time.perf_counter()
         fps = self.options['max_processing_fps']
         if (fps and self.last_processed_at is not None
@@ -191,6 +235,11 @@ class FacePositionNode(Node):
                 try:
                     transform = self.tf_buffer.lookup_transform(
                         self.options['selection_frame'], image_msg.header.frame_id, stamp)
+                    smoothing = self.options.get('point_smoothing', False)
+                    if smoothing:
+                        # Resolve both directions before updating selection/filter state.
+                        inverse = self.tf_buffer.lookup_transform(
+                            image_msg.header.frame_id, self.options['selection_frame'], stamp)
                 except TransformException:
                     return
                 fixed = []
@@ -200,13 +249,21 @@ class FacePositionNode(Node):
                     fixed.append((point.x, point.y, point.z))
                 selected = self.selector.select(fixed, stamp.nanoseconds / 1e9)
                 reason = 'OK' if selected is not None else 'CONFIRMING_FACE'
-                self.publish_observation(selected, reason)
+                if smoothing and selected is not None:
+                    filtered = self.point_filter.update(
+                        fixed[selected], stamp.nanoseconds / 1e9, self.selector.track_id)
+                    fixed_point = stamped_point(transform.header, filtered)
+                    point = do_transform_point(fixed_point, inverse).point
+                    self.publish_observation(selected, reason, (point.x, point.y, point.z))
+                else:
+                    self.publish_observation(selected, reason)
         self.publish_world_point()
 
-    def publish_observation(self, selected, reason):
+    def publish_observation(self, selected, reason, filtered_xyz=None):
         image_msg, image, faces, candidates, depth_map, elapsed_ms, _ = self.pending_observation
         self.pending_observation = None
-        selected_index, xyz = candidates[selected] if selected is not None else (None, None)
+        selected_index, raw_xyz = candidates[selected] if selected is not None else (None, None)
+        xyz = filtered_xyz if filtered_xyz is not None else raw_xyz
         header = image_msg.header
         self.detection_pub.publish(detection_message(header, faces))
         if xyz is not None:
@@ -229,9 +286,15 @@ class FacePositionNode(Node):
                   'world_point_drops': self.world_point_drops,
                   'observation_drops': self.observation_drops, 'valid_faces': len(candidates),
                   'selected_track_id': self.selector.track_id if xyz is not None else 0,
+                  'point_smoothing': self.options.get('point_smoothing', False),
+                  'point_smoothing_method': self.options.get(
+                      'point_smoothing_method', 'one_euro'),
                   'selection_frame': self.options['selection_frame']}
         if xyz is not None:
             values.update(dict(zip(('x_m', 'y_m', 'z_m'), xyz)))
+            values.update(dict(zip(('raw_x_m', 'raw_y_m', 'raw_z_m'), raw_xyz)))
+            values['point_smoothing_correction_m'] = float(
+                np.linalg.norm(np.asarray(xyz) - raw_xyz))
             values['selected_distance_m'] = float(np.linalg.norm(self.selector.current))
         self.status_pub.publish(status_message(
             header, 'face_depth', reason, values, xyz is not None))

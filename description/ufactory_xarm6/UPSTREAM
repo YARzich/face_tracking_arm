@@ -1,0 +1,8 @@
+Source: https://github.com/xArm-Developer/xarm_ros2
+Branch: jazzy
+Commit: 3dc2b5e8294758d96b54b15fa5920d581b7cbb3d
+License: BSD-3-Clause (see LICENSE)
+
+Unmodified upstream xArm6 URDF, default kinematics, type-6 inertias,
+common macros and DAE/OBJ meshes selected by the upstream DAE model.
+Build-time path substitution is applied only to the generated URDF macro.

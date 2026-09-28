@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "face_tracking_arm/pointing_geometry.hpp"
+
 namespace face_tracking_arm::tracking
 {
 namespace
@@ -49,23 +51,11 @@ std::optional<Eigen::Quaterniond> look_at_orientation(
     return std::nullopt;
   }
 
-  const Eigen::Vector3d direction = target_from_origin / distance;
-  Eigen::Vector3d screen_up = Eigen::Vector3d::UnitZ() -
-    direction.dot(Eigen::Vector3d::UnitZ()) * direction;
-  const double up_projection_norm = screen_up.norm();
-  if (!std::isfinite(up_projection_norm) ||
-    up_projection_norm <= config.up_projection_epsilon)
-  {
+  const auto rotation = pointingRotation(target_from_origin);
+  if (!rotation) {
     return std::nullopt;
   }
-  screen_up /= up_projection_norm;
-  const Eigen::Vector3d screen_left = screen_up.cross(direction).normalized();
-
-  Eigen::Matrix3d rotation;
-  rotation.col(0) = direction;
-  rotation.col(1) = screen_left;
-  rotation.col(2) = screen_up;
-  Eigen::Quaterniond orientation{rotation};
+  Eigen::Quaterniond orientation{*rotation};
   orientation.normalize();
   return orientation;
 }
@@ -96,9 +86,6 @@ GeometryResult compute_face_geometry(
   if (base_to_face_m <= config.direction_epsilon_m) {
     return RejectReason::kDegenerateDirection;
   }
-  if (base_to_face_m <= config.minimum_face_distance_m) {
-    return RejectReason::kFaceInsideMinimumDistance;
-  }
 
   const Eigen::Vector3d face_from_reach_center =
     face_in_planning_frame - reach_center_in_planning_frame;
@@ -119,15 +106,11 @@ GeometryResult compute_face_geometry(
 
   const double desired_range_m =
     reach_center_to_face_m - config.minimum_face_distance_m;
-  // If the whole reach sphere lies inside the face exclusion radius, no target
-  // can satisfy the minimum distance. Otherwise the center-to-face line gives
-  // the closest permissible point. A negative range retreats past the center
-  // when a close face requires it, while remaining inside the reach sphere.
-  if (desired_range_m < -config.safe_reach_radius_m) {
-    return RejectReason::kReachEnvelopeUnavailable;
-  }
-  const bool reach_limited = desired_range_m > config.safe_reach_radius_m;
-  const double selected_range_m = std::min(desired_range_m, config.safe_reach_radius_m);
+  // Distance is a preference. An unattainable distance must not erase the
+  // observed face and make the arm stop looking at it.
+  const bool reach_limited = std::abs(desired_range_m) > config.safe_reach_radius_m;
+  const double selected_range_m = std::clamp(
+    desired_range_m, -config.safe_reach_radius_m, config.safe_reach_radius_m);
 
   FaceGeometry geometry;
   geometry.monitor_pose.position =
