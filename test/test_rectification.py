@@ -50,6 +50,24 @@ def test_raw_input_reuses_maps_and_invalidates_them_on_calibration_change():
     assert rectifier.maps is not maps
 
 
+def test_raw_rgbd_depth_uses_the_same_nonzero_distortion_map_as_color():
+    calibration = info()
+    rectifier = Rectification()
+    rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+    rectifier.apply(rgb, calibration, 'raw')
+    raw_depth = np.zeros((480, 640), dtype=np.uint16)
+    raw_depth[220, 320] = 1234
+    expected = cv2.remap(raw_depth, *rectifier.maps, interpolation=cv2.INTER_NEAREST,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    aligned_output = rectifier.apply_depth(raw_depth, 'raw')
+    np.testing.assert_array_equal(aligned_output, expected)
+    assert np.count_nonzero(aligned_output) == 1
+    actual_pixel = np.argwhere(aligned_output == 1234)[0].tolist()
+    expected_pixel = np.argwhere(expected == 1234)[0].tolist()
+    assert actual_pixel == expected_pixel
+    assert not np.array_equal(aligned_output, raw_depth)
+
+
 def test_bad_calibration_is_rejected_instead_of_guessing_focal_length():
     calibration = info()
     image = np.zeros((480, 640, 3), dtype=np.uint8)

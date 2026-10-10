@@ -41,6 +41,7 @@ find_package(trajectory_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/TrackingTarget.msg"
+  "msg/PerceptionStatus.msg"
   DEPENDENCIES builtin_interfaces geometry_msgs std_msgs
 )
 rosidl_get_typesupport_target(tracking_typesupport ${PROJECT_NAME} "rosidl_typesupport_cpp")
@@ -397,6 +398,7 @@ if(BUILD_TESTING)
     test/test_hardware_activation_guard.py TIMEOUT 30)
   ament_add_pytest_test(test_controller_shutdown test/test_controller_shutdown.py TIMEOUT 60)
   ament_add_pytest_test(test_rectification test/test_rectification.py TIMEOUT 30)
+  ament_add_pytest_test(test_processing_rate test/test_processing_rate.py TIMEOUT 30)
   ament_add_gtest(test_table_geometry test/test_table_geometry.cpp)
   target_include_directories(test_table_geometry PRIVATE include)
   target_link_libraries(test_table_geometry Eigen3::Eigen)

@@ -48,6 +48,37 @@ class StereoDepth:
         return depth
 
 
+class AlignedRGBDDepth:
+    """Validate an already aligned ROS depth image and convert it to meters."""
+
+    def __init__(self, uint16_scale_m=0.001, float32_scale_m=1.0,
+                 minimum_m=0.25, maximum_m=8.0):
+        values = (uint16_scale_m, float32_scale_m, minimum_m, maximum_m)
+        if (not np.isfinite(values).all() or min(values) <= 0
+                or minimum_m >= maximum_m):
+            raise ValueError('RGB-D scales and valid depth limits must be finite and positive')
+        self.uint16_scale_m = float(uint16_scale_m)
+        self.float32_scale_m = float(float32_scale_m)
+        self.minimum_m = float(minimum_m)
+        self.maximum_m = float(maximum_m)
+
+    def convert(self, image, encoding):
+        """Return a float32 optical-Z image in meters; invalid samples are NaN."""
+        if encoding == '16UC1':
+            if image.dtype != np.uint16:
+                raise ValueError('16UC1 depth payload must be uint16')
+            depth = image.astype(np.float32) * self.uint16_scale_m
+        elif encoding == '32FC1':
+            if image.dtype not in (np.float32, np.float64):
+                raise ValueError('32FC1 depth payload must be floating point')
+            depth = image.astype(np.float32) * self.float32_scale_m
+        else:
+            raise ValueError(f'Unsupported aligned depth encoding: {encoding}')
+        valid = np.isfinite(depth) & (depth >= self.minimum_m) & (depth <= self.maximum_m)
+        depth[~valid] = np.nan
+        return depth
+
+
 class MetricDepth:
     """Official Depth Anything V2 Metric Hypersim Small, loaded once on CUDA."""
 

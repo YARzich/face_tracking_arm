@@ -11,6 +11,38 @@ import numpy as np
 MAX_OBSERVATION_GAP_SEC = 1.5
 
 
+def same_visible_face(previous_box, face, minimum_iou=.15):
+    """Match a current detector box to the last selected box before depth filtering."""
+    if previous_box is None:
+        return False
+    previous = np.asarray(previous_box, dtype=float)
+    current = np.asarray((face.x, face.y, face.width, face.height), dtype=float)
+    if (not np.isfinite(previous).all() or not np.isfinite(current).all()
+            or min(previous[2], previous[3], current[2], current[3]) <= 0):
+        return False
+    left = max(previous[0], current[0])
+    top = max(previous[1], current[1])
+    right = min(previous[0] + previous[2], current[0] + current[2])
+    bottom = min(previous[1] + previous[3], current[1] + current[3])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    union = previous[2] * previous[3] + current[2] * current[3] - intersection
+    if union > 0 and intersection / union >= minimum_iou:
+        return True
+    previous_center = previous[:2] + previous[2:] / 2
+    current_center = current[:2] + current[2:] / 2
+    scale = max(np.linalg.norm(previous[2:]), np.linalg.norm(current[2:]))
+    return scale > 0 and np.linalg.norm(previous_center - current_center) <= .35 * scale
+
+
+def selected_target_missing_depth(previous_box, faces, depth_candidate_indices):
+    """Fail closed if the prior visible target was removed by depth filtering."""
+    if previous_box is None:
+        return False
+    usable = set(depth_candidate_indices)
+    return any(same_visible_face(previous_box, face) and index not in usable
+               for index, face in enumerate(faces))
+
+
 class NearestFaceSelector:
     """Associate positions in a fixed frame; confirm acquisition and closer challengers."""
 

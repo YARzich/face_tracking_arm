@@ -45,3 +45,12 @@ class Rectification:
                 self.signature = signature
             image = cv2.remap(image, *self.maps, interpolation=cv2.INTER_LINEAR)
         return image, camera, r.T
+
+    def apply_depth(self, depth, mode):
+        """Apply the RGB undistortion map to aligned depth with nearest sampling."""
+        if mode in ('none', 'rectified'):
+            return depth
+        if mode != 'raw' or self.maps is None:
+            raise ValueError('Aligned depth rectification requires the RGB calibration map')
+        return cv2.remap(depth, *self.maps, interpolation=cv2.INTER_NEAREST,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)

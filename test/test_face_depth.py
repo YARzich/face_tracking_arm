@@ -5,32 +5,37 @@
 
 from pathlib import Path
 import sys
+import time
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
-from cv_bridge import CvBridge
-from geometry_msgs.msg import TransformStamped
-import numpy as np
-import pytest
-from rclpy.clock import ClockType
-from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Header
-from tf2_ros import TransformException
-import xacro
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 
-from face_tracking_perception.depth_backends import StereoDepth  # noqa: E402, I100
+from cv_bridge import CvBridge  # noqa: E402
+from face_tracking_arm.msg import PerceptionStatus  # noqa: E402
+from geometry_msgs.msg import TransformStamped  # noqa: E402
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
+from rclpy.clock import ClockType  # noqa: E402
+from rclpy.time import Time  # noqa: E402
+from sensor_msgs.msg import CameraInfo, Image  # noqa: E402
+from std_msgs.msg import Header  # noqa: E402
+from tf2_ros import TransformException  # noqa: E402
+import xacro  # noqa: E402
+from face_tracking_perception.depth_backends import (  # noqa: E402, I100
+    AlignedRGBDDepth, StereoDepth)
 from face_tracking_perception.depth_geometry import (  # noqa: E402, I100
-    Camera, sample_face_depth, size_depth, stereo_baseline, visible_face)
+    Camera, partial_face_center, sample_face_depth, sample_face_measurement, size_depth,
+    stereo_baseline, visible_face)
 from face_tracking_perception.depth_messages import (  # noqa: E402
     point_marker, stamped_point, status_message)
 from face_tracking_perception.detectors import Face  # noqa: E402
+from face_tracking_perception.face_selection import NearestFaceSelector  # noqa: E402
 from face_tracking_perception.kalman_point_filter import KalmanPointFilter  # noqa: E402
 from face_tracking_perception.depth_node import FacePositionNode  # noqa: E402, I100
 from face_tracking_perception.node import FaceDetectionNode  # noqa: E402
 from face_tracking_perception.point_filter import PointFilter  # noqa: E402
+from face_tracking_perception.rectification import Rectification  # noqa: E402
 
 
 def camera_info():
@@ -42,6 +47,7 @@ def camera_info():
 
 def test_bad_image_encoding_drops_the_observation_and_next_frame_is_processed():
     observations, detected = [], []
+    invalid_cadence_observations = []
     previews, points = [], []
     discard = SimpleNamespace(publish=lambda message: None)
 
@@ -64,6 +70,10 @@ def test_bad_image_encoding_drops_the_observation_and_next_frame_is_processed():
         publish_observation=publish,
         get_clock=lambda: SimpleNamespace(now=lambda: Time(clock_type=ClockType.ROS_TIME)),
         detection_pub=discard, marker_pub=discard, status_pub=discard,
+        cadence=SimpleNamespace(observe=lambda *args: invalid_cadence_observations.append(args)),
+        pair_cadence=SimpleNamespace(
+            observe=lambda *args: invalid_cadence_observations.append(args),
+            bounded_gap_limit=lambda maximum: maximum),
         point_pub=SimpleNamespace(publish=points.append),
         image_pub=SimpleNamespace(publish=previews.append, get_subscription_count=lambda: 1),
         compressed_pub=SimpleNamespace(get_subscription_count=lambda: 0),
@@ -77,11 +87,14 @@ def test_bad_image_encoding_drops_the_observation_and_next_frame_is_processed():
     assert observations[0][0] is None
     assert observations[0][2][1] is None  # No image exists to annotate.
     assert observations[0][2][3] == []   # No 3D point can escape a failed conversion.
+    assert invalid_cadence_observations == []
+    assert not hasattr(node, 'last_pair_receipt')
     assert not previews and not points
     valid = node.bridge.cv2_to_imgmsg(np.zeros((480, 640, 3), dtype=np.uint8), 'bgr8')
     valid.header = camera_info().header
     FacePositionNode.on_frame(node, valid, camera_info())
     assert detected == [(480, 640, 3)]
+    assert len(invalid_cadence_observations) == 2
     assert observations[1][1] == 'NO_FACE'
     assert len(previews) == 1 and not points
 
@@ -120,7 +133,9 @@ def test_width_distance_scales_and_rejects_clipped_faces():
     camera = Camera.from_info(camera_info())
     assert size_depth(Face(200, 100, 80, 100, 0.9), camera, .16) == pytest.approx(1)
     assert size_depth(Face(200, 100, 40, 50, 0.9), camera, .16) == pytest.approx(2)
-    assert not visible_face(Face(0, 100, 80, 100, 0.9), camera)
+    assert visible_face(Face(0, 100, 80, 100, 0.9), camera)
+    with pytest.raises(ValueError, match='truncated'):
+        size_depth(Face(0, 100, 80, 100, 0.9), camera, .16)
     with pytest.raises(ValueError):
         size_depth(Face(200, 100, 5, 5, 0.9), camera, .16)
 
@@ -138,6 +153,210 @@ def test_depth_median_ignores_background_outliers_and_invalid_pixels():
     depth[:] = np.random.default_rng(10).uniform(.5, 6, depth.shape)
     with pytest.raises(ValueError, match='inconsistent'):
         sample_face_depth(depth, face)
+
+
+def test_partial_rgbd_face_uses_supported_pixel_bearing_not_clipped_box_center():
+    depth = np.full((480, 640), np.nan, dtype=np.float32)
+    face = Face(0, 100, 90, 100, .9)
+    depth[125:175, 8:28] = 1.2
+    z, u, v = sample_face_measurement(depth, face)
+    assert z == pytest.approx(1.2)
+    assert u == pytest.approx(17.5)
+    assert v == pytest.approx(149.5)
+
+
+def test_partial_cpu_face_direction_compensates_for_clipped_width_using_retained_range():
+    camera = Camera.from_info(camera_info())
+    left = Face(0, 100, 45, 100, .9)
+    right = Face(595, 100, 45, 100, .9)
+    # A full 16 cm face at 1 m spans 80 px; the visible 45 px fragment is not
+    # treated as the full face center.
+    assert partial_face_center(left, camera, 1.0, .16)[0] == pytest.approx(40)
+    assert partial_face_center(right, camera, 1.0, .16)[0] == pytest.approx(600)
+
+
+def test_rgbd_replay_stops_when_selected_visible_face_loses_depth_even_if_background_is_valid():
+    selected = Face(100, 100, 80, 100, .95)
+    background = Face(420, 110, 90, 110, .99)
+    header = Header(frame_id='color_optical')
+    header.stamp.sec = 10
+    published = []
+    node = SimpleNamespace(
+        mode='rgbd',
+        last_selected_face_box=(selected.x, selected.y, selected.width, selected.height),
+        pending_observation=(SimpleNamespace(header=header), None,
+                             [selected, background], [(1, (1., 0., 2.))], None, 0., 'OK'),
+        options={'selection_frame': 'world', 'max_frame_age_sec': .2},
+        get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=10.05)),
+        publish_observation=lambda index, reason: published.append((index, reason)),
+        publish_world_point=lambda: None)
+    FacePositionNode.flush_observation(node)
+    assert published == [(None, 'NO_VALID_FACE_DEPTH')]
+
+
+def test_stereo_rejects_invalid_required_right_calibration_even_without_detections():
+    bridge = CvBridge()
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    left_info, right_info = camera_info(), camera_info()
+    left_info.header.stamp.sec = right_info.header.stamp.sec = 10
+    right_info.header.frame_id = 'right_optical'
+    right_info.p[3] = -50.
+    invalid_right = camera_info()
+    invalid_right.header = right_info.header
+    invalid_right.p = [0.] * 12
+    messages = [bridge.cv2_to_imgmsg(frame, 'bgr8'), bridge.cv2_to_imgmsg(frame, 'bgr8')]
+    messages[0].header, messages[1].header = left_info.header, right_info.header
+    node = SimpleNamespace(
+        mode='stereo', options={
+            'max_frame_age_sec': .2, 'input_left_frame': '', 'input_right_frame': '',
+            'rectification': 'none', 'selection_frame': 'left_optical',
+            'stereo_baseline_m': 0., 'timing_mode': 'auto', 'source_timeout_sec': .25,
+            'point_smoothing': False, 'face_width_m': .16},
+        bridge=bridge, rectifiers=[Rectification(), Rectification()],
+        detector=SimpleNamespace(detect=lambda image: []),
+        pending_observation=None, last_processed_at=None, last_capture_sec=None,
+        last_pair_receipt=None, flush_observation=lambda: None,
+        get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=10.05)),
+        pending_since=None, observation_drops=0,
+        publish_observation=lambda *args: None,
+        status_pub=SimpleNamespace(publish=lambda msg: None))
+    FacePositionNode.on_frame(node, messages[0], left_info, messages[1], invalid_right)
+    assert node.pending_observation[6].startswith('INVALID_INPUT: CameraInfo')
+
+
+def make_rgbd_frame_node(depth_message, detected_faces):
+    bridge = CvBridge()
+    header = Header(frame_id='color_optical', stamp=Time(seconds=10).to_msg())
+    image = bridge.cv2_to_imgmsg(np.zeros((480, 640, 3), dtype=np.uint8), 'bgr8')
+    image.header = header
+    info = camera_info()
+    info.header = header
+    perception_states = []
+    empty_pub = SimpleNamespace(publish=lambda _message: None)
+    detector_calls = []
+
+    node = SimpleNamespace(
+        mode='rgbd', options={
+            'max_frame_age_sec': .2, 'input_left_frame': 'color_optical',
+            'rectification': 'none', 'rgbd_sync_slop_sec': .02,
+            'rgbd_depth_topic': '/depth', 'timing_mode': 'auto', 'source_timeout_sec': .25,
+            'selection_frame': 'color_optical', 'point_smoothing': False,
+            'point_smoothing_method': 'one_euro', 'preview_fps': 5.},
+        bridge=bridge, rectifiers=[Rectification()], backend=AlignedRGBDDepth(),
+        detector=SimpleNamespace(detect=lambda _image: detector_calls.append(True)
+                                 or detected_faces), rate_gate=None,
+        pending_observation=None, pending_since=None, selector=NearestFaceSelector(),
+        cadence=SimpleNamespace(observe=lambda *args: None),
+        pair_cadence=SimpleNamespace(observe=lambda *args: None,
+                                     bounded_gap_limit=lambda maximum: maximum),
+        processing_cadence=SimpleNamespace(observe=lambda *args: None),
+        last_selected_face_box=None, last_reliable_fixed_point=None,
+        last_reliable_depth_stamp=None, last_depth_stamp=None,
+        last_target_id=-1, last_valid_input_receipt=None, last_pair_receipt=None,
+        last_capture_sec=None, last_processed_at=None, observation_drops=0,
+        last_preview_at=-float('inf'), last_report=time.monotonic(),
+        pending_world_point=None, world_point_drops=0,
+        get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=10.05)),
+        get_logger=lambda: SimpleNamespace(info=lambda _message: None),
+        publish_observation=None,
+        publish_perception_state=lambda state, reason, stamp=None: perception_states.append(
+            (state, reason, stamp)), publish_world_point=lambda: None,
+        status_pub=empty_pub, perception_status_pub=empty_pub,
+        detection_pub=empty_pub, marker_pub=empty_pub, point_pub=empty_pub,
+        image_pub=SimpleNamespace(get_subscription_count=lambda: 0),
+        compressed_pub=SimpleNamespace(get_subscription_count=lambda: 0),
+        depth_pub=SimpleNamespace(get_subscription_count=lambda: 0))
+    node.publish_observation = lambda *args: FacePositionNode.publish_observation(node, *args)
+    node.flush_observation = lambda: FacePositionNode.flush_observation(node)
+    FacePositionNode.on_frame(node, image, info, depth_message)
+    return node, perception_states, detector_calls
+
+
+def test_rgbd_all_invalid_depth_map_without_a_face_is_a_healthy_no_face_pair():
+    header = Header(frame_id='color_optical', stamp=Time(seconds=10).to_msg())
+    depth = CvBridge().cv2_to_imgmsg(
+        np.full((480, 640), np.inf, dtype=np.float32), '32FC1')
+    depth.header = header
+    node, states, detector_calls = make_rgbd_frame_node(depth, [])
+
+    assert detector_calls == [True]
+    assert node.last_pair_receipt is not None
+    assert states[-1][0:2] == (PerceptionStatus.NO_FACE, 'NO_FACE')
+
+
+def test_rgbd_visible_face_with_all_invalid_depth_is_face_no_depth():
+    header = Header(frame_id='color_optical', stamp=Time(seconds=10).to_msg())
+    depth = CvBridge().cv2_to_imgmsg(
+        np.full((480, 640), np.inf, dtype=np.float32), '32FC1')
+    depth.header = header
+    face = Face(270, 180, 80, 90, .95)
+    node, states, detector_calls = make_rgbd_frame_node(depth, [face])
+
+    assert detector_calls == [True]
+    assert node.last_pair_receipt is not None
+    assert states[-1][0:2] == (PerceptionStatus.FACE_NO_DEPTH, 'NO_VALID_FACE_DEPTH')
+
+
+@pytest.mark.parametrize(
+    'encoding,data', [('bad_encoding', bytes(4)), ('32FC1', b'')])
+def test_rgbd_malformed_or_empty_depth_frame_is_invalid_input(encoding, data):
+    header = Header(frame_id='color_optical', stamp=Time(seconds=10).to_msg())
+    depth = Image(header=header, height=480, width=640, encoding=encoding,
+                  step=640 * 4, data=data)
+    node, states, detector_calls = make_rgbd_frame_node(depth, [])
+
+    assert states[-1][0] == PerceptionStatus.INVALID_INPUT
+    assert states[-1][1].startswith('INVALID_INPUT:')
+    assert node.last_pair_receipt is None
+    assert not detector_calls
+
+
+def test_cpu_partial_target_reuses_original_depth_age_and_capture_tf():
+    header = Header(frame_id='left_optical', stamp=Time(seconds=10.1).to_msg())
+    camera = Camera.from_info(camera_info())
+    face = Face(0, 100, 30, 100, .95)
+    tf = TransformStamped()
+    tf.transform.rotation.w = 1.0
+    selected = []
+
+    def publish(index, reason, filtered=None):
+        selected.append((index, reason, node.pending_observation[3][index]))
+        node.pending_observation = None
+
+    node = SimpleNamespace(
+        mode='mono_cpu', options={
+            'selection_frame': 'world', 'max_frame_age_sec': .2,
+            'mono_partial_depth_max_age_sec': .30, 'face_width_m': .16,
+            'point_smoothing': False},
+        pending_observation=(SimpleNamespace(header=header), None, [face], [], None, 1.0,
+                             'NO_VALID_FACE_DEPTH', [(0, face)], camera, np.eye(3)),
+        last_selected_face_box=(0., 100., 40., 100.),
+        last_reliable_fixed_point=(0., 0., 2.),
+        last_reliable_depth_stamp=Time(seconds=10).to_msg(),
+        selector=SimpleNamespace(select=lambda points, stamp: 0, track_id=3),
+        get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=10.15)),
+        tf_buffer=SimpleNamespace(lookup_transform=lambda *args: tf),
+        publish_observation=publish, publish_world_point=lambda: None,
+        observation_drops=0)
+    FacePositionNode.flush_observation(node)
+    assert selected[0][0:2] == (0, 'OK')
+    assert selected[0][2][1][0] == pytest.approx(-1.2)
+    assert node.last_reliable_depth_stamp == Time(seconds=10).to_msg()
+
+
+def test_aligned_rgbd_units_encodings_and_invalid_depth_are_explicit():
+    backend = AlignedRGBDDepth()
+    raw = np.asarray([[0, 250, 1200, 9000]], dtype=np.uint16)
+    converted = backend.convert(raw, '16UC1')
+    assert np.isnan(converted[0, 0])
+    assert converted[0, 1] == pytest.approx(.25)
+    assert converted[0, 2] == pytest.approx(1.2)
+    assert np.isnan(converted[0, 3])
+    float_depth = backend.convert(np.asarray([[1.0, np.inf]], dtype=np.float32), '32FC1')
+    assert float_depth[0, 0] == pytest.approx(1.0)
+    assert np.isnan(float_depth[0, 1])
+    with pytest.raises(ValueError, match='encoding'):
+        backend.convert(raw, 'mono16')
 
 
 def test_stereo_requires_calibrated_positive_baseline():
@@ -516,6 +735,29 @@ def test_stale_stereo_input_is_dropped_before_conversion_and_keeps_pending_resul
     assert float(values['oldest_input_age_ms']) == pytest.approx(201.)
 
 
+def test_watchdog_does_not_reclassify_a_recent_pair_as_stale_by_observation_age():
+    published = []
+    now = time.monotonic()
+    node = SimpleNamespace(
+        last_pair_receipt=now - .25, source_gap_limit=.5,
+        last_perception_state=PerceptionStatus.OK, last_perception_reason='OK',
+        last_source_stamp=Time(seconds=9.7).to_msg(),
+        publish_perception_state=lambda state, reason: published.append((state, reason)))
+    FacePositionNode.publish_watchdog_status(node)
+    assert published == [(PerceptionStatus.OK, 'OK')]
+
+
+def test_watchdog_reports_stream_lost_only_after_the_bounded_pair_gap():
+    published = []
+    node = SimpleNamespace(
+        last_pair_receipt=time.monotonic() - .51, source_gap_limit=.5,
+        last_perception_state=PerceptionStatus.OK, last_perception_reason='OK',
+        last_source_stamp=Time(seconds=9.7).to_msg(),
+        publish_perception_state=lambda state, reason: published.append((state, reason)))
+    FacePositionNode.publish_watchdog_status(node)
+    assert published == [(PerceptionStatus.DEPTH_STREAM_LOST, 'camera pair watchdog expired')]
+
+
 def test_pending_exact_tf_is_retried_before_next_frame_uses_its_fps_slot():
     events = []
     info = camera_info()
@@ -523,7 +765,8 @@ def test_pending_exact_tf_is_retried_before_next_frame_uses_its_fps_slot():
     image = Image(header=info.header)
     node = SimpleNamespace(
         options={'max_frame_age_sec': .2, 'max_processing_fps': 20.},
-        last_processed_at=float('inf'), pending_observation=None,
+        rate_gate=SimpleNamespace(accept=lambda now: False), last_processed_at=float('inf'),
+        pending_observation=None,
         get_clock=lambda: SimpleNamespace(
             now=lambda: Time(seconds=10.1, clock_type=ClockType.ROS_TIME)),
         flush_observation=lambda: events.append('retry exact TF'))

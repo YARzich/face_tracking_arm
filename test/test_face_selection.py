@@ -6,11 +6,12 @@
 from pathlib import Path
 import sys
 
-import numpy as np
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
-from face_tracking_perception.face_selection import NearestFaceSelector  # noqa: E402, I100
+from face_tracking_perception.detectors import Face  # noqa: E402
+from face_tracking_perception.face_selection import (  # noqa: E402
+    NearestFaceSelector, same_visible_face, selected_target_missing_depth)
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
 
 
 def acquire(selector, points, start=1):
@@ -64,6 +65,22 @@ def test_occlusion_and_old_stamps_cannot_create_fake_confirmations():
 def test_invalid_positions_are_rejected():
     with pytest.raises(ValueError):
         NearestFaceSelector().select([[np.nan, 0, 1]], 1)
+
+
+def test_rgbd_associates_selected_face_before_filtering_missing_depth_candidates():
+    selected = Face(100, 100, 80, 100, .95)
+    same_target_partial = Face(108, 102, 74, 96, .90)
+    background = Face(420, 110, 90, 110, .99)
+    assert same_visible_face((selected.x, selected.y, selected.width, selected.height),
+                             same_target_partial)
+    assert not same_visible_face((selected.x, selected.y, selected.width, selected.height),
+                                 background)
+    assert selected_target_missing_depth(
+        (selected.x, selected.y, selected.width, selected.height),
+        [same_target_partial, background], {1})
+    assert not selected_target_missing_depth(
+        (selected.x, selected.y, selected.width, selected.height),
+        [same_target_partial, background], {0, 1})
 
 
 @pytest.mark.parametrize('fps', [1, 2, 3, 4, 5, 15, 20, 30, 60])
