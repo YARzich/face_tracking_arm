@@ -26,7 +26,7 @@ from image_manifest import source_fingerprint
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = 'face-tracking-arm:jazzy-v2'
 CONTAINER = 'face-tracking-arm'
-MODES = {'cpu': 'mono_cpu', 'stereo': 'stereo'}
+MODES = {'cpu': 'mono_cpu', 'stereo': 'stereo', 'rgbd': 'rgbd'}
 MODELS = {'yunet': 'face_detection_yunet_2023mar.onnx',
           'yolov5n_face': 'yolov5n-face.onnx',
           'yolo_facev2n': 'yolo-facev2n-preweight.onnx'}
@@ -185,9 +185,9 @@ def metadata(docker, config, mode):
     return json.loads(result.stdout)
 
 
-def resources(data, config, mode, *, calibration=False):
+def resources(data, config, mode, *, calibration=False, mount_setup=False):
     """Translate selected camera paths into narrowly scoped mounts and device grants."""
-    flags = mount(config, '/input/hardware.yaml')
+    flags = [] if mount_setup else mount(config, '/input/hardware.yaml')
     groups = set()
     devices = set()
     video_devices = {}
@@ -203,7 +203,7 @@ def resources(data, config, mode, *, calibration=False):
             # Vendor UVC controls identify hardware through the matching sysfs videoN.
             flags += ['--device', f'{device}:{device}:rw']
             video_devices[side] = str(device)
-            if not calibration:
+            if not calibration and not mount_setup:
                 value = camera['calibration_file'] or f'calibration/{MODES[mode]}/{side}.yaml'
                 path = host_path(value, config)
                 if not path.is_file():
@@ -211,9 +211,61 @@ def resources(data, config, mode, *, calibration=False):
                     raise ValueError(f'Нет калибровки {path}. Выполните {command}')
                 flags += mount(path, f'/calibration/{side}.yaml')
         flags += ['--env', 'FACE_TRACKING_VIDEO_DEVICES=' + json.dumps(video_devices)]
+    elif data['source'] == 'realsense':
+        candidates = []
+        for usb in Path('/sys/bus/usb/devices').glob('*'):
+            vendor = usb / 'idVendor'
+            product = usb / 'idProduct'
+            serial_file = usb / 'serial'
+            if not vendor.is_file() or not product.is_file() or not serial_file.is_file():
+                continue
+            if vendor.read_text().strip().lower() != '8086':
+                continue
+            serial = serial_file.read_text().strip() if serial_file.is_file() else ''
+            if data.get('serial_no') and serial != data['serial_no']:
+                continue
+            candidates.append((usb.resolve(), usb, serial))
+        if not candidates:
+            selector = f" serial {data['serial_no']}" if data.get('serial_no') else ''
+            raise ValueError('Не найдена Intel RealSense' + selector +
+                             '. Подключите камеру и повторите ./run devices')
+        if not data.get('serial_no') and len(candidates) > 1:
+            raise ValueError('Найдено несколько RealSense; задайте rgbd.serial_no в hardware.yaml')
+        usb_path, usb, _ = candidates[0]
+        speed_path = usb / 'speed'
+        if speed_path.is_file():
+            speed = float(speed_path.read_text().strip())
+            if speed < 500:
+                raise ValueError(f'RealSense подключена на USB {speed:g} Mbit/s. '
+                                 'Нужен USB 3.x порт и кабель; проверьте ./run devices')
+        bus = int((usb / 'busnum').read_text())
+        address = int((usb / 'devnum').read_text())
+        usb_node = Path(f'/dev/bus/usb/{bus:03d}/{address:03d}')
+        if not usb_node.is_char_device():
+            raise ValueError(f'Нет USB-узла RealSense {usb_node}')
+        flags += ['--device', f'{usb_node}:{usb_node}:rw']
+        groups.add(usb_node.stat().st_gid)
+        video_devices = []
+        for sys_video in Path('/sys/class/video4linux').glob('video*'):
+            resolved = sys_video.joinpath('device').resolve()
+            if usb_path not in resolved.parents:
+                continue
+            device = Path('/dev') / sys_video.name
+            if device.is_char_device():
+                video_devices.append(device)
+        for device in sorted(video_devices):
+            if device == usb_node:
+                continue
+            flags += ['--device', f'{device}:{device}:rw']
+            groups.add(device.stat().st_gid)
+        if not video_devices:
+            raise ValueError('RealSense USB доступен, но его /dev/video* узлы не найдены; '
+                             'проверьте USB 3.x кабель/порт и ./run devices')
     if calibration:
         if data['source'] != 'usb':
             raise ValueError('Для source=ros используйте калибровку драйвера камеры')
+    elif mount_setup:
+        pass
     elif not (data['detector'] == 'yunet' and data['model_dir'] in (
             '', '~/.cache/face_tracking_arm/models')):
         model_dir = host_path(data['model_dir'], config)
@@ -248,6 +300,8 @@ def execute(docker, args):
     config = args.config.expanduser().resolve()
     if not config.is_file():
         raise ValueError('Нет конфига: ' + str(config))
+    if args.operation == 'mount-setup':
+        return execute_mount_setup(docker, args, config)
     mode = args.mode if args.operation == 'calibrate' else args.operation
     calibration = args.operation == 'calibrate'
     data = metadata(docker, config, mode)
@@ -292,6 +346,63 @@ def execute(docker, args):
     return 130 if interrupted else returncode
 
 
+def execute_mount_setup(docker, args, config):
+    """Run read-only setup or one explicit, isolated mount operation."""
+    mode = args.mode
+    data = metadata(docker, config, mode)
+    output = config.parent / 'mount_setup_output'
+    output.mkdir(parents=True, exist_ok=True)
+    flags = mount(config, '/input/hardware.yaml')
+    flags += mount(output, '/output', writable=True)
+    needs_camera = args.action in ('view', 'calibrate')
+    needs_robot = args.action in ('remember-top', 'set-top', 'calibrate')
+    if needs_camera and not args.external_sim:
+        flags += resources(data, config, mode, mount_setup=True)
+    if args.show_image or args.action == 'calibrate':
+        flags += display_options(os.environ)
+    command = docker + ['run', '--rm', '--init', '--name', CONTAINER,
+                        '--network', 'host', '--cap-drop', 'ALL',
+                        '--security-opt', 'no-new-privileges',
+                        '--user', f'{os.getuid()}:{os.getgid()}',
+                        '--env', f'ROS_DOMAIN_ID={args.domain}',
+                        '--stop-signal', 'SIGINT', '--stop-timeout', '20']
+    if args.action == 'manual':
+        command.append('--interactive')
+    command += flags
+    if needs_robot and not args.mock and not args.external_sim:
+        command += ['--ulimit', 'rtprio=50', '--ulimit', 'memlock=-1']
+    command += [IMAGE, 'mount-setup', mode,
+                '--action', args.action,
+                '--marker-side-mm', str(args.marker_side_mm)]
+    if args.external_sim:
+        command.append('--external-sim')
+    if args.show_image or args.action == 'calibrate':
+        command.append('--show-image')
+    if args.mock:
+        command.append('--mock')
+    process = subprocess.Popen(command, start_new_session=True)
+    interrupted = False
+    try:
+        returncode = process.wait()
+    except KeyboardInterrupt:
+        capture(docker + ['stop', '--time', '20', CONTAINER])
+        returncode = process.wait(timeout=25)
+        interrupted = True
+    generated = output / ('calibration-result.yaml' if args.external_sim else 'hardware.yaml')
+    if returncode == 0 and args.external_sim and args.action == 'calibrate':
+        print('Результат калибровки сохранён отдельно: ' + str(generated), flush=True)
+    elif returncode == 0 and args.action in ('manual', 'remember-top', 'calibrate'):
+        if not generated.is_file():
+            raise ValueError('Workflow завершился без /output/hardware.yaml')
+        temporary = config.with_name(config.name + '.mount-setup.tmp')
+        shutil.copyfile(generated, temporary)
+        temporary.replace(config)
+        print('Конфигурация обновлена: ' + str(config), flush=True)
+    elif returncode == 0 and args.action == 'marker':
+        print('Маркер сохранён: ' + str(output / 'mount_marker.png'), flush=True)
+    return 130 if interrupted else returncode
+
+
 def list_devices():
     paths = sorted(Path('/dev/v4l/by-id').glob('*')) or sorted(Path('/dev').glob('video*'))
     for path in paths:
@@ -300,12 +411,26 @@ def list_devices():
         print(f'{path}  {name.read_text().strip() if name.is_file() else ""}')
     if not paths:
         print('USB-камеры не найдены. Подключите камеру и повторите ./run devices')
+    found_realsense = False
+    for usb in Path('/sys/bus/usb/devices').glob('*'):
+        vendor, product = usb / 'idVendor', usb / 'idProduct'
+        serial = usb / 'serial'
+        if (vendor.is_file() and product.is_file() and serial.is_file() and
+                vendor.read_text().strip().lower() == '8086'):
+            speed = (usb / 'speed').read_text().strip() if (usb / 'speed').is_file() else '?'
+            warning = '  ВНИМАНИЕ: USB 2.0; нужен USB 3.x кабель/порт' \
+                if speed != '?' and float(speed) < 500 else ''
+            print(f'RealSense serial={serial.read_text().strip()} '
+                  f'USB={speed} Mbit/s product={product.read_text().strip()}{warning}')
+            found_realsense = True
+    if not found_realsense:
+        print('Intel RealSense не найдена. Для RGB-D проверьте USB 3.x кабель и порт.')
 
 
 def main():
     parser = argparse.ArgumentParser(description='Подготовка и запуск face_tracking_arm в Docker')
     parser.add_argument('operation', choices=['prepare', 'build', 'export', 'devices',
-                                              'cpu', 'stereo', 'calibrate'])
+                                              'cpu', 'stereo', 'rgbd', 'calibrate', 'mount-setup'])
     parser.add_argument('mode', nargs='?', choices=MODES, default='cpu')
     parser.add_argument('--config', type=Path, default=ROOT / 'config/hardware.yaml')
     parser.add_argument('--domain', type=int, default=71, help='ROS domain: по умолчанию 71')
@@ -316,12 +441,19 @@ def main():
                         help='Фильтр точки на этот запуск; без аргумента — из YAML')
     parser.add_argument('--size', default='8x6', help='Внутренние углы шахматной доски')
     parser.add_argument('--square', type=float, default=.025, help='Размер клетки доски в метрах')
+    parser.add_argument(
+        '--action', choices=['manual', 'marker', 'view', 'remember-top', 'set-top', 'calibrate'],
+        default='manual')
+    parser.add_argument('--marker-side-mm', type=float, default=45.0)
+    parser.add_argument('--external-sim', action='store_true',
+                        help='Connect to an already running rendered Gazebo scenario')
     args = parser.parse_args()
     if args.point_filter is not None and args.operation not in MODES:
         parser.error('--point-filter используется только с cpu или stereo')
     if not 0 <= args.domain <= 101:
         parser.error('--domain должен быть от 0 до 101')
-    if (not re.fullmatch(r'[0-9]+x[0-9]+', args.size)
+    if args.operation == 'calibrate' and (
+            not re.fullmatch(r'[0-9]+x[0-9]+', args.size)
             or min(map(int, args.size.split('x'))) < 2 or not 0 < args.square <= 1):
         parser.error('Проверьте --size (например 8x6) и --square (метры)')
     try:

@@ -6,6 +6,7 @@
 import argparse
 import copy
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -18,7 +19,7 @@ import yaml
 
 
 CONFIG = Path('/input/hardware.yaml')
-MODES = {'cpu': 'mono_cpu', 'stereo': 'stereo'}
+MODES = {'cpu': 'mono_cpu', 'stereo': 'stereo', 'rgbd': 'rgbd'}
 
 
 def describe(config, mode):
@@ -29,8 +30,9 @@ def describe(config, mode):
         if not isinstance(config.get(name), dict):
             raise ValueError(f'{name}: ожидается раздел настроек')
     section = config[MODES[mode]]
-    if section.get('source') not in ('usb', 'ros'):
-        raise ValueError('source должен быть usb или ros')
+    allowed_sources = ('usb', 'ros') if mode in ('cpu', 'stereo') else ('ros', 'realsense')
+    if section.get('source') not in allowed_sources:
+        raise ValueError('source должен быть одним из ' + ', '.join(allowed_sources))
     sides = ['left', 'right'] if mode == 'stereo' else ['left']
     for side in sides:
         camera = section.get(side)
@@ -44,6 +46,7 @@ def describe(config, mode):
         if not isinstance(config['perception'].get(key), str):
             raise ValueError(f'perception.{key}: ожидается строка')
     return {'source': section['source'], 'cameras': {s: section[s] for s in sides},
+            'serial_no': section.get('serial_no', ''),
             'model_dir': config['perception']['model_dir'],
             'detector': config['perception']['detector']}
 
@@ -163,9 +166,79 @@ def calibrate(config, args):
     print('Калибровка сохранена.', flush=True)
 
 
+def mount_setup(config, args):
+    """Run offline setup actions or the isolated ROS setup launch."""
+    from face_tracking_bringup.hand_eye_calibration import generate_marker
+    from face_tracking_bringup.mount_geometry import migrate_mount_config
+    from face_tracking_bringup.mount_setup import (
+        apply_manual_geometry, manual_measurement_top, pose_in_measurement_frame,
+        save_yaml_atomic)
+
+    output = Path('/output')
+    output.mkdir(parents=True, exist_ok=True)
+    if args.action == 'marker':
+        generate_marker(output / 'mount_marker.png')
+        print('Маркер: /output/mount_marker.png (сторона чёрного квадрата 45 мм).',
+              flush=True)
+        return
+    resolved = migrate_mount_config(config)
+    if args.action == 'manual':
+        top, source = manual_measurement_top(resolved)
+        left = [top[1], -top[0], 0.0]
+        print('Точка отсчёта: центр плоскости flange. Направления измерения: '
+              f'вперёд +Z flange, вверх {top}, влево {left}. '
+              f'Верх взят из {source}. XYZ — метры, RPY — градусы.', flush=True)
+        measured = {}
+        for section, xyz_key, rpy_key, label, result_key in (
+                ('monitor', 'mount_xyz_m', 'mount_rpy_deg', 'экран', 'monitor'),
+                ('camera_mount', 'xyz_m', 'rpy_deg', 'корпус камеры', 'camera')):
+            xyz, rpy = pose_in_measurement_frame(
+                top, resolved[section][xyz_key], resolved[section][rpy_key])
+            print(f'{label}: текущие XYZ={xyz}, RPY={rpy}', flush=True)
+            answer = input(
+                'Новые x,y,z,roll,pitch,yaw; Enter — оставить текущую позу: ').strip()
+            values = [*xyz, *rpy]
+            if answer:
+                try:
+                    values = [float(value.strip()) for value in answer.split(',')]
+                except ValueError as error:
+                    raise ValueError('Введите шесть чисел: x,y,z,roll,pitch,yaw') from error
+                if len(values) != 6 or not all(math.isfinite(value) for value in values):
+                    raise ValueError('Введите шесть конечных чисел: x,y,z,roll,pitch,yaw')
+                if any(abs(value) > 2.0 for value in values[:3]):
+                    raise ValueError('Положение должно быть в пределах ±2 м от центра flange')
+                if any(abs(value) > 360.0 for value in values[3:]):
+                    raise ValueError('Каждый угол RPY должен быть в пределах ±360 градусов')
+            measured[result_key] = (values[:3], values[3:])
+        resolved = apply_manual_geometry(
+            resolved, top, *measured['monitor'], *measured['camera'])
+        resolved.setdefault('mount_setup', {})['preferred_top_flange'] = top
+        save_yaml_atomic(output / 'hardware.yaml', resolved)
+        print('Измерения преобразованы к осям flange и сохранены в '
+              '/output/hardware.yaml.', flush=True)
+        return
+    if args.action not in ('view', 'remember-top', 'set-top', 'calibrate'):
+        raise ValueError('Неизвестное действие mount-setup')
+    path = Path('/tmp/hardware_mount_setup.yaml')
+    path.write_text(yaml.safe_dump(resolved))
+    output_path = ('/output/calibration-result.yaml' if args.external_sim else
+                   '/output/hardware.yaml')
+    command = [
+        'ros2', 'launch', 'face_tracking_arm', 'mount_setup.launch.py',
+        f'config_file:={path}', f'mode:={MODES[args.mode]}',
+        f'operation:={args.action}', f'output_file:={output_path}',
+        f'marker_side_mm:={args.marker_side_mm}',
+        f'mock_hardware:={str(args.mock).lower()}',
+        f'show_image:={str(args.show_image).lower()}',
+        f'external_sim:={str(args.external_sim).lower()}',
+        f'use_sim_time:={str(args.external_sim).lower()}']
+    os.execvp('ros2', command)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['describe', 'launch', 'calibrate', 'shell', 'help'])
+    parser.add_argument(
+        'operation', choices=['describe', 'launch', 'calibrate', 'mount-setup', 'shell', 'help'])
     parser.add_argument('mode', choices=MODES, nargs='?', default='cpu')
     parser.add_argument('--camera-only', action='store_true')
     parser.add_argument('--show-image', action='store_true')
@@ -173,6 +246,12 @@ def main():
     parser.add_argument('--point-filter', choices=['off', 'kalman', 'one_euro'])
     parser.add_argument('--size', default='8x6')
     parser.add_argument('--square', type=float, default=.025)
+    parser.add_argument(
+        '--action', choices=['manual', 'marker', 'view', 'remember-top', 'set-top', 'calibrate'],
+        default='manual')
+    parser.add_argument('--marker-side-mm', type=float, default=45.0)
+    parser.add_argument('--external-sim', action='store_true',
+                        help='Attach to an existing rendered Gazebo calibration scenario')
     args = parser.parse_args()
     if args.point_filter is not None and args.operation != 'launch':
         parser.error('--point-filter используется только с launch')
@@ -186,6 +265,10 @@ def main():
         print(json.dumps(describe(config, args.mode)))
     elif args.operation == 'calibrate':
         calibrate(config, args)
+    elif args.operation == 'mount-setup':
+        if not math.isfinite(args.marker_side_mm) or args.marker_side_mm <= 0:
+            raise ValueError('--marker-side-mm должен быть положительным')
+        mount_setup(config, args)
     else:
         path = write_config(config, args.mode, point_filter=args.point_filter)
         os.execvp('ros2', [

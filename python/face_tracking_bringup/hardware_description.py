@@ -4,18 +4,18 @@
 """Build one consistent robot model, named poses and controller limits from the hardware YAML."""
 
 import math
+from pathlib import Path
 import xml.etree.ElementTree as ET
 
-import xacro
 import yaml
 
 from .hardware_config import point_filter_parameters
 from .mount_collisions import allow_fixed_mount_collisions
-from .robot_profile import get_robot_profile
+from .robot_profile import get_robot_profile, validate_joint_positions
 
 
 def load_yaml(path):
-    return yaml.safe_load(path.read_text())
+    return yaml.safe_load(Path(path).read_text())
 
 
 def perception_parameters(config, mode, *, camera_only=False):
@@ -33,14 +33,23 @@ def perception_parameters(config, mode, *, camera_only=False):
                       stereo_num_disparities=settings.get('num_disparities', 128),
                       stereo_block_size=settings.get('block_size', 5),
                       input_right_frame=settings['right']['frame_id'])
+    elif mode == 'rgbd':
+        params.update(rgbd_depth_topic=settings['left']['depth_topic'],
+                      rgbd_sync_slop_sec=settings['sync_slop_sec'],
+                      input_left_frame=settings['left']['frame_id'])
     return params
 
 
 def robot_parameters(config, mode, share, config_path, mock, probe_result=None):
+    import xacro
+
     profile = (probe_result['profile'] if probe_result else
                get_robot_profile(config['robot']['model'], config['robot']['model_num']))
     bounds = (probe_result['effective_position_limits_rad'] if probe_result else
               profile['position_limits_rad'])
+    compact_goal = config.get('compact_maneuver', {}).get('goal_joints_rad')
+    if compact_goal is not None:
+        validate_joint_positions(compact_goal, bounds, 'compact_maneuver.goal_joints_rad')
     mappings = {'config_file': str(config_path), 'camera_mode': mode,
                 'mock_hardware': str(mock).lower(), 'robot_model': profile['model'],
                 'model_num': str(profile['model_num'])}
@@ -53,7 +62,10 @@ def robot_parameters(config, mode, share, config_path, mock, probe_result=None):
     if len(names) != len(set(names)):
         raise ValueError('Camera frame names collide with the robot links')
     semantic = ET.parse(share / profile['srdf_file']).getroot()
-    for name in ('rest', 'search'):
+    pose_names = ['rest']
+    if config['tracking']['idle_behavior'] != 'rest':
+        pose_names.append('search')
+    for name in pose_names:
         state = semantic.find(f"group_state[@name='{name}']")
         values = config['motion'][name + '_joints_deg']
         for i, value in enumerate(values, start=1):
@@ -100,7 +112,19 @@ def control_parameters(config, share, limits, mode='mono_cpu'):
                  move_group_name=profile['planning_group'],
                  command_out_topic='/' + profile['controller_name'] + '/joint_trajectory')
     motion = load_yaml(share / 'config/moveit/collision_aware_servo.yaml')
-    motion.update(config['controller'])
+    ignored = {'monitor_near_distance_lipschitz_m_per_rad'}
+    if not config['controller'].get('monitor_guard_joint_name'):
+        ignored.update(('monitor_guard_min_position_rad', 'monitor_guard_max_position_rad'))
+    for key in ignored:
+        motion.pop(key, None)
+    motion.update({key: value for key, value in config['controller'].items()
+                   if key not in ignored})
+    compact_speed_scale = config.get('compact_maneuver', {}).get('speed_scale')
+    if compact_speed_scale is not None:
+        motion['compact_maneuver.speed_scale'] = float(compact_speed_scale)
+    compact_goal = config.get('compact_maneuver', {}).get('goal_joints_rad')
+    if compact_goal is not None:
+        motion['compact_maneuver.goal_joints_rad'] = list(compact_goal)
     motion['table_collision_enabled'] = any(config['table']['dimensions_m'])
     motion['planning_group_name'] = profile['planning_group']
     motion['gaze_frame'] = (config[mode]['left']['frame_id']
@@ -118,9 +142,14 @@ def control_parameters(config, share, limits, mode='mono_cpu'):
         motion[field] = [v[key] for v in joints.values()]
     motion.update({k: v for k, v in config['motion'].items() if k.startswith('search_')
                    and k != 'search_joints_deg'})
+    motion['search_enabled'] = config['tracking']['idle_behavior'] != 'rest'
     tracking = load_yaml(share / 'config/tracking.yaml')[
         'face_tracking_controller']['ros__parameters']
     tracking.update(config['tracking'])
+    tracking['require_perception_status'] = True
+    motion['face_target_freshness_timeout_sec'] = tracking.get(
+        'face_target_freshness_timeout_sec', .5)
+    motion['face_prediction_timeout_sec'] = tracking.get('face_prediction_timeout_sec', .8)
     table = config['table']
     tracking.update(table_shape=table['shape'], table_dimensions_m=table['dimensions_m'],
                     table_center_m=table['center_m'], table_yaw_rad=math.radians(table['yaw_deg']))

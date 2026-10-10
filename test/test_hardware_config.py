@@ -4,6 +4,7 @@
 """Hardware configuration and robot assembly checks without camera, arm or network."""
 
 import copy
+import math
 from pathlib import Path
 import sys
 import xml.etree.ElementTree as ET
@@ -17,6 +18,7 @@ sys.path.insert(0, str(ROOT / 'python'))
 from face_tracking_bringup.hardware_config import validate_config  # noqa: E402, I100
 from face_tracking_bringup.hardware_description import (  # noqa: E402
     control_parameters, perception_parameters, robot_parameters)
+from face_tracking_bringup.robot_profile import get_robot_profile  # noqa: E402
 
 
 @pytest.fixture
@@ -85,9 +87,9 @@ def test_filter_can_be_disabled_or_changed_without_changing_the_detector(config)
     params = perception_parameters(validated, 'mono_cpu')
     assert params['point_smoothing'] is False
     assert params['point_smoothing_method'] == 'one_euro'
-    assert params['point_smoothing_min_cutoff_hz'] == 2.0
-    assert params['point_smoothing_beta'] == 0.0
-    assert params['point_smoothing_derivative_cutoff_hz'] == 3.0
+    assert params['point_smoothing_min_cutoff_hz'] == 1.5
+    assert params['point_smoothing_beta'] == 32.0
+    assert params['point_smoothing_derivative_cutoff_hz'] == 1.0
     assert params['detector'] == original['detector']
     assert config['perception'] == original
 
@@ -97,22 +99,41 @@ def test_filter_can_be_disabled_or_changed_without_changing_the_detector(config)
     ({'enable': True}, 'point_filter'),
     ({'enabled': 'true'}, 'point_filter.enabled'),
     ({'method': 'Kalman'}, 'point_filter.method'),
-    ({'reset_after_sec': 0}, 'point_filter.reset_after_sec'),
-    ({'reset_after_sec': float('nan')}, 'point_filter.reset_after_sec'),
-    ({'mono_cpu': []}, 'point_filter.mono_cpu'),
-    ({'stereo': {'measurement_std_m': -1}}, 'point_filter.stereo.measurement_std_m'),
-    ({'mono_cpu': {'measurement_std_m': 0}}, 'point_filter.mono_cpu.measurement_std_m'),
-    ({'mono_cpu': {'acceleration_std_mps2': True}}, 'point_filter.mono_cpu.acceleration_std_mps2'),
-    ({'stereo': {'acceleration_std_mps2': float('inf')}},
-     'point_filter.stereo.acceleration_std_mps2'),
     ({'stereo': {'measurement_std': .02}}, 'point_filter.stereo'),
-    ({'one_euro': {'beta': -.1}}, 'point_filter.one_euro.beta'),
-    ({'one_euro': {'min_cutoff_hz': 0}}, 'point_filter.one_euro.min_cutoff_hz'),
-    ({'one_euro': {'derivative_cutoff_hz': 0}}, 'point_filter.one_euro.derivative_cutoff_hz'),
+    ({'one_euro': {'minimum_cutoff': 2}}, 'point_filter.one_euro'),
 ])
-def test_bad_filter_settings_fail_before_drivers_even_when_disabled(config, settings, path):
+def test_filter_types_and_unknown_names_are_rejected_even_when_inactive(config, settings, path):
     config['point_filter'] = settings
     with pytest.raises(ValueError, match=path):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
+def test_only_active_filter_values_are_validated_and_forwarded(config):
+    config['point_filter'].update(enabled=True, method='kalman')
+    config['point_filter']['stereo'] = {'measurement_std_m': -1}
+    config['point_filter']['one_euro'] = {'beta': float('nan')}
+    params = perception_parameters(validate_config(config, 'mono_cpu', mock=True), 'mono_cpu')
+    assert params['point_smoothing'] is True
+    assert params['point_kalman_measurement_std_m'] == .03
+    assert params['point_smoothing_beta'] == 32.0
+
+    config['point_filter'].update(enabled=False)
+    config['point_filter']['mono_cpu'] = {'measurement_std_m': 0}
+    config['point_filter']['one_euro'] = {'min_cutoff_hz': 0}
+    params = perception_parameters(validate_config(config, 'mono_cpu', mock=True), 'mono_cpu')
+    assert params['point_smoothing'] is False
+    assert 'point_kalman_measurement_std_m' not in params
+    assert params['point_smoothing_min_cutoff_hz'] == 1.5
+
+
+def test_invalid_values_in_the_selected_filter_still_block_startup(config):
+    config['point_filter'].update(enabled=True, method='kalman')
+    config['point_filter']['mono_cpu'] = {'measurement_std_m': 0}
+    with pytest.raises(ValueError, match='point_filter.mono_cpu.measurement_std_m'):
+        validate_config(config, 'mono_cpu', mock=True)
+    config['point_filter'].update(method='one_euro')
+    config['point_filter']['one_euro'] = {'beta': -1}
+    with pytest.raises(ValueError, match='point_filter.one_euro.beta'):
         validate_config(config, 'mono_cpu', mock=True)
 
 
@@ -125,6 +146,37 @@ def test_real_address_is_required_but_camera_only_never_needs_a_robot(config):
     validate_config(config, 'stereo')
 
 
+def test_active_mode_allows_missing_inactive_mode_and_rest_search_settings(config):
+    del config['stereo']
+    for key in ('search_joints_deg', 'search_speed_rad_s', 'search_sweep_half_range_rad',
+                'search_local_half_range_rad', 'search_local_duration_sec'):
+        del config['motion'][key]
+    result = validate_config(config, 'mono_cpu', mock=True)
+    assert 'stereo' not in result
+    assert not any(key.startswith('search_') for key in result['motion'])
+    assert result['tracking']['idle_behavior'] == 'rest'
+
+
+def test_camera_only_needs_no_robot_or_motion_sections(config):
+    for section in ('robot', 'table', 'monitor', 'camera_mount', 'tracking', 'motion',
+                    'limits', 'controller', 'stereo'):
+        config.pop(section, None)
+    validate_config(config, 'mono_cpu', camera_only=True)
+
+
+def test_driver_only_needs_only_selected_camera_settings(config):
+    for section in ('robot', 'table', 'monitor', 'camera_mount', 'tracking', 'motion',
+                    'limits', 'controller', 'perception', 'point_filter', 'stereo'):
+        config.pop(section, None)
+    validate_config(config, 'mono_cpu', driver_only=True)
+
+
+def test_driver_only_still_reports_misspelled_inactive_filter_settings(config):
+    config['point_filter'] = {'enabled': False, 'kalman': {'measurement_std': .2}}
+    with pytest.raises(ValueError, match='point_filter'):
+        validate_config(config, 'mono_cpu', driver_only=True)
+
+
 @pytest.mark.parametrize('section,key,value', [
     ('motion', 'speed_scale', 0), ('motion', 'speed_scale', float('nan')),
     ('stereo', 'sync_slop_sec', -.5), ('stereo', 'baseline_m', -.08),
@@ -134,6 +186,112 @@ def test_invalid_settings_fail_before_starting_drivers(config, section, key, val
     config[section][key] = value
     with pytest.raises(ValueError):
         validate_config(config, 'stereo', mock=True)
+
+
+def test_hardware_config_mirrors_cpp_motion_and_solver_limits(config):
+    config['tracking']['idle_behavior'] = 'search_sweep'
+    config['motion']['search_speed_rad_s'] = .50
+    config['controller'].update(
+        position_gain=.0001,
+        solver_time_limit_sec=.003,
+        maximum_collision_constraints=24)
+    validate_config(config, 'mono_cpu', mock=True)
+    config['controller']['maximum_collision_constraints'] = 64
+    validate_config(config, 'mono_cpu', mock=True)
+
+
+def test_compact_goal_override_is_optional_and_forwarded_without_a_build(config):
+    # No hardware YAML value selects the model's SRDF named state at runtime.
+    validated = validate_config(config, 'mono_cpu', mock=True)
+    motion_limits = {
+        'joint_limits': {
+            f'joint{i}': {
+                'max_velocity': 1.,
+                'max_acceleration': 2.,
+                'max_jerk': 20.,
+            }
+            for i in range(1, 7)
+        }
+    }
+    _, motion, _, _ = control_parameters(
+        validated, Path(get_package_share_directory('face_tracking_arm')),
+        motion_limits)
+    assert 'compact_maneuver.goal_joints_rad' not in motion
+
+    config['compact_maneuver'] = {
+        'speed_scale': 0.6,
+        'goal_joints_rad': [0.0, -0.2715944, -2.8699983, 0.0, -1.151386, math.pi]}
+    validated = validate_config(config, 'mono_cpu', mock=True)
+    _, motion, _, _ = control_parameters(
+        validated, Path(get_package_share_directory('face_tracking_arm')),
+        motion_limits)
+    assert motion['compact_maneuver.goal_joints_rad'] == config['compact_maneuver'][
+        'goal_joints_rad']
+    assert motion['compact_maneuver.speed_scale'] == pytest.approx(0.6)
+
+
+@pytest.mark.parametrize('scale', [0, -0.1, float('nan'), float('inf'), True])
+def test_compact_speed_scale_must_be_finite_and_positive(config, scale):
+    config['compact_maneuver'] = {'speed_scale': scale}
+    with pytest.raises(ValueError, match='compact_maneuver.speed_scale'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
+@pytest.mark.parametrize('goal', [
+    [0.0] * 5,
+    [0.0, float('nan'), 0.0, 0.0, 0.0, 0.0],
+    [0.0, 3.0, 0.0, 0.0, 0.0, 0.0],
+])
+def test_compact_goal_override_must_be_finite_six_axis_and_model_bounded(config, goal):
+    config['compact_maneuver'] = {'goal_joints_rad': goal}
+    with pytest.raises(ValueError, match='compact_maneuver.goal_joints_rad'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
+def test_compact_goal_override_rejects_unknown_fields(config):
+    config['compact_maneuver'] = {'goal_joints_rad': [0.0] * 6,
+                                  'joint_names': ['joint1']}
+    with pytest.raises(ValueError, match='compact_maneuver'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
+def test_compact_goal_override_is_checked_against_active_reduced_bounds(config, tmp_path):
+    share = Path(get_package_share_directory('face_tracking_arm'))
+    path = tmp_path / 'hardware.yaml'
+    reduced = [[-1.0, 1.0] for _ in range(6)]
+    probe = {'profile': get_robot_profile('xarm6'),
+             'effective_position_limits_rad': reduced}
+    config['compact_maneuver'] = {'goal_joints_rad': [.5, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    path.write_text(yaml.safe_dump(config))
+    robot_parameters(config, 'mono_cpu', share, path, True, probe_result=probe)
+    config['compact_maneuver']['goal_joints_rad'][0] = 1.1
+    path.write_text(yaml.safe_dump(config))
+    with pytest.raises(ValueError, match='compact_maneuver.goal_joints_rad'):
+        robot_parameters(config, 'mono_cpu', share, path, True, probe_result=probe)
+
+
+@pytest.mark.parametrize('speed', [.500001, 0])
+def test_hardware_config_rejects_search_speed_outside_cpp_bounds(config, speed):
+    config['tracking']['idle_behavior'] = 'search_sweep'
+    config['motion']['search_speed_rad_s'] = speed
+    with pytest.raises(ValueError, match='search_speed_rad_s'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
+@pytest.mark.parametrize('value', [23, 65, 24.0, True])
+def test_hardware_config_rejects_collision_row_values_outside_cpp_contract(config, value):
+    config['controller']['maximum_collision_constraints'] = value
+    with pytest.raises(ValueError, match='maximum_collision_constraints'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
+@pytest.mark.parametrize('key,value', [
+    ('position_gain', 0), ('position_gain', -1),
+    ('solver_time_limit_sec', 0), ('solver_time_limit_sec', .003001)])
+def test_hardware_config_rejects_cpp_invalid_controller_bounds(config, key, value):
+    config['controller'][key] = value
+    with pytest.raises(ValueError, match=key):
+        validate_config(config, 'mono_cpu', mock=True)
 
 
 @pytest.mark.parametrize('shape,dimensions', [('cylinder', [0, 0]), ('box', [0, 0, 0])])
@@ -183,6 +341,17 @@ def test_camera_tuning_reaches_perception_without_modifying_program_defaults(con
     assert type(stereo['stereo_num_disparities']) is int
 
 
+def test_realsense_frame_prefix_matches_the_single_configured_optical_tf(config):
+    result = validate_config(config, 'rgbd', mock=True)
+    assert result['rgbd']['left']['frame_id'] == 'camera_color_optical_frame'
+    config['rgbd']['camera_name'] = 'head_sensor'
+    config['rgbd']['left']['frame_id'] = 'head_sensor_color_optical_frame'
+    validate_config(config, 'rgbd', mock=True)
+    config['rgbd']['left']['frame_id'] = 'camera_color_optical_frame'
+    with pytest.raises(ValueError, match='camera_name.*_color_optical_frame'):
+        validate_config(config, 'rgbd', mock=True)
+
+
 def test_old_yaml_keeps_exact_mono_sync_and_original_stereo_search(config):
     del config['mono_cpu']['sync_slop_sec']
     del config['stereo']['num_disparities']
@@ -229,9 +398,43 @@ def test_implicit_freshness_is_applied_to_the_controller_as_validated(config):
     assert result['tracking']['face_target_freshness_timeout_sec'] == .5
 
 
-def test_legacy_geometry_reserve_is_not_silently_presented_as_effective_tuning(config):
-    config['controller']['monitor_near_distance_lipschitz_m_per_rad'] = 1.0
-    with pytest.warns(UserWarning, match='derived from robot geometry'):
+@pytest.mark.parametrize('timeout', [.5, 2.000001, -0.01, float('nan')])
+def test_face_prediction_timeout_is_bounded_before_any_driver_starts(config, timeout):
+    config['tracking']['face_prediction_timeout_sec'] = timeout
+    with pytest.raises(ValueError, match='tracking.face_prediction_timeout_sec'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
+@pytest.mark.parametrize('timeout', [0, .500001, 2.0])
+def test_face_prediction_timeout_accepts_disabled_or_bounded_valid_values(config, timeout):
+    config['tracking']['face_prediction_timeout_sec'] = timeout
+    result = validate_config(config, 'mono_cpu', mock=True)
+    assert result['tracking']['face_prediction_timeout_sec'] == float(timeout)
+
+
+def test_legacy_monitor_geometry_override_is_ignored_without_numerical_validation(config):
+    config['controller']['monitor_near_distance_lipschitz_m_per_rad'] = float('nan')
+    result = validate_config(config, 'mono_cpu', mock=True)
+    assert math.isnan(result['controller']['monitor_near_distance_lipschitz_m_per_rad'])
+    share = Path(get_package_share_directory('face_tracking_arm'))
+    limits = {'joint_limits': {f'joint{i}': {'max_velocity': .1, 'max_acceleration': 1.,
+                                             'max_jerk': 2.} for i in range(1, 7)}}
+    _, motion, _, _ = control_parameters(result, share, limits)
+    assert 'monitor_near_distance_lipschitz_m_per_rad' not in motion
+
+
+def test_inactive_monitor_guard_bounds_do_not_block_startup(config):
+    config['controller']['monitor_guard_min_position_rad'] = float('nan')
+    config['controller']['monitor_guard_max_position_rad'] = float('inf')
+    result = validate_config(config, 'mono_cpu', mock=True)
+    assert 'monitor_guard_min_position_rad' not in result['controller']
+    assert 'monitor_guard_max_position_rad' not in result['controller']
+
+
+def test_active_monitor_guard_bounds_are_still_validated(config):
+    config['controller']['monitor_guard_joint_name'] = 'joint6'
+    config['controller']['monitor_guard_min_position_rad'] = float('nan')
+    with pytest.raises(ValueError, match='monitor_guard_min_position_rad'):
         validate_config(config, 'mono_cpu', mock=True)
 
 

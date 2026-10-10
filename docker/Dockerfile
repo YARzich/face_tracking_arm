@@ -79,7 +79,8 @@ RUN apt-get update && rosdep update --rosdistro jazzy && \
     rosdep install --from-paths /opt/manifests --ignore-src -y --rosdistro jazzy \
       --dependency-types exec --skip-keys 'gz_ros2_control ros_gz_bridge ros_gz_sim rviz2' && \
     apt-get install -y --no-install-recommends \
-      ros-jazzy-camera-calibration v4l-utils libgomp1 && \
+      ros-jazzy-camera-calibration ros-jazzy-realsense2-camera \
+      ros-jazzy-librealsense2 v4l-utils libgomp1 && \
     rm -rf /var/lib/apt/lists/* /opt/manifests
 COPY --from=build /opt/face_tracking_ws/install /opt/face_tracking_ws/install
 COPY --from=build /opt/face_tracking_venv /opt/face_tracking_venv

@@ -247,6 +247,15 @@ def test_filter_cli_reaches_runtime_config_and_launch(config, tmp_path, monkeypa
     assert path.read_text() == yaml.safe_dump(config)
 
 
+def test_devices_command_does_not_validate_calibration_only_options(monkeypatch):
+    seen = []
+    monkeypatch.setattr(host, 'list_devices', lambda: seen.append('listed'))
+    monkeypatch.setattr(host, 'docker_connection', lambda: pytest.fail('devices needs no Docker'))
+    monkeypatch.setattr(sys, 'argv', ['./run', 'devices', '--square', '0'])
+    assert host.main() == 0
+    assert seen == ['listed']
+
+
 @pytest.mark.parametrize('module,arguments', [
     (host, ['cpu', '--point-filter', 'typo']),
     (host, ['build', '--point-filter', 'kalman']),

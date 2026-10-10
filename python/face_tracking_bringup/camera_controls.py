@@ -94,7 +94,7 @@ def requested_value(name, value, control):
 
 
 def configure_controls(camera, *, command_runner=subprocess.run, cli=CLI):
-    """Set controls and independently read them back; failure prevents robot launch."""
+    """Apply auto/manual controls in dependency order and verify each readback."""
     desired = camera.get('control_values', {})
     if not desired:
         return {}
@@ -118,15 +118,43 @@ def configure_controls(camera, *, command_runner=subprocess.run, cli=CLI):
         return result.stdout
 
     before = parse_controls(run(['--list']))
-    expected = {}
-    for name, value in desired.items():
+    for name in desired:
         if name not in before:
             raise ValueError(f'{device}: camera/USB ID does not support control {name}')
-        expected[name] = requested_value(name, value, before[name])
-    run(['-c', ','.join(f'{name}={value}' for name, value in expected.items())])
-    actual = parse_controls(run(['--list']))
-    for name, value in expected.items():
-        received = actual.get(name, {}).get('value')
-        if received != value:
-            raise ValueError(f'{device}: {name} requested {value}, read back {received}')
-    return expected
+
+    # These driver control families expose their manual value only after the
+    # corresponding automatic mode is disabled. Do not probe/write a manual
+    # value while it is inactive; switch modes, reread capabilities, then set it.
+    dependencies = {
+        'focus_absolute': ('autofocus', 'focus_auto', 'focus_automatic_continuous'),
+        'focus': ('autofocus', 'focus_auto', 'focus_automatic_continuous'),
+        'exposure_absolute': ('autoexposure', 'auto_exposure'),
+        'exposure_time_absolute': ('autoexposure', 'auto_exposure'),
+        'exposure': ('autoexposure', 'auto_exposure'),
+    }
+    deferred = {name for name in desired if name in dependencies and any(
+        dependency in desired for dependency in dependencies[name])}
+    automatic = {name: value for name, value in desired.items() if name not in deferred}
+
+    def apply_and_verify(values, controls):
+        expected = {}
+        for name, value in values.items():
+            if name not in controls:
+                raise ValueError(f'{device}: camera/USB ID does not support control {name}')
+            expected[name] = requested_value(name, value, controls[name])
+        actual = controls
+        if expected:
+            run(['-c', ','.join(f'{name}={value}' for name, value in expected.items())])
+            actual = parse_controls(run(['--list']))
+            for name, value in expected.items():
+                received = actual.get(name, {}).get('value')
+                if received != value:
+                    raise ValueError(f'{device}: {name} requested {value}, read back {received}')
+        return expected, actual
+
+    applied, after_automatic = apply_and_verify(automatic, before)
+    if deferred:
+        deferred_values = {name: desired[name] for name in desired if name in deferred}
+        verified, _ = apply_and_verify(deferred_values, after_automatic)
+        applied.update(verified)
+    return applied

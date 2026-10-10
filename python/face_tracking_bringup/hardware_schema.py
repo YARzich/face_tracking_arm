@@ -11,7 +11,9 @@ SECTIONS = {
     'camera_mount': 'xyz_m rpy_deg size_m mass_kg body_frame publish_optical_tf',
     'perception': 'python_executable model_dir detector threads confidence face_width_m '
                   'max_processing_fps preview_fps max_frame_age_sec '
-                  'switch_margin_m switch_delay_sec',
+                  'switch_margin_m switch_delay_sec timing_mode source_timeout_sec '
+                  'mono_partial_depth_max_age_sec rgbd_depth_topic rgbd_sync_slop_sec '
+                  'rgbd_16u_scale_m rgbd_32f_scale_m',
     'tracking': 'idle_behavior minimum_face_distance_m safe_reach_radius_m '
                 'return_to_rest_delay_sec',
     'motion': 'speed_scale search_speed_rad_s search_sweep_half_range_rad '
@@ -20,15 +22,26 @@ SECTIONS = {
     'limits': 'max_velocity_rad_s max_acceleration_rad_s2 max_jerk_rad_s3',
     'controller': '', 'mono_cpu': 'source rectification left',
     'stereo': 'source rectification left right baseline_m sync_slop_sec',
+    'rgbd': 'source rectification left sync_slop_sec serial_no camera_namespace camera_name '
+            'color_profile depth_profile',
 }
+ROOT_FIELDS = frozenset(('mount_geometry_version', 'mount_setup', 'compact_maneuver'))
+COMPACT_MANEUVER_FIELDS = frozenset(('goal_joints_rad speed_scale').split())
+MOUNT_SETUP_FIELDS = frozenset(('preferred_top_flange',
+                                'remembered_joint_positions_deg'))
 CAMERA_FIELDS = frozenset(('device width height fps pixel_format driver_parameters '
                            'control_values camera_name calibration_file frame_id image_topic '
-                           'info_topic optical_xyz_m optical_rpy_deg').split())
-TRACKING_OPTIONAL = frozenset(('face_target_freshness_timeout_sec rest_position_m').split())
+                           'info_topic depth_topic optical_xyz_m optical_rpy_deg').split())
+TRACKING_OPTIONAL = frozenset((
+    'face_target_freshness_timeout_sec face_prediction_timeout_sec rest_position_m').split())
 MODE_OPTIONAL = {
     'mono_cpu': frozenset(('sync_slop_sec',)),
     'stereo': frozenset(('num_disparities', 'block_size')),
+    'rgbd': frozenset(),
 }
+PERCEPTION_OPTIONAL = frozenset((
+    'timing_mode source_timeout_sec mono_partial_depth_max_age_sec rgbd_depth_topic '
+    'rgbd_sync_slop_sec rgbd_16u_scale_m rgbd_32f_scale_m').split())
 POINT_FILTER_FIELDS = frozenset((
     'enabled method reset_after_sec mono_cpu stereo one_euro').split())
 KALMAN_FIELDS = frozenset(('measurement_std_m acceleration_std_mps2').split())

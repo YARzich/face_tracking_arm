@@ -14,6 +14,8 @@ import json
 import math
 import re
 import socket
+import statistics
+import time
 
 from .robot_profile import identify_robot, intersect_joint_limits, validate_joint_positions
 
@@ -133,7 +135,7 @@ def probe_robot(ip, expected_model='xarm6', joint_targets=None, timeout_sec=5.0,
         states = client.get_reduced_states()
         if len(states) != 7 or states[0] not in (0, 1):
             raise ValueError('Invalid reduced-mode state')
-        mode, _, _, max_speed, ranges, fence, rebound = states
+        mode, tcp_boundary, tcp_max_speed, max_speed, ranges, fence, rebound = states
         if len(ranges) != 14:
             raise ValueError('Expected seven reduced-mode joint-limit pairs')
         reduced = [list(ranges[i:i + 2]) for i in range(0, 12, 2)]
@@ -152,10 +154,56 @@ def probe_robot(ip, expected_model='xarm6', joint_targets=None, timeout_sec=5.0,
             'current_joints_rad': current, 'reduced_mode': bool(mode),
             'reduced_joint_limits_rad': reduced,
             'effective_position_limits_rad': effective,
+            'reduced_tcp_boundary_mm': list(tcp_boundary),
+            'reduced_tcp_max_speed_mmps': tcp_max_speed,
             'reduced_max_joint_speed_rad_s': max_speed if mode else None,
             'safety_boundary_enabled': bool(fence), 'collision_rebound_enabled': bool(rebound),
             'controller_state': state, 'error_code': error, 'warning_code': warning,
         }
+    finally:
+        client.close()
+
+
+def stable_joint_position(samples, *, max_spread_rad=math.radians(.1)):
+    """Return a median measured pose only when bounded fresh reads are settled."""
+    if len(samples) < 2 or not math.isfinite(max_spread_rad) or max_spread_rad <= 0:
+        raise ValueError('Stationary sampling requires multiple samples and a positive tolerance')
+    if any(len(sample) != 6 or not all(math.isfinite(value) for value in sample)
+           for sample in samples):
+        raise ValueError('Stationary sampling received malformed or non-finite joint angles')
+    spreads = [max(sample[index] for sample in samples) -
+               min(sample[index] for sample in samples) for index in range(6)]
+    if max(spreads) > max_spread_rad:
+        raise ValueError('Arm moved during read-only sampling; top was not remembered')
+    return [statistics.median(sample[index] for sample in samples) for index in range(6)]
+
+
+def sample_stationary_joint_positions(ip, *, expected_model='xarm6', sample_count=6,
+                                      interval_sec=.1, timeout_sec=1.0,
+                                      client_factory=None):
+    """Read real joint angles repeatedly without starting a ROS control driver."""
+    if (sample_count < 2 or sample_count > 20 or not math.isfinite(interval_sec) or
+            not 0 < interval_sec <= 1 or not math.isfinite(timeout_sec) or
+            not 0 < timeout_sec <= 5):
+        raise ValueError('Invalid read-only stationary sampling bounds')
+    factory = client_factory or _SdkReadOnlyClient
+    client = factory(ip, timeout_sec)
+    try:
+        axis, device_type = _identity(client.get_version())
+        identify_robot(client.get_robot_sn(), axis, device_type, expected_model)
+        samples = []
+        for index in range(sample_count):
+            state = client.get_controller_status()[0]
+            if state not in (0, 1, 2, 3, 4, 5):
+                raise ValueError(f'Controller returned an unknown state {state}; '
+                                 'measured angles were not accepted')
+            sample = list(client.get_joint_positions())
+            if len(sample) != 6 or not all(math.isfinite(value) for value in sample):
+                raise ValueError('Incomplete or non-finite measured joint positions')
+            samples.append(sample)
+            if index + 1 < sample_count:
+                time.sleep(interval_sec)
+        return stable_joint_position(samples)
     finally:
         client.close()
 

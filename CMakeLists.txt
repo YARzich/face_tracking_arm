@@ -313,6 +313,8 @@ install(PROGRAMS
   scripts/face_position_node.py
   scripts/face_depth_reference.py
   scripts/face_appearances.py
+  scripts/mount_setup_node.py
+  scripts/hardware_monitor_gate.py
   DESTINATION lib/${PROJECT_NAME})
 install(
   FILES "${generated_description_directory}/lite6.urdf.xacro"
@@ -397,6 +399,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_fast_stress_motion test/test_fast_stress_motion.py TIMEOUT 30)
   ament_add_pytest_test(test_simulation_start test/test_simulation_start.py TIMEOUT 60)
   ament_add_pytest_test(test_simulation_launch test/test_simulation_launch.py TIMEOUT 60)
+  ament_add_pytest_test(test_mount_setup test/test_mount_setup.py TIMEOUT 60)
   ament_add_pytest_test(test_face_selection test/test_face_selection.py TIMEOUT 30)
   ament_add_pytest_test(test_point_filter test/test_point_filter.py TIMEOUT 30)
   ament_add_pytest_test(test_kalman_point_filter test/test_kalman_point_filter.py TIMEOUT 30)
@@ -408,6 +411,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_camera_controls test/test_camera_controls.py TIMEOUT 30)
   ament_add_pytest_test(test_robot_profile test/test_robot_profile.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_probe test/test_hardware_probe.py TIMEOUT 30)
+  ament_add_pytest_test(test_hardware_monitor test/test_hardware_monitor.py TIMEOUT 30)
   ament_add_pytest_test(test_processing_rate test/test_processing_rate.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_activation_guard
     test/test_hardware_activation_guard.py TIMEOUT 30)

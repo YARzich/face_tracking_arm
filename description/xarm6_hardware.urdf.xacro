@@ -66,7 +66,7 @@
         ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
   <joint name="hardware_camera_mount" type="fixed">
-    <parent link="monitor_link"/><child link="${mount['body_frame']}"/>
+    <parent link="link6"/><child link="${mount['body_frame']}"/>
     <origin xyz="${' '.join(map(str, mount['xyz_m']))}"
       rpy="${' '.join([str(v * degree_scale) for v in mount['rpy_deg']])}"/>
   </joint>

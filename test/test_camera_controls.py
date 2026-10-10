@@ -98,6 +98,24 @@ def test_unknown_readback_is_not_considered_success(camera, tmp_path):
         configure_controls(camera, command_runner=run, cli=cli)
 
 
+def test_manual_focus_is_applied_after_autofocus_is_disabled(camera, tmp_path):
+    camera['control_values'] = {
+        'focus_automatic_continuous': False, 'focus_absolute': 35}
+    manual = LISTING
+    after_mode = LISTING.replace(' | inactive', '')
+    actual = after_mode.replace('focus_absolute = 30', 'focus_absolute = 35')
+    cli, calls, run = runner(tmp_path, iter([manual, '', after_mode, '', actual]))
+    assert configure_controls(camera, command_runner=run, cli=cli) == {
+        'focus_automatic_continuous': '0', 'focus_absolute': '35'}
+    assert calls == [
+        ['--list'],
+        ['-c', 'focus_automatic_continuous=0'],
+        ['--list'],
+        ['-c', 'focus_absolute=35'],
+        ['--list'],
+    ]
+
+
 def test_no_controls_does_not_need_optional_cli():
     assert configure_controls({'device': '/missing'}, cli='/missing') == {}
 

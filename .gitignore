@@ -41,8 +41,10 @@ __pycache__/
 *.pem
 *.key
 /dist/
-/config/calibration/
-/config/*.local.yaml
+/config/**/calibration/
+/config/**/mount_setup_output/
+/config/**/*.local.yaml
+/config/**/*.mount-setup.tmp
 
 # External model weights and recorded sensor data.
 /models/

@@ -52,6 +52,27 @@ def run(fake, **kwargs):
     return probe.probe_robot('192.0.2.1', client_factory=lambda ip, timeout: fake, **kwargs)
 
 
+def test_read_only_stationary_sampling_requires_unique_joint_samples():
+    samples = [[0.01 * index, 0, 0, 0, 0, 0] for index in range(5)]
+    with pytest.raises(ValueError, match='moved'):
+        probe.stable_joint_position(samples)
+    settled = [[.2 + index * math.radians(.01), -.3, .4, 0, 0, 0]
+               for index in range(5)]
+    assert probe.stable_joint_position(settled) == pytest.approx(
+        [.2 + math.radians(.02), -.3, .4, 0, 0, 0])
+
+
+def test_stationary_reader_allows_paused_state_without_activating_or_moving(monkeypatch):
+    fake = FakeClient()
+    fake.status = (3, 0, 0)
+    monkeypatch.setattr(probe.time, 'sleep', lambda _: None)
+    actual = probe.sample_stationary_joint_positions(
+        '192.0.2.1', client_factory=lambda ip, timeout: fake)
+    assert actual == fake.angles
+    assert fake.closed
+    assert fake.checked == []
+
+
 def test_measured_coordinates_are_preserved_and_inactive_reduced_limits_are_not_applied():
     fake = FakeClient()
     result = run(fake, joint_targets={'rest': [0] * 6})
@@ -60,6 +81,8 @@ def test_measured_coordinates_are_preserved_and_inactive_reduced_limits_are_not_
     assert result['profile']['model_num'] == 1305
     assert result['effective_position_limits_rad'][0] == [-2 * math.pi, 2 * math.pi]
     assert result['reduced_joint_limits_rad'][0] == [-1, 1]
+    assert result['reduced_tcp_boundary_mm'] == [0] * 6
+    assert result['reduced_tcp_max_speed_mmps'] == 100
     assert result['reduced_max_joint_speed_rad_s'] is None
     assert len(fake.checked) == 2
     assert fake.checked[0] == fake.angles
