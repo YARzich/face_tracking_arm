@@ -78,6 +78,7 @@ struct MotionReferenceDiagnostics
 {
   std::string state{"HOLD"};
   std::string tracking_phase{"FACE"};
+  std::string recovery_mode{"compact"};
   std::string compact_phase{"INACTIVE"};
   std::string compact_reason;
   std::string last_plan_message{"not requested"};
@@ -102,6 +103,7 @@ struct MotionReferenceDiagnostics
   bool compact_actual_settled{false};
   bool compact_return_full_face_active{false};
   bool compact_return_face_qualified{false};
+  bool disabled_limit_hold_latched{false};
   double compact_return_face_dwell_sec{0.0};
   std::optional<double> compact_actual_goal_error_rad;
   std::optional<double> compact_actual_speed_max_rad_s;
@@ -161,6 +163,12 @@ public:
 
 private:
   friend class MotionReferenceTestPeer;
+
+  enum class RecoveryMode
+  {
+    kCompact,
+    kDisabled
+  };
 
   enum class RestMode
   {
@@ -247,6 +255,14 @@ private:
     const std::optional<JointMotionState> & command_queue_state) const;
   [[nodiscard]] bool compactGoalPositionReached(
     const JointMotionState & feedback, const Eigen::VectorXd & goal) const;
+  [[nodiscard]] static bool hasAvailablePairYawResource(
+    const PairYawResourceAssessment & assessment) noexcept;
+  void updatePairYawResourceAndLimitHold(
+    const moveit::core::RobotState & state,
+    const std::optional<msg::TrackingTarget> & target,
+    const TargetMotionEstimate & target_motion, double time_sec, bool fresh_actual_state,
+    const std::optional<JointMotionState> & actual_feedback,
+    const std::optional<JointMotionState> & command_queue_state);
   [[nodiscard]] bool appendCompactPathConstraints(
     const moveit::core::RobotState & state,
     const JointMotionState & motion_state,
@@ -331,6 +347,7 @@ private:
     const std::optional<double> & actual_feedback_time_sec, bool fresh_actual_state);
 
   ControllerParameters parameters_;
+  RecoveryMode recovery_mode_{RecoveryMode::kCompact};
   JointMotionLimits limits_;
   CollisionConstraintBuilder collision_validator_;
   moveit::core::RobotModelConstPtr robot_model_;
@@ -363,6 +380,11 @@ private:
   std::optional<std::uint64_t> pending_generation_;
   std::optional<std::uint64_t> active_scene_revision_;
   PairYawResourceAssessment pair_yaw_assessment_;
+  bool disabled_limit_hold_latched_{false};
+  std::optional<std::int64_t> disabled_limit_hold_source_stamp_ns_;
+  std::optional<msg::TrackingTarget> last_real_face_target_;
+  std::optional<TargetMotionEstimate> last_real_face_motion_;
+  std::optional<double> last_control_time_sec_;
   std::optional<double> last_face_return_evidence_time_sec_;
   double face_return_dwell_sec_{0.0};
   bool compact_return_full_face_active_{false};

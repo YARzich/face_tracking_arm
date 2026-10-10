@@ -14,7 +14,7 @@ from .camera_controls import validate_control_values, validate_driver_parameters
 from .hardware_schema import (
     CAMERA_FIELDS, COMPACT_MANEUVER_FIELDS, CONTROLLER_FIELDS, KALMAN_FIELDS,
     MODE_OPTIONAL, MOUNT_SETUP_FIELDS, ONE_EURO_FIELDS, PERCEPTION_OPTIONAL,
-    POINT_FILTER_FIELDS, ROOT_FIELDS, SECTIONS, TRACKING_OPTIONAL)
+    POINT_FILTER_FIELDS, RECOVERY_FIELDS, ROOT_FIELDS, SECTIONS, TRACKING_OPTIONAL)
 from .mount_geometry import migrate_mount_config
 from .robot_profile import get_robot_profile, validate_joint_positions
 
@@ -58,6 +58,11 @@ def validate_structure(config, mode, *, camera_only=False, driver_only=False, se
     if 'compact_maneuver' in config:
         known_keys(config['compact_maneuver'], 'compact_maneuver',
                    COMPACT_MANEUVER_FIELDS)
+    if 'recovery' in config:
+        known_keys(config['recovery'], 'recovery', RECOVERY_FIELDS)
+        recovery_mode = config['recovery'].get('mode', 'compact')
+        if recovery_mode not in ('compact', 'disabled'):
+            raise ValueError('recovery.mode must be compact or disabled')
     if driver_only:
         active = {mode}
     elif camera_only:

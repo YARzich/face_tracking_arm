@@ -148,6 +148,23 @@ def _controller_parameters(
     config_path = (Path(controller_config_file).expanduser() if controller_config_file else
                    share / 'config/moveit/collision_aware_servo.yaml')
     controller = _load_yaml(config_path)
+    has_flat_recovery_mode = 'recovery.mode' in controller
+    flat_recovery_mode = controller.pop('recovery.mode', None)
+    has_nested_recovery = 'recovery' in controller
+    recovery = controller.pop('recovery', {})
+    if has_flat_recovery_mode and has_nested_recovery:
+        raise ValueError(
+            'recovery.mode must use either the flat key or nested recovery mapping, not both')
+    if not isinstance(recovery, dict):
+        raise ValueError('recovery must be a mapping')
+    unknown_recovery_fields = set(recovery) - {'mode'}
+    if unknown_recovery_fields:
+        raise ValueError(f'recovery: unknown settings {sorted(map(str, unknown_recovery_fields))}')
+    recovery_mode = (flat_recovery_mode if has_flat_recovery_mode else
+                     recovery.get('mode', 'compact'))
+    if recovery_mode not in ('compact', 'disabled'):
+        raise ValueError('recovery.mode must be compact or disabled')
+    controller['recovery.mode'] = recovery_mode
     compact = controller.setdefault('compact_maneuver', {})
     if not isinstance(compact, dict):
         raise ValueError('compact_maneuver must be a mapping')

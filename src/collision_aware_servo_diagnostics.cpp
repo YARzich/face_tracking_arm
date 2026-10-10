@@ -79,6 +79,10 @@ void append_compact_tracking_diagnostics(
 {
   status.values.push_back(key_value("motion_reference_state", reference.state));
   status.values.push_back(key_value("tracking_phase", reference.tracking_phase));
+  status.values.push_back(key_value("recovery_mode", reference.recovery_mode));
+  status.values.push_back(key_value(
+      "disabled_limit_hold_latched",
+      reference.disabled_limit_hold_latched ? "true" : "false"));
   status.values.push_back(key_value("compact_phase", reference.compact_phase));
   status.values.push_back(key_value(
       "compact_generation", std::to_string(reference.compact_generation)));

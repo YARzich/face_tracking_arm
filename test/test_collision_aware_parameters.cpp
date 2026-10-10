@@ -73,10 +73,30 @@ TEST_F(ControllerParameterTest, DefaultsRemainValidWithoutDeprecationWarnings)
   const auto output = testing::internal::GetCapturedStderr();
   EXPECT_EQ(output.find("deprecated"), std::string::npos);
   EXPECT_NO_THROW(validateControllerParameters(parameters));
+  EXPECT_EQ(parameters.recovery_mode, "compact");
+  EXPECT_TRUE(node->describe_parameter("recovery.mode").read_only);
   for (const auto * name : kDeprecatedNames) {
     EXPECT_EQ(node->get_parameter(name).get_type(), rclcpp::ParameterType::PARAMETER_DOUBLE);
     EXPECT_NE(node->describe_parameter(name).description.find("ignored"), std::string::npos);
   }
+}
+
+TEST_F(ControllerParameterTest, RecoveryModeAcceptsDisabledAndRejectsHotChanges)
+{
+  auto node = makeNode({rclcpp::Parameter("recovery.mode", "disabled")});
+  const auto parameters = declareControllerParameters(*node);
+  EXPECT_EQ(parameters.recovery_mode, "disabled");
+  EXPECT_NO_THROW(validateControllerParameters(parameters));
+
+  const auto result = node->set_parameter(rclcpp::Parameter("recovery.mode", "compact"));
+  EXPECT_FALSE(result.successful);
+}
+
+TEST_F(ControllerParameterTest, InvalidRecoveryModeFailsValidation)
+{
+  auto node = makeNode({rclcpp::Parameter("recovery.mode", "automatic")});
+  const auto parameters = declareControllerParameters(*node);
+  EXPECT_THROW(validateControllerParameters(parameters), std::invalid_argument);
 }
 
 TEST_F(ControllerParameterTest, DeprecatedOverridesWarnButDoNotRejectWorkingConfiguration)

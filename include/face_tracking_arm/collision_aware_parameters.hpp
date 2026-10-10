@@ -28,6 +28,8 @@ struct ControllerParameters
   std::string planning_group_name{"xarm6"};
   std::string planning_frame{"world"};
   std::string command_frame{"monitor_control_frame"};
+  /// Compact recovery is selected at startup and cannot be changed at runtime.
+  std::string recovery_mode{"compact"};
   /// Optional optical camera frame: +Z forward. Empty uses the monitor +X axis.
   std::string gaze_frame;
   /// Derived from the table dimensions; initialization waits for this scene state.

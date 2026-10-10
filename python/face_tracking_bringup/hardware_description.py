@@ -112,6 +112,7 @@ def control_parameters(config, share, limits, mode='mono_cpu'):
                  move_group_name=profile['planning_group'],
                  command_out_topic='/' + profile['controller_name'] + '/joint_trajectory')
     motion = load_yaml(share / 'config/moveit/collision_aware_servo.yaml')
+    motion.pop('recovery', None)
     ignored = {'monitor_near_distance_lipschitz_m_per_rad'}
     if not config['controller'].get('monitor_guard_joint_name'):
         ignored.update(('monitor_guard_min_position_rad', 'monitor_guard_max_position_rad'))
@@ -119,6 +120,7 @@ def control_parameters(config, share, limits, mode='mono_cpu'):
         motion.pop(key, None)
     motion.update({key: value for key, value in config['controller'].items()
                    if key not in ignored})
+    motion['recovery.mode'] = config.get('recovery', {}).get('mode', 'compact')
     compact_speed_scale = config.get('compact_maneuver', {}).get('speed_scale')
     if compact_speed_scale is not None:
         motion['compact_maneuver.speed_scale'] = float(compact_speed_scale)

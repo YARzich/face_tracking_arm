@@ -175,6 +175,13 @@ public:
     static_cast<void>(reference.face_policy_.update({true, false}));
   }
 
+  static void removeCompactProfileForTest(MotionReference & reference)
+  {
+    reference.compact_goal_.profile_id.clear();
+    reference.compact_geometry_validator_.reset();
+    reference.default_compact_goals_.clear();
+  }
+
   [[nodiscard]] static BackgroundPathResult resultForCurrentCandidate(
     const MotionReference & reference, const bool success,
     const double terminal_joint6_offset_rad = 0.0)
@@ -253,6 +260,12 @@ public:
     const JointMotionState feedback{position, velocity, acceleration};
     return reference.evaluatePairYawResource(
       state, target, TargetMotionEstimate{}, feedback, feedback);
+  }
+
+  [[nodiscard]] static bool hasAvailablePairYawResource(
+    const PairYawResourceAssessment & assessment)
+  {
+    return MotionReference::hasAvailablePairYawResource(assessment);
   }
 
   static JointPathUpdate updateFollower(
@@ -506,6 +519,7 @@ protected:
         std::vector<std::string>{"RRTConnectkConfigDefault"}),
           rclcpp::Parameter("recovery_planner.xarm6.longest_valid_segment_fraction", 0.00019),
           rclcpp::Parameter("search_enabled", searchEnabled()),
+          rclcpp::Parameter("recovery.mode", recoveryMode()),
           rclcpp::Parameter("search_speed_rad_s", searchEnabled() ? 0.30 : -1.0),
           rclcpp::Parameter("compact_maneuver.goal_joints_rad", compactGoalOverride()),
     });
@@ -518,6 +532,7 @@ protected:
     ASSERT_NE(group_, nullptr);
     ASSERT_EQ(group_->getVariableCount(), 6U);
     parameters_.joint_names = group_->getVariableNames();
+    parameters_.recovery_mode = recoveryMode();
     parameters_.gaze_frame = gazeFrame();
     parameters_.command_frame = commandFrame();
     limits_.lower_position.resize(6);
@@ -563,6 +578,7 @@ protected:
   virtual std::string gazeFrame() const {return "";}
   virtual std::string commandFrame() const {return "monitor_control_frame";}
   virtual bool searchEnabled() const {return true;}
+  virtual std::string recoveryMode() const {return "compact";}
   virtual bool compactProfileEnabled() const {return true;}
   virtual std::vector<double> compactGoalOverride() const {return {};}
 
@@ -698,12 +714,13 @@ protected:
     const PublishedTrajectoryRecord * active_publication = nullptr,
     const PublishedTrajectoryRecord * latest_publication = nullptr,
     const std::optional<JointMotionState> & command_queue_state = std::nullopt,
-    const std::uint64_t scene_revision = kSceneRevision)
+    const std::uint64_t scene_revision = kSceneRevision,
+    const std::optional<double> & time_override_sec = std::nullopt)
   {
     planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
     const planning_scene::PlanningSceneConstPtr planning_scene = scene;
-    const double now = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - clock_origin_).count();
+    const double now = time_override_sec.value_or(std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - clock_origin_).count());
     Eigen::VectorXd actual_position;
     Eigen::VectorXd actual_velocity;
     robot_state.copyJointGroupPositions(group_, actual_position);
@@ -905,6 +922,19 @@ protected:
   bool compactProfileEnabled() const override {return false;}
 };
 
+class MotionReferenceRecoveryDisabledTest : public MotionReferenceTest
+{
+protected:
+  std::string recoveryMode() const override {return "disabled";}
+};
+
+class MotionReferenceRecoveryDisabledNoCompactProfileTest : public MotionReferenceTest
+{
+protected:
+  std::string recoveryMode() const override {return "disabled";}
+  bool compactProfileEnabled() const override {return false;}
+};
+
 class MotionReferenceCustomCompactGoalTest : public MotionReferenceTest
 {
 protected:
@@ -1027,6 +1057,243 @@ TEST_F(MotionReferenceTest, PublicUpdateTriggersForDirectionallyExhaustedJ1J4Pai
   EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
       return event.event == "pair_resource_exhausted";
   }));
+}
+
+TEST_F(MotionReferenceRecoveryDisabledTest, ExhaustionBrakesAndLatchesAcrossLossPredictionAndReset)
+{
+  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+  auto observed_target = exhausted_target;
+  observed_target.header.stamp = rclcpp::Time(0, 1'000'000, RCL_ROS_TIME);
+  observed_target.face_stamp = observed_target.header.stamp;
+  observed_target.target_id = 7;
+
+  const auto exhausted = update(robot_state, observed_target);
+
+  EXPECT_FALSE(exhausted.task);
+  EXPECT_FALSE(exhausted.follows_path);
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  auto lost = target(msg::TrackingTarget::HOLD);
+  lost.allow_recovery = true;
+  EXPECT_FALSE(update(robot_state, lost).task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  reference_->reset(true);
+  EXPECT_FALSE(update(robot_state, lost, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 10.0).task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+  auto rest = target(msg::TrackingTarget::REST);
+  EXPECT_FALSE(update(robot_state, rest, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 30.0).task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+  auto search = target(msg::TrackingTarget::SEARCH);
+  search.search_pattern = "sweep";
+  EXPECT_FALSE(update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 60.0).task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+  EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
+
+  auto prediction = observed_target;
+  prediction.face_is_prediction = true;
+  prediction.header.stamp = rclcpp::Time(0, 2, RCL_ROS_TIME);
+  prediction.face_stamp = rclcpp::Time(0, 1, RCL_ROS_TIME);
+  EXPECT_FALSE(update(robot_state, prediction).task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+}
+
+TEST_F(MotionReferenceRecoveryDisabledTest, OnlyNewRealAccessibleFaceReleasesLimitHold)
+{
+  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+  auto blocked = exhausted_target;
+  blocked.header.stamp = rclcpp::Time(0, 1'000'000, RCL_ROS_TIME);
+  blocked.face_stamp = blocked.header.stamp;
+  blocked.target_id = 7;
+  ASSERT_FALSE(update(robot_state, blocked).task);
+  ASSERT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  auto stale_accessible = faceAlongLookDirection(robot_state);
+  stale_accessible.header.stamp = blocked.header.stamp;
+  stale_accessible.face_stamp = blocked.face_stamp;
+  stale_accessible.target_id = 99;
+  EXPECT_FALSE(update(robot_state, stale_accessible).task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  auto still_blocked = blocked;
+  still_blocked.header.stamp = rclcpp::Time(0, 2'000'000, RCL_ROS_TIME);
+  still_blocked.face_stamp = still_blocked.header.stamp;
+  still_blocked.target_id = 100;
+  EXPECT_FALSE(update(robot_state, still_blocked).task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  auto accessible = faceAlongLookDirection(robot_state);
+  accessible.header.stamp = rclcpp::Time(0, 3'000'000, RCL_ROS_TIME);
+  accessible.face_stamp = accessible.header.stamp;
+  accessible.target_id = 101;
+  const auto resumed = update(robot_state, accessible);
+
+  EXPECT_TRUE(resumed.task);
+  EXPECT_TRUE(resumed.tracking);
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().state, "FACE");
+}
+
+TEST_F(MotionReferenceRecoveryDisabledTest, PredictionStampCannotReleaseLimitHold)
+{
+  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+  auto prediction = exhausted_target;
+  prediction.face_is_prediction = true;
+  prediction.header.stamp = rclcpp::Time(0, 2'000'000, RCL_ROS_TIME);
+  prediction.face_stamp = rclcpp::Time(0, 1'000'000, RCL_ROS_TIME);
+  ASSERT_FALSE(update(robot_state, prediction).task);
+  ASSERT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  auto repeated_source_frame = faceAlongLookDirection(robot_state);
+  repeated_source_frame.header.stamp = rclcpp::Time(0, 3'000'000, RCL_ROS_TIME);
+  repeated_source_frame.face_stamp = prediction.face_stamp;
+  repeated_source_frame.target_id = 12;
+  EXPECT_FALSE(update(robot_state, repeated_source_frame).task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  repeated_source_frame.header.stamp = rclcpp::Time(0, 4'000'000, RCL_ROS_TIME);
+  repeated_source_frame.face_stamp = repeated_source_frame.header.stamp;
+  EXPECT_TRUE(update(robot_state, repeated_source_frame).task);
+  EXPECT_EQ(reference_->diagnostics().state, "FACE");
+}
+
+TEST_F(MotionReferenceRecoveryDisabledTest, FreshFeedbackOnFaceLossCanLatchExhaustion)
+{
+  const auto [critical_state, critical_face] = criticalPairExhaustedCase();
+  auto last_face = critical_face;
+  last_face.header.stamp = rclcpp::Time(3, 0, RCL_ROS_TIME);
+  last_face.face_stamp = last_face.header.stamp;
+  last_face.target_id = 31;
+  auto initial_state = state();
+
+  const auto initial = update(initial_state, last_face, nullptr, nullptr,
+    std::nullopt, kSceneRevision, 3.0);
+  EXPECT_TRUE(initial.tracking);
+  EXPECT_NE(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  auto lost = target(msg::TrackingTarget::HOLD);
+  lost.allow_recovery = true;
+  const auto braking = update(initial_state, lost, nullptr, nullptr,
+    std::nullopt, kSceneRevision, 3.01);
+  EXPECT_FALSE(braking.task);
+  EXPECT_NE(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  const auto held = update(critical_state, lost, nullptr, nullptr,
+    std::nullopt, kSceneRevision, 3.02);
+  EXPECT_FALSE(held.task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+  EXPECT_TRUE(reference_->diagnostics().disabled_limit_hold_latched);
+}
+
+TEST_F(MotionReferenceTest, FailedPairYawProbeCannotProveResourceAvailable)
+{
+  PairYawResourceAssessment assessment;
+  assessment.valid = true;
+  assessment.demand_present = true;
+  assessment.pair_bound_candidate = true;
+  assessment.probe_valid = false;
+  assessment.exhausted = false;
+
+  EXPECT_FALSE(MotionReferenceTestPeer::hasAvailablePairYawResource(assessment));
+
+  assessment.probe_valid = true;
+  assessment.actual_probe_solved = true;
+  assessment.actual_available_yaw_rad = kPairYawProbeDisplacementRad;
+  EXPECT_TRUE(MotionReferenceTestPeer::hasAvailablePairYawResource(assessment));
+}
+
+TEST_F(MotionReferenceRecoveryDisabledTest, ClockRewindKeepsHoldUntilFreshFaceInNewEpoch)
+{
+  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+  auto exhausted = exhausted_target;
+  exhausted.header.stamp = rclcpp::Time(9, 500'000'000, RCL_ROS_TIME);
+  exhausted.face_stamp = exhausted.header.stamp;
+  ASSERT_FALSE(update(robot_state, exhausted, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 10.0).task);
+  ASSERT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  auto lost = target(msg::TrackingTarget::HOLD);
+  lost.allow_recovery = true;
+  EXPECT_FALSE(update(robot_state, lost, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 1.0).task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+
+  auto accessible = faceAlongLookDirection(robot_state);
+  accessible.header.stamp = rclcpp::Time(1, 100'000'000, RCL_ROS_TIME);
+  accessible.face_stamp = accessible.header.stamp;
+  accessible.target_id = 203;
+  const auto resumed = update(robot_state, accessible, nullptr, nullptr,
+    std::nullopt, kSceneRevision, 1.2);
+
+  EXPECT_TRUE(resumed.task);
+  EXPECT_TRUE(resumed.tracking);
+  EXPECT_EQ(reference_->diagnostics().state, "FACE");
+}
+
+TEST_F(MotionReferenceRecoveryDisabledTest, MissingCompactProfileDoesNotBlockDisabledMode)
+{
+  MotionReferenceTestPeer::removeCompactProfileForTest(*reference_);
+  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+
+  const auto result = update(robot_state, exhausted_target);
+
+  EXPECT_FALSE(result.task);
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+  EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
+}
+
+TEST_F(MotionReferenceRecoveryDisabledNoCompactProfileTest, StartsWithoutCompactProfile)
+{
+  const auto [robot_state, face] = criticalPairExhaustedCase();
+  const auto result = update(robot_state, face);
+
+  EXPECT_FALSE(result.task);
+  EXPECT_EQ(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+  EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
+}
+
+TEST_F(MotionReferenceRecoveryDisabledTest, OrdinaryRestAndSearchRemainAvailableBeforeLimitHold)
+{
+  const auto robot_state = state(0.4);
+  const auto rest = update(robot_state, target(msg::TrackingTarget::REST));
+  (void)rest;
+  EXPECT_NE(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+  EXPECT_GE(reference_->diagnostics().plans_requested, 1U);
+
+  reference_->reset(false);
+  auto search = target(msg::TrackingTarget::SEARCH);
+  search.search_pattern = "sweep";
+  (void)update(robot_state, search);
+  EXPECT_NE(reference_->diagnostics().state, "DISABLED_LIMIT_HOLD");
+  EXPECT_FALSE(reference_->compactManeuverActive());
+}
+
+TEST_F(MotionReferenceRecoveryDisabledTest, AvailablePairKeepsNormalFaceTracking)
+{
+  auto robot_state = state();
+  constexpr std::array<double, 6> kJointAnglesRad{
+    6.233, -0.784, -1.010, 1.311, -1.097, 4.632};
+  for (std::size_t index = 0; index < kJointAnglesRad.size(); ++index) {
+    robot_state.setVariablePosition(parameters_.joint_names[index], kJointAnglesRad[index]);
+  }
+  robot_state.update(true);
+  auto face = target(msg::TrackingTarget::FACE);
+  face.face.x = 0.425;
+  face.face.y = -0.736;
+  face.face.z = 1.680;
+
+  const auto result = update(robot_state, face);
+
+  ASSERT_TRUE(result.task);
+  ASSERT_TRUE(result.tracking);
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().state, "FACE");
 }
 
 TEST_F(MotionReferenceTest, PairYawProbeDoesNotBlameJ4WhenTheOtherSwivelCanContinue)

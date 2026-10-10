@@ -87,6 +87,10 @@ search_speed_rad_s: 0.30
 search_sweep_half_range_rad: 2.80
 search_local_half_range_rad: 0.35
 search_local_duration_sec: 6.0
+# Режим восстановления при исчерпании полезного поворота J1/J4.
+recovery:
+  mode: compact  # compact — разрешить маршрут; disabled — отключить его.
+
 # Скорость компактного разворота: 1.0 — исходная настройка; меньше — медленнее.
 # Большее значение повышает запрос скорости; ограничения плавности сохраняются.
 # После правки перезапустите симуляцию с этим файлом через collision_aware_servo_config_file.

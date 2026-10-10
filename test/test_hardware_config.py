@@ -230,6 +230,51 @@ def test_compact_goal_override_is_optional_and_forwarded_without_a_build(config)
     assert motion['compact_maneuver.speed_scale'] == pytest.approx(0.6)
 
 
+@pytest.mark.parametrize('mode', ['mono_cpu', 'stereo', 'rgbd'])
+@pytest.mark.parametrize('recovery_mode', ['compact', 'disabled'])
+def test_recovery_mode_is_forwarded_for_every_hardware_camera_mode(
+        config, mode, recovery_mode):
+    config['recovery'] = {'mode': recovery_mode}
+    validated = validate_config(config, mode, mock=True)
+    motion_limits = {
+        'joint_limits': {
+            f'joint{i}': {'max_velocity': 1., 'max_acceleration': 2., 'max_jerk': 20.}
+            for i in range(1, 7)
+        }
+    }
+
+    _, motion, _, _ = control_parameters(
+        validated, Path(get_package_share_directory('face_tracking_arm')),
+        motion_limits, mode)
+
+    assert motion['recovery.mode'] == recovery_mode
+    assert 'recovery' not in motion
+
+
+def test_old_hardware_config_defaults_to_compact_recovery(config):
+    config.pop('recovery')
+    validated = validate_config(config, 'mono_cpu', mock=True)
+    motion_limits = {
+        'joint_limits': {
+            f'joint{i}': {'max_velocity': 1., 'max_acceleration': 2., 'max_jerk': 20.}
+            for i in range(1, 7)
+        }
+    }
+
+    _, motion, _, _ = control_parameters(
+        validated, Path(get_package_share_directory('face_tracking_arm')),
+        motion_limits)
+
+    assert motion['recovery.mode'] == 'compact'
+
+
+@pytest.mark.parametrize('mode', ['search', '', None, True])
+def test_hardware_recovery_mode_rejects_unknown_values(config, mode):
+    config['recovery'] = {'mode': mode}
+    with pytest.raises(ValueError, match='recovery.mode must be compact or disabled'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
 @pytest.mark.parametrize('scale', [0, -0.1, float('nan'), float('inf'), True])
 def test_compact_speed_scale_must_be_finite_and_positive(config, scale):
     config['compact_maneuver'] = {'speed_scale': scale}

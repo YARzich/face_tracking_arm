@@ -138,3 +138,20 @@ ros2 launch face_tracking_arm tracking_sim.launch.py \
 Изменяйте его только для отдельного сравнения. Launch принимает
 `collision_aware_servo_config_file`, поэтому правка YAML в рабочей копии
 применится без пересборки пакета.
+
+Режим `recovery.mode` выбирает поведение после исчерпания полезного поворота J1/J4:
+`compact` разрешает компактный маршрут, `disabled` отключает его. Чтобы проверить
+режим без пересборки, скопируйте штатный YAML, измените в копии `recovery.mode`,
+затем укажите эту копию в уже существующем аргументе запуска:
+
+```bash
+cd ~/ros2_ws/src/face_tracking_arm
+cp config/moveit/collision_aware_servo.yaml config/moveit/collision_aware_servo.local.yaml
+sed -i 's/^  mode: compact/  mode: disabled/' config/moveit/collision_aware_servo.local.yaml
+ros2 launch face_tracking_arm tracking_sim.launch.py \
+  robot_model:=xarm6 start_pose:=folded test_face_scenario:=walk_around \
+  collision_aware_servo_config_file:="$PWD/config/moveit/collision_aware_servo.local.yaml"
+```
+
+Без `recovery.mode` используется `compact`, в том числе в прежних пользовательских
+YAML. Неизвестное значение отклоняется до запуска контроллера.

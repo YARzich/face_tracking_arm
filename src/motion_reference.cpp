@@ -16,6 +16,7 @@
 #include "face_tracking_arm/pointing_geometry.hpp"
 #include "face_tracking_arm/compact_upright.hpp"
 #include "face_tracking_arm/detail/scalar_braking_policy.hpp"
+#include "face_tracking_arm/face_target_age_policy.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -309,6 +310,35 @@ std::int64_t toNanoseconds(const double time_sec)
   return static_cast<std::int64_t>(std::llround(time_sec * 1.0e9));
 }
 
+std::int64_t sourceFaceStampNs(const msg::TrackingTarget & target)
+{
+  return static_cast<std::int64_t>(target.face_stamp.sec) * 1'000'000'000LL +
+         static_cast<std::int64_t>(target.face_stamp.nanosec);
+}
+
+std::int64_t commandStampNs(const msg::TrackingTarget & target)
+{
+  return static_cast<std::int64_t>(target.header.stamp.sec) * 1'000'000'000LL +
+         static_cast<std::int64_t>(target.header.stamp.nanosec);
+}
+
+bool isFreshMeasuredFace(
+  const msg::TrackingTarget & target, const double time_sec,
+  const double freshness_timeout_sec)
+{
+  if (target.mode != msg::TrackingTarget::FACE || target.face_is_prediction ||
+    !std::isfinite(time_sec) || !std::isfinite(freshness_timeout_sec) ||
+    freshness_timeout_sec <= 0.0 ||
+    time_sec > static_cast<double>(std::numeric_limits<std::int64_t>::max()) * 1.0e-9)
+  {
+    return false;
+  }
+  return validFaceTargetAge(
+    sourceFaceStampNs(target), commandStampNs(target), toNanoseconds(time_sec),
+    static_cast<std::int64_t>(std::llround(freshness_timeout_sec * 1.0e9)),
+    false, 0, 0);
+}
+
 std::optional<LinearVelocityConstraint> makeOutwardStoppingConstraint(
   const Eigen::VectorXd & outward_gradient, const double remaining_distance,
   const JointMotionState & motion_state, const JointMotionLimits & limits,
@@ -385,6 +415,15 @@ MotionReference::MotionReference(
   base_link_(robot_model_->getLinkModel("link_base")),
   compact_geometry_validator_(nullptr)
 {
+  if (parameters_.recovery_mode == "compact") {
+    recovery_mode_ = RecoveryMode::kCompact;
+  } else if (parameters_.recovery_mode == "disabled") {
+    recovery_mode_ = RecoveryMode::kDisabled;
+  } else {
+    throw std::invalid_argument("recovery.mode must be either 'compact' or 'disabled'");
+  }
+  diagnostics_.recovery_mode = parameters_.recovery_mode;
+
   if (!base_link_) {
     base_link_ = robot_model_->getRootLink();
   }
@@ -1153,6 +1192,8 @@ void MotionReference::reset(const bool preserve_compact_maneuver)
   rest_settling_ = false;
   target_id_.reset();
   handoff_target_id_.reset();
+  last_real_face_target_.reset();
+  last_real_face_motion_.reset();
   target_bearing_motion_sign_ = 0;
   target_bearing_moving_ = false;
   compact_path_adopted_ = false;
@@ -1182,8 +1223,10 @@ void MotionReference::reset(const bool preserve_compact_maneuver)
     // compact generation and records its first actual path execution.
     compact_path_started_event_emitted_ = false;
     if (!preserve_compact_maneuver) {
-      upright_roll_guard_armed_ = false;
-      diagnostics_.upright_roll_guard_armed = false;
+      if (!disabled_limit_hold_latched_) {
+        upright_roll_guard_armed_ = false;
+        diagnostics_.upright_roll_guard_armed = false;
+      }
       compact_goal_.path_requirements.maximum_abs_screen_pitch_rad.reset();
       compact_goal_.path_requirements.maximum_assembly_radius_m = kCompactRadiusFloorM;
       diagnostics_.compact_entry_radius_cap_m =
@@ -1201,7 +1244,11 @@ void MotionReference::reset(const bool preserve_compact_maneuver)
     "RETURN_FACE" : face_policy_.phase() == FaceTrackingPhase::kCompactManeuver ?
     "PLANNING" : "INACTIVE";
   diagnostics_.tracking_phase = preserve_return_stage ? "COMPACT_RETURN_FACE" : "FACE";
-  diagnostics_.state = preserve_return_stage ? "COMPACT_RETURN_FACE" : "HOLD";
+  diagnostics_.state = disabled_limit_hold_latched_ ? "DISABLED_LIMIT_HOLD" :
+    preserve_return_stage ? "COMPACT_RETURN_FACE" : "HOLD";
+  diagnostics_.tracking_phase = disabled_limit_hold_latched_ ? "FACE_LIMIT_HOLD" :
+    preserve_return_stage ? "COMPACT_RETURN_FACE" : "FACE";
+  diagnostics_.disabled_limit_hold_latched = disabled_limit_hold_latched_;
 }
 
 void MotionReference::rejectPath()
@@ -3241,6 +3288,79 @@ void MotionReference::updateFaceTargetIdentity(
   target_id_ = target->target_id;
 }
 
+bool MotionReference::hasAvailablePairYawResource(
+  const PairYawResourceAssessment & assessment) noexcept
+{
+  if (!assessment.valid) {
+    return false;
+  }
+  if (!assessment.demand_present || !assessment.pair_bound_candidate) {
+    return true;
+  }
+  return assessment.probe_valid && assessment.actual_probe_solved &&
+         !assessment.actual_probe_infeasible &&
+         std::isfinite(assessment.actual_available_yaw_rad) &&
+         assessment.actual_available_yaw_rad >= 0.80 * kPairYawProbeDisplacementRad;
+}
+
+void MotionReference::updatePairYawResourceAndLimitHold(
+  const moveit::core::RobotState & state,
+  const std::optional<msg::TrackingTarget> & target,
+  const TargetMotionEstimate & target_motion, const double time_sec,
+  const bool fresh_actual_state,
+  const std::optional<JointMotionState> & actual_feedback,
+  const std::optional<JointMotionState> & command_queue_state)
+{
+  const bool has_face = target && target->mode == msg::TrackingTarget::FACE;
+  if (recovery_mode_ == RecoveryMode::kDisabled && has_face &&
+    isFreshMeasuredFace(*target, time_sec, parameters_.face_target_freshness_timeout_sec))
+  {
+    last_real_face_target_ = *target;
+    last_real_face_motion_ = target_motion;
+  }
+  pair_yaw_assessment_ = has_face && fresh_actual_state && !compact_commit_initialized_ ?
+    evaluatePairYawResource(state, *target, target_motion, actual_feedback,
+      command_queue_state) : PairYawResourceAssessment{};
+  if (recovery_mode_ == RecoveryMode::kDisabled && !has_face &&
+    !disabled_limit_hold_latched_ && fresh_actual_state &&
+    last_real_face_target_ && last_real_face_motion_ &&
+    isFreshMeasuredFace(*last_real_face_target_, time_sec,
+    parameters_.face_target_freshness_timeout_sec))
+  {
+    const auto cached_stamp_ns = sourceFaceStampNs(*last_real_face_target_);
+    const auto loss_assessment = evaluatePairYawResource(
+      state, *last_real_face_target_, *last_real_face_motion_, actual_feedback,
+      command_queue_state);
+    if (loss_assessment.valid && loss_assessment.exhausted) {
+      pair_yaw_assessment_ = loss_assessment;
+      disabled_limit_hold_latched_ = true;
+      disabled_limit_hold_source_stamp_ns_ = cached_stamp_ns;
+    }
+  }
+  if (recovery_mode_ == RecoveryMode::kDisabled && has_face && fresh_actual_state &&
+    pair_yaw_assessment_.valid && pair_yaw_assessment_.exhausted)
+  {
+    disabled_limit_hold_latched_ = true;
+    disabled_limit_hold_source_stamp_ns_ = sourceFaceStampNs(*target);
+  } else {
+    if (recovery_mode_ == RecoveryMode::kDisabled && disabled_limit_hold_latched_ &&
+      has_face && !target->face_is_prediction && pair_yaw_assessment_.valid &&
+      hasAvailablePairYawResource(pair_yaw_assessment_))
+    {
+      const std::int64_t source_stamp_ns = sourceFaceStampNs(*target);
+      const bool fresh_real_observation = isFreshMeasuredFace(
+        *target, time_sec, parameters_.face_target_freshness_timeout_sec);
+      const bool newer_than_exhaustion = !disabled_limit_hold_source_stamp_ns_ ||
+        source_stamp_ns > *disabled_limit_hold_source_stamp_ns_;
+      if (fresh_real_observation && newer_than_exhaustion) {
+        disabled_limit_hold_latched_ = false;
+        disabled_limit_hold_source_stamp_ns_.reset();
+      }
+    }
+  }
+  diagnostics_.disabled_limit_hold_latched = disabled_limit_hold_latched_;
+}
+
 bool MotionReference::handleCompactPreparation(
   const moveit::core::RobotState & state,
   const std::optional<msg::TrackingTarget> & target,
@@ -3390,12 +3510,23 @@ MotionReferenceResult MotionReference::update(
   const PublishedTrajectoryRecord * latest_publication)
 {
   MotionReferenceResult result;
+  if (std::isfinite(time_sec)) {
+    if (last_control_time_sec_ && time_sec < *last_control_time_sec_) {
+      // Keep the limit hold across a ROS clock epoch reset, but allow the new
+      // epoch's first independently fresh observation to prove access again.
+      disabled_limit_hold_source_stamp_ns_.reset();
+      last_real_face_target_.reset();
+      last_real_face_motion_.reset();
+    }
+    last_control_time_sec_ = time_sec;
+  }
   const bool has_face = target && target->mode == msg::TrackingTarget::FACE;
   const bool healthy_face_loss = target && target->allow_recovery && !has_face;
   const auto mode = target ? target->mode : msg::TrackingTarget::HOLD;
   const bool idle = mode == msg::TrackingTarget::REST || mode == msg::TrackingTarget::SEARCH;
-  if (idle || ((!has_face && !healthy_face_loss) &&
-    face_policy_.phase() != FaceTrackingPhase::kCompactManeuver))
+  if (!disabled_limit_hold_latched_ &&
+    (idle || ((!has_face && !healthy_face_loss) &&
+    face_policy_.phase() != FaceTrackingPhase::kCompactManeuver)))
   {
     upright_roll_guard_armed_ = false;
     diagnostics_.upright_roll_guard_armed = false;
@@ -3462,9 +3593,9 @@ MotionReferenceResult MotionReference::update(
     actual_feedback->position.size() == position.size() &&
     actual_feedback->velocity.size() == position.size() &&
     actual_feedback->position.allFinite() && actual_feedback->velocity.allFinite();
-  pair_yaw_assessment_ = has_face && fresh_actual_state && !compact_commit_initialized_ ?
-    evaluatePairYawResource(state, *target, target_motion, actual_feedback,
-      command_queue_state) : PairYawResourceAssessment{};
+  updatePairYawResourceAndLimitHold(
+    state, target, target_motion, time_sec, fresh_actual_state,
+    actual_feedback, command_queue_state);
   if (!upright_roll_guard_armed_ && (has_face || (healthy_face_loss &&
     !idle && face_policy_.phase() == FaceTrackingPhase::kCompactManeuver)))
   {
@@ -3473,6 +3604,18 @@ MotionReferenceResult MotionReference::update(
         active_publication, latest_publication));
   }
   diagnostics_.upright_roll_guard_armed = upright_roll_guard_armed_;
+  diagnostics_.disabled_limit_hold_latched = disabled_limit_hold_latched_;
+  if (recovery_mode_ == RecoveryMode::kDisabled && disabled_limit_hold_latched_ &&
+    mode != msg::TrackingTarget::POSE)
+  {
+    diagnostics_.state = "DISABLED_LIMIT_HOLD";
+    diagnostics_.tracking_phase = "FACE_LIMIT_HOLD";
+    if (upright_roll_guard_armed_) {
+      static_cast<void>(appendFaceRollGuardConstraints(
+          state, command_queue_state, result));
+    }
+    return result;
+  }
   recordCompactSettledEvent(time_sec, compact_goal_reached_ && fresh_actual_state &&
     compactSettled(*actual_feedback, command_queue_state, compact_goal_.bounded_positions),
     actual_feedback, actual_feedback_time_sec, command_queue_state);

@@ -25,8 +25,10 @@ SECTIONS = {
     'rgbd': 'source rectification left sync_slop_sec serial_no camera_namespace camera_name '
             'color_profile depth_profile',
 }
-ROOT_FIELDS = frozenset(('mount_geometry_version', 'mount_setup', 'compact_maneuver'))
+ROOT_FIELDS = frozenset((
+    'mount_geometry_version', 'mount_setup', 'compact_maneuver', 'recovery'))
 COMPACT_MANEUVER_FIELDS = frozenset(('goal_joints_rad speed_scale').split())
+RECOVERY_FIELDS = frozenset(('mode',))
 MOUNT_SETUP_FIELDS = frozenset(('preferred_top_flange',
                                 'remembered_joint_positions_deg'))
 CAMERA_FIELDS = frozenset(('device width height fps pixel_format driver_parameters '

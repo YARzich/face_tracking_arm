@@ -12,6 +12,7 @@
 /.vscode/
 /cmake-build-*/
 /.cache/
+/.serena/
 *.swp
 *.swo
 *~

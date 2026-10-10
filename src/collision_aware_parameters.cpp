@@ -12,6 +12,7 @@
 #include <utility>
 
 #include <moveit_servo/moveit_servo_lib_parameters.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 
@@ -88,6 +89,12 @@ ControllerParameters declareControllerParameters(rclcpp::Node & node)
     "planning_frame", result.planning_frame);
   result.command_frame = node.declare_parameter<std::string>(
     "command_frame", result.command_frame);
+  rcl_interfaces::msg::ParameterDescriptor recovery_mode_descriptor;
+  recovery_mode_descriptor.description =
+    "Recovery mechanism selected at startup: compact or disabled.";
+  recovery_mode_descriptor.read_only = true;
+  result.recovery_mode = node.declare_parameter<std::string>(
+    "recovery.mode", result.recovery_mode, recovery_mode_descriptor);
   result.gaze_frame = node.declare_parameter<std::string>("gaze_frame", result.gaze_frame);
   result.table_collision_enabled = node.declare_parameter<bool>(
     "table_collision_enabled", result.table_collision_enabled);
@@ -217,6 +224,10 @@ void validateControllerParameters(const ControllerParameters & parameters)
   const auto positive = [](const double value) {
       return std::isfinite(value) && value > 0.0;
     };
+  if (parameters.recovery_mode != "compact" && parameters.recovery_mode != "disabled") {
+    throw std::invalid_argument(
+            "recovery.mode must be either 'compact' or 'disabled'");
+  }
   if (!positive(parameters.control_period_sec) ||
     parameters.control_period_sec > kMaximumControlPeriodSec ||
     !positive(parameters.trajectory_controller_period_sec) ||

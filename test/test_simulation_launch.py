@@ -286,6 +286,75 @@ def test_compact_speed_scale_loads_from_an_external_controller_yaml(tmp_path):
     assert _config().controller['compact_maneuver']['speed_scale'] == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize('mode', ['compact', 'disabled'])
+def test_recovery_mode_loads_from_an_external_controller_yaml(tmp_path, mode):
+    source_config = ROOT / 'config/moveit/collision_aware_servo.yaml'
+    external_config = tmp_path / 'collision_aware_servo.yaml'
+    data = yaml.safe_load(source_config.read_text())
+    data['recovery']['mode'] = mode
+    external_config.write_text(yaml.safe_dump(data), encoding='utf-8')
+
+    configured = _config(controller_config_file=external_config)
+
+    assert configured.controller['recovery.mode'] == mode
+    assert 'recovery' not in configured.controller
+    assert _config().controller['recovery.mode'] == 'compact'
+
+
+def test_old_controller_yaml_defaults_to_compact_recovery(tmp_path):
+    external_config = tmp_path / 'collision_aware_servo.yaml'
+    data = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    data.pop('recovery')
+    external_config.write_text(yaml.safe_dump(data), encoding='utf-8')
+
+    configured = _config(controller_config_file=external_config)
+
+    assert configured.controller['recovery.mode'] == 'compact'
+
+
+def test_flat_recovery_mode_is_supported_without_nested_mapping(tmp_path):
+    external_config = tmp_path / 'collision_aware_servo.yaml'
+    data = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    data.pop('recovery')
+    data['recovery.mode'] = 'disabled'
+    external_config.write_text(yaml.safe_dump(data), encoding='utf-8')
+
+    configured = _config(controller_config_file=external_config)
+
+    assert configured.controller['recovery.mode'] == 'disabled'
+
+
+def test_simulation_rejects_flat_and_nested_recovery_mode_together(tmp_path):
+    external_config = tmp_path / 'collision_aware_servo.yaml'
+    data = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    data['recovery.mode'] = 'disabled'
+    external_config.write_text(yaml.safe_dump(data), encoding='utf-8')
+
+    with pytest.raises(ValueError, match='either the flat key or nested recovery mapping'):
+        _config(controller_config_file=external_config)
+
+
+@pytest.mark.parametrize('mode', ['search', '', None, True])
+def test_simulation_rejects_unknown_recovery_mode(tmp_path, mode):
+    external_config = tmp_path / 'collision_aware_servo.yaml'
+    data = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    data['recovery']['mode'] = mode
+    external_config.write_text(yaml.safe_dump(data), encoding='utf-8')
+
+    with pytest.raises(ValueError, match='recovery.mode must be compact or disabled'):
+        _config(controller_config_file=external_config)
+
+
+def test_simulation_rejects_unknown_recovery_settings(tmp_path):
+    external_config = tmp_path / 'collision_aware_servo.yaml'
+    data = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    data['recovery']['future_mode'] = 'search'
+    external_config.write_text(yaml.safe_dump(data), encoding='utf-8')
+
+    with pytest.raises(ValueError, match='recovery: unknown settings'):
+        _config(controller_config_file=external_config)
+
+
 @pytest.mark.parametrize('scale', [0, -0.1, float('nan'), float('inf'), True])
 def test_compact_speed_scale_must_be_finite_and_positive(tmp_path, scale):
     external_config = tmp_path / 'collision_aware_servo.yaml'
