@@ -3,6 +3,9 @@
 
 #include "collision_aware_servo_component.hpp"
 
+#include <builtin_interfaces/msg/duration.hpp>
+#include <builtin_interfaces/msg/time.hpp>
+
 namespace face_tracking_arm
 {
 namespace
@@ -22,149 +25,6 @@ control::JointMotionState to_motion_state(const moveit_servo::KinematicState & s
 }
 
 }  // namespace
-
-const control::PublishedTrajectoryRecord * CollisionAwareServoComponent::active_published_record()
-const noexcept
-{
-  return active_publication_id_.has_value() ?
-         published_trajectory_history_.find(*active_publication_id_) : nullptr;
-}
-
-std::optional<ExpectedCommandState> CollisionAwareServoComponent::expected_command_state_at(
-  const rclcpp::Time & sample_time) const
-{
-  const auto * published_record = active_published_record();
-  if (published_record == nullptr ||
-    published_record->execution_queue.size() < 3U ||
-    (!command_epoch_has_published_ && !published_tail_rearm_pending_))
-  {
-    return std::nullopt;
-  }
-  const auto & queue = published_record->execution_queue;
-
-  // composeTrajectoryMessage intentionally withholds the final queue entry.
-  const auto last_state = std::prev(queue.end(), 2);
-  if (sample_time < queue.front().time_stamp ||
-    sample_time > last_state->time_stamp)
-  {
-    return std::nullopt;
-  }
-
-  auto end = std::find_if(
-    queue.begin(), std::next(last_state),
-    [&sample_time](const moveit_servo::KinematicState & state) {
-      return state.time_stamp >= sample_time;
-    });
-  if (end == queue.begin()) {
-    ++end;
-  } else if (end == std::next(last_state)) {
-    end = last_state;
-  }
-  const auto start = std::prev(end);
-  const double duration_sec = (end->time_stamp - start->time_stamp).seconds();
-  if (!std::isfinite(duration_sec) || duration_sec <= 0.0 ||
-    start->positions.size() != end->positions.size())
-  {
-    return std::nullopt;
-  }
-  const double elapsed_sec = (sample_time - start->time_stamp).seconds();
-  const double ratio = std::clamp(elapsed_sec / duration_sec, 0.0, 1.0);
-
-  ExpectedCommandState expected;
-  expected.positions = start->positions + ratio * (end->positions - start->positions);
-  expected.velocities = (end->positions - start->positions) / duration_sec;
-  if (!expected.positions.allFinite() || !expected.velocities.allFinite()) {
-    return std::nullopt;
-  }
-  return expected;
-}
-
-TimelineRecoveryStatus CollisionAwareServoComponent::recover_published_timeline(
-  const std::uint64_t skipped_periods, const rclcpp::Time & current_time,
-  std::string & failure_reason)
-{
-  if (!command_epoch_active_ || skipped_periods == 0U) {
-    return TimelineRecoveryStatus::kSuccess;
-  }
-  const auto * published_record = active_published_record();
-  if (!command_epoch_has_published_ || command_queue_.empty() ||
-    published_record == nullptr || published_record->execution_queue.size() < 3U)
-  {
-    failure_reason = "active epoch has no recoverable published suffix";
-    return TimelineRecoveryStatus::kInvariantFailure;
-  }
-
-  const rclcpp::Duration retained_history = rclcpp::Duration::from_seconds(
-    servo_parameters_.max_expected_latency);
-  while (command_queue_.size() > 1U &&
-    command_queue_.front().time_stamp < current_time - retained_history)
-  {
-    command_queue_.pop_front();
-  }
-
-  // The final execution-queue entry is intentionally withheld by MoveIt
-  // Servo's trajectory composer, so it must never become a recovery anchor.
-  const auto & published_queue = published_record->execution_queue;
-  const auto transmitted_end = std::prev(published_queue.end());
-  const auto current_branch = std::find_if(
-    published_queue.begin(), transmitted_end,
-    [this](const moveit_servo::KinematicState & state) {
-      return state.time_stamp == command_queue_.back().time_stamp;
-    });
-  if (current_branch == transmitted_end ||
-    !current_branch->positions.isApprox(command_queue_.back().positions, kFiniteEpsilon) ||
-    !current_branch->velocities.isApprox(command_queue_.back().velocities, kFiniteEpsilon) ||
-    !current_branch->accelerations.isApprox(
-      command_queue_.back().accelerations, kFiniteEpsilon))
-  {
-    failure_reason = "current branch is not an exact prefix of the transmitted trajectory";
-    return TimelineRecoveryStatus::kInvariantFailure;
-  }
-
-  const auto available_periods = static_cast<std::uint64_t>(
-    std::distance(std::next(current_branch), transmitted_end));
-  if (skipped_periods > available_periods) {
-    failure_reason = "transmitted braking suffix is too short for the delayed callback";
-    return TimelineRecoveryStatus::kExhaustedPublishedSuffix;
-  }
-  const auto recovery_anchor = std::next(
-    current_branch, static_cast<std::ptrdiff_t>(skipped_periods));
-
-  const std::size_t recovered_periods = static_cast<std::size_t>(skipped_periods);
-  // Retained past points are useful for matching a replacement, but they are
-  // not part of the future safety horizon. Drop only the oldest history when
-  // a delayed callback needs room for already-published future samples.
-  while (command_queue_.size() > 1U &&
-    command_queue_.size() + recovered_periods > max_command_queue_points_)
-  {
-    command_queue_.pop_front();
-  }
-  if (command_queue_.size() + recovered_periods > max_command_queue_points_) {
-    failure_reason = "published recovery span exceeds the command queue hard bound";
-    return TimelineRecoveryStatus::kExhaustedPublishedSuffix;
-  }
-
-  auto previous_stamp = current_branch->time_stamp;
-  for (auto point = std::next(current_branch); point != std::next(recovery_anchor); ++point) {
-    if (!finite_state(*point, parameters_.joint_names.size()) ||
-      point->time_stamp - previous_stamp !=
-      rclcpp::Duration::from_nanoseconds(control_time_grid_->periodNs()))
-    {
-      failure_reason = "published recovery prefix left the fixed command grid";
-      return TimelineRecoveryStatus::kInvariantFailure;
-    }
-    previous_stamp = point->time_stamp;
-  }
-  if (!control_time_grid_->adoptPublishedStamp(recovery_anchor->time_stamp.nanoseconds())) {
-    failure_reason = "recovery anchor was not on the active command grid";
-    return TimelineRecoveryStatus::kInvariantFailure;
-  }
-  command_queue_.insert(
-    command_queue_.end(), std::next(current_branch), std::next(recovery_anchor));
-  ++timeline_recovery_events_;
-  timeline_recovered_periods_ += recovered_periods;
-  return TimelineRecoveryStatus::kSuccess;
-}
 
 std::optional<BootstrapCommand> CollisionAwareServoComponent::make_stationary_bootstrap(
   const moveit_servo::KinematicState & measured_state,
@@ -204,50 +64,46 @@ std::optional<BootstrapCommand> CollisionAwareServoComponent::make_stationary_bo
   if (maximum_difference(
       controller_state->reference.positions,
       controller_state->output.positions) > kControllerCommandAlignmentToleranceRad ||
-    maximum_difference(
-      controller_state->reference.positions,
-      controller_state->feedback.positions) >
-    parameters_.collision_tracking_error_bound_rad ||
     maximum_absolute(controller_state->reference.velocities) > kStoppedVelocityRadps ||
-    maximum_absolute(controller_state->feedback.velocities) > kStoppedVelocityRadps)
+    maximum_absolute(controller_state->feedback.velocities) > kStoppedVelocityRadps ||
+    measured_state.velocities.cwiseAbs().maxCoeff() > kStoppedVelocityRadps)
   {
     failure_kind = BootstrapFailureKind::kRetryableState;
-    failure_reason = "trajectory controller left its settled hold before bootstrap";
+    failure_reason =
+      "trajectory controller or measured state left its stationary hold before bootstrap";
     return std::nullopt;
   }
 
   moveit_servo::KinematicState stationary_state(
     static_cast<int>(parameters_.joint_names.size()));
   stationary_state.joint_names = parameters_.joint_names;
-  stationary_state.positions = Eigen::Map<const Eigen::VectorXd>(
-    controller_state->reference.positions.data(),
-    static_cast<Eigen::Index>(controller_state->reference.positions.size()));
+  stationary_state.positions = measured_state.positions;
   stationary_state.velocities.setZero();
   stationary_state.accelerations.setZero();
 
   const control::JointMotionState measured_motion_state = to_motion_state(measured_state);
   const control::JointMotionState stationary_motion_state = to_motion_state(stationary_state);
-  ++segment_validation_count_;
-  ++bootstrap_segment_validation_count_;
+  ++telemetry_.segment_validation_count;
+  ++telemetry_.bootstrap_segment_validation_count;
   const control::CollisionSegmentValidationResult bootstrap_segment =
     collision_constraint_builder_->validateSegment(
     planning_scene, robot_state, *joint_model_group_, measured_motion_state,
     stationary_motion_state,
     static_cast<std::size_t>(parameters_.segment_validation_substeps));
-  observe_clearances(
+  telemetry_.observeClearances(
     bootstrap_segment.minimum_self_distance_m,
     bootstrap_segment.minimum_world_distance_m);
   if (!bootstrap_segment.input_valid || bootstrap_segment.unsafe) {
     record_segment_rejection(CommandAttempt::kBraking, bootstrap_segment);
     failure_reason = "stationary bootstrap rejected: " +
-      last_segment_rejection_reason_;
+      telemetry_.last_segment_rejection_reason;
     return std::nullopt;
   }
 
   control::EmergencyBrakeTail stationary_tail =
     emergency_brake_tail_generator_->generate(stationary_motion_state, motion_limits_);
   if (!stationary_tail.command_available()) {
-    ++braking_tail_generation_failure_count_;
+    ++telemetry_.braking_tail_generation_failure_count;
     failure_reason = "stationary bootstrap tail is unavailable: " +
       stationary_tail.failure_reason;
     return std::nullopt;
@@ -269,12 +125,14 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
   const bool segment_validation_required,
   const CommandAttempt attempt,
   std::string & failure_reason,
-  const control::CollisionConstraintDiagnostics * path_clearance)
+  const control::CollisionConstraintDiagnostics & collision_diagnostics,
+  CandidateRejectionKind & rejection_kind)
 {
+  rejection_kind = CandidateRejectionKind::kOther;
   auto next_state = make_next_state(
     robot_state, current_state, joint_velocity, failure_reason);
   if (!next_state.has_value()) {
-    ++moveit_validation_failure_count_;
+    ++telemetry_.moveit_validation_failure_count;
     RCLCPP_WARN(
       get_logger(), "%s MoveIt Servo validation rejected the command: %s",
       command_attempt_name(attempt), failure_reason.c_str());
@@ -282,29 +140,42 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
   }
 
   const control::JointMotionState candidate_motion_state = to_motion_state(*next_state);
-  // The QP already enforces a jerk-aware stopping envelope at every control
-  // tick. Re-running mesh FCL over the candidate and its complete braking
-  // suffix in free space used more than one 10 ms period and starved the JTC
-  // command buffer. Keep the expensive sampled check as a last-line guard at
-  // the configured hard-boundary activation distance only.
-  const bool path_requires_sampling = path_clearance &&
+  if (motion_reference_) {
+    std::string motion_reference_violation;
+    if (!motion_reference_->validateCommandPosition(
+        *robot_state, candidate_motion_state.position, &motion_reference_violation))
+    {
+      failure_reason = motion_reference_->compactManeuverActive() ?
+        "Compact command violates its committed " + motion_reference_violation +
+        " constraint" :
+        "FACE command violates its armed " + motion_reference_violation + " guard";
+      ++telemetry_.moveit_validation_failure_count;
+      return std::nullopt;
+    }
+  }
+  // The QP enforces a jerk-aware stopping envelope at every control tick.
+  // Validate the next segment when its distance reserve is active or its
+  // conservative distance certificate is inconclusive. The complete braking
+  // suffix is separately certified before publication, using a whole-path
+  // bound when possible and sampled checks for unresolved blocks otherwise.
+  const bool path_requires_sampling =
     !collision_constraint_builder_->canCertifySegment(
-    *path_clearance, current_motion_state.position, candidate_motion_state.position);
+    collision_diagnostics, current_motion_state.position, candidate_motion_state.position);
   if (segment_validation_required || path_requires_sampling) {
-    ++segment_validation_count_;
+    ++telemetry_.segment_validation_count;
     const auto segment_validation_start = std::chrono::steady_clock::now();
     const control::CollisionSegmentValidationResult segment_result =
       collision_constraint_builder_->validateSegment(
       planning_scene, *robot_state, *joint_model_group_, current_motion_state,
       candidate_motion_state,
       static_cast<std::size_t>(parameters_.segment_validation_substeps));
-    (void)segment_validation_statistics_.add(std::chrono::duration<double, std::milli>(
+    (void)telemetry_.segment_validation_statistics.add(std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - segment_validation_start).count());
-    observe_clearances(
+    telemetry_.observeClearances(
       segment_result.minimum_self_distance_m, segment_result.minimum_world_distance_m);
     if (!segment_result.input_valid || segment_result.unsafe) {
       record_segment_rejection(attempt, segment_result);
-      failure_reason = last_segment_rejection_reason_;
+      failure_reason = telemetry_.last_segment_rejection_reason;
       return std::nullopt;
     }
   }
@@ -312,7 +183,7 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
   control::EmergencyBrakeTail braking_tail =
     emergency_brake_tail_generator_->generate(candidate_motion_state, motion_limits_);
   if (!braking_tail.command_available()) {
-    ++braking_tail_generation_failure_count_;
+    ++telemetry_.braking_tail_generation_failure_count;
     RCLCPP_WARN(
       get_logger(), "%s braking-tail candidate rejected: %s",
       command_attempt_name(attempt), braking_tail.failure_reason.c_str());
@@ -330,8 +201,41 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
       braking_tail.failure_reason;
     return std::nullopt;
   }
+  if (motion_reference_) {
+    for (const auto & point : braking_tail.points) {
+      std::string motion_reference_violation;
+      if (!motion_reference_->validateCommandPosition(
+          *robot_state, point.position, &motion_reference_violation))
+      {
+        failure_reason = motion_reference_->compactManeuverActive() ?
+          "Compact emergency-braking suffix violates its committed " +
+          motion_reference_violation + " constraint" :
+          "FACE emergency-braking suffix violates its armed " +
+          motion_reference_violation + " guard";
+        if (motion_reference_->compactManeuverActive()) {
+          rejection_kind = CandidateRejectionKind::kCompactStopEnvelope;
+        }
+        ++telemetry_.braking_tail_generation_failure_count;
+        return std::nullopt;
+      }
+    }
+  }
 
-  if (segment_validation_required) {
+  const bool braking_tail_certified = collision_constraint_builder_->canCertifyPath(
+    collision_diagnostics, braking_tail.points);
+  telemetry_.last_braking_tail_certified_segment_count = 0U;
+  telemetry_.last_braking_tail_uncertified_segment_count = 0U;
+  for (std::size_t index = 0U; index + 1U < braking_tail.points.size(); ++index) {
+    if (collision_constraint_builder_->canCertifySegment(
+        collision_diagnostics, braking_tail.points[index].position,
+        braking_tail.points[index + 1U].position))
+    {
+      ++telemetry_.last_braking_tail_certified_segment_count;
+    } else {
+      ++telemetry_.last_braking_tail_uncertified_segment_count;
+    }
+  }
+  if (!braking_tail_certified) {
     moveit::core::RobotState tail_robot_state(*robot_state);
     const auto & tail_start = braking_tail.points.front();
     tail_robot_state.setJointGroupPositions(joint_model_group_, tail_start.position);
@@ -340,21 +244,27 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
       joint_model_group_, tail_start.acceleration);
     tail_robot_state.update();
     const std::size_t tail_segment_count = braking_tail.points.size() - 1U;
-    segment_validation_count_ += tail_segment_count;
-    braking_tail_segment_validation_count_ += tail_segment_count;
+    telemetry_.segment_validation_count += tail_segment_count;
+    telemetry_.braking_tail_segment_validation_count += tail_segment_count;
     const auto path_validation_start = std::chrono::steady_clock::now();
     const control::CollisionSegmentValidationResult tail_path =
       collision_constraint_builder_->validatePath(
       planning_scene, tail_robot_state, *joint_model_group_, braking_tail.points,
       static_cast<std::size_t>(parameters_.segment_validation_substeps));
-    (void)path_validation_statistics_.add(std::chrono::duration<double, std::milli>(
+    telemetry_.braking_tail_distance_query_count += tail_path.distance_query_count;
+    telemetry_.braking_tail_certified_path_block_count +=
+      tail_path.certified_path_block_count;
+    telemetry_.braking_tail_inconclusive_path_block_count +=
+      tail_path.inconclusive_path_block_count;
+    (void)telemetry_.path_validation_statistics.add(std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - path_validation_start).count());
-    observe_clearances(tail_path.minimum_self_distance_m, tail_path.minimum_world_distance_m);
+    telemetry_.observeClearances(tail_path.minimum_self_distance_m,
+        tail_path.minimum_world_distance_m);
     if (!tail_path.input_valid || tail_path.unsafe) {
-      ++braking_tail_collision_rejection_count_;
+      ++telemetry_.braking_tail_collision_rejection_count;
       record_segment_rejection(attempt, tail_path);
       failure_reason = "pre-published braking tail rejected: " +
-        last_segment_rejection_reason_;
+        telemetry_.last_segment_rejection_reason;
       return std::nullopt;
     }
   }
@@ -427,7 +337,7 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
     return CommandPublicationStatus::kInvariantFailure;
   }
   const auto make_stamp = [this, &scheduling_time, initial_lead_ns, minimum_lead_ns]() {
-      const auto stamp_ns = control_time_grid_->commandStamp(
+      const auto stamp_ns = commands_.time_grid->commandStamp(
         scheduling_time.nanoseconds(), initial_lead_ns, minimum_lead_ns);
       if (!stamp_ns.has_value()) {
         return std::optional<rclcpp::Time>{};
@@ -436,12 +346,12 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
           *stamp_ns, scheduling_time.get_clock_type())};
     };
 
-  if (!command_queue_.empty() && !command_epoch_active_) {
+  if (!commands_.queue.empty() && !commands_.epoch_active) {
     failure_reason = "Inactive command epoch retained an online branch";
     return CommandPublicationStatus::kInvariantFailure;
   }
-  if (command_queue_.empty()) {
-    if (command_epoch_active_) {
+  if (commands_.queue.empty()) {
+    if (commands_.epoch_active) {
       failure_reason = "Command epoch lost its buffered timeline";
       return CommandPublicationStatus::kInvariantFailure;
     }
@@ -452,48 +362,48 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
       return CommandPublicationStatus::kInvariantFailure;
     }
     seed.time_stamp = *seed_stamp;
-    command_queue_.push_back(std::move(seed));
-    command_epoch_active_ = true;
-    command_epoch_has_published_ = false;
+    commands_.queue.push_back(std::move(seed));
+    commands_.epoch_active = true;
+    commands_.epoch_has_published = false;
   }
 
-  if (command_queue_.size() + 1U > max_command_queue_points_) {
+  if (commands_.queue.size() + 1U > commands_.max_queue_points) {
     failure_reason = "Command queue exceeded its calibrated hard size bound";
     return CommandPublicationStatus::kInvariantFailure;
   }
   const auto next_stamp = make_stamp();
   if (!next_stamp.has_value()) {
     failure_reason = "Command buffer fell below the minimum safe lead";
-    return CommandPublicationStatus::kRecoverableTimingFailure;
+    return CommandPublicationStatus::kRecoverableCommandDeadline;
   }
-  const rclcpp::Duration interval = *next_stamp - command_queue_.back().time_stamp;
-  if (interval.nanoseconds() != control_time_grid_->periodNs()) {
+  const rclcpp::Duration interval = *next_stamp - commands_.queue.back().time_stamp;
+  if (interval.nanoseconds() != commands_.time_grid->periodNs()) {
     failure_reason = "Command timeline interval left the fixed control grid";
     return CommandPublicationStatus::kInvariantFailure;
   }
   command.next_state.time_stamp = *next_stamp;
-  command_queue_.push_back(std::move(command.next_state));
+  commands_.queue.push_back(std::move(command.next_state));
 
   if (command.braking_tail.points.size() < 3U ||
     command.braking_tail.first_stationary_point >= command.braking_tail.points.size() ||
     command.braking_tail.points.size() -
     command.braking_tail.first_stationary_point < 3U ||
     !command.braking_tail.points.front().position.isApprox(
-      command_queue_.back().positions, kFiniteEpsilon) ||
+      commands_.queue.back().positions, kFiniteEpsilon) ||
     !command.braking_tail.points.front().velocity.isApprox(
-      command_queue_.back().velocities, kFiniteEpsilon) ||
+      commands_.queue.back().velocities, kFiniteEpsilon) ||
     !command.braking_tail.points.front().acceleration.isApprox(
-      command_queue_.back().accelerations, kFiniteEpsilon))
+      commands_.queue.back().accelerations, kFiniteEpsilon))
   {
     failure_reason = "Validated braking tail does not start at the command branch";
     return CommandPublicationStatus::kInvariantFailure;
   }
 
-  const auto * previous_publication = active_published_record();
-  if (previous_publication != nullptr && command_queue_.size() >= 2U) {
+  const auto * previous_publication = commands_.activePublication();
+  if (previous_publication != nullptr && commands_.queue.size() >= 2U) {
     const auto & previous_queue = previous_publication->execution_queue;
-    const auto new_branch = std::prev(command_queue_.end());
-    for (auto branch = command_queue_.begin(); branch != new_branch; ++branch) {
+    const auto new_branch = std::prev(commands_.queue.end());
+    for (auto branch = commands_.queue.begin(); branch != new_branch; ++branch) {
       const auto published_match = std::find_if(
         previous_queue.begin(), previous_queue.end(),
         [&branch](const moveit_servo::KinematicState & published_state) {
@@ -510,9 +420,9 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
     }
   }
 
-  std::deque<moveit_servo::KinematicState> publication_queue = command_queue_;
+  std::deque<moveit_servo::KinematicState> publication_queue = commands_.queue;
   const rclcpp::Duration period = rclcpp::Duration::from_nanoseconds(
-    control_time_grid_->periodNs());
+    commands_.time_grid->periodNs());
   for (std::size_t index = 1; index < command.braking_tail.points.size(); ++index) {
     const control::JointMotionState & tail_point = command.braking_tail.points[index];
     moveit_servo::KinematicState state(
@@ -533,8 +443,8 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
     // previous branch point, one period before the new waypoint itself.
     const rclcpp::Time replacement_commit_time =
       previous_publication == nullptr ?
-      command_queue_.front().time_stamp :
-      std::prev(command_queue_.end(), 2)->time_stamp;
+      commands_.queue.front().time_stamp :
+      std::prev(commands_.queue.end(), 2)->time_stamp;
     const double replacement_lead_sec =
       (replacement_commit_time - send_time).seconds();
     if (!std::isfinite(replacement_lead_sec) ||
@@ -553,35 +463,35 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
         "Checked trajectory reached publication with less than the residual safety horizon";
       return CommandPublicationStatus::kRecoverableTimingFailure;
     }
-    last_published_horizon_sec_ = published_horizon_sec;
-    if (!minimum_published_horizon_sec_.has_value() ||
-      published_horizon_sec < *minimum_published_horizon_sec_)
+    telemetry_.last_published_horizon_sec = published_horizon_sec;
+    if (!telemetry_.minimum_published_horizon_sec.has_value() ||
+      published_horizon_sec < *telemetry_.minimum_published_horizon_sec)
     {
-      minimum_published_horizon_sec_ = published_horizon_sec;
+      telemetry_.minimum_published_horizon_sec = published_horizon_sec;
     }
-    const rclcpp::Time stationary_time = command_queue_.back().time_stamp +
+    const rclcpp::Time stationary_time = commands_.queue.back().time_stamp +
       rclcpp::Duration::from_nanoseconds(
-      control_time_grid_->periodNs() * static_cast<std::int64_t>(
+      commands_.time_grid->periodNs() * static_cast<std::int64_t>(
         command.braking_tail.first_stationary_point));
-    const auto publication_id = published_trajectory_history_.append(
+    const auto publication_id = commands_.publications.append(
       std::move(publication_queue), stationary_time);
     if (!publication_id.has_value()) {
       failure_reason = "Published trajectory history rejected a checked command";
       return CommandPublicationStatus::kInvariantFailure;
     }
     trajectory_publisher_->publish(*trajectory);
-    active_publication_id_ = *publication_id;
-    last_replacement_lead_sec_ = replacement_lead_sec;
-    if (!minimum_replacement_lead_sec_.has_value() ||
-      replacement_lead_sec < *minimum_replacement_lead_sec_)
+    commands_.active_publication_id = *publication_id;
+    telemetry_.last_replacement_lead_sec = replacement_lead_sec;
+    if (!telemetry_.minimum_replacement_lead_sec.has_value() ||
+      replacement_lead_sec < *telemetry_.minimum_replacement_lead_sec)
     {
-      minimum_replacement_lead_sec_ = replacement_lead_sec;
+      telemetry_.minimum_replacement_lead_sec = replacement_lead_sec;
     }
-    last_braking_tail_points_ = command.braking_tail.points.size() - 1U;
-    maximum_braking_tail_points_ = std::max(
-      maximum_braking_tail_points_, last_braking_tail_points_);
-    ++published_command_count_;
-    command_epoch_has_published_ = true;
+    telemetry_.last_braking_tail_points = command.braking_tail.points.size() - 1U;
+    telemetry_.maximum_braking_tail_points = std::max(
+      telemetry_.maximum_braking_tail_points, telemetry_.last_braking_tail_points);
+    ++telemetry_.published_command_count;
+    commands_.epoch_has_published = true;
     return CommandPublicationStatus::kSuccess;
   }
   failure_reason = "MoveIt Servo could not compose the buffered trajectory";
@@ -593,21 +503,112 @@ void CollisionAwareServoComponent::process_startup_cycle(
   const moveit::core::RobotState & robot_state,
   const planning_scene::PlanningScene & planning_scene)
 {
-  if (!startup_warmup_complete_) {
-    ++startup_warmup_cycles_;
+  if (!commands_.startup_warmup_complete) {
+    ++commands_.startup_warmup_cycles;
     controller_mode_ = ControllerMode::kBraking;
-    if (startup_warmup_cycles_ >= kRequiredStartupWarmupCycles) {
-      startup_warmup_complete_ = true;
+    if (commands_.startup_warmup_cycles >= kRequiredStartupWarmupCycles) {
+      commands_.startup_warmup_complete = true;
     }
     publish_status(
       moveit_msgs::msg::ServoStatus::NO_WARNING,
       "Priming collision and solver caches before starting the command timeline (" +
-      std::to_string(startup_warmup_cycles_) + "/" +
+      std::to_string(commands_.startup_warmup_cycles) + "/" +
       std::to_string(kRequiredStartupWarmupCycles) + ")");
     return;
   }
 
-  if (!command_epoch_active_) {
+  if (commands_.bootstrap_reset_ack_pending) {
+    const auto controller_state = current_controller_state();
+    if (!controller_state.has_value()) {
+      publish_status(
+        moveit_msgs::msg::ServoStatus::NO_WARNING,
+        "Stationary controller reset is waiting for fresh feedback");
+      return;
+    }
+    std::string feedback_failure;
+    if (std::abs(controller_state->speed_scaling_factor - 1.0) >
+      kControllerSpeedScalingTolerance ||
+      !feedback_motion_within_limits(*controller_state, feedback_failure))
+    {
+      enter_safety_wait(
+        "Stationary controller reset feedback is unsafe" +
+        (feedback_failure.empty() ? std::string{} : ": " + feedback_failure));
+      return;
+    }
+    if (!commands_.bootstrap_reset_positions.has_value()) {
+      enter_safety_wait("Stationary controller reset lost its measured target");
+      return;
+    }
+    const auto map_values = [](const std::vector<double> & values) {
+        return Eigen::Map<const Eigen::VectorXd>(
+          values.data(), static_cast<Eigen::Index>(values.size())).eval();
+      };
+    const Eigen::VectorXd measured_positions = state.positions;
+    const bool measured_state_matches_reset = measured_positions.size() ==
+      commands_.bootstrap_reset_positions->size() && measured_positions.allFinite() &&
+      (measured_positions - *commands_.bootstrap_reset_positions).cwiseAbs().maxCoeff() <=
+      parameters_.collision_tracking_error_bound_rad;
+    const bool acknowledged = commands_.observeBootstrapResetAcknowledgement(
+      rclcpp::Time(controller_state->header.stamp, get_clock()->get_clock_type()),
+      *commands_.bootstrap_reset_positions,
+      map_values(controller_state->reference.positions),
+      map_values(controller_state->output.positions),
+      map_values(controller_state->feedback.positions),
+      map_values(controller_state->reference.velocities),
+      map_values(controller_state->feedback.velocities),
+      kControllerCommandAlignmentToleranceRad,
+      parameters_.collision_tracking_error_bound_rad, kStoppedVelocityRadps,
+      measured_state_matches_reset);
+    if (!acknowledged) {
+      publish_status(
+        moveit_msgs::msg::ServoStatus::NO_WARNING,
+        "Stationary controller reset is waiting for three fresh settled acknowledgements");
+      return;
+    }
+    commands_.bootstrap_reset_ack_pending = false;
+    commands_.bootstrap_reset_published_time.reset();
+  }
+
+  if (!commands_.epoch_active) {
+    if (!commands_.bootstrap_reset_positions.has_value()) {
+      const auto controller_state = current_controller_state();
+      if (!controller_state.has_value()) {
+        publish_status(
+          moveit_msgs::msg::ServoStatus::NO_WARNING,
+          "Stationary controller hold is waiting for fresh feedback");
+        return;
+      }
+      std::string feedback_failure;
+      if (std::abs(controller_state->speed_scaling_factor - 1.0) >
+        kControllerSpeedScalingTolerance ||
+        !feedback_motion_within_limits(*controller_state, feedback_failure))
+      {
+        enter_safety_wait(
+          "Stationary controller hold is unsafe" +
+          (feedback_failure.empty() ? std::string{} : ": " + feedback_failure));
+        return;
+      }
+      const auto map_values = [](const std::vector<double> & values) {
+          return Eigen::Map<const Eigen::VectorXd>(
+            values.data(), static_cast<Eigen::Index>(values.size())).eval();
+        };
+      const bool source_hold_ready = commands_.observeBootstrapSourceHold(
+        rclcpp::Time(controller_state->header.stamp, get_clock()->get_clock_type()),
+        map_values(controller_state->reference.positions),
+        map_values(controller_state->output.positions),
+        map_values(controller_state->feedback.positions),
+        map_values(controller_state->reference.velocities),
+        map_values(controller_state->feedback.velocities),
+        kControllerCommandAlignmentToleranceRad,
+        parameters_.collision_tracking_error_bound_rad, kStoppedVelocityRadps, true);
+      if (!source_hold_ready) {
+        publish_status(
+          moveit_msgs::msg::ServoStatus::NO_WARNING,
+          "Stationary controller hold is confirming three fresh stable samples");
+        return;
+      }
+    }
+
     std::string bootstrap_failure;
     BootstrapFailureKind bootstrap_failure_kind =
       BootstrapFailureKind::kSafetyOrInvariant;
@@ -623,34 +624,66 @@ void CollisionAwareServoComponent::process_startup_cycle(
       }
       return;
     }
+
+    if (!commands_.bootstrap_reset_positions.has_value()) {
+      // Replace only a stationary controller hold. A zero-stamped t=0 point
+      // makes Jazzy JTC sample this measured hold immediately instead of
+      // blending from its previous desired state to the fresh actual state.
+      trajectory_msgs::msg::JointTrajectory reset_trajectory;
+      reset_trajectory.joint_names = parameters_.joint_names;
+      reset_trajectory.header.stamp = builtin_interfaces::msg::Time{};
+      trajectory_msgs::msg::JointTrajectoryPoint reset_point;
+      reset_point.positions.assign(
+        bootstrap->seed_state.positions.data(),
+        bootstrap->seed_state.positions.data() + bootstrap->seed_state.positions.size());
+      reset_point.velocities.assign(parameters_.joint_names.size(), 0.0);
+      reset_point.accelerations.assign(parameters_.joint_names.size(), 0.0);
+      reset_point.time_from_start = builtin_interfaces::msg::Duration{};
+      reset_trajectory.points.push_back(std::move(reset_point));
+      commands_.bootstrap_reset_published_time = bootstrap_time;
+      trajectory_publisher_->publish(reset_trajectory);
+      commands_.bootstrap_reset_positions = bootstrap->seed_state.positions;
+      commands_.bootstrap_reset_ack_pending = true;
+      commands_.bootstrap_reset_stable_samples = 0U;
+      commands_.last_bootstrap_reset_sample_time.reset();
+      commands_.startRearmDeadline(bootstrap_time, std::chrono::steady_clock::now());
+      controller_mode_ = ControllerMode::kBraking;
+      publish_status(
+        moveit_msgs::msg::ServoStatus::NO_WARNING,
+        "Published stationary actual-state reset; waiting for controller acknowledgement");
+      return;
+    }
+
     const CommandPublicationStatus publication_status = enqueue_and_publish(
       bootstrap->seed_state, std::move(bootstrap->first_command),
       bootstrap_time, bootstrap_failure);
     if (publication_status != CommandPublicationStatus::kSuccess) {
-      if (publication_status == CommandPublicationStatus::kRecoverableTimingFailure) {
+      if (publication_status == CommandPublicationStatus::kRecoverableCommandDeadline ||
+        publication_status == CommandPublicationStatus::kRecoverableTimingFailure)
+      {
         enter_startup_retry("Command timeline bootstrap retry: " + bootstrap_failure);
       } else {
         enter_safety_wait("Command timeline bootstrap failed: " + bootstrap_failure);
       }
       return;
     }
-    ++bootstrap_publication_count_;
-    const auto * bootstrap_record = active_published_record();
+    ++telemetry_.bootstrap_publication_count;
+    const auto * bootstrap_record = commands_.activePublication();
     if (bootstrap_record == nullptr || bootstrap_record->execution_queue.empty() ||
-      !active_publication_id_.has_value())
+      !commands_.active_publication_id.has_value())
     {
       enter_safety_wait("Published bootstrap record is unavailable");
       return;
     }
-    bootstrap_ack_pending_ = true;
-    bootstrap_publication_id_ = *active_publication_id_;
-    bootstrap_trajectory_origin_ =
+    commands_.bootstrap_ack_pending = true;
+    commands_.bootstrap_publication_id = *commands_.active_publication_id;
+    commands_.bootstrap_trajectory_origin =
       bootstrap_record->execution_queue.front().time_stamp;
-    bootstrap_seed_positions_ =
+    commands_.bootstrap_seed_positions =
       bootstrap_record->execution_queue.front().positions;
     // A bootstrap acknowledgement is a new bounded phase. Do not inherit a
     // nearly expired settle deadline from the preceding controlled re-arm.
-    start_rearm_deadline(bootstrap_time);
+    commands_.startRearmDeadline(bootstrap_time, std::chrono::steady_clock::now());
     controller_mode_ = ControllerMode::kBraking;
     publish_status(
       moveit_msgs::msg::ServoStatus::NO_WARNING,

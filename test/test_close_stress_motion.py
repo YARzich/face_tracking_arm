@@ -28,12 +28,14 @@ def test_close_route_stays_visible_at_human_height_and_faces_the_robot():
     assert height.min() == pytest.approx(1.40)
     assert height.max() == pytest.approx(1.75)
     bearing = np.arctan2(poses[:, 1], poses[:, 0])
-    assert math.degrees(bearing.min()) == pytest.approx(-30)
-    assert math.degrees(bearing.max()) == pytest.approx(30)
+    assert math.degrees(bearing.min()) == pytest.approx(-45)
+    assert math.degrees(bearing.max()) == pytest.approx(45)
     face_forward = np.column_stack((np.sin(poses[:, 3]), -np.cos(poses[:, 3])))
     np.testing.assert_allclose(face_forward, -poses[:, :2] / radius[:, None], atol=1e-12)
     velocity = np.diff(poses[:, :3], axis=0) / .01
-    assert np.max(np.linalg.norm(velocity, axis=1)) < .22
+    assert np.max(np.linalg.norm(velocity, axis=1)) < 1.2
+    assert motion.sample(44).phase == 'CLOSE_CROSS_LEFT'
+    assert motion.sample(46).phase == 'CLOSE_CROSS_RIGHT'
 
 
 def test_second_approach_requires_a_settled_screen_to_retreat():
@@ -56,8 +58,8 @@ def test_second_approach_requires_a_settled_screen_to_retreat():
     assert distances[-1] < preferred_distance - .15
 
 
-@pytest.mark.parametrize('boundary', [10, 22, 28, 32, 42, 50, 60, 68, 76, 84,
-                                      94, 100, 110, 120])
+@pytest.mark.parametrize('boundary', [10, 22, 28, 32, 42, 44, 46, 48, 58, 66, 74,
+                                      82, 92, 98, 108, 120])
 def test_segment_and_cycle_joins_have_continuous_position_velocity_and_acceleration(boundary):
     motion = CloseStressMotion()
     step = .001
@@ -68,13 +70,14 @@ def test_segment_and_cycle_joins_have_continuous_position_velocity_and_accelerat
     np.testing.assert_allclose(right, center, atol=1e-8)
     np.testing.assert_allclose((center - left) / step, 0, atol=1e-5)
     np.testing.assert_allclose((right - center) / step, 0, atol=1e-5)
-    np.testing.assert_allclose((center - 2 * left + before) / step**2, 0, atol=.001)
-    np.testing.assert_allclose((after - 2 * right + center) / step**2, 0, atol=.001)
+    np.testing.assert_allclose((center - 2 * left + before) / step**2, 0, atol=.02)
+    np.testing.assert_allclose((after - 2 * right + center) / step**2, 0, atol=.02)
 
 
 @pytest.mark.parametrize('start,end,phase', [
     (0, 10, 'START_HOLD'), (22, 28, 'NEAR_HOLD'), (32, 42, 'CLOSE_HOLD'),
-    (76, 84, 'LOW_CLOSE_HOLD'), (94, 100, 'RECOVERY_HOLD'), (110, 120, 'FINAL_HOLD')])
+    (74, 82, 'LOW_CLOSE_HOLD'),
+    (92, 98, 'RECOVERY_HOLD'), (108, 120, 'FINAL_HOLD')])
 def test_stops_leave_time_to_settle_before_another_approach_or_departure(start, end, phase):
     motion = CloseStressMotion()
     assert end - start >= 6

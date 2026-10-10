@@ -15,7 +15,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
 
-from face_tracking_perception.arm_scene import write_vision_world  # noqa: E402, I100
+from face_tracking_perception.arm_scene import (  # noqa: E402, I100
+    write_collisionless_person_model, write_vision_world)
 from face_tracking_perception.stress_motion import StressMotion  # noqa: E402
 
 
@@ -120,6 +121,23 @@ def test_world_starts_with_visible_stress_person_and_keeps_other_people_hidden(t
     for name in ('round_table', 'ground_plane'):
         query = f"world/model[@name='{name}']"
         assert ET.tostring(original.find(query)) == ET.tostring(result.find(query))
+
+
+def test_collisionless_person_copy_keeps_visuals_and_preserves_cached_model(tmp_path):
+    source = tmp_path / 'cached/person_standing'
+    source.mkdir(parents=True)
+    source_sdf = source / 'model.sdf'
+    source_sdf.write_text(
+        '<sdf><model name="person"><link name="body">'
+        '<visual name="appearance"><geometry><mesh><uri>standing.dae</uri></mesh>'
+        '</geometry></visual><collision name="body_collision"><geometry><box/>'
+        '</geometry></collision></link></model></sdf>')
+    original = source_sdf.read_bytes()
+    copied = write_collisionless_person_model(source, tmp_path / 'overlay/person_standing')
+    root = ET.parse(copied / 'model.sdf').getroot()
+    assert root.find('.//visual/geometry/mesh/uri').text == 'standing.dae'
+    assert root.findall('.//collision') == []
+    assert source_sdf.read_bytes() == original
 
 
 @pytest.mark.parametrize('pose', [(1, 2, 3), (1, 2, 3, 4, 5), (1, 2, math.nan, 0)])

@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -47,6 +49,27 @@ Projection projectWithinWindow(
     }
   }
   return best;
+}
+
+std::size_t projectionWindowSegments(
+  const std::vector<double> & cumulative_length, const std::size_t first_segment,
+  const std::size_t minimum_segments, const double progress, const double lookahead)
+{
+  if (cumulative_length.size() <= 1U || first_segment >= cumulative_length.size() - 1U) {
+    return 0U;
+  }
+  const std::size_t available_segments = cumulative_length.size() - 1U - first_segment;
+  const double target_progress = std::min(progress + lookahead, cumulative_length.back());
+  const auto search_begin = cumulative_length.begin() +
+    static_cast<std::ptrdiff_t>(first_segment + 1U);
+  const auto search_end = cumulative_length.end();
+  const auto target_vertex = std::lower_bound(search_begin, search_end, target_progress);
+  const std::size_t end_vertex = target_vertex == search_end ?
+    cumulative_length.size() - 1U :
+    static_cast<std::size_t>(std::distance(cumulative_length.begin(), target_vertex));
+  const std::size_t segments_to_lookahead = end_vertex - first_segment;
+  return std::min(
+    available_segments, std::max(minimum_segments, segments_to_lookahead));
 }
 
 }  // namespace
@@ -145,8 +168,11 @@ JointPathUpdate JointPathFollower::update(
     return last_update_;
   }
   last_update_time_sec_ = time_sec;
+  const std::size_t projection_segments = projectionWindowSegments(
+    cumulative_length_, segment_, config_.projection_search_segments,
+    last_update_.progress_rad, config_.lookahead_distance_rad);
   const Projection projection = projectWithinWindow(
-    path_, current_position, segment_, config_.projection_search_segments);
+    path_, current_position, segment_, projection_segments);
   last_update_.distance_from_path_rad = projection.distance;
   if (!std::isfinite(projection.distance) ||
     projection.distance > config_.maximum_corridor_distance_rad)

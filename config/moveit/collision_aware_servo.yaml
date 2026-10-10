@@ -7,11 +7,21 @@ recovery_planner:
   planner_configs:
     RRTConnectkConfigDefault:
       type: geometric::RRTConnect
+      # Compact paths are checked against a narrow roll-valid corridor; short
+      # extensions reduce samples that jump outside it before post-validation.
+      range: 0.10
   xarm6:
     planner_configs: [RRTConnectkConfigDefault]
-    longest_valid_segment_fraction: 0.005
+    # The xArm6 bounded-joint L1 span gives an OMPL segment bound <=0.00966 rad.
+    # Keep it below the compact validator's 0.01 rad step; returned paths are
+    # independently sampled and checked before use.
+    longest_valid_segment_fraction: 0.00019
 trajectory_controller_period_sec: 0.01
 incoming_command_timeout_sec: 0.10
+timing_mode: auto
+source_timeout_sec: 0.50
+face_target_freshness_timeout_sec: 0.50
+face_prediction_timeout_sec: 0.80
 planning_group_name: xarm6
 planning_frame: world
 command_frame: monitor_control_frame
@@ -27,10 +37,12 @@ position_deadband_m: 0.03
 # This 0.29 degree quiet zone keeps pauses near a target reversal short.
 pointing_deadband_rad: 0.005
 # This is a hierarchy-preservation tolerance, not a target accuracy setting.
-# Keep it tight so the lower-priority position task cannot make the screen drift.
-primary_orientation_tolerance_radps: 0.002
-# Screen roll shares the secondary position task; pointing has priority.
-secondary_roll_weight: 0.5
+# Keep it below the first jerk-limited orientation step so a path objective cannot
+# cancel the upright correction at the start of motion.
+primary_orientation_tolerance_radps: 0.0002
+# Roll residual weight within the primary face-orientation task. The parameter
+# name is retained for existing YAML files.
+secondary_roll_weight: 1.0
 velocity_regularization_weight: 0.0001
 
 # Query nearby pairs before the hard boundary so jerk-aware constraints can react.
@@ -59,19 +71,24 @@ collision_tracking_error_bound_rad: 0.006
 # These legacy values are only lower bounds for the unknown-body fallback.
 numerical_distance_reserve_m: 0.0001
 default_distance_lipschitz_m_per_rad: 2.6193
-monitor_near_distance_lipschitz_m_per_rad: 0.4543
 
 # Tracking failures enter constrained braking in the same control tick.
 solver_max_iterations: 2000
 solver_absolute_tolerance: 1.0e-5
 solver_relative_tolerance: 1.0e-5
 solver_time_limit_sec: 0.003
-# Sample the complete candidate/braking path only at the physical hard boundary.
-# In normal motion the 100 Hz jerk-aware QP envelope is the collision guard;
-# repeating mesh checks over every future point would starve the command stream.
+# Every candidate braking tail is checked before publication. A conservative
+# distance certificate can cover the full path; inconclusive blocks are split
+# until dense sampled checks resolve them, with the same clearance margins.
+# These settings also control sampled checks for a candidate's next segment.
 segment_validation_distance_m: 0.015
 segment_validation_substeps: 3
 search_speed_rad_s: 0.30
 search_sweep_half_range_rad: 2.80
 search_local_half_range_rad: 0.35
 search_local_duration_sec: 6.0
+# Скорость компактного разворота: 1.0 — исходная настройка; меньше — медленнее.
+# Большее значение повышает запрос скорости; ограничения плавности сохраняются.
+# После правки перезапустите симуляцию с этим файлом через collision_aware_servo_config_file.
+compact_maneuver:
+  speed_scale: 1.0

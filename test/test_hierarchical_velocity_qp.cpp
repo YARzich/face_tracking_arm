@@ -5,14 +5,17 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <vector>
 
 #include "face_tracking_arm/emergency_brake_tail.hpp"
+#include "face_tracking_arm/detail/scalar_braking_policy.hpp"
 #include "face_tracking_arm/hierarchical_velocity_qp.hpp"
 
 namespace face_tracking_arm::control
@@ -216,6 +219,195 @@ TEST(HierarchicalVelocityQp, PrimaryOrientationWinsAConflictingSecondaryRequest)
   EXPECT_LT(result.joint_velocity[0], 0.81);
 }
 
+TEST(HierarchicalVelocityQp, DefaultPreservationKeepsMultirowPrimaryUnderJerkLimits)
+{
+  const HierarchicalVelocityQpConfig config;
+  EXPECT_DOUBLE_EQ(config.primary_preservation_tolerance, 2.0e-4);
+  const HierarchicalVelocityQp solver{config};
+  JointMotionLimits limits = make_limits(3);
+  limits.max_velocity.setConstant(1.0);
+  limits.max_acceleration.setConstant(2.0);
+  limits.max_jerk.setConstant(20.0);
+  const Eigen::Vector3d primary_reference(0.5, -0.4, 0.3);
+  const Eigen::Matrix3d identity = Eigen::Matrix3d::Identity();
+  const HierarchicalVelocityTask task = make_task(
+    identity, primary_reference, identity, -primary_reference);
+
+  const QpResult result = solver.solve(task, make_state(3), limits);
+
+  ASSERT_TRUE(result.fully_solved());
+  for (Eigen::Index row = 0; row < primary_reference.size(); ++row) {
+    EXPECT_GT(primary_reference[row] * result.joint_velocity[row], 0.0) << "row " << row;
+    EXPECT_GT(
+      primary_reference[row] * result.achieved_primary_velocity[row], 0.0) << "row " << row;
+    EXPECT_GE(std::abs(result.achieved_primary_velocity[row]), 0.0015) << "row " << row;
+    EXPECT_LE(std::abs(result.joint_velocity[row]), 0.0021) << "row " << row;
+  }
+}
+
+TEST(HierarchicalVelocityQp, JerkLimitedBaseHoldLetsOtherJointTrackOrientation)
+{
+  HierarchicalVelocityQpConfig config;
+  config.primary_preservation_tolerance = 2.0e-4;
+  config.solver_absolute_tolerance = 1.0e-5;
+  config.solver_relative_tolerance = 1.0e-5;
+  const HierarchicalVelocityQp solver{config};
+  JointMotionState state = make_state(2);
+  state.position[0] = 0.4;
+  state.velocity[0] = 0.13;  // J1 is still moving outward at its work edge.
+  state.acceleration[0] = 0.2;
+  JointMotionLimits limits = make_limits(2);
+  limits.lower_position << -1.0, -10.0;
+  limits.upper_position << 0.5, 10.0;
+  limits.max_velocity.setConstant(1.0);
+  limits.max_acceleration.setConstant(2.0);
+  limits.max_jerk.setConstant(20.0);
+
+  Eigen::Matrix<double, 1, 2> roll_row;
+  roll_row << 0.0, 1.0;
+  Eigen::Matrix2d path_identity = Eigen::Matrix2d::Identity();
+  detail::ScalarBrakingOptions braking_options;
+  braking_options.period_sec = config.period_sec;
+  braking_options.comparison_tolerance = config.solution_feasibility_tolerance;
+  braking_options.maximum_braking_steps = 1000;
+
+  double roll_error = -0.05;
+  double maximum_base_position = state.position[0];
+  int brake_steps = 0;
+  const auto solve_step = [&](const double base_velocity) {
+      LinearVelocityConstraint j1_hold;
+      j1_hold.coefficients = Eigen::Vector2d(1.0, 0.0);
+      j1_hold.lower_bound = base_velocity;
+      j1_hold.upper_bound = base_velocity;
+      const HierarchicalVelocityTask task = make_task(
+        roll_row, Eigen::VectorXd::Constant(1, 4.0 * roll_error),
+        path_identity, Eigen::Vector2d(-0.5, 0.3));
+      return solver.solve(task, state, limits, {j1_hold});
+    };
+
+  for (; brake_steps < 100; ++brake_steps) {
+    const auto step = detail::scalar_braking_policy::nextStep(
+      state.velocity[0], state.acceleration[0],
+      detail::ScalarBrakingLimits{limits.max_velocity[0], limits.max_acceleration[0],
+        limits.max_jerk[0]}, braking_options);
+    ASSERT_TRUE(step.valid) << "braking tick " << brake_steps;
+    const QpResult result = solve_step(step.velocity);
+    ASSERT_TRUE(result.fully_solved()) << "braking tick " << brake_steps;
+    EXPECT_NEAR(result.joint_velocity[0], step.velocity, 2.0e-5);
+    for (Eigen::Index joint = 0; joint < 2; ++joint) {
+      const double acceleration =
+        (result.joint_velocity[joint] - state.velocity[joint]) / config.period_sec;
+      const double jerk = (acceleration - state.acceleration[joint]) / config.period_sec;
+      EXPECT_LE(std::abs(result.joint_velocity[joint]), limits.max_velocity[joint] + 2.0e-5);
+      EXPECT_LE(std::abs(acceleration), limits.max_acceleration[joint] + 2.0e-5);
+      EXPECT_LE(std::abs(jerk), limits.max_jerk[joint] + 2.0e-5);
+      state.position[joint] += result.joint_velocity[joint] * config.period_sec;
+      state.acceleration[joint] = acceleration;
+    }
+    state.velocity = result.joint_velocity;
+    roll_error -= result.joint_velocity[1] * config.period_sec;
+    maximum_base_position = std::max(maximum_base_position, state.position[0]);
+    if (std::abs(state.velocity[0]) <= 5.0e-5 &&
+      std::abs(state.acceleration[0]) <= 5.0e-3)
+    {
+      ++brake_steps;
+      break;
+    }
+  }
+  ASSERT_LT(brake_steps, 100);
+  const double captured_hold_position = state.position[0];
+  EXPECT_EQ(brake_steps, 18);
+  EXPECT_NEAR(maximum_base_position, captured_hold_position, 2.0e-5);
+  EXPECT_NEAR(captured_hold_position, 0.41049, 1.0e-4);
+  EXPECT_NEAR(roll_error, -0.03169, 2.0e-3);
+  EXPECT_LT(roll_error, -0.005);
+
+  // The committed hold is now a zero-velocity hard row. The secondary path
+  // asks J1 to center inward, while the primary roll task uses joint 2.
+  for (int tick = 0; tick < 150; ++tick) {
+    const QpResult result = solve_step(0.0);
+    ASSERT_TRUE(result.fully_solved()) << "hold tick " << tick;
+    EXPECT_NEAR(result.joint_velocity[0], 0.0, 2.0e-5);
+    EXPECT_NEAR(state.position[0], captured_hold_position, 2.0e-5);
+    for (Eigen::Index joint = 0; joint < 2; ++joint) {
+      const double acceleration =
+        (result.joint_velocity[joint] - state.velocity[joint]) / config.period_sec;
+      const double jerk = (acceleration - state.acceleration[joint]) / config.period_sec;
+      EXPECT_LE(std::abs(acceleration), limits.max_acceleration[joint] + 2.0e-5);
+      EXPECT_LE(std::abs(jerk), limits.max_jerk[joint] + 2.0e-5);
+      state.position[joint] += result.joint_velocity[joint] * config.period_sec;
+      state.acceleration[joint] = acceleration;
+    }
+    state.velocity = result.joint_velocity;
+    roll_error -= result.joint_velocity[1] * config.period_sec;
+  }
+  EXPECT_NEAR(state.position[0], captured_hold_position, 2.0e-5);
+  EXPECT_NEAR(roll_error, 0.0, 0.01);
+  EXPECT_LT(state.velocity[1], 0.0);
+}
+
+TEST(HierarchicalVelocityQp, PrimaryPreservationToleranceControlsMultiTickRollDrift)
+{
+  struct TrackingResult
+  {
+    double first_command{0.0};
+    double final_roll_error{0.0};
+    double maximum_roll_error{0.0};
+  };
+  const auto simulate = [](const double preservation_tolerance) {
+      HierarchicalVelocityQpConfig config;
+      config.primary_preservation_tolerance = preservation_tolerance;
+      config.solver_absolute_tolerance = 1.0e-5;
+      config.solver_relative_tolerance = 1.0e-5;
+      const HierarchicalVelocityQp solver{config};
+      JointMotionState state = make_state(1);
+      JointMotionLimits limits = make_limits(1);
+      limits.lower_position[0] = -10.0;
+      limits.upper_position[0] = 10.0;
+      limits.max_velocity[0] = 1.0;
+      limits.max_acceleration[0] = 2.0;
+      limits.max_jerk[0] = 20.0;
+      Eigen::Matrix<double, 1, 1> roll_row;
+      roll_row << 1.0;
+      double roll_error = -0.1;
+      TrackingResult result_summary;
+      result_summary.maximum_roll_error = std::abs(roll_error);
+      for (int tick = 0; tick < 100; ++tick) {
+        const HierarchicalVelocityTask task = make_task(
+          roll_row, Eigen::VectorXd::Constant(1, 4.0 * roll_error),
+          roll_row, Eigen::VectorXd::Constant(1, 0.4));
+        const QpResult result = solver.solve(task, state, limits);
+        if (!result.command_available()) {
+          return std::optional<TrackingResult>{};
+        }
+        if (tick == 0) {
+          result_summary.first_command = result.joint_velocity[0];
+        }
+        const double acceleration =
+          (result.joint_velocity[0] - state.velocity[0]) / config.period_sec;
+        state.position[0] += result.joint_velocity[0] * config.period_sec;
+        state.acceleration[0] = acceleration;
+        state.velocity = result.joint_velocity;
+        roll_error -= result.joint_velocity[0] * config.period_sec;
+        result_summary.maximum_roll_error = std::max(
+          result_summary.maximum_roll_error, std::abs(roll_error));
+      }
+      result_summary.final_roll_error = roll_error;
+      return std::optional<TrackingResult>{result_summary};
+    };
+
+  const auto production_tolerance = simulate(2.0e-3);
+  const auto tighter_tolerance = simulate(2.0e-4);
+  ASSERT_TRUE(production_tolerance.has_value());
+  ASSERT_TRUE(tighter_tolerance.has_value());
+  EXPECT_GT(production_tolerance->first_command, -1.0e-5);
+  EXPECT_GT(std::abs(production_tolerance->final_roll_error), 0.105);
+  EXPECT_LT(std::abs(production_tolerance->final_roll_error), 0.12);
+  EXPECT_LT(tighter_tolerance->first_command, -1.0e-3);
+  EXPECT_LT(std::abs(tighter_tolerance->final_roll_error), 0.015);
+  EXPECT_LE(tighter_tolerance->maximum_roll_error, 0.1001);
+}
+
 TEST(HierarchicalVelocityQp, AppliesGenericHardVelocityConstraintsInBothStages)
 {
   const HierarchicalVelocityQp solver{make_config()};
@@ -329,6 +521,122 @@ TEST(HierarchicalVelocityQp, BrakingRetainsExternalSafetyRows)
 
   ASSERT_TRUE(result.command_available());
   EXPECT_NEAR(result.joint_velocity[0], 0.25, kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, SolvesNearlyTangentBrakingRowsAndRejectsContradictions)
+{
+  struct TangentCase
+  {
+    std::array<double, 6> position;
+    std::array<double, 6> velocity;
+    std::array<double, 6> acceleration;
+    double corridor_lower;
+    double corridor_upper;
+    std::array<double, 6> contact_coefficients;
+    double contact_lower;
+  };
+  // Recorded braking states where the corridor upper bound and contact
+  // row meet at a feasible corner within a few floating-point ulps.
+  const std::array<TangentCase, 2> cases{{
+    {{5.960496519820877, -0.43688958388824339, -0.72703861510303025,
+      -0.82839894153494298, -1.4436177987342067, 0.84473601951570909},
+      {-0.3294417890399815, -0.13009267322737211, -0.24949826729082525,
+        0.077259127367283853, -0.14411847802484234, 0.079504831245636398},
+      {2.0000000000000018, -1.9999999999999989, 0.21263417731456347,
+        -2.0000000000000004, -1.9829118823534844, 1.2000420841046953},
+      -0.16411847802484233, -0.1619475968483772,
+      {-7.9797279894933126e-17, 2.3245294578089215e-16,
+        2.4286128663675299e-16, 0.037084315694588386, 0.25835238842402286,
+        -1.3877787807814457e-16},
+      -0.039641964258234914},
+    {{5.7879122036751705, -0.32800732028457658, -1.4366573709024333,
+      -1.3044393942847239, -1.391391822185811, 1.5049696127926477},
+      {0.064774742207727665, 0.050250371990259529, 0.31015827939044871,
+        0.16416480211269061, -0.21910603610019239, -0.18333102724386829},
+      {-1.5983792536470587, -0.72378533936061851, 2.0000000000000018,
+        0.78292497382690673, -1.8313012332490775, 1.9999999999999989},
+      -0.23910603610019238, -0.23541904843268316,
+      {-1.7694179454963432e-16, 2.0816681711721685e-17,
+        2.3418766925686896e-17, 0.011880087117186987, 0.24789672264481233,
+        2.3592239273284576e-16},
+      -0.056292546060760791}}};
+
+  HierarchicalVelocityQpConfig config;
+  config.residual_command_latency_sec = 0.0;
+  config.solver_absolute_tolerance = 1.0e-5;
+  config.solver_relative_tolerance = 1.0e-5;
+  config.solver_time_limit_sec = 0.003;
+  config.solver_max_iterations = 2000;
+  const HierarchicalVelocityQp solver{config};
+  JointMotionLimits limits = make_limits(6);
+  limits.lower_position << -6.2831853071795862, -2.059488, -3.92699,
+    -6.2831853071795862, -1.6929689999999999, -6.2831853071795862;
+  limits.upper_position << 6.2831853071795862, 2.094395, 0.19198599999999999,
+    6.2831853071795862, 3.1415926535897931, 6.2831853071795862;
+  limits.max_velocity.setConstant(1.0);
+  limits.max_acceleration.setConstant(2.0);
+  limits.max_jerk.setConstant(20.0);
+
+  EmergencyBrakeTailConfig tail_config;
+  tail_config.period_sec = config.period_sec;
+  const EmergencyBrakeTailGenerator tail_generator{tail_config};
+  for (const TangentCase & tangent_case : cases) {
+    JointMotionState state = make_state(6);
+    for (Eigen::Index index = 0; index < 6; ++index) {
+      state.position[index] = tangent_case.position[static_cast<std::size_t>(index)];
+      state.velocity[index] = tangent_case.velocity[static_cast<std::size_t>(index)];
+      state.acceleration[index] =
+        tangent_case.acceleration[static_cast<std::size_t>(index)];
+    }
+
+    LinearVelocityConstraint corridor;
+    corridor.coefficients = Eigen::VectorXd::Zero(6);
+    corridor.coefficients[4] = 1.0;
+    corridor.lower_bound = tangent_case.corridor_lower;
+    corridor.upper_bound = tangent_case.corridor_upper;
+    LinearVelocityConstraint contact;
+    contact.coefficients.resize(6);
+    for (Eigen::Index index = 0; index < 6; ++index) {
+      contact.coefficients[index] =
+        tangent_case.contact_coefficients[static_cast<std::size_t>(index)];
+    }
+    contact.lower_bound = tangent_case.contact_lower;
+    const std::vector<LinearVelocityConstraint> constraints{corridor, contact};
+
+    const QpResult result = solver.brake(state, limits, constraints);
+
+    ASSERT_TRUE(result.fully_solved());
+    ASSERT_EQ(result.joint_velocity.size(), 6);
+    for (const LinearVelocityConstraint & constraint : constraints) {
+      const double value = constraint.coefficients.dot(result.joint_velocity);
+      EXPECT_GE(value, constraint.lower_bound - config.solution_feasibility_tolerance);
+      EXPECT_LE(value, constraint.upper_bound + config.solution_feasibility_tolerance);
+    }
+    for (Eigen::Index index = 0; index < 6; ++index) {
+      const double acceleration =
+        (result.joint_velocity[index] - state.velocity[index]) / config.period_sec;
+      const double jerk =
+        (acceleration - state.acceleration[index]) / config.period_sec;
+      EXPECT_LE(std::abs(acceleration), limits.max_acceleration[index] + kTolerance);
+      EXPECT_LE(std::abs(jerk), limits.max_jerk[index] + kTolerance);
+    }
+
+    JointMotionState tail_state = state;
+    tail_state.position += result.joint_velocity * config.period_sec;
+    tail_state.acceleration =
+      (result.joint_velocity - state.velocity) / config.period_sec;
+    tail_state.velocity = result.joint_velocity;
+    const EmergencyBrakeTail tail = tail_generator.generate(tail_state, limits);
+    ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
+  }
+
+  LinearVelocityConstraint impossible;
+  impossible.coefficients = Eigen::VectorXd::Ones(1);
+  impossible.lower_bound = 11.0;
+  impossible.upper_bound = std::numeric_limits<double>::infinity();
+  EXPECT_EQ(
+    solver.brake(make_state(1), make_limits(1), {impossible}).status,
+    QpStatus::kInfeasible);
 }
 
 TEST(HierarchicalVelocityQp, PhysicalPositionBoundPreventsACommandFurtherIntoTheLimit)

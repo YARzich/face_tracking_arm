@@ -53,9 +53,7 @@ public:
         }
         for (const auto & status : message->status) {
           if (reports_ready(status)) {
-            started_at_ = now();
-            RCLCPP_INFO(
-              get_logger(), "Tracking is ready; starting test face scenario");
+            ready_seen_ = true;
             return;
           }
         }
@@ -67,14 +65,25 @@ public:
 private:
   void publish_sample()
   {
-    if (!started_at_) {
+    if (!ready_seen_) {
       return;
     }
 
     const rclcpp::Time sample_time = now();
+    if (sample_time.nanoseconds() <= 0) {
+      started_at_.reset();
+      last_phase_.reset();
+      return;
+    }
+    if (!started_at_) {
+      started_at_ = sample_time;
+      RCLCPP_INFO(
+        get_logger(), "Starting test face scenario at ROS time %.3f s",
+        sample_time.seconds());
+    }
     const double elapsed = (sample_time - *started_at_).seconds();
     if (elapsed < 0.0) {
-      started_at_ = sample_time;
+      started_at_.reset();
       last_phase_.reset();
       return;
     }
@@ -98,6 +107,7 @@ private:
   }
 
   test_targets::Scenario scenario_;
+  bool ready_seen_{false};
   std::optional<rclcpp::Time> started_at_;
   std::optional<std::string_view> last_phase_;
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr target_publisher_;

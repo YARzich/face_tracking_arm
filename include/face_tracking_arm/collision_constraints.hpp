@@ -45,6 +45,8 @@ struct CollisionConstraintConfig
   double monitor_near_distance_lipschitz_m_per_rad{0.4543};
   std::size_t maximum_constraint_rows{24};
   std::size_t maximum_contacts_per_pair{4};
+  /// Number of samples used by next-segment validation; reserves the same interval motion in QP.
+  std::size_t segment_validation_substeps{3};
   double minimum_gradient_norm{1.0e-8};
   /// Optional soft preference to preserve room before hard braking becomes necessary.
   double separation_buffer_m{0.0};
@@ -162,6 +164,12 @@ struct CollisionSegmentSampleDiagnostic
 {
   std::size_t sample_index{0};
   double interpolation_fraction{0.0};
+  /// True when this query was a conservative anchor for a path-block certificate attempt.
+  bool path_block_certificate_attempt{false};
+  /// True when the attempted block was proven safe from this query and its uncertainty bound.
+  bool path_block_certified{false};
+  /// Last global dense-grid sample covered by the certificate attempt, or max() otherwise.
+  std::size_t path_block_end_sample_index{std::numeric_limits<std::size_t>::max()};
   double protected_joint_position_rad{0.0};
   double minimum_self_distance_m{std::numeric_limits<double>::infinity()};
   double minimum_world_distance_m{std::numeric_limits<double>::infinity()};
@@ -181,14 +189,24 @@ struct CollisionSegmentValidationResult
   bool robust_clearance_violated{false};
   std::size_t requested_substeps{0};
   std::size_t evaluated_samples{0};
+  /// Number of self/world distance backend calls, including inconclusive block attempts.
+  std::size_t distance_query_count{0};
+  /// Number of path blocks proven by a distance query and conservative Lipschitz envelope.
+  std::size_t certified_path_block_count{0};
+  /// Number of block attempts that required subdivision or dense leaf validation.
+  std::size_t inconclusive_path_block_count{0};
   std::size_t first_unsafe_sample{std::numeric_limits<std::size_t>::max()};
   double first_unsafe_fraction{std::numeric_limits<double>::quiet_NaN()};
+  /// Minimum distance observed at queried anchors or dense leaf samples.
   double minimum_self_distance_m{std::numeric_limits<double>::infinity()};
+  /// Minimum distance observed at queried anchors or dense leaf samples.
   double minimum_world_distance_m{std::numeric_limits<double>::infinity()};
+  /// Minimum distance observed at queried anchors or dense leaf samples.
   double minimum_distance_m{std::numeric_limits<double>::infinity()};
   std::string closest_pair;
   /// Invalid input/query reason, or the first actual clearance violation with its pair.
   std::string failure_reason;
+  /// Actual FCL query anchors, including inconclusive attempts, and dense leaf samples.
   std::vector<CollisionSegmentSampleDiagnostic> samples;
 };
 
@@ -293,6 +311,21 @@ public:
     const Eigen::VectorXd & start_position,
     const Eigen::VectorXd & end_position) const;
 
+  /// Conservatively certifies every straight segment in a waypoint suffix. It bounds
+  /// the complete joint-space envelope once; false requires sampled validation.
+  [[nodiscard]] bool canCertifyPath(
+    const CollisionConstraintDiagnostics & diagnostics,
+    const std::vector<JointMotionState> & waypoints) const;
+
+  /// Checks one stationary pose with the same robust clearance, tracking-error reserve,
+  /// allowed contacts and protected-joint corridor as a sampled segment.
+  /// Invalid input and collision-query failures are reported as unsafe and never throw.
+  [[nodiscard]] CollisionSegmentValidationResult validatePose(
+    const planning_scene::PlanningScene & scene,
+    const moveit::core::RobotState & robot_state,
+    const moveit::core::JointModelGroup & joint_model_group,
+    const JointMotionState & pose) const;
+
   /// Checks the complete straight joint-space segment using substeps equal intervals. Both
   /// endpoints and every internal boundary are sampled, for a total of substeps + 1 samples.
   /// Additional inter-sample uncertainty uses only ancestors affecting relative body motion;
@@ -306,11 +339,12 @@ public:
     const JointMotionState & candidate_motion_state,
     std::size_t substeps) const;
 
-  /// Checks a piecewise-linear joint-space path while sharing one collision-query setup.
-  /// Waypoints include the path start and every later state. Shared endpoints are sampled
-  /// once, so N segments produce N * substeps_per_segment + 1 globally indexed samples.
-  /// Shared endpoints use the componentwise maximum uncertainty of the adjacent segments,
-  /// then the same relative-motion ancestor mask as validateSegment.
+  /// Checks a piecewise-linear joint-space path. Conservative distance-query anchors may
+  /// certify waypoint blocks using the configured Lipschitz bounds; inconclusive blocks are
+  /// subdivided, and single-segment leaves use the dense sampled check. No clearance margin
+  /// is reduced. Waypoints include the path start and every later state. Dense-grid sample
+  /// indices are global, and shared endpoints use the componentwise maximum uncertainty of
+  /// both adjacent segments, including at adaptive block boundaries.
   /// Invalid input is reported as unsafe and never throws.
   [[nodiscard]] CollisionSegmentValidationResult validatePath(
     const planning_scene::PlanningScene & scene,

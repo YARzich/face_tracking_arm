@@ -4,6 +4,8 @@
 """Prepare the existing table world for real rendered face observations."""
 
 import math
+from pathlib import Path
+import shutil
 import xml.etree.ElementTree as ET
 
 
@@ -12,6 +14,27 @@ def person_entity_name(index):
     if not isinstance(index, int) or isinstance(index, bool) or index < 0:
         raise ValueError('Person index must be a nonnegative integer')
     return 'face_test_person' + (f'_{index + 1}' if index else '')
+
+
+def write_collisionless_person_model(source_dir, destination_dir):
+    """Copy the visual test target and remove collision geometry from the copy only."""
+    source_dir = Path(source_dir)
+    destination_dir = Path(destination_dir)
+    source_sdf = source_dir / 'model.sdf'
+    if not source_sdf.is_file():
+        raise FileNotFoundError(f'Test-person model is missing {source_sdf}')
+    shutil.copytree(source_dir, destination_dir, dirs_exist_ok=True)
+    copied_sdf = destination_dir / 'model.sdf'
+    tree = ET.parse(copied_sdf)
+    root = tree.getroot()
+    parents = {child: parent for parent in root.iter() for child in parent}
+    collisions = list(root.iter('collision'))
+    for collision in collisions:
+        parent = parents.get(collision)
+        if parent is not None:
+            parent.remove(collision)
+    tree.write(copied_sdf, encoding='utf-8', xml_declaration=True)
+    return destination_dir
 
 
 def _validated_person_pose(pose):

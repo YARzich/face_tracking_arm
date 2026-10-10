@@ -61,6 +61,11 @@ struct WorkspaceDeleter
 
 using WorkspacePtr = std::unique_ptr<OSQPWorkspace, WorkspaceDeleter>;
 
+// OSQP's default primal-infeasibility certificate tolerance can classify a
+// nearly tangent but feasible collision row as infeasible. Tighten only the
+// certificate test; this does not alter primal constraints or acceptance.
+constexpr double kSolverPrimalInfeasibilityTolerance = 1.0e-10;
+
 bool is_finite(const Eigen::VectorXd & vector)
 {
   return vector.array().isFinite().all();
@@ -603,21 +608,55 @@ StageResult solve_stage(
   }
 
   const Eigen::MatrixXd symmetric_hessian = 0.5 * (hessian + hessian.transpose());
+  Eigen::VectorXd variable_shift(variable_count);
+  for (Eigen::Index index = 0; index < variable_count; ++index) {
+    const double lower = constraints.lower[index];
+    const double upper = constraints.upper[index];
+    if (!std::isfinite(lower) || !std::isfinite(upper) || lower > upper) {
+      return result;
+    }
+    variable_shift[index] = 0.5 * lower + 0.5 * upper;
+  }
+
+  // Center the bounded velocity variables before solving. The affine change
+  // preserves the QP exactly while keeping the near-zero feasible corner away
+  // from cancellation between absolute joint velocities and active safety rows.
+  Eigen::VectorXd solver_gradient = gradient + symmetric_hessian * variable_shift;
+  Eigen::VectorXd solver_warm_start = warm_start - variable_shift;
+  Eigen::VectorXd solver_lower = constraints.lower;
+  Eigen::VectorXd solver_upper = constraints.upper;
+  const Eigen::VectorXd row_shift = constraints.matrix * variable_shift;
+  if (!is_finite(variable_shift) || !is_finite(solver_gradient) ||
+    !is_finite(solver_warm_start) || !is_finite(row_shift))
+  {
+    return result;
+  }
+  solver_lower -= row_shift;
+  solver_upper -= row_shift;
+  for (Eigen::Index row = 0; row < solver_lower.size(); ++row) {
+    if (std::isnan(solver_lower[row]) || std::isnan(solver_upper[row]) ||
+      (std::isfinite(constraints.lower[row]) && !std::isfinite(solver_lower[row])) ||
+      (std::isfinite(constraints.upper[row]) && !std::isfinite(solver_upper[row])))
+    {
+      return result;
+    }
+  }
+
   SparseArrays p_sparse = make_upper_triangular_csc(symmetric_hessian);
   SparseArrays a_sparse = make_csc(constraints.matrix);
 
   std::vector<c_float> linear_cost(static_cast<std::size_t>(variable_count));
   for (Eigen::Index index = 0; index < variable_count; ++index) {
     linear_cost[static_cast<std::size_t>(index)] =
-      static_cast<c_float>(gradient[index]);
+      static_cast<c_float>(solver_gradient[index]);
   }
   std::vector<c_float> lower(
-    static_cast<std::size_t>(constraints.lower.size()));
+    static_cast<std::size_t>(solver_lower.size()));
   std::vector<c_float> upper(
-    static_cast<std::size_t>(constraints.upper.size()));
-  for (Eigen::Index row = 0; row < constraints.lower.size(); ++row) {
-    lower[static_cast<std::size_t>(row)] = osqp_bound(constraints.lower[row]);
-    upper[static_cast<std::size_t>(row)] = osqp_bound(constraints.upper[row]);
+    static_cast<std::size_t>(solver_upper.size()));
+  for (Eigen::Index row = 0; row < solver_lower.size(); ++row) {
+    lower[static_cast<std::size_t>(row)] = osqp_bound(solver_lower[row]);
+    upper[static_cast<std::size_t>(row)] = osqp_bound(solver_upper[row]);
   }
 
   csc p_matrix{
@@ -655,6 +694,7 @@ StageResult solve_stage(
   settings.scaled_termination = 1;
   settings.check_termination = 1;
   settings.max_iter = static_cast<c_int>(config.solver_max_iterations);
+  settings.eps_prim_inf = static_cast<c_float>(kSolverPrimalInfeasibilityTolerance);
   settings.eps_abs = static_cast<c_float>(config.solver_absolute_tolerance);
   settings.eps_rel = static_cast<c_float>(config.solver_relative_tolerance);
   settings.time_limit = static_cast<c_float>(config.solver_time_limit_sec);
@@ -669,7 +709,7 @@ StageResult solve_stage(
   std::vector<c_float> initial_velocity(static_cast<std::size_t>(variable_count));
   for (Eigen::Index index = 0; index < variable_count; ++index) {
     initial_velocity[static_cast<std::size_t>(index)] =
-      static_cast<c_float>(warm_start[index]);
+      static_cast<c_float>(solver_warm_start[index]);
   }
   if (osqp_warm_start_x(workspace.get(), initial_velocity.data()) != 0) {
     return result;
@@ -693,7 +733,7 @@ StageResult solve_stage(
 
   result.velocity.resize(variable_count);
   for (Eigen::Index index = 0; index < variable_count; ++index) {
-    result.velocity[index] = workspace->solution->x[index];
+    result.velocity[index] = workspace->solution->x[index] + variable_shift[index];
   }
   // The first N rows are the per-joint interval assembled by
   // build_constraint_matrix(). Clamp round-off at those boundaries so a small

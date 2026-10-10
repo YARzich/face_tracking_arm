@@ -7,11 +7,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 
 #include "face_tracking_arm/tracking_core.hpp"
+#include "face_tracking_arm/face_target_age_policy.hpp"
 
 namespace face_tracking_arm::tracking
 {
@@ -317,12 +319,10 @@ TEST(TrackingGeometry, RejectsNonFiniteInputAndInvalidConfiguration)
       Eigen::Vector3d{1.0, 0.0, 0.2}, origin, origin, invalid)),
     RejectReason::kInvalidConfiguration);
 
-  invalid = TrackingGeometryConfig{};
-  invalid.up_projection_epsilon = 0.0;
-  EXPECT_EQ(
-    rejection(compute_face_geometry(
-      Eigen::Vector3d{1.0, 0.0, 0.2}, origin, origin, invalid)),
-    RejectReason::kInvalidConfiguration);
+  TrackingGeometryConfig legacy_config;
+  legacy_config.up_projection_epsilon = 0.0;
+  EXPECT_TRUE(std::holds_alternative<FaceGeometry>(compute_face_geometry(
+      Eigen::Vector3d{1.0, 0.0, 0.2}, origin, origin, legacy_config)));
 }
 
 TEST(TrackingValidation, RejectsInvalidTimingAndPreservesLastAcceptedStamp)
@@ -586,6 +586,139 @@ TEST(TrackingCore, SearchIsAnIdleIntentAndFacePreemptsItAfterNormalLossDelay)
   ASSERT_TRUE(core.ingest_face(make_sample({2.0, .2, 1.7}, kReturnDelay + 11),
     kReturnDelay + 11).accepted());
   EXPECT_EQ(command(core.tick(kReturnDelay + 11)).mode, TargetMode::kFace);
+}
+
+TEST(TrackingPolicy, ForecastUsesRecentMotionOnlyWhenHealthyNoFaceIsExplicit)
+{
+  TrackingConfig config = make_config();
+  config.prediction_timeout_ns = 600'000'000;
+  TrackingCore core(config);
+  ASSERT_TRUE(core.ingest_face(make_sample({1.0, 0.0, 0.0}, 1'000'000'000),
+      1'000'000'000).accepted());
+  ASSERT_TRUE(core.ingest_face(make_sample({1.1, 0.0, 0.0}, 1'100'000'000),
+      1'100'000'000).accepted());
+
+  const auto actual = make_actual_pose({0.4, 0.0, 0.0}, 0.0, 1'350'000'000);
+  const auto no_prediction = command(core.tick(1'350'000'000, actual, false));
+  EXPECT_EQ(no_prediction.mode, TargetMode::kHold);
+
+  const auto forecast = command(core.tick(1'350'000'000, actual, true));
+  EXPECT_EQ(forecast.mode, TargetMode::kFace);
+  ASSERT_TRUE(forecast.face_in_planning_frame);
+  EXPECT_GT(forecast.face_in_planning_frame->x(), 1.1);
+  ASSERT_TRUE(forecast.source_face_stamp_ns);
+  EXPECT_EQ(*forecast.source_face_stamp_ns, 1'100'000'000);
+  ASSERT_TRUE(forecast.face_prediction_expiry_ns);
+  EXPECT_EQ(*forecast.face_prediction_expiry_ns, 1'700'000'000);
+  EXPECT_TRUE(control::validFaceTargetAge(
+      *forecast.source_face_stamp_ns, forecast.command_stamp_ns, 1'350'000'000,
+      200'000'000, true, *forecast.face_prediction_expiry_ns, 600'000'000));
+  EXPECT_FALSE(control::validFaceTargetAge(
+      *forecast.source_face_stamp_ns, forecast.command_stamp_ns, 1'350'000'000,
+      200'000'000, false, *forecast.face_prediction_expiry_ns, 600'000'000));
+  EXPECT_FALSE(control::validFaceTargetAge(
+      *forecast.source_face_stamp_ns, forecast.command_stamp_ns, 1'700'000'000,
+      200'000'000, true, *forecast.face_prediction_expiry_ns, 600'000'000));
+
+  const auto expiry_pose = make_actual_pose({.4, 0.0, 0.0}, 0.0, 1'700'000'000);
+  EXPECT_EQ(command(core.tick(1'700'000'000, expiry_pose, true)).mode, TargetMode::kHold);
+}
+
+TEST(TrackingPolicy, HealthyNoFaceForecastUsesSourceHorizonAtThirtyAndFifteenHertz)
+{
+  constexpr std::int64_t prediction_horizon_ns = 800'000'000;
+  constexpr std::int64_t origin_ns = 1'000'000'000;
+  for (const double sample_period_sec : {1.0 / 30.0, 1.0 / 15.0}) {
+    TrackingConfig config = make_config();
+    config.prediction_timeout_ns = prediction_horizon_ns;
+    TrackingCore core(config);
+    std::int64_t last_stamp_ns = origin_ns;
+    double last_face_x = 1.0;
+    for (int sample_index = 0; sample_index < 60; ++sample_index) {
+      const double elapsed_sec = static_cast<double>(sample_index) * sample_period_sec;
+      last_stamp_ns = origin_ns + static_cast<std::int64_t>(std::llround(
+          elapsed_sec * 1.0e9));
+      last_face_x = 1.0 + 0.2 * elapsed_sec;
+      const auto result = core.ingest_face(
+        make_sample({last_face_x, 0.0, 0.0}, last_stamp_ns), last_stamp_ns);
+      ASSERT_TRUE(result.accepted()) << "sample " << sample_index;
+    }
+
+    // Explicit healthy no-face status selects a source-time forecast immediately,
+    // without waiting for the unrelated live-target freshness window to expire.
+    const auto early_ns = last_stamp_ns + 10'000'000;
+    const auto early = command(core.tick(early_ns, std::nullopt, true));
+    EXPECT_EQ(early.mode, TargetMode::kFace);
+    ASSERT_TRUE(early.face_in_planning_frame);
+    EXPECT_GT(early.face_in_planning_frame->x(), last_face_x);
+    ASSERT_TRUE(early.face_prediction_expiry_ns);
+    EXPECT_EQ(*early.face_prediction_expiry_ns, last_stamp_ns + prediction_horizon_ns);
+
+    const auto half_horizon_ns = last_stamp_ns + 500'000'000;
+    EXPECT_EQ(command(core.tick(half_horizon_ns, std::nullopt, true)).mode,
+      TargetMode::kFace);
+    const auto before_expiry_ns = last_stamp_ns + 799'000'000;
+    const auto before_expiry = command(core.tick(before_expiry_ns, std::nullopt, true));
+    EXPECT_EQ(before_expiry.mode, TargetMode::kFace);
+    EXPECT_EQ(before_expiry.face_prediction_expiry_ns,
+      std::optional<RosTimeNanoseconds>(last_stamp_ns + prediction_horizon_ns));
+
+    const auto expiry_ns = last_stamp_ns + prediction_horizon_ns;
+    const auto actual = make_actual_pose({0.4, 0.0, 0.0}, 0.0, expiry_ns);
+    const auto expired = command(core.tick(expiry_ns, actual, true));
+    EXPECT_EQ(expired.mode, TargetMode::kHold);
+    EXPECT_FALSE(expired.face_prediction_expiry_ns);
+  }
+}
+
+TEST(TrackingPolicy, DisabledForecastAndCoreResetNeverEmitPredictedFace)
+{
+  TrackingCore core(make_config());
+  ASSERT_TRUE(core.ingest_face(make_sample({1.0, 0.0, 0.0}, 1'000'000'000),
+      1'000'000'000).accepted());
+  ASSERT_TRUE(core.ingest_face(make_sample({1.02, 0.0, 0.0}, 1'100'000'000),
+      1'100'000'000).accepted());
+  const auto now_ns = 1'600'000'000;
+  const auto actual = make_actual_pose({0.4, 0.0, 0.0}, 0.0, now_ns);
+  const auto disabled = command(core.tick(now_ns, actual, true));
+  EXPECT_EQ(disabled.mode, TargetMode::kHold);
+  EXPECT_FALSE(disabled.face_in_planning_frame);
+  EXPECT_FALSE(disabled.face_prediction_expiry_ns);
+
+  core.reset();
+  const auto after_reset = command(core.tick(now_ns + 1, actual, true));
+  EXPECT_EQ(after_reset.mode, TargetMode::kRest);
+  EXPECT_FALSE(after_reset.face_in_planning_frame);
+  EXPECT_FALSE(after_reset.face_prediction_expiry_ns);
+}
+
+TEST(TrackingPolicy, RetainedForecastSnapshotExpiresWithoutANewCommand)
+{
+  // The executor keeps the last command snapshot until its command timeout,
+  // which is longer than this forecast horizon. Its control tick must still
+  // reject the snapshot as soon as the source-based forecast expires.
+  constexpr std::int64_t source_stamp_ns = 1'100'000'000;
+  constexpr std::int64_t command_stamp_ns = 1'350'000'000;
+  constexpr std::int64_t expiry_ns = 1'700'000'000;
+  constexpr std::int64_t live_age_limit_ns = 200'000'000;
+  constexpr std::int64_t prediction_horizon_ns = 600'000'000;
+  constexpr std::int64_t incoming_command_timeout_ns = 2'000'000'000;
+
+  EXPECT_LT(1'699'000'000 - command_stamp_ns, incoming_command_timeout_ns);
+  EXPECT_TRUE(control::validFaceTargetAge(
+      source_stamp_ns, command_stamp_ns, 1'699'000'000, live_age_limit_ns,
+      true, expiry_ns, prediction_horizon_ns));
+  EXPECT_FALSE(control::validFaceTargetAge(
+      source_stamp_ns, command_stamp_ns, expiry_ns, live_age_limit_ns,
+      true, expiry_ns, prediction_horizon_ns));
+
+  constexpr std::int64_t live_command_stamp_ns = 1'250'000'000;
+  EXPECT_TRUE(control::validFaceTargetAge(
+      source_stamp_ns, live_command_stamp_ns, 1'290'000'000, live_age_limit_ns,
+      false, 0, prediction_horizon_ns));
+  EXPECT_FALSE(control::validFaceTargetAge(
+      source_stamp_ns, live_command_stamp_ns, 1'301'000'000, live_age_limit_ns,
+      false, 0, prediction_horizon_ns));
 }
 
 }  // namespace

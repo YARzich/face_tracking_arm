@@ -115,6 +115,28 @@ std::optional<std::int64_t> ControlTimeGrid::commandStamp(
   return next_grid_stamp_ns;
 }
 
+std::optional<std::uint64_t> ControlTimeGrid::periodsUntilCommandLead(
+  const std::int64_t now_ns, const std::int64_t target_lead_ns) const
+{
+  validateTime(now_ns, "command time");
+  validateTime(target_lead_ns, "target command lead");
+  if (!last_command_stamp_ns_.has_value()) {
+    return std::nullopt;
+  }
+
+  const std::int64_t next_grid_stamp_ns = checkedAdd(
+    *last_command_stamp_ns_, period_ns_);
+  const std::int64_t target_stamp_ns = checkedAdd(now_ns, target_lead_ns);
+  if (next_grid_stamp_ns >= target_stamp_ns) {
+    return 0U;
+  }
+
+  const std::int64_t deficit_ns = target_stamp_ns - next_grid_stamp_ns;
+  const std::int64_t periods = deficit_ns / period_ns_ +
+    (deficit_ns % period_ns_ == 0 ? 0 : 1);
+  return static_cast<std::uint64_t>(periods);
+}
+
 bool ControlTimeGrid::adoptPublishedStamp(const std::int64_t stamp_ns)
 {
   validateTime(stamp_ns, "published command stamp");

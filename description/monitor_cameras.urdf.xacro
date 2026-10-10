@@ -37,10 +37,41 @@
     </gazebo>
   </xacro:macro>
 
+  <xacro:macro name="monitor_rgbd_sensor" params="name frame topic">
+    <link name="${name}_frame"/>
+    <joint name="${name}_mount" type="fixed">
+      <parent link="monitor_camera_bar"/><child link="${name}_frame"/>
+      <origin xyz="${camera_depth / 2 + .001} 0 0"/>
+    </joint>
+    <link name="${frame}"/>
+    <joint name="${name}_optical_joint" type="fixed">
+      <parent link="${name}_frame"/><child link="${frame}"/>
+      <origin rpy="${-pi / 2} 0 ${-pi / 2}"/>
+    </joint>
+    <gazebo reference="monitor_camera_bar">
+      <sensor name="${name}" type="rgbd_camera">
+        <pose>${camera_depth / 2 + .001} 0 0 0 0 0</pose>
+        <always_on>true</always_on><update_rate>${camera_rate}</update_rate>
+        <topic>${topic}</topic>
+        <camera>
+          <horizontal_fov>${horizontal_fov}</horizontal_fov>
+          <image><width>${image_width}</width><height>${image_height}</height><format>R8G8B8</format></image>
+          <clip><near>0.05</near><far>20</far></clip>
+          <camera_info_topic>${topic}/camera_info</camera_info_topic>
+          <optical_frame_id>${frame}</optical_frame_id>
+          <depth_camera>
+            <clip><near>0.05</near><far>20</far></clip>
+          </depth_camera>
+        </camera>
+      </sensor>
+    </gazebo>
+  </xacro:macro>
+
   <xacro:macro name="monitor_cameras" params="mode baseline horizontal_fov:=1.433 image_width:=1280 image_height:=720
     camera_rate:=30 monitor_height:=0.224 camera_depth:=0.027 camera_height:=0.0265">
     <xacro:property name="camera_focal" value="${image_width / (2 * tan(horizontal_fov / 2))}"/>
     <xacro:property name="stereo" value="${mode == 'stereo'}"/>
+    <xacro:property name="rgbd" value="${mode == 'rgbd'}"/>
     <xacro:property name="bar_width" value="${max(0.102, baseline + 0.028) if stereo else 0.102}"/>
     <xacro:property name="bar_mass" value="0.065"/>
     <link name="monitor_camera_bar">
@@ -72,9 +103,15 @@
       <parent link="monitor_link"/><child link="monitor_camera_bar"/>
       <origin xyz="0 0 ${monitor_height / 2 + camera_height / 2}"/>
     </joint>
-    <xacro:monitor_rgb_sensor name="monitor_left_camera"
-      lateral="${baseline / 2 if stereo else 0}" frame="face_test_camera_optical_frame"
-      topic="/face_test/image_raw" info="/face_test/camera_info" tx="0"/>
+    <xacro:if value="${rgbd}">
+      <xacro:monitor_rgbd_sensor name="monitor_rgbd_camera"
+        frame="face_test_camera_optical_frame" topic="/face_test/rgbd"/>
+    </xacro:if>
+    <xacro:unless value="${rgbd}">
+      <xacro:monitor_rgb_sensor name="monitor_left_camera"
+        lateral="${baseline / 2 if stereo else 0}" frame="face_test_camera_optical_frame"
+        topic="/face_test/image_raw" info="/face_test/camera_info" tx="0"/>
+    </xacro:unless>
     <xacro:if value="${stereo}">
       <xacro:monitor_rgb_sensor name="monitor_right_camera"
         lateral="${-baseline / 2}" frame="face_test_right_optical_frame"

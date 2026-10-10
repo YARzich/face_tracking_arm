@@ -12,6 +12,11 @@ namespace rclcpp
 class Node;
 }  // namespace rclcpp
 
+namespace servo
+{
+struct Params;
+}  // namespace servo
+
 namespace face_tracking_arm
 {
 
@@ -34,26 +39,23 @@ struct ControllerParameters
   double maximum_angular_reference_radps{0.70};
   double position_deadband_m{0.10};
   double pointing_deadband_rad{0.005};
-  double primary_orientation_tolerance_radps{0.002};
+  double primary_orientation_tolerance_radps{0.0002};
   double secondary_roll_weight{0.5};
   double velocity_regularization_weight{1.0e-4};
-  double joint_centering_activation_fraction{0.35};
-  double joint_centering_max_velocity_rad_s{0.4};
-  double joint_centering_weight{3.0};
 
   double hard_clearance_m{0.015};
   double collision_query_distance_m{0.200};
   int maximum_collision_constraints{24};
   double collision_gradient_epsilon{1.0e-8};
-  double collision_avoidance_buffer_m{0.04};
-  double collision_avoidance_max_velocity_mps{0.12};
-  double collision_avoidance_lookahead_sec{0.4};
-  double collision_avoidance_weight{4.0};
 
   std::string monitor_guard_joint_name{};
   double monitor_guard_min_position_rad{-1.60};
   double monitor_guard_max_position_rad{1.60};
   double joint_position_margin_rad{0.10};
+  std::string timing_mode{"auto"};
+  double source_timeout_sec{0.50};
+  double face_target_freshness_timeout_sec{0.50};
+  double face_prediction_timeout_sec{0.80};
   double residual_command_latency_sec{0.020};
   double state_feedback_timeout_sec{0.040};
   double following_position_tolerance_rad{0.020};
@@ -61,12 +63,6 @@ struct ControllerParameters
   double collision_tracking_error_bound_rad{0.006};
   double numerical_distance_reserve_m{0.0001};
   double default_distance_lipschitz_m_per_rad{2.6193};
-  double monitor_near_distance_lipschitz_m_per_rad{0.4543};
-
-  double lower_singularity_threshold{40.0};
-  double hard_stop_singularity_threshold{80.0};
-  double singularity_recovery_gain{2.0};
-  double singularity_gradient_step_rad{0.001};
 
   int solver_max_iterations{2000};
   double solver_absolute_tolerance{1.0e-5};
@@ -81,8 +77,14 @@ struct ControllerParameters
   std::vector<double> max_joint_jerk_rad_s3;
 };
 
-/// Declare the existing collision-aware controller parameters on the supplied node.
+/// Declare active settings and retain deprecated ROS names for old configurations.
+/// Explicit overrides of unused parameters emit a warning and cannot affect validation.
 [[nodiscard]] ControllerParameters declareControllerParameters(rclcpp::Node & node);
+
+/// Declare the legacy shared moveit_servo.* settings used by the custom backend.
+/// Output mode, group, and period are fixed by the collision-aware controller.
+[[nodiscard]] servo::Params declareCollisionAwareServoParameters(
+  rclcpp::Node & node, const ControllerParameters & controller);
 
 /// Reject configurations outside the calibrated controller safety envelope.
 /// Robot-model and Servo-interface compatibility are checked separately at startup.

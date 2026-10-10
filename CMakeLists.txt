@@ -18,6 +18,7 @@ find_package(controller_manager_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(geometric_shapes REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(moveit_core REQUIRED)
@@ -38,6 +39,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Threads REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(urdf REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/TrackingTarget.msg"
@@ -85,24 +87,35 @@ target_link_libraries(tracking_velocity_task PUBLIC hierarchical_velocity_qp Eig
 
 add_tracking_library(target_motion_estimator src/target_motion_estimator.cpp)
 target_link_libraries(target_motion_estimator PUBLIC Eigen3::Eigen)
+target_link_libraries(tracking_core PUBLIC target_motion_estimator)
 
 add_tracking_library(joint_path_follower src/joint_path_follower.cpp)
 target_link_libraries(joint_path_follower PUBLIC Eigen3::Eigen)
 
-add_tracking_library(background_path_planner src/background_path_planner.cpp)
+add_tracking_library(background_path_planner
+  src/background_path_planner.cpp
+  src/compact_upright.cpp
+  src/compact_upright_path.cpp
+  src/compact_geometry_validator.cpp)
 target_link_libraries(background_path_planner Eigen3::Eigen Threads::Threads)
 ament_target_dependencies(background_path_planner
-  moveit_core moveit_ros_planning moveit_msgs rclcpp)
+  geometric_shapes moveit_core moveit_ros_planning moveit_msgs rclcpp urdf)
 
 add_tracking_library(emergency_brake_tail src/emergency_brake_tail.cpp)
 target_link_libraries(emergency_brake_tail PUBLIC Eigen3::Eigen)
 
 add_tracking_library(collision_constraints
-  src/collision_constraints.cpp src/robot_geometry_bounds.cpp)
+  src/collision_constraints.cpp
+  src/collision_distance_query.cpp
+  src/collision_stopping.cpp
+  src/collision_validation.cpp
+  src/robot_geometry_bounds.cpp)
 target_link_libraries(collision_constraints hierarchical_velocity_qp Eigen3::Eigen)
 ament_target_dependencies(collision_constraints moveit_core)
 
 add_tracking_library(collision_aware_servo_component
+  src/command_session.cpp
+  src/servo_telemetry.cpp
   src/collision_aware_servo_component.cpp
   src/collision_aware_servo_control.cpp
   src/collision_aware_servo_feedback.cpp
@@ -383,6 +396,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_stress_motion test/test_stress_motion.py TIMEOUT 30)
   ament_add_pytest_test(test_fast_stress_motion test/test_fast_stress_motion.py TIMEOUT 30)
   ament_add_pytest_test(test_simulation_start test/test_simulation_start.py TIMEOUT 60)
+  ament_add_pytest_test(test_simulation_launch test/test_simulation_launch.py TIMEOUT 60)
   ament_add_pytest_test(test_face_selection test/test_face_selection.py TIMEOUT 30)
   ament_add_pytest_test(test_point_filter test/test_point_filter.py TIMEOUT 30)
   ament_add_pytest_test(test_kalman_point_filter test/test_kalman_point_filter.py TIMEOUT 30)
@@ -394,11 +408,26 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_camera_controls test/test_camera_controls.py TIMEOUT 30)
   ament_add_pytest_test(test_robot_profile test/test_robot_profile.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_probe test/test_hardware_probe.py TIMEOUT 30)
+  ament_add_pytest_test(test_processing_rate test/test_processing_rate.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_activation_guard
     test/test_hardware_activation_guard.py TIMEOUT 30)
   ament_add_pytest_test(test_controller_shutdown test/test_controller_shutdown.py TIMEOUT 60)
   ament_add_pytest_test(test_rectification test/test_rectification.py TIMEOUT 30)
-  ament_add_pytest_test(test_processing_rate test/test_processing_rate.py TIMEOUT 30)
+  ament_add_gtest(test_collision_aware_parameters
+    test/test_collision_aware_parameters.cpp src/collision_aware_parameters.cpp)
+  target_include_directories(test_collision_aware_parameters PRIVATE include)
+  target_link_libraries(test_collision_aware_parameters moveit_servo::moveit_servo_lib_cpp)
+  ament_target_dependencies(test_collision_aware_parameters moveit_servo rclcpp)
+  ament_add_gtest(test_command_session test/test_command_session.cpp
+    src/command_session.cpp)
+  target_include_directories(test_command_session PRIVATE src include)
+  target_link_libraries(test_command_session control_time_grid published_trajectory_history)
+  ament_target_dependencies(test_command_session moveit_servo rclcpp)
+  ament_add_gtest(test_servo_telemetry test/test_servo_telemetry.cpp
+    src/servo_telemetry.cpp)
+  target_include_directories(test_servo_telemetry PRIVATE src include)
+  target_link_libraries(test_servo_telemetry rolling_statistics collision_constraints)
+  ament_target_dependencies(test_servo_telemetry moveit_servo rclcpp)
   ament_add_gtest(test_table_geometry test/test_table_geometry.cpp)
   target_include_directories(test_table_geometry PRIVATE include)
   target_link_libraries(test_table_geometry Eigen3::Eigen)
@@ -406,10 +435,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_tracking_core test/test_tracking_core.cpp)
   ament_add_gtest(test_tracking_velocity_task test/test_tracking_velocity_task.cpp)
   target_link_libraries(test_tracking_velocity_task tracking_velocity_task)
+  ament_add_gtest(test_face_tracking_policy test/test_face_tracking_policy.cpp)
+  target_include_directories(test_face_tracking_policy PRIVATE include)
+  target_link_libraries(test_face_tracking_policy Eigen3::Eigen)
   ament_add_gtest(test_target_motion_estimator test/test_target_motion_estimator.cpp)
   target_link_libraries(test_target_motion_estimator target_motion_estimator)
-  ament_add_gtest(test_posture_recovery_policy test/test_posture_recovery_policy.cpp)
-  target_include_directories(test_posture_recovery_policy PRIVATE include)
   ament_add_gtest(test_joint_path_follower test/test_joint_path_follower.cpp)
   ament_add_gtest(test_idle_search test/test_idle_search.cpp src/idle_search.cpp)
   target_include_directories(test_idle_search PRIVATE include)
@@ -417,6 +447,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_joint_path_follower joint_path_follower)
   ament_add_gtest(test_background_path_planner test/test_background_path_planner.cpp)
   target_link_libraries(test_background_path_planner background_path_planner)
+  ament_add_gtest(test_compact_upright test/test_compact_upright.cpp)
+  target_include_directories(test_compact_upright PRIVATE include)
+  target_link_libraries(test_compact_upright Eigen3::Eigen background_path_planner)
   # Expand the installed integration description at test time, after colcon
   # installs this package. This also works for a first build in a clean workspace.
   find_program(XACRO_EXECUTABLE xacro REQUIRED)
@@ -432,6 +465,13 @@ if(BUILD_TESTING)
     TEST_ROBOT_SRDF_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/moveit/xarm6.srdf")
   target_link_libraries(test_motion_reference collision_aware_servo_component)
   set_tests_properties(test_motion_reference PROPERTIES
+    FIXTURES_REQUIRED motion_reference_description)
+  ament_add_gtest(test_compact_upright_path test/test_compact_upright_path.cpp)
+  target_compile_definitions(test_compact_upright_path PRIVATE
+    TEST_ROBOT_URDF_FILE="${CMAKE_CURRENT_BINARY_DIR}/test_robot.urdf"
+    TEST_ROBOT_SRDF_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/moveit/xarm6.srdf")
+  target_link_libraries(test_compact_upright_path background_path_planner collision_constraints)
+  set_tests_properties(test_compact_upright_path PROPERTIES
     FIXTURES_REQUIRED motion_reference_description)
   target_link_libraries(test_tracking_core tracking_core Eigen3::Eigen)
   ament_add_gtest(test_face_scenarios_test test/test_face_scenarios.cpp)

@@ -20,6 +20,7 @@ struct JointPathFollowerConfig
   double arrival_tolerance_rad{0.02};
   double minimum_progress_rad{0.005};
   double stall_timeout_sec{1.5};
+  /// Minimum forward segment count; search also covers the configured arc lookahead.
   std::size_t projection_search_segments{4};
 };
 
@@ -56,7 +57,7 @@ public:
     const std::vector<Eigen::VectorXd> & path,
     const Eigen::VectorXd & current_position, double time_sec);
 
-  /// Advance only forward using the current and following local segments.
+  /// Advance only forward within a local arc-length window that reaches the lookahead.
   /// Invalid/stalled/arrived are terminal until a new path is accepted or reset().
   [[nodiscard]] JointPathUpdate update(
     const Eigen::VectorXd & current_position, double time_sec);

@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 
+#include <builtin_interfaces/msg/time.hpp>
 #include <joint_trajectory_controller/interpolation_methods.hpp>
 #include <joint_trajectory_controller/trajectory.hpp>
 #include <moveit_servo/moveit_servo_lib_parameters.hpp>
@@ -96,6 +97,63 @@ TEST(JointTrajectoryInterpolation, NoneModeWouldSkipToTheFollowingPoint)
     trajectory, kHeaderTimeNs, InterpolationMethod::NONE);
   ASSERT_EQ(at_start.positions.size(), 1U);
   EXPECT_NEAR(at_start.positions[0], 0.11, 1.0e-12);
+}
+
+TEST(JointTrajectoryInterpolation, ZeroStampedStationaryResetSamplesMeasuredHoldAtTimeZero)
+{
+  auto message = std::make_shared<trajectory_msgs::msg::JointTrajectory>();
+  message->joint_names = {"joint1"};
+  trajectory_msgs::msg::JointTrajectoryPoint measured_hold;
+  measured_hold.positions = {0.118631};
+  measured_hold.velocities = {0.0};
+  measured_hold.accelerations = {0.0};
+  message->points = {measured_hold};
+  Trajectory trajectory(message);
+  trajectory_msgs::msg::JointTrajectoryPoint old_desired_state;
+  old_desired_state.positions = {0.0};
+  old_desired_state.velocities = {0.0};
+  old_desired_state.accelerations = {0.0};
+  trajectory.set_point_before_trajectory_msg(
+    rclcpp::Time(kHeaderTimeNs - kPeriodNs, RCL_ROS_TIME), old_desired_state);
+
+  const auto at_zero = sample(
+    trajectory, kHeaderTimeNs, InterpolationMethod::VARIABLE_DEGREE_SPLINE);
+  const auto next_update = sample(
+    trajectory, kHeaderTimeNs + kPeriodNs, InterpolationMethod::VARIABLE_DEGREE_SPLINE);
+
+  ASSERT_EQ(at_zero.positions.size(), 1U);
+  EXPECT_NEAR(at_zero.positions[0], 0.118631, 1.0e-12);
+  EXPECT_NEAR(at_zero.velocities[0], 0.0, 1.0e-12);
+  ASSERT_EQ(next_update.positions.size(), 1U);
+  EXPECT_NEAR(next_update.positions[0], 0.118631, 1.0e-12);
+  EXPECT_NEAR(next_update.velocities[0], 0.0, 1.0e-12);
+}
+
+TEST(JointTrajectoryInterpolation, FutureDatedStationaryResetInterpolatesFromOldDesiredState)
+{
+  auto message = std::make_shared<trajectory_msgs::msg::JointTrajectory>();
+  message->header.stamp.sec = 1;
+  message->header.stamp.nanosec = static_cast<std::uint32_t>(3 * kPeriodNs);
+  message->joint_names = {"joint1"};
+  trajectory_msgs::msg::JointTrajectoryPoint measured_hold;
+  measured_hold.positions = {0.118631};
+  measured_hold.velocities = {0.0};
+  measured_hold.accelerations = {0.0};
+  message->points = {measured_hold};
+  Trajectory trajectory(message);
+  trajectory_msgs::msg::JointTrajectoryPoint old_desired_state;
+  old_desired_state.positions = {0.0};
+  old_desired_state.velocities = {0.0};
+  old_desired_state.accelerations = {0.0};
+  trajectory.set_point_before_trajectory_msg(
+    rclcpp::Time(kHeaderTimeNs - kPeriodNs, RCL_ROS_TIME), old_desired_state);
+
+  const auto before_start = sample(
+    trajectory, kHeaderTimeNs + kPeriodNs, InterpolationMethod::VARIABLE_DEGREE_SPLINE);
+
+  ASSERT_EQ(before_start.positions.size(), 1U);
+  EXPECT_GT(before_start.positions[0], 0.0);
+  EXPECT_LT(before_start.positions[0], 0.118631);
 }
 
 TEST(JointTrajectoryInterpolation, MatchingControllerGridPreservesDiscreteAcceleration)

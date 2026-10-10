@@ -31,7 +31,8 @@ def assemble(context):
     share = Path(get_package_share_directory('face_tracking_arm'))
     scripts = Path(get_package_prefix('face_tracking_arm')) / 'lib/face_tracking_arm'
     sys.path.insert(0, str(scripts))
-    from face_tracking_perception.arm_scene import write_vision_world
+    from face_tracking_perception.arm_scene import (
+        write_collisionless_person_model, write_vision_world)
     from face_tracking_perception.close_stress_motion import CloseStressMotion
     from face_tracking_perception.fast_stress_motion import FastStressMotion
     from face_tracking_perception.stress_motion import StressMotion
@@ -53,6 +54,9 @@ def assemble(context):
         raise RuntimeError('Prepare the face test first; see docs/face_detection_test.md')
     directory = tempfile.TemporaryDirectory(prefix='tracking_vision_')
     world_path = Path(directory.name) / 'world.sdf'
+    model_overlay = Path(directory.name) / 'models'
+    write_collisionless_person_model(
+        assets / 'person_standing', model_overlay / 'person_standing')
     initial_pose = StressMotion().initial_pose if scenario == 'stress' else None
     if scenario == 'stress_close':
         initial_pose = CloseStressMotion().initial_pose
@@ -73,14 +77,29 @@ def assemble(context):
                             'ros_type_name': 'sensor_msgs/msg/' + ros_type,
                             'gz_type_name': 'gz.msgs.' + gz_type,
                             'direction': 'GZ_TO_ROS', 'qos_profile': 'SENSOR_DATA'})
+    elif mode == 'rgbd':
+        bridges = [item for item in bridges if item['ros_topic_name'] not in (
+            '/face_test/image_raw', '/face_test/camera_info')]
+        for ros_topic, gz_topic, ros_type, gz_type in (
+                ('/face_test/image_raw', '/face_test/rgbd/image', 'Image', 'Image'),
+                ('/face_test/camera_info', '/face_test/rgbd/camera_info',
+                 'CameraInfo', 'CameraInfo'),
+                ('/face_test/depth/image_raw', '/face_test/rgbd/depth_image', 'Image', 'Image')):
+            bridges.append({
+                'ros_topic_name': ros_topic, 'gz_topic_name': gz_topic,
+                'ros_type_name': 'sensor_msgs/msg/' + ros_type,
+                'gz_type_name': 'gz.msgs.' + gz_type,
+                'direction': 'GZ_TO_ROS', 'qos_profile': 'SENSOR_DATA'})
     bridge_path = Path(directory.name) / 'bridge.yaml'
     bridge_path.write_text(yaml.safe_dump(bridges))
-    resource_path = str(assets) + os.pathsep + os.environ.get('GZ_SIM_RESOURCE_PATH', '')
+    resource_path = (str(model_overlay) + os.pathsep + str(assets) + os.pathsep
+                     + os.environ.get('GZ_SIM_RESOURCE_PATH', ''))
     environment = SetEnvironmentVariable('GZ_SIM_RESOURCE_PATH', resource_path)
     tracking = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(str(share / 'launch/tracking_sim.launch.py')),
         launch_arguments={'headless': value('headless'), 'test_face_scenario': 'disabled',
                           'visualize_target': 'false', 'servo_backend': 'collision_aware',
+                          'require_perception_status': 'true',
                           'camera_mode': mode, 'camera_baseline': value('baseline'),
                           'camera_width': value('camera_width'),
                           'camera_height': value('camera_height'),
@@ -107,6 +126,11 @@ def assemble(context):
                 value('point_kalman_acceleration_std_mps2')),
             'model_dir': value('model_dir'), 'threads': int(value('threads')),
             'face_width_m': float(value('face_width_m')),
+            'rgbd_depth_topic': value('rgbd_depth_topic'),
+            'rgbd_sync_slop_sec': float(value('rgbd_sync_slop_sec')),
+            'timing_mode': value('timing_mode'),
+            'source_timeout_sec': float(value('source_timeout_sec')),
+            'max_frame_age_sec': float(value('max_frame_age_sec')),
             'confidence': float(value('confidence'))}],
         remappings=[('/face_test/center_3d', '/face/center')])
     srdf = ET.parse(share / f'config/moveit/{robot_model}.srdf').getroot()
@@ -157,10 +181,13 @@ def generate_launch_description():
         'camera_height': PythonExpression([
             "'360' if '", LaunchConfiguration('mode'), "' == 'stereo' else '720'"]),
         'camera_rate': '30', 'camera_horizontal_fov': '1.433',
+        'rgbd_depth_topic': '/face_test/depth/image_raw',
+        'rgbd_sync_slop_sec': '0.02', 'timing_mode': 'auto',
+        'source_timeout_sec': '0.50', 'max_frame_age_sec': '0.20',
         'rest_sec': '8.0', 'cycles': '0', 'model_dir': str(cache / 'models'),
         'assets_dir': str(cache / 'gazebo_models'),
         'python_executable': str(cache / 'perception_venv/bin/python')}
-    choices = {'mode': ['mono_cpu', 'stereo'], 'headless': ['true', 'false'],
+    choices = {'mode': ['mono_cpu', 'stereo', 'rgbd'], 'headless': ['true', 'false'],
                'scenario': ['appearances', 'stress', 'stress_fast', 'stress_close'],
                'robot_model': ['xarm6', 'lite6'],
                'start_pose': ['rest', 'zero', 'folded', 'joint1_limit', 'incident'],

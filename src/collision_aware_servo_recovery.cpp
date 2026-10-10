@@ -5,79 +5,6 @@
 
 namespace face_tracking_arm
 {
-namespace
-{
-
-using namespace std::chrono_literals;
-
-constexpr std::size_t kHealthyPublicationsToResetRearmBudget = 100;
-
-}  // namespace
-
-void CollisionAwareServoComponent::clear_bootstrap_ack_state() noexcept
-{
-  bootstrap_ack_pending_ = false;
-  bootstrap_publication_id_.reset();
-  bootstrap_trajectory_origin_.reset();
-  bootstrap_seed_positions_.reset();
-}
-
-void CollisionAwareServoComponent::start_rearm_deadline(const rclcpp::Time & current_time)
-{
-  rclcpp::Time settle_start = current_time;
-  if (published_tail_rearm_pending_) {
-    const auto * published_record = active_published_record();
-    if (published_record != nullptr && published_record->stationary_time > settle_start) {
-      settle_start = published_record->stationary_time;
-    }
-  }
-  rearm_deadline_ = settle_start +
-    rclcpp::Duration::from_seconds(kSafeRearmSettleBudgetSec);
-  const double remaining_tail_sec = std::max(
-    0.0, (settle_start - current_time).seconds());
-  rearm_wall_deadline_ = std::chrono::steady_clock::now() +
-    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-    std::chrono::duration<double>(remaining_tail_sec + kSafeRearmSettleBudgetSec));
-}
-
-void CollisionAwareServoComponent::ensure_rearm_deadline(const rclcpp::Time & current_time)
-{
-  if (!rearm_deadline_.has_value() || !rearm_wall_deadline_.has_value()) {
-    start_rearm_deadline(current_time);
-  }
-}
-
-void CollisionAwareServoComponent::clear_rearm_deadlines() noexcept
-{
-  rearm_deadline_.reset();
-  rearm_wall_deadline_.reset();
-}
-
-bool CollisionAwareServoComponent::rearm_deadline_expired(
-  const rclcpp::Time & current_time,
-  const std::chrono::steady_clock::time_point & wall_time) const noexcept
-{
-  const bool ros_deadline_expired =
-    rearm_deadline_.has_value() && current_time >= *rearm_deadline_;
-  const bool wall_deadline_expired =
-    rearm_wall_deadline_.has_value() && wall_time >= *rearm_wall_deadline_;
-  return ros_deadline_expired || wall_deadline_expired;
-}
-
-void CollisionAwareServoComponent::record_healthy_publication() noexcept
-{
-  if (consecutive_automatic_rearms_ == 0U || bootstrap_ack_pending_) {
-    return;
-  }
-  ++healthy_publications_since_rearm_;
-  if (healthy_publications_since_rearm_ >=
-    kHealthyPublicationsToResetRearmBudget)
-  {
-    consecutive_automatic_rearms_ = 0U;
-    healthy_publications_since_rearm_ = 0U;
-  }
-}
-
 void CollisionAwareServoComponent::enter_safety_wait(std::string message)
 {
   // Keep the last checked stop on the controller. Reconsider fresh feedback
@@ -85,20 +12,15 @@ void CollisionAwareServoComponent::enter_safety_wait(std::string message)
   halt_latched_.store(true, std::memory_order_release);
   controller_mode_ = ControllerMode::kWaitingForSafeState;
   latched_halt_reason_ = std::move(message);
-  const auto * record = active_published_record();
+  const auto * record = commands_.activePublication();
   const auto current_time = now();
-  published_tail_rearm_pending_ = record && current_time < record->stationary_time;
-  command_queue_.clear();
-  control_time_grid_->resetCommandEpoch();
-  command_epoch_active_ = false;
-  command_epoch_has_published_ = false;
-  clear_bootstrap_ack_state();
-  rearm_pending_ = true;
-  stable_rearm_samples_ = 0;
-  last_rearm_sample_time_.reset();
-  start_rearm_deadline(current_time);
+  commands_.published_tail_rearm_pending = record && current_time < record->stationary_time;
+  commands_.discardBranch();
+  commands_.rearm_pending = true;
+  commands_.restartSettling();
+  commands_.startRearmDeadline(current_time, std::chrono::steady_clock::now());
   reset_feedback_derivative_history();
-  motion_reference_->reset();
+  motion_reference_->reset(true);
   publish_status(moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION, latched_halt_reason_);
 }
 
@@ -107,7 +29,6 @@ void CollisionAwareServoComponent::reset_feedback_derivative_history()
   last_feedback_sample_time_.reset();
   last_feedback_velocity_.reset();
   last_feedback_acceleration_.reset();
-  last_feedback_jerk_.reset();
 }
 
 void CollisionAwareServoComponent::enter_startup_retry(std::string message)
@@ -115,23 +36,20 @@ void CollisionAwareServoComponent::enter_startup_retry(std::string message)
   // Before the first successful publication the trajectory controller is
   // still holding its own stationary reference. A transiently stale sample
   // must restart the settled-state gate, not create a permanent safety latch.
-  command_queue_.clear();
-  published_trajectory_history_.clear();
-  active_publication_id_.reset();
-  control_time_grid_->resetCommandEpoch();
-  command_epoch_active_ = false;
-  command_epoch_has_published_ = false;
-  clear_bootstrap_ack_state();
+  const bool reset_ack_pending = commands_.bootstrap_reset_ack_pending;
+  commands_.discardBranch(reset_ack_pending);
+  if (!reset_ack_pending) {
+    commands_.forgetPublished();
+  }
   controller_mode_ = ControllerMode::kBraking;
-  rearm_pending_ = true;
-  published_tail_rearm_pending_ = false;
-  stable_rearm_samples_ = 0;
-  last_rearm_sample_time_.reset();
-  ensure_rearm_deadline(now());
+  commands_.rearm_pending = true;
+  commands_.published_tail_rearm_pending = false;
+  commands_.restartSettling();
+  commands_.ensureRearmDeadline(now(), std::chrono::steady_clock::now());
   reset_feedback_derivative_history();
   pause_terminal_pending_.store(false, std::memory_order_release);
-  ++startup_retry_count_;
-  last_startup_retry_reason_ = message;
+  ++telemetry_.startup_retry_count;
+  telemetry_.last_startup_retry_reason = message;
   publish_status(
     moveit_msgs::msg::ServoStatus::NO_WARNING,
     std::move(message) + "; waiting for a fresh settled hold before retry");
@@ -139,7 +57,7 @@ void CollisionAwareServoComponent::enter_startup_retry(std::string message)
 
 void CollisionAwareServoComponent::handle_recoverable_control_gap(std::string message)
 {
-  if (command_epoch_has_published_) {
+  if (commands_.epoch_has_published || commands_.hasRetainedPublication()) {
     enter_controlled_rearm(std::move(message));
   } else {
     enter_startup_retry(std::move(message));
@@ -148,44 +66,212 @@ void CollisionAwareServoComponent::handle_recoverable_control_gap(std::string me
 
 void CollisionAwareServoComponent::enter_controlled_rearm(std::string message)
 {
-  motion_reference_->reset();
-  const auto * published_record = active_published_record();
-  if (!command_epoch_has_published_ || published_record == nullptr ||
-    published_record->execution_queue.empty())
-  {
+  motion_reference_->reset(true);
+  const auto * published_record = commands_.activePublication();
+  if (published_record == nullptr || published_record->execution_queue.empty()) {
     enter_safety_wait(std::move(message));
     return;
   }
-  ++consecutive_automatic_rearms_;
-  healthy_publications_since_rearm_ = 0U;
+  ++commands_.consecutive_automatic_rearms;
+  commands_.healthy_publications_since_rearm = 0U;
 
   // Do not replace the controller command. Its immutable suffix already
   // brakes to an exact hold. Discard only the unpublished online branch,
   // wait for measured settling, then bootstrap a fresh fixed-grid epoch.
-  command_queue_.clear();
-  control_time_grid_->resetCommandEpoch();
-  command_epoch_active_ = false;
-  command_epoch_has_published_ = false;
-  clear_bootstrap_ack_state();
+  commands_.discardBranch();
   controller_mode_ = ControllerMode::kBraking;
-  rearm_pending_ = true;
+  commands_.rearm_pending = true;
   const rclcpp::Time rearm_start = now();
-  published_tail_rearm_pending_ = rearm_start < published_record->stationary_time;
-  stable_rearm_samples_ = 0;
-  last_rearm_sample_time_.reset();
-  start_rearm_deadline(rearm_start);
+  commands_.published_tail_rearm_pending = rearm_start < published_record->stationary_time;
+  commands_.restartSettling();
+  commands_.startRearmDeadline(rearm_start, std::chrono::steady_clock::now());
   reset_feedback_derivative_history();
   pause_terminal_pending_.store(false, std::memory_order_release);
-  ++controlled_rearm_count_;
-  last_controlled_rearm_reason_ = message;
+  ++telemetry_.controlled_rearm_count;
+  telemetry_.last_controlled_rearm_reason = message;
   publish_status(
-    published_tail_rearm_pending_ ?
+    commands_.published_tail_rearm_pending ?
     moveit_msgs::msg::ServoStatus::DECELERATE_FOR_COLLISION :
     moveit_msgs::msg::ServoStatus::NO_WARNING,
     std::move(message) +
-    (published_tail_rearm_pending_ ?
+    (commands_.published_tail_rearm_pending ?
     "; executing the pre-published smooth stop before automatic re-arm" :
     "; published stop is complete, confirming the settled state before automatic re-arm"));
+}
+
+bool CollisionAwareServoComponent::prepare_control_cycle(
+  const rclcpp::Time & current_time,
+  const std::chrono::steady_clock::time_point & current_wall_time,
+  const control::ControlTimeObservation & time_observation)
+{
+  if (time_observation.status == control::ControlTimeStatus::kRewind) {
+    ++telemetry_.clock_rewind_count;
+    motion_reference_->reset();
+    commands_.discardBranch();
+    commands_.forgetPublished();
+    commands_.rearm_pending = false;
+    commands_.published_tail_rearm_pending = false;
+    commands_.restartSettling();
+    commands_.clearRearmDeadlines();
+    reset_feedback_derivative_history();
+    initial_state_received_ = false;
+    {
+      std::lock_guard<std::mutex> lock(target_mutex_);
+      latest_pose_.reset();
+    }
+    {
+      std::lock_guard<std::mutex> lock(controller_state_mutex_);
+      latest_controller_state_.reset();
+    }
+    controller_mode_ = ControllerMode::kWaitingForSafeState;
+    halt_latched_.store(true, std::memory_order_release);
+    commands_.rearm_pending = true;
+    latched_halt_reason_ =
+      "ROS time rewound; waiting for fresh feedback and a settled controller";
+    publish_status(
+      moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION, latched_halt_reason_);
+    return false;
+  }
+  const bool rearm_requested = reset_queue_requested_.exchange(
+    false, std::memory_order_acq_rel);
+  if (rearm_requested) {
+    motion_reference_->reset();
+    const auto * published_record = commands_.activePublication();
+    commands_.published_tail_rearm_pending = published_record != nullptr &&
+      current_time < published_record->stationary_time;
+    commands_.discardBranch();
+    commands_.rearm_pending = true;
+    commands_.restartSettling();
+    commands_.clearRearmDeadlines();
+    commands_.consecutive_automatic_rearms = 0U;
+    commands_.healthy_publications_since_rearm = 0U;
+    reset_feedback_derivative_history();
+    if (controller_mode_ != ControllerMode::kWaitingForSafeState) {
+      controller_mode_ = ControllerMode::kBraking;
+    }
+  }
+  if (commands_.rearm_pending) {
+    commands_.ensureRearmDeadline(current_time, std::chrono::steady_clock::now());
+  }
+  if (time_observation.status == control::ControlTimeStatus::kNotAdvancing) {
+    ++telemetry_.clock_not_advancing_observations;
+    if ((commands_.rearm_pending || commands_.bootstrap_ack_pending) &&
+      commands_.rearmDeadlineExpired(current_time, current_wall_time))
+    {
+      ++telemetry_.rearm_timeout_count;
+      enter_safety_wait(
+        commands_.bootstrap_ack_pending ?
+        "Trajectory controller bootstrap acknowledgement timed out while ROS time was frozen" :
+        "Safe re-arm timed out while ROS time was frozen");
+      return false;
+    }
+    publish_status(
+      controller_mode_ == ControllerMode::kWaitingForSafeState ?
+      moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION :
+      moveit_msgs::msg::ServoStatus::NO_WARNING,
+      controller_mode_ == ControllerMode::kWaitingForSafeState ?
+      (latched_halt_reason_.empty() ? "Waiting for a safe controller state" :
+      latched_halt_reason_) : "ROS time is not advancing");
+    return false;
+  }
+  if (time_observation.status == control::ControlTimeStatus::kWait) {
+    if ((commands_.rearm_pending || commands_.bootstrap_ack_pending) &&
+      commands_.rearmDeadlineExpired(current_time, current_wall_time))
+    {
+      ++telemetry_.rearm_timeout_count;
+      enter_safety_wait(
+        commands_.bootstrap_ack_pending ?
+        "Trajectory controller bootstrap acknowledgement timed out in wall time" :
+        "Safe re-arm timed out in wall time");
+    }
+    return false;
+  }
+  telemetry_.skipped_control_periods += time_observation.skipped_periods;
+
+  telemetry_.resetTick();
+  if (!commands_.rearm_pending && controller_mode_ == ControllerMode::kWaitingForSafeState) {
+    publish_status(
+      moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION,
+      latched_halt_reason_.empty() ? "Waiting for a safe controller state" :
+      latched_halt_reason_);
+    return false;
+  }
+  if (paused_.load(std::memory_order_acquire) &&
+    pause_requested_.load(std::memory_order_acquire))
+  {
+    publish_status(moveit_msgs::msg::ServoStatus::NO_WARNING, "Servoing paused");
+    return false;
+  }
+
+  if (trajectory_publisher_->get_subscription_count() == 0U ||
+    !trajectory_controller_active_.load(std::memory_order_acquire))
+  {
+    if (commands_.rearm_pending) {
+      if (commands_.published_tail_rearm_pending) {
+        enter_safety_wait(
+          "Trajectory controller was lost while a published braking tail was in flight");
+      } else if (commands_.rearmDeadlineExpired(current_time, current_wall_time)) {
+        ++telemetry_.rearm_timeout_count;
+        enter_safety_wait(
+          "Safe re-arm timed out waiting for an active subscribed trajectory controller");
+      } else {
+        publish_status(
+          halt_latched_.load(std::memory_order_acquire) ?
+          moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION :
+          moveit_msgs::msg::ServoStatus::NO_WARNING,
+          "Safe re-arm is waiting for an active subscribed trajectory controller");
+      }
+    } else {
+      enter_safety_wait("Trajectory controller is not active and subscribed");
+    }
+    return false;
+  }
+
+  if (commands_.rearm_pending) {
+    if (commands_.published_tail_rearm_pending &&
+      planning_scene_collision_revision_.load(std::memory_order_acquire) !=
+      last_validated_scene_revision_)
+    {
+      ++telemetry_.planning_scene_invalidation_count;
+      enter_safety_wait(
+        "PlanningScene collision geometry changed while a published braking tail was in flight");
+      return false;
+    }
+    std::string rearm_reason;
+    const RearmReadiness rearm_readiness = safe_rearm_ready(
+      current_time, rearm_reason);
+    if (rearm_readiness == RearmReadiness::kUnsafe) {
+      enter_safety_wait(std::move(rearm_reason));
+      return false;
+    }
+    if (rearm_readiness == RearmReadiness::kWaiting) {
+      if (commands_.rearmDeadlineExpired(current_time, current_wall_time)) {
+        ++telemetry_.rearm_timeout_count;
+        enter_safety_wait(
+          "Safe re-arm timed out after its bounded settle window: " + rearm_reason);
+        return false;
+      }
+      publish_status(
+        halt_latched_.load(std::memory_order_acquire) ?
+        moveit_msgs::msg::ServoStatus::HALT_FOR_COLLISION :
+        (commands_.published_tail_rearm_pending ?
+        moveit_msgs::msg::ServoStatus::DECELERATE_FOR_COLLISION :
+        moveit_msgs::msg::ServoStatus::NO_WARNING),
+        std::move(rearm_reason));
+      return false;
+    }
+    commands_.rearm_pending = false;
+    commands_.published_tail_rearm_pending = false;
+    commands_.restartSettling();
+    commands_.forgetPublished();
+    commands_.clearBootstrap();
+    halt_latched_.store(false, std::memory_order_release);
+    paused_.store(false, std::memory_order_release);
+    controller_mode_ = ControllerMode::kBraking;
+    latched_halt_reason_.clear();
+  }
+
+  return true;
 }
 
 }  // namespace face_tracking_arm

@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <model name="face_tracking_arm_calibration_marker">
+    <static>true</static>
+    <link name="marker_panel">
+      <visual name="aruco_id_0">
+        <geometry>
+          <plane>
+            <normal>0 0 1</normal>
+            <size>0.060 0.060</size>
+          </plane>
+        </geometry>
+        <material>
+          <ambient>1 1 1 1</ambient>
+          <diffuse>1 1 1 1</diffuse>
+          <pbr>
+            <metal>
+              <albedo_map>model://face_tracking_arm_calibration_marker/materials/textures/aruco_0.png</albedo_map>
+              <metalness>0</metalness>
+              <roughness>1</roughness>
+            </metal>
+          </pbr>
+        </material>
+        <cast_shadows>false</cast_shadows>
+      </visual>
+    </link>
+  </model>
+</sdf>

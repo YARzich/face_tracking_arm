@@ -153,7 +153,10 @@ def test_launch_bootstraps_installed_helpers_without_project_pythonpath(tmp_path
     pytest.importorskip('launch_ros.actions')
     installed = tmp_path / 'lib/face_tracking_arm/face_tracking_bringup'
     installed.mkdir(parents=True)
-    for filename in ('__init__.py', 'robot_profile.py', 'simulation_start.py'):
+    for filename in (
+        '__init__.py', 'robot_profile.py', 'simulation_start.py',
+        'simulation_config.py', 'simulation_launch.py', 'mount_collisions.py',
+    ):
         shutil.copyfile(PACKAGE / 'python/face_tracking_bringup' / filename,
                         installed / filename)
     env = dict(os.environ)

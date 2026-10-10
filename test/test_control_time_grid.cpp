@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "face_tracking_arm/control_time_grid.hpp"
+#include "face_tracking_arm/snapshot_timing.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -163,6 +164,32 @@ TEST(ControlTimeGrid, RefusesToRebaseADepletedCommandBuffer)
   EXPECT_EQ(grid.commandStamp(159, 50, 20), 180);
 }
 
+TEST(ControlTimeGrid, CountsPublishedPeriodsNeededForTargetLead)
+{
+  ControlTimeGrid grid{10};
+  EXPECT_FALSE(grid.periodsUntilCommandLead(100, 20).has_value());
+  ASSERT_EQ(grid.commandStamp(100, 50, 20), 150);
+
+  EXPECT_EQ(grid.periodsUntilCommandLead(121, 20), 0U);
+  EXPECT_EQ(grid.periodsUntilCommandLead(141, 20), 1U);
+  EXPECT_EQ(grid.periodsUntilCommandLead(171, 20), 4U);
+}
+
+TEST(ControlTimeGrid, RecoveredAnchorRetainsComputeLeadAcrossNearBoundaryDelay)
+{
+  ControlTimeGrid grid{10};
+  ASSERT_EQ(grid.commandStamp(100, 10, 0), 110);
+
+  // At 109, the original next stamp has only 11 units of lead. Preserve a
+  // 30-unit epoch lead (20 minimum plus one 10-unit compute period).
+  ASSERT_EQ(grid.periodsUntilCommandLead(109, 30), 2U);
+  ASSERT_TRUE(grid.adoptPublishedStamp(130));
+
+  // Five units of work after the near-boundary recovery still leaves at least
+  // the 20-unit physical minimum when the next command is appended.
+  EXPECT_EQ(grid.commandStamp(114, 50, 20), 140);
+}
+
 TEST(ControlTimeGrid, AdoptsOnlyAFutureStampOnTheActiveCommandGrid)
 {
   ControlTimeGrid grid{10};
@@ -213,6 +240,72 @@ TEST(ControlTimeGrid, DetectsTimestampOverflowWithoutWrapping)
   EXPECT_EQ(command_grid.commandStamp(maximum - 10, 0, 0), maximum - 10);
   EXPECT_EQ(command_grid.commandStamp(maximum - 10, 0, 0), maximum);
   EXPECT_THROW(command_grid.commandStamp(maximum - 10, 0, 0), std::overflow_error);
+}
+
+TEST(SnapshotTiming, TargetArrivingAfterTickStartIsReadBeforeItsValidationTime)
+{
+  std::int64_t clock_ns = 1'000;
+  std::int64_t latest_target_stamp_ns = 0;
+  const auto [target_stamp_ns, validation_time_ns] = readSnapshotAtCurrentTime(
+    [&]() {
+      // Model receive_target replacing latest_pose_ before current_target()
+      // acquires its mutex, after control_tick sampled its start time.
+      clock_ns = 1'001;
+      latest_target_stamp_ns = 1'001;
+      return latest_target_stamp_ns;
+    },
+    [&clock_ns]() {return clock_ns;});
+  EXPECT_EQ(target_stamp_ns, 1'001);
+  EXPECT_EQ(validation_time_ns, 1'001);
+  EXPECT_TRUE(isInSameClockEpoch(1'000, validation_time_ns));
+  EXPECT_TRUE(isFreshSnapshotTimestamp(target_stamp_ns, validation_time_ns, 20));
+}
+
+TEST(SnapshotTiming, FeedbackUpdateBetweenTickStartAndStateSnapshotIsAccepted)
+{
+  std::int64_t clock_ns = 1'000;
+  std::int64_t feedback_stamp_ns = 0;
+  const auto [snapshot_stamp_ns, snapshot_time_ns] = readSnapshotAtCurrentTime(
+    [&]() {
+      // Model a MoveIt state-monitor update before getCurrentStateAndTime().
+      clock_ns = 1'001;
+      feedback_stamp_ns = 1'001;
+      return feedback_stamp_ns;
+    },
+    [&clock_ns]() {return clock_ns;});
+  EXPECT_EQ(snapshot_stamp_ns, 1'001);
+  EXPECT_EQ(snapshot_time_ns, 1'001);
+  EXPECT_TRUE(isInSameClockEpoch(1'000, snapshot_time_ns));
+  EXPECT_TRUE(isFreshSnapshotTimestamp(snapshot_stamp_ns, snapshot_time_ns, 20));
+}
+
+TEST(SnapshotTiming, KeepsFutureStaleAndRewoundFeedbackInvalid)
+{
+  const auto [ordinary_stamp_ns, ordinary_time_ns] = readSnapshotAtCurrentTime(
+    []() {return std::int64_t{900};},
+    []() {return std::int64_t{900};});
+  EXPECT_TRUE(isFreshSnapshotTimestamp(ordinary_stamp_ns, ordinary_time_ns, 20));
+  EXPECT_TRUE(isInSameClockEpoch(ordinary_time_ns, ordinary_time_ns));
+
+  // An actually future sample stays invalid relative to the post-snapshot time.
+  EXPECT_FALSE(isFreshSnapshotTimestamp(1'002, 1'001, 20));
+  // Freshness remains bounded; taking a later time does not bless stale state.
+  EXPECT_FALSE(isFreshSnapshotTimestamp(900, 1'001, 100));
+
+  std::int64_t clock_ns = 2'000;
+  const auto [rewound_stamp_ns, rewound_snapshot_time_ns] = readSnapshotAtCurrentTime(
+    [&]() {
+      // A ROS-time reset between the old tick time and snapshot must use the
+      // rewound time, so data from the previous time epoch is still future.
+      clock_ns = 1'000;
+      return std::int64_t{1'500};
+    },
+    [&clock_ns]() {return clock_ns;});
+  EXPECT_EQ(rewound_stamp_ns, 1'500);
+  EXPECT_EQ(rewound_snapshot_time_ns, 1'000);
+  EXPECT_FALSE(isInSameClockEpoch(2'000, rewound_snapshot_time_ns));
+  EXPECT_FALSE(isFreshSnapshotTimestamp(
+      rewound_stamp_ns, rewound_snapshot_time_ns, 20));
 }
 
 }  // namespace

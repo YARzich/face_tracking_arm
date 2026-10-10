@@ -187,6 +187,18 @@ JointMotionState twoDofMotion(const double common, const double relative)
   return diagnostic == result.diagnostics.pairs.end() ? nullptr : &*diagnostic;
 }
 
+[[nodiscard]] const CollisionSegmentSampleDiagnostic * findDensePathSample(
+  const CollisionSegmentValidationResult & result, const std::size_t sample_index)
+{
+  const auto sample = std::find_if(
+    result.samples.begin(), result.samples.end(),
+    [sample_index](const CollisionSegmentSampleDiagnostic & candidate) {
+      return candidate.sample_index == sample_index &&
+             !candidate.path_block_certificate_attempt;
+    });
+  return sample == result.samples.end() ? nullptr : &*sample;
+}
+
 [[nodiscard]] std::pair<double, double> oneDofReachableVelocityInterval(
   const JointMotionState & state,
   const JointMotionLimits & limits,
@@ -512,6 +524,10 @@ TEST(CollisionConstraints, RejectsContradictorySafetyProfile)
   EXPECT_THROW(static_cast<void>(CollisionConstraintBuilder{config}), std::invalid_argument);
 
   config = CollisionConstraintConfig{};
+  config.segment_validation_substeps = 1U;
+  EXPECT_THROW(static_cast<void>(CollisionConstraintBuilder{config}), std::invalid_argument);
+
+  config = CollisionConstraintConfig{};
   config.protected_joint_lower_rad = config.protected_joint_upper_rad;
   EXPECT_THROW(static_cast<void>(CollisionConstraintBuilder{config}), std::invalid_argument);
 
@@ -641,7 +657,8 @@ TEST(CollisionConstraints, QpEnvelopeUsesPairSpecificRobustRemainingDistance)
   ASSERT_TRUE(result.diagnostics.valid) << result.diagnostics.failure_reason;
   const auto * wall_pair = findWorldPair(result, "wall");
   ASSERT_NE(wall_pair, nullptr);
-  constexpr double expected_required_clearance = 0.015 + 0.0001 + 2.6193 * 0.006;
+  constexpr double expected_required_clearance =
+    0.015 + 0.0001 + 2.6193 * (0.006 + 0.002 * 0.01 / 6.0);
   EXPECT_NEAR(wall_pair->distance_m, 0.016, 1.0e-9);
   EXPECT_NEAR(wall_pair->distance_lipschitz_m_per_rad, 2.6193, 1.0e-12);
   EXPECT_NEAR(wall_pair->required_clearance_m, expected_required_clearance, 1.0e-12);
@@ -649,6 +666,121 @@ TEST(CollisionConstraints, QpEnvelopeUsesPairSpecificRobustRemainingDistance)
   EXPECT_TRUE(result.diagnostics.robust_clearance_violated);
   EXPECT_FALSE(result.diagnostics.hard_clearance_violated);
   EXPECT_LT(wall_pair->applied_approach_speed_cap_mps, 0.0);
+}
+
+TEST(CollisionConstraints, QpNextStepReserveMatchesSegmentValidator)
+{
+  constexpr double period = 0.01;
+  constexpr double legacy_candidate_velocity = 0.002;
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+
+  CollisionConstraintConfig config = sliderConfig();
+  config.residual_latency_sec = 0.0;
+  config.segment_validation_substeps = 3U;
+  const JointMotionLimits limits = oneDofLimits();
+  JointMotionState motion = motionAt(-0.30);
+  motion.velocity[0] = legacy_candidate_velocity;
+
+  Eigen::VectorXd legacy_velocity(1);
+  legacy_velocity[0] = legacy_candidate_velocity;
+  const Eigen::VectorXd distance_gradient = Eigen::VectorXd::Constant(1, -1.0);
+  const double pair_lipschitz = config.default_distance_lipschitz_m_per_rad;
+  const double base_required_clearance = config.hard_clearance_m +
+    config.numerical_distance_reserve_m +
+    pair_lipschitz * config.tracking_position_error_bound_rad;
+  const double candidate_step_toward_contact =
+    -distance_gradient.dot(legacy_velocity) * period;
+  const double candidate_stop_tail = jerkLimitedCollisionStoppingDistance(
+    distance_gradient, motion, legacy_velocity, limits, period, config.residual_latency_sec);
+  const double validator_inter_sample_reserve = pair_lipschitz * legacy_candidate_velocity *
+    period / (2.0 * static_cast<double>(config.segment_validation_substeps));
+  ASSERT_GT(validator_inter_sample_reserve, 0.0);
+
+  // The old QP envelope leaves only a fraction of the segment check's extra reserve after
+  // this reachable command's first integration step.
+  const double remaining_margin = 0.25 * validator_inter_sample_reserve;
+  const double initial_distance = base_required_clearance + candidate_step_toward_contact +
+    candidate_stop_tail + remaining_margin;
+  Eigen::Isometry3d obstacle_pose = Eigen::Isometry3d::Identity();
+  obstacle_pose.translation().x() = motion.position[0] + 0.1 + initial_distance;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle_pose);
+
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(fixture.group, motion.position);
+  robot_state.update(true);
+  const CollisionConstraintResult collision = CollisionConstraintBuilder(config).build(
+    *fixture.scene, robot_state, *fixture.group, motion, limits, period);
+  ASSERT_TRUE(collision.diagnostics.valid) << collision.diagnostics.failure_reason;
+  const CollisionPairDiagnostic * wall_pair = findWorldPair(collision, "wall");
+  ASSERT_NE(wall_pair, nullptr);
+  ASSERT_EQ(collision.diagnostics.active_distance_constraints, 1U);
+  ASSERT_EQ(collision.constraints.size(), 2U);
+  const Eigen::VectorXd actual_distance_gradient = collision.constraints.back().coefficients;
+  ASSERT_EQ(actual_distance_gradient.size(), 1);
+  EXPECT_NEAR(actual_distance_gradient[0], distance_gradient[0], 1.0e-12);
+  const auto [reachable_minimum, reachable_maximum] =
+    oneDofReachableVelocityInterval(motion, limits, period);
+  const double qp_inter_sample_reserve = pair_lipschitz *
+    std::max(std::abs(reachable_minimum), std::abs(reachable_maximum)) * period /
+    (2.0 * static_cast<double>(config.segment_validation_substeps));
+  EXPECT_NEAR(
+    wall_pair->required_clearance_m,
+    base_required_clearance + qp_inter_sample_reserve, 1.0e-12);
+
+  const double old_qp_safe_approach_speed = maximumSafeCollisionApproachSpeed(
+    wall_pair->distance_m - base_required_clearance,
+    actual_distance_gradient, motion, limits, period, config.residual_latency_sec);
+  ASSERT_GE(old_qp_safe_approach_speed, legacy_candidate_velocity);
+
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = period;
+  qp_config.residual_command_latency_sec = config.residual_latency_sec;
+  qp_config.solver_time_limit_sec = 0.1;
+  qp_config.solver_max_iterations = 2000;
+  const HierarchicalVelocityQp solver(qp_config);
+  HierarchicalVelocityTask task;
+  task.primary_matrix = Eigen::MatrixXd::Identity(1, 1);
+  task.primary_reference = Eigen::VectorXd::Constant(1, legacy_candidate_velocity);
+  task.primary_weights = Eigen::VectorXd::Ones(1);
+  task.secondary_matrix = Eigen::MatrixXd(0, 1);
+  task.secondary_reference = Eigen::VectorXd(0);
+  task.secondary_weights = Eigen::VectorXd(0);
+
+  std::vector<LinearVelocityConstraint> legacy_constraints = collision.constraints;
+  legacy_constraints.back().lower_bound = -old_qp_safe_approach_speed;
+  const QpResult legacy_qp = solver.solve(task, motion, limits, legacy_constraints);
+  ASSERT_TRUE(legacy_qp.command_available());
+  EXPECT_NEAR(legacy_qp.joint_velocity[0], legacy_candidate_velocity, 1.0e-6);
+
+  const auto next_motion = [&motion, period](const double velocity) {
+      JointMotionState next;
+      next.position = motion.position + Eigen::VectorXd::Constant(1, velocity * period);
+      next.velocity = Eigen::VectorXd::Constant(1, velocity);
+      next.acceleration = Eigen::VectorXd::Constant(
+        1, (velocity - motion.velocity[0]) / period);
+      return next;
+    };
+  const CollisionSegmentValidationResult legacy_segment = CollisionConstraintBuilder(
+    config).validateSegment(
+    *fixture.scene, robot_state, *fixture.group, motion,
+    next_motion(legacy_qp.joint_velocity[0]), config.segment_validation_substeps);
+  ASSERT_TRUE(legacy_segment.input_valid) << legacy_segment.failure_reason;
+  EXPECT_TRUE(legacy_segment.unsafe);
+  EXPECT_TRUE(legacy_segment.robust_clearance_violated);
+
+  const QpResult corrected_qp = solver.solve(task, motion, limits, collision.constraints);
+  ASSERT_TRUE(corrected_qp.command_available());
+  EXPECT_LE(corrected_qp.joint_velocity[0], legacy_qp.joint_velocity[0] + 1.0e-8);
+  const CollisionSegmentValidationResult corrected_segment = CollisionConstraintBuilder(
+    config).validateSegment(
+    *fixture.scene, robot_state, *fixture.group, motion,
+    next_motion(corrected_qp.joint_velocity[0]), config.segment_validation_substeps);
+  ASSERT_TRUE(corrected_segment.input_valid) << corrected_segment.failure_reason;
+  EXPECT_FALSE(corrected_segment.unsafe) << corrected_segment.failure_reason;
 }
 
 TEST(CollisionConstraints, BuildSingleDoesNotLetInvariantHideControllablePair)
@@ -715,6 +847,38 @@ TEST(CollisionConstraints, BuildSingleDoesNotLetInvariantHideControllablePair)
       repeated.diagnostics.pairs[index].distance_m,
       result.diagnostics.pairs[index].distance_m);
   }
+}
+
+TEST(CollisionConstraints, SegmentBatchKeepsNonNearestRobustlyUnsafePair)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState state(fixture.robot_model);
+  state.setToDefaultValues();
+  const JointMotionState pose = motionAt(0.125);
+  state.setJointGroupPositions(fixture.group, pose.position);
+  state.update(true);
+
+  const auto result = builder.validateSegment(
+    *fixture.scene, state, *fixture.group, pose, pose, 2U);
+
+  ASSERT_TRUE(result.input_valid) << result.failure_reason;
+  ASSERT_TRUE(result.unsafe);
+  ASSERT_TRUE(result.robust_clearance_violated);
+  ASSERT_EQ(result.first_unsafe_sample, 0U);
+  ASSERT_EQ(result.samples.size(), 3U);
+  // The nearer mount-neighbor pair is safe under its tighter profile. The farther
+  // base-to-moving pair violates the default reserve and must not be hidden by the
+  // global nearest result returned by MoveIt.
+  const auto * sample = findDensePathSample(result, 0U);
+  ASSERT_NE(sample, nullptr);
+  EXPECT_EQ(sample->closest_pair, "mount_neighbor <-> moving");
+  EXPECT_TRUE(sample->robust_clearance_violated);
+  EXPECT_NE(result.failure_reason.find("base <-> moving"), std::string::npos);
+  // One batch for self distances and one for world distances per sampled pose.
+  EXPECT_EQ(result.distance_query_count, 6U);
 }
 
 TEST(CollisionConstraints, WorldDistanceGradientMatchesFiniteDifference)
@@ -1043,6 +1207,65 @@ TEST(CollisionConstraints, CertificateBoundsPairsOmittedBeyondTheQueryDistance)
   EXPECT_TRUE(unsafe.unsafe);
 }
 
+TEST(CollisionConstraints, PathCertificateIncludesIntermediateSuffixExtrema)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d obstacle = Eigen::Isometry3d::Identity();
+  obstacle.translation().x() = 0.6;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle);
+  CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState state(fixture.robot_model);
+  state.setToDefaultValues();
+  const auto start = motionAt(0.3);
+  state.setJointGroupPositions(fixture.group, start.position);
+  state.update(true);
+  const auto result = builder.build(
+    *fixture.scene, state, *fixture.group, start, oneDofLimits(), 0.01);
+  ASSERT_TRUE(result.diagnostics.valid) << result.diagnostics.failure_reason;
+
+  const std::vector<JointMotionState> safe_path{
+    motionAt(0.3), motionAt(0.305), motionAt(0.31)};
+  EXPECT_TRUE(builder.canCertifyPath(result.diagnostics, safe_path));
+
+  // The path returns to its safe start after an unsafe middle waypoint. A check
+  // that considered only the first and last point would incorrectly certify it.
+  const std::vector<JointMotionState> unsafe_suffix{
+    motionAt(0.3), motionAt(0.51), motionAt(0.3)};
+  EXPECT_FALSE(builder.canCertifyPath(result.diagnostics, unsafe_suffix));
+}
+
+TEST(CollisionConstraints, UnsafePathReportsItsFirstSampleWithoutEvaluatingTheRemainder)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d obstacle = Eigen::Isometry3d::Identity();
+  obstacle.translation().x() = 0.6;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle);
+  CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState state(fixture.robot_model);
+  const auto first = motionAt(0.51);
+  const auto second = motionAt(0.3);
+  state.setToDefaultValues();
+  state.setJointGroupPositions(fixture.group, first.position);
+  state.update(true);
+
+  const auto result = builder.validatePath(
+    *fixture.scene, state, *fixture.group, {first, second}, 10U);
+
+  ASSERT_TRUE(result.input_valid) << result.failure_reason;
+  ASSERT_TRUE(result.unsafe);
+  EXPECT_EQ(result.first_unsafe_sample, 0U);
+  EXPECT_GE(result.evaluated_samples, 1U);
+  EXPECT_GT(result.distance_query_count, 0U);
+  const auto * first_unsafe = findDensePathSample(result, 0U);
+  ASSERT_NE(first_unsafe, nullptr);
+  EXPECT_TRUE(first_unsafe->collision_detected || first_unsafe->robust_clearance_violated);
+  EXPECT_LT(result.evaluated_samples, result.requested_substeps + 1U);
+}
+
 TEST(CollisionConstraints, CertificateRejectsIncompleteDataAndProtectedCorridorExit)
 {
   SliderFixture fixture;
@@ -1109,6 +1332,157 @@ TEST(CollisionConstraints, SegmentDoesNotLetSafeInvariantHideUnsafeGenericPair)
   EXPECT_NE(segment.failure_reason.find("base <-> moving"), std::string::npos);
   EXPECT_NE(segment.failure_reason.find("distance="), std::string::npos);
   EXPECT_NE(segment.failure_reason.find("required="), std::string::npos);
+}
+
+TEST(CollisionConstraints, SampledWorldDistancesPreservePairSpecificReservesAndClosestPair)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.group, nullptr);
+  fixture.scene->getAllowedCollisionMatrixNonConst().setEntry("moving", "mount_neighbor", true);
+  CollisionConstraintConfig config = sliderConfig();
+  config.distance_bounds[{"near", ""}] = 0.0;
+  config.distance_bounds[{"moving", ""}] = config.default_distance_lipschitz_m_per_rad;
+  CollisionConstraintBuilder builder(config);
+  Eigen::Isometry3d obstacle = Eigen::Isometry3d::Identity();
+  obstacle.translation() = Eigen::Vector3d(0.30, 10.12, 0.0);
+  fixture.scene->getWorldNonConst()->addToObject(
+    "near_wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle);
+  obstacle.translation() = Eigen::Vector3d(0.30, -0.125, 0.0);
+  fixture.scene->getWorldNonConst()->addToObject(
+    "moving_wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle);
+  moveit::core::RobotState state(fixture.robot_model);
+  state.setToDefaultValues();
+  state.setJointGroupPositions(fixture.group, motionAt(0.30).position);
+  state.update(true);
+
+  // The nearest world pair is safe; the farther pair violates its larger reserve.
+  for (int repeat = 0; repeat < 3; ++repeat) {
+    const auto result = builder.validatePath(
+      *fixture.scene, state, *fixture.group, {motionAt(0.30), motionAt(0.30)}, 2);
+    ASSERT_TRUE(result.input_valid) << result.failure_reason;
+    ASSERT_TRUE(result.unsafe);
+    EXPECT_EQ(result.first_unsafe_sample, 0U);
+    EXPECT_NEAR(result.minimum_world_distance_m, 0.020, 1.0e-9);
+    EXPECT_EQ(result.closest_pair, "near <-> near_wall");
+    EXPECT_NE(result.failure_reason.find("moving <-> moving_wall"), std::string::npos);
+    const auto * dense_failure = findDensePathSample(result, 0U);
+    ASSERT_NE(dense_failure, nullptr);
+    EXPECT_FALSE(dense_failure->collision_detected);
+    EXPECT_FALSE(dense_failure->hard_clearance_violated);
+    EXPECT_TRUE(dense_failure->robust_clearance_violated);
+  }
+  // Querying a sample must not change the scene's collision exclusions.
+  fixture.scene->getAllowedCollisionMatrixNonConst().setEntry("moving", "moving_wall", true);
+  EXPECT_FALSE(builder.validateSegment(
+      *fixture.scene, state, *fixture.group, motionAt(0.30), motionAt(0.30), 2).unsafe);
+}
+
+TEST(CollisionConstraints, EmptySampledDistancesKeepInfiniteClearanceAndNoClosestPair)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.group, nullptr);
+  auto & acm = fixture.scene->getAllowedCollisionMatrixNonConst();
+  const auto & links = fixture.robot_model->getLinkModelNames();
+  acm.setEntry(links, links, true);
+  moveit::core::RobotState state(fixture.robot_model);
+  state.setToDefaultValues();
+  state.setJointGroupPositions(fixture.group, motionAt(0.30).position);
+  state.update(true);
+  CollisionConstraintBuilder builder(sliderConfig());
+  const auto result = builder.validatePath(
+    *fixture.scene, state, *fixture.group, {motionAt(0.30), motionAt(0.32)}, 2);
+  ASSERT_TRUE(result.input_valid) << result.failure_reason;
+  EXPECT_FALSE(result.unsafe);
+  EXPECT_TRUE(result.closest_pair.empty());
+  EXPECT_TRUE(result.failure_reason.empty());
+  EXPECT_EQ(result.minimum_distance_m, std::numeric_limits<double>::infinity());
+  EXPECT_EQ(result.certified_path_block_count, 1U);
+  ASSERT_EQ(result.samples.size(), 1U);
+  EXPECT_TRUE(result.samples.front().path_block_certificate_attempt);
+  EXPECT_TRUE(result.samples.front().path_block_certified);
+  for (const auto & sample : result.samples) {
+    EXPECT_EQ(sample.minimum_self_distance_m, std::numeric_limits<double>::infinity());
+    EXPECT_EQ(sample.minimum_world_distance_m, std::numeric_limits<double>::infinity());
+    EXPECT_FALSE(sample.collision_detected);
+  }
+}
+
+TEST(CollisionConstraints, SampledSignedPenetrationRemainsUnsafeWithOtherClearPairs)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.group, nullptr);
+  moveit::core::RobotState state(fixture.robot_model);
+  state.setToDefaultValues();
+  state.setJointGroupPositions(fixture.group, motionAt(0.30).position);
+  state.update(true);
+  Eigen::Isometry3d obstacle = Eigen::Isometry3d::Identity();
+  obstacle.translation() = Eigen::Vector3d(0.39, 0.0, 0.0);
+  fixture.scene->getWorldNonConst()->addToObject(
+    "penetrating_wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle);
+  CollisionConstraintBuilder builder(sliderConfig());
+  const auto result = builder.validateSegment(
+    *fixture.scene, state, *fixture.group, motionAt(0.30), motionAt(0.30), 2);
+  ASSERT_TRUE(result.input_valid) << result.failure_reason;
+  EXPECT_TRUE(result.unsafe);
+  EXPECT_EQ(result.first_unsafe_sample, 0U);
+  EXPECT_NEAR(result.minimum_world_distance_m, -0.01, 1.0e-9);
+  EXPECT_EQ(result.closest_pair, "moving <-> penetrating_wall");
+  for (const auto & sample : result.samples) {
+    EXPECT_TRUE(sample.collision_detected);
+    EXPECT_TRUE(sample.hard_clearance_violated);
+    EXPECT_TRUE(sample.robust_clearance_violated);
+  }
+}
+
+TEST(CollisionConstraints, SampledQueryLeavesPairsBeyondItsThresholdSafe)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.group, nullptr);
+  CollisionConstraintConfig config = sliderConfig();
+  config.tracking_position_error_bound_rad = 0.0;
+  CollisionConstraintBuilder builder(config);
+  moveit::core::RobotState state(fixture.robot_model);
+  state.setToDefaultValues();
+  state.setJointGroupPositions(fixture.group, motionAt(0.30).position);
+  state.update(true);
+  // Every pair is beyond the 15.1 mm query threshold; the closest is at 20 mm.
+  const auto result = builder.validateSegment(
+    *fixture.scene, state, *fixture.group, motionAt(0.30), motionAt(0.30), 2);
+  ASSERT_TRUE(result.input_valid) << result.failure_reason;
+  EXPECT_FALSE(result.unsafe);
+  EXPECT_GE(result.minimum_self_distance_m, 0.019999);
+  EXPECT_TRUE(result.failure_reason.empty());
+}
+
+TEST(CollisionConstraints, SampledEqualDistancesKeepClosestPairAndFailureDeterministic)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d obstacle = Eigen::Isometry3d::Identity();
+  obstacle.translation().x() = 0.41;
+  for (const std::string name : {"wall_a", "wall_b"}) {
+    fixture.scene->getWorldNonConst()->addToObject(
+      name, std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle);
+  }
+  moveit::core::RobotState state(fixture.robot_model);
+  state.setToDefaultValues();
+  state.setJointGroupPositions(fixture.group, motionAt(0.30).position);
+  state.update(true);
+  CollisionConstraintBuilder builder(sliderConfig());
+  const auto first = builder.validateSegment(
+    *fixture.scene, state, *fixture.group, motionAt(0.30), motionAt(0.30), 2);
+  ASSERT_TRUE(first.input_valid) << first.failure_reason;
+  ASSERT_TRUE(first.unsafe);
+  EXPECT_NEAR(first.minimum_world_distance_m, 0.01, 1.0e-9);
+  EXPECT_NE(first.failure_reason.find(first.closest_pair), std::string::npos);
+  for (int repeat = 0; repeat < 5; ++repeat) {
+    const auto result = builder.validateSegment(
+      *fixture.scene, state, *fixture.group, motionAt(0.30), motionAt(0.30), 2);
+    EXPECT_EQ(result.closest_pair, first.closest_pair);
+    EXPECT_EQ(result.failure_reason, first.failure_reason);
+    EXPECT_EQ(result.first_unsafe_sample, first.first_unsafe_sample);
+    EXPECT_DOUBLE_EQ(result.minimum_world_distance_m, first.minimum_world_distance_m);
+  }
 }
 
 TEST(CollisionConstraints, SegmentUsesTighterMonitorNearLipschitzProfile)
@@ -1219,8 +1593,12 @@ TEST(CollisionConstraints, RelativeMotionKeepsItsReserveIncludingAtSharedPathWay
   ASSERT_TRUE(path.input_valid) << path.failure_reason;
   ASSERT_TRUE(path.unsafe);
   EXPECT_EQ(path.first_unsafe_sample, 2U);
-  EXPECT_FALSE(path.samples[0].robust_clearance_violated);
-  EXPECT_TRUE(path.samples[2].robust_clearance_violated);
+  const auto * first_sample = findDensePathSample(path, 0U);
+  const auto * unsafe_sample = findDensePathSample(path, 2U);
+  ASSERT_NE(first_sample, nullptr);
+  ASSERT_NE(unsafe_sample, nullptr);
+  EXPECT_FALSE(first_sample->robust_clearance_violated);
+  EXPECT_TRUE(unsafe_sample->robust_clearance_violated);
 }
 
 TEST(CollisionConstraints, CommonAncestorMotionStillChargesRobotWorldSamplingReserve)
@@ -1410,6 +1788,91 @@ TEST(CollisionConstraints, SegmentUsesRobustBoundaryAbovePhysicalHardClearance)
   EXPECT_FALSE(below_robust_boundary.samples.front().hard_clearance_violated);
 }
 
+TEST(CollisionConstraints, StationaryPoseMatchesSegmentDecisionWithOneSample)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  const auto pose = motionAt(0.130);
+  robot_state.setJointGroupPositions(fixture.group, pose.position);
+  robot_state.update(true);
+
+  const auto stationary_segment = builder.validateSegment(
+    *fixture.scene, robot_state, *fixture.group, pose, pose, 2);
+  const auto single_pose = builder.validatePose(
+    *fixture.scene, robot_state, *fixture.group, pose);
+
+  ASSERT_TRUE(stationary_segment.input_valid) << stationary_segment.failure_reason;
+  ASSERT_TRUE(single_pose.input_valid) << single_pose.failure_reason;
+  EXPECT_EQ(stationary_segment.unsafe, single_pose.unsafe);
+  EXPECT_EQ(stationary_segment.robust_clearance_violated, single_pose.robust_clearance_violated);
+  EXPECT_EQ(
+    stationary_segment.samples.front().collision_detected,
+    single_pose.samples.front().collision_detected);
+  EXPECT_DOUBLE_EQ(stationary_segment.minimum_self_distance_m, single_pose.minimum_self_distance_m);
+  EXPECT_DOUBLE_EQ(
+    stationary_segment.minimum_world_distance_m, single_pose.minimum_world_distance_m);
+  EXPECT_EQ(single_pose.evaluated_samples, 1U);
+  EXPECT_EQ(single_pose.samples.size(), 1U);
+  EXPECT_EQ(stationary_segment.evaluated_samples, 3U);
+  EXPECT_EQ(stationary_segment.distance_query_count, single_pose.distance_query_count * 3U);
+  EXPECT_TRUE(single_pose.unsafe);
+  EXPECT_TRUE(single_pose.robust_clearance_violated);
+  EXPECT_FALSE(single_pose.samples.front().hard_clearance_violated);
+}
+
+TEST(CollisionConstraints, StationaryPoseHonorsContactsAndRejectsInvalidGeometryOrState)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d obstacle_pose = Eigen::Isometry3d::Identity();
+  obstacle_pose.translation().x() = -0.19;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle_pose);
+  fixture.scene->getAllowedCollisionMatrixNonConst().setEntry("near", "mount_neighbor", true);
+  const auto pose = motionAt(-0.30);
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(fixture.group, pose.position);
+  robot_state.update(true);
+  CollisionConstraintBuilder builder(sliderConfig());
+
+  const auto collision = builder.validatePose(*fixture.scene, robot_state, *fixture.group, pose);
+  ASSERT_TRUE(collision.input_valid) << collision.failure_reason;
+  EXPECT_TRUE(collision.unsafe);
+  fixture.scene->getAllowedCollisionMatrixNonConst().setEntry("moving", "wall", true);
+  fixture.scene->getAllowedCollisionMatrixNonConst().setEntry("mount_neighbor", "wall", true);
+  const auto allowed = builder.validatePose(*fixture.scene, robot_state, *fixture.group, pose);
+  ASSERT_TRUE(allowed.input_valid) << allowed.failure_reason;
+  EXPECT_FALSE(allowed.unsafe) << allowed.failure_reason << "; closest=" << allowed.closest_pair;
+
+  auto invalid = pose;
+  invalid.position[0] = std::numeric_limits<double>::quiet_NaN();
+  const auto invalid_state = builder.validatePose(
+    *fixture.scene, robot_state, *fixture.group, invalid);
+  EXPECT_FALSE(invalid_state.input_valid);
+  EXPECT_TRUE(invalid_state.unsafe);
+
+  std::string description = kSliderUrdf;
+  const auto start = description.find("<link name=\"near\">");
+  description.replace(start, description.find("</link>", start) + 7U - start,
+    "<link name=\"near\"/>");
+  SliderFixture geometry_off(description);
+  ASSERT_NE(geometry_off.group, nullptr);
+  moveit::core::RobotState geometry_state(geometry_off.robot_model);
+  geometry_state.setToDefaultValues();
+  geometry_state.update(true);
+  const auto no_geometry = CollisionConstraintBuilder(sliderConfig()).validatePose(
+    *geometry_off.scene, geometry_state, *geometry_off.group, motionAt(0.0));
+  EXPECT_FALSE(no_geometry.input_valid);
+  EXPECT_TRUE(no_geometry.unsafe);
+  EXPECT_NE(no_geometry.failure_reason.find("'near' has no collision geometry"), std::string::npos);
+}
+
 TEST(CollisionConstraints, InvalidSegmentInputFailsClosed)
 {
   SliderFixture fixture;
@@ -1437,7 +1900,142 @@ TEST(CollisionConstraints, InvalidSegmentInputFailsClosed)
   EXPECT_TRUE(non_finite.unsafe);
 }
 
-TEST(CollisionConstraints, PathSamplesSharedWaypointsOnceWithGlobalIndices)
+TEST(CollisionConstraints, SegmentRejectsOverflowAndCapacityBeforeAllocatingSamples)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  const CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(fixture.group, motionAt(-0.30).position);
+  robot_state.update(true);
+  const std::vector<CollisionSegmentSampleDiagnostic> samples;
+  for (const std::size_t substeps : {
+        std::numeric_limits<std::size_t>::max(), samples.max_size()})
+  {
+    SCOPED_TRACE(substeps);
+    CollisionSegmentValidationResult result;
+    ASSERT_NO_THROW(result = builder.validateSegment(
+        *fixture.scene, robot_state, *fixture.group, motionAt(-0.30), motionAt(-0.28), substeps));
+    EXPECT_FALSE(result.input_valid);
+    EXPECT_TRUE(result.unsafe);
+    EXPECT_EQ(result.requested_substeps, substeps);
+    EXPECT_EQ(result.evaluated_samples, 0U);
+    EXPECT_TRUE(result.samples.empty());
+    EXPECT_NE(result.failure_reason.find("sample count"), std::string::npos);
+  }
+}
+
+void expectEquivalentSamples(
+  const CollisionSegmentValidationResult & segment,
+  const CollisionSegmentValidationResult & path)
+{
+  ASSERT_TRUE(segment.input_valid) << segment.failure_reason;
+  ASSERT_TRUE(path.input_valid) << path.failure_reason;
+  EXPECT_EQ(path.unsafe, segment.unsafe);
+  EXPECT_EQ(path.requested_substeps, segment.requested_substeps);
+  EXPECT_EQ(path.first_unsafe_sample, segment.first_unsafe_sample);
+  EXPECT_EQ(path.samples.size(), path.evaluated_samples);
+  if (segment.unsafe) {
+    EXPECT_DOUBLE_EQ(path.first_unsafe_fraction, segment.first_unsafe_fraction);
+  } else {
+    EXPECT_EQ(path.robust_clearance_violated, segment.robust_clearance_violated);
+    EXPECT_TRUE(std::isnan(segment.first_unsafe_fraction));
+    EXPECT_TRUE(std::isnan(path.first_unsafe_fraction));
+  }
+  for (const auto & right : path.samples) {
+    if (right.path_block_certificate_attempt) {
+      continue;
+    }
+    ASSERT_LT(right.sample_index, segment.samples.size());
+    const auto & left = segment.samples[right.sample_index];
+    EXPECT_DOUBLE_EQ(right.interpolation_fraction, left.interpolation_fraction);
+    EXPECT_DOUBLE_EQ(right.protected_joint_position_rad, left.protected_joint_position_rad);
+    EXPECT_DOUBLE_EQ(right.minimum_self_distance_m, left.minimum_self_distance_m);
+    EXPECT_DOUBLE_EQ(right.minimum_world_distance_m, left.minimum_world_distance_m);
+    EXPECT_DOUBLE_EQ(right.minimum_distance_m, left.minimum_distance_m);
+    EXPECT_EQ(right.closest_pair, left.closest_pair);
+    EXPECT_EQ(right.collision_detected, left.collision_detected);
+    EXPECT_EQ(right.hard_clearance_violated, left.hard_clearance_violated);
+    EXPECT_EQ(right.robust_clearance_violated, left.robust_clearance_violated);
+    EXPECT_EQ(right.protected_joint_corridor_violated, left.protected_joint_corridor_violated);
+    EXPECT_EQ(right.skipped_invariant_contacts, left.skipped_invariant_contacts);
+  }
+}
+
+TEST(CollisionConstraints, SingleSegmentAndPathHaveEquivalentClearanceDiagnostics)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d obstacle_pose = Eigen::Isometry3d::Identity();
+  obstacle_pose.translation().x() = 0.50;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle_pose);
+  const CollisionConstraintBuilder builder(sliderConfig());
+  const std::vector<std::pair<double, double>> endpoints{
+    {-0.30, -0.26}, {-0.13, -0.135}, {-0.30, 0.30}, {0.20, 0.70}, {0.79, 0.82}};
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+
+  for (const bool allow_world_contact : {false, true}) {
+    fixture.scene->getAllowedCollisionMatrixNonConst().setEntry(
+      "moving", "wall", allow_world_contact);
+    for (const auto & [start, finish] : endpoints) {
+      SCOPED_TRACE(start);
+      SCOPED_TRACE(finish);
+      std::vector<JointMotionState> waypoints{motionAt(start), motionAt(finish)};
+      // Distance queries depend on position; finite derivatives must not change the verdict.
+      waypoints[0].velocity[0] = 0.30;
+      waypoints[0].acceleration[0] = -0.20;
+      waypoints[1].velocity[0] = -0.10;
+      waypoints[1].acceleration[0] = 0.50;
+      robot_state.setJointGroupPositions(fixture.group, waypoints.front().position);
+      robot_state.update(true);
+      for (const std::size_t substeps : {2U, 7U, 20U}) {
+        SCOPED_TRACE(substeps);
+        expectEquivalentSamples(
+          builder.validateSegment(
+            *fixture.scene, robot_state, *fixture.group, waypoints[0], waypoints[1], substeps),
+          builder.validatePath(*fixture.scene, robot_state, *fixture.group, waypoints, substeps));
+      }
+    }
+  }
+}
+
+TEST(CollisionConstraints, SingleSegmentAndPathRejectTheSameInvalidMotionStates)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  const CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(fixture.group, motionAt(-0.30).position);
+  robot_state.update(true);
+  for (const bool wrong_dimension : {false, true}) {
+    std::vector<JointMotionState> waypoints{motionAt(-0.30), motionAt(-0.28)};
+    if (wrong_dimension) {
+      waypoints[1].acceleration = Eigen::VectorXd::Zero(2);
+    } else {
+      waypoints[1].velocity[0] = std::numeric_limits<double>::quiet_NaN();
+    }
+    const auto segment = builder.validateSegment(
+      *fixture.scene, robot_state, *fixture.group, waypoints[0], waypoints[1], 2U);
+    const auto path = builder.validatePath(
+      *fixture.scene, robot_state, *fixture.group, waypoints, 2U);
+    EXPECT_FALSE(segment.input_valid);
+    EXPECT_FALSE(path.input_valid);
+    EXPECT_TRUE(segment.unsafe);
+    EXPECT_TRUE(path.unsafe);
+    EXPECT_EQ(segment.evaluated_samples, 0U);
+    EXPECT_EQ(path.evaluated_samples, 0U);
+    EXPECT_EQ(segment.failure_reason, path.failure_reason);
+  }
+}
+
+TEST(CollisionConstraints, SafePathBlockUsesGlobalDenseGridIndices)
 {
   SliderFixture fixture;
   ASSERT_NE(fixture.scene, nullptr);
@@ -1464,15 +2062,16 @@ TEST(CollisionConstraints, PathSamplesSharedWaypointsOnceWithGlobalIndices)
   ASSERT_TRUE(path.input_valid) << path.failure_reason;
   EXPECT_FALSE(path.unsafe);
   EXPECT_EQ(path.requested_substeps, 6U);
-  ASSERT_EQ(path.evaluated_samples, 7U);
-  ASSERT_EQ(path.samples.size(), 7U);
-  for (std::size_t index = 0; index < path.samples.size(); ++index) {
-    EXPECT_EQ(path.samples[index].sample_index, index);
-    EXPECT_DOUBLE_EQ(
-      path.samples[index].interpolation_fraction,
-      static_cast<double>(index) / 6.0);
-  }
-  EXPECT_DOUBLE_EQ(path.samples[3].protected_joint_position_rad, -0.28);
+  EXPECT_EQ(path.evaluated_samples, path.samples.size());
+  EXPECT_LT(path.evaluated_samples, path.requested_substeps + 1U);
+  EXPECT_GT(path.distance_query_count, 0U);
+  EXPECT_EQ(path.certified_path_block_count, 1U);
+  ASSERT_EQ(path.samples.size(), 1U);
+  EXPECT_EQ(path.samples.front().sample_index, 3U);
+  EXPECT_DOUBLE_EQ(path.samples.front().interpolation_fraction, 0.5);
+  EXPECT_DOUBLE_EQ(path.samples.front().protected_joint_position_rad, -0.28);
+  EXPECT_TRUE(path.samples.front().path_block_certified);
+  EXPECT_EQ(path.samples.front().path_block_end_sample_index, 6U);
   EXPECT_EQ(path.unsafe, first_segment.unsafe || second_segment.unsafe);
   EXPECT_NEAR(
     path.minimum_self_distance_m,
@@ -1487,7 +2086,7 @@ TEST(CollisionConstraints, PathSamplesSharedWaypointsOnceWithGlobalIndices)
       second_segment.minimum_world_distance_m));
 }
 
-TEST(CollisionConstraints, PathFindsCollisionInsideSecondSegmentWithoutEarlyExit)
+TEST(CollisionConstraints, UnsafePathStopsAtFirstViolationInsideSecondSegment)
 {
   SliderFixture fixture;
   ASSERT_NE(fixture.scene, nullptr);
@@ -1512,12 +2111,114 @@ TEST(CollisionConstraints, PathFindsCollisionInsideSecondSegmentWithoutEarlyExit
   ASSERT_TRUE(path.input_valid) << path.failure_reason;
   EXPECT_TRUE(path.unsafe);
   EXPECT_EQ(path.requested_substeps, 20U);
-  EXPECT_EQ(path.evaluated_samples, 21U);
-  EXPECT_EQ(path.samples.size(), 21U);
+  EXPECT_EQ(path.evaluated_samples, path.samples.size());
   EXPECT_EQ(path.first_unsafe_sample, 11U);
   EXPECT_DOUBLE_EQ(path.first_unsafe_fraction, 11.0 / 20.0);
-  EXPECT_LE(path.minimum_world_distance_m, 0.0);
-  EXPECT_NE(path.closest_pair.find("wall"), std::string::npos);
+  EXPECT_TRUE(path.robust_clearance_violated);
+  EXPECT_LT(path.evaluated_samples, path.requested_substeps + 1U);
+  const auto * first_unsafe = findDensePathSample(path, 11U);
+  ASSERT_NE(first_unsafe, nullptr);
+  EXPECT_TRUE(first_unsafe->robust_clearance_violated);
+}
+
+TEST(CollisionConstraints, AdaptivePathCertificateMatchesDenseOracleForInteriorObstacle)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d obstacle_pose = Eigen::Isometry3d::Identity();
+  obstacle_pose.translation().x() = 0.50;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle_pose);
+
+  CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState start_state(fixture.robot_model);
+  start_state.setToDefaultValues();
+  start_state.setJointGroupPositions(fixture.group, motionAt(0.20).position);
+  start_state.update(true);
+  const std::vector<JointMotionState> waypoints{
+    motionAt(0.20), motionAt(0.70), motionAt(0.20)};
+
+  // Independent dense oracle: the first segment crosses the wall before reaching
+  // the intermediate waypoint. Its shared-endpoint reserve matches the reverse
+  // segment's reserve componentwise.
+  const auto dense_first_segment = builder.validateSegment(
+    *fixture.scene, start_state, *fixture.group, waypoints[0], waypoints[1], 10U);
+  const auto adaptive_path = builder.validatePath(
+    *fixture.scene, start_state, *fixture.group, waypoints, 10U);
+
+  ASSERT_TRUE(dense_first_segment.input_valid) << dense_first_segment.failure_reason;
+  ASSERT_TRUE(adaptive_path.input_valid) << adaptive_path.failure_reason;
+  ASSERT_TRUE(dense_first_segment.unsafe);
+  ASSERT_TRUE(adaptive_path.unsafe);
+  ASSERT_LT(dense_first_segment.first_unsafe_sample, 10U);
+  EXPECT_EQ(adaptive_path.first_unsafe_sample, dense_first_segment.first_unsafe_sample);
+  const auto * dense_first_unsafe = findDensePathSample(
+    dense_first_segment, dense_first_segment.first_unsafe_sample);
+  const auto * path_first_unsafe = findDensePathSample(
+    adaptive_path, adaptive_path.first_unsafe_sample);
+  ASSERT_NE(dense_first_unsafe, nullptr);
+  ASSERT_NE(path_first_unsafe, nullptr);
+  EXPECT_EQ(path_first_unsafe->collision_detected, dense_first_unsafe->collision_detected);
+  EXPECT_EQ(
+    path_first_unsafe->robust_clearance_violated,
+    dense_first_unsafe->robust_clearance_violated);
+  EXPECT_EQ(path_first_unsafe->closest_pair, dense_first_unsafe->closest_pair);
+}
+
+TEST(CollisionConstraints, SharedWaypointMarginViolationPrecedesLaterCollision)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d obstacle_pose = Eigen::Isometry3d::Identity();
+  obstacle_pose.translation().x() = 0.72;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle_pose);
+
+  CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(
+    fixture.group, Eigen::VectorXd::Constant(1, 0.20));
+  robot_state.update(true);
+  const std::vector<JointMotionState> waypoints{
+    motionAt(0.20), motionAt(0.21), motionAt(0.70)};
+
+  const auto first_segment = builder.validateSegment(
+    *fixture.scene, robot_state, *fixture.group, waypoints[0], waypoints[1], 2U);
+  const auto path = builder.validatePath(
+    *fixture.scene, robot_state, *fixture.group, waypoints, 2U);
+
+  ASSERT_TRUE(first_segment.input_valid) << first_segment.failure_reason;
+  EXPECT_FALSE(first_segment.unsafe) << first_segment.failure_reason;
+  ASSERT_TRUE(path.input_valid) << path.failure_reason;
+  ASSERT_TRUE(path.unsafe);
+  EXPECT_EQ(path.requested_substeps, 4U);
+  // Global sample 2 is the shared waypoint. Its outgoing segment has much larger
+  // inter-sample uncertainty (0.49 / (2 * 2) = 0.1225 rad), so the path rejects
+  // that otherwise-clear pose before reaching the later collision at sample 4.
+  EXPECT_EQ(path.first_unsafe_sample, 2U);
+  EXPECT_EQ(path.evaluated_samples, path.samples.size());
+  const auto * safe_before = findDensePathSample(path, 1U);
+  const auto * first_unsafe = findDensePathSample(path, 2U);
+  ASSERT_NE(safe_before, nullptr);
+  EXPECT_FALSE(safe_before->robust_clearance_violated);
+  ASSERT_NE(first_unsafe, nullptr);
+  EXPECT_TRUE(first_unsafe->robust_clearance_violated);
+  EXPECT_FALSE(first_unsafe->collision_detected);
+  EXPECT_GT(path.minimum_world_distance_m, 0.0);
+
+  moveit::core::RobotState endpoint_state(robot_state);
+  endpoint_state.setJointGroupPositions(fixture.group, waypoints.back().position);
+  endpoint_state.update(true);
+  const auto later_collision = builder.validatePose(
+    *fixture.scene, endpoint_state, *fixture.group, waypoints.back());
+  ASSERT_TRUE(later_collision.input_valid) << later_collision.failure_reason;
+  EXPECT_TRUE(later_collision.unsafe);
+  ASSERT_EQ(later_collision.samples.size(), 1U);
+  EXPECT_TRUE(later_collision.samples.front().collision_detected);
+  EXPECT_NE(later_collision.closest_pair.find("wall"), std::string::npos);
 }
 
 TEST(CollisionConstraints, PathSharedWaypointUsesBothAdjacentSegmentReserves)
@@ -1541,9 +2242,15 @@ TEST(CollisionConstraints, PathSharedWaypointUsesBothAdjacentSegmentReserves)
   ASSERT_TRUE(path.unsafe);
   EXPECT_EQ(path.first_unsafe_sample, 2U);
   EXPECT_DOUBLE_EQ(path.first_unsafe_fraction, 0.5);
-  EXPECT_FALSE(path.samples[0].robust_clearance_violated);
-  EXPECT_FALSE(path.samples[1].robust_clearance_violated);
-  EXPECT_TRUE(path.samples[2].robust_clearance_violated);
+  const auto * safe_start = findDensePathSample(path, 0U);
+  const auto * safe_adjacent = findDensePathSample(path, 1U);
+  const auto * unsafe_shared = findDensePathSample(path, 2U);
+  ASSERT_NE(safe_start, nullptr);
+  ASSERT_NE(safe_adjacent, nullptr);
+  ASSERT_NE(unsafe_shared, nullptr);
+  EXPECT_FALSE(safe_start->robust_clearance_violated);
+  EXPECT_FALSE(safe_adjacent->robust_clearance_violated);
+  EXPECT_TRUE(unsafe_shared->robust_clearance_violated);
 }
 
 TEST(CollisionConstraints, InvalidPathInputFailsClosed)

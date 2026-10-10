@@ -53,8 +53,12 @@ struct JointCenteringGuidance
 
 /// Task-space velocity objectives, already expressed in a common command frame.
 ///
-/// The primary rows normally represent the two observable components of screen-normal
-/// angular velocity. The secondary rows normally contain translation and screen roll.
+/// The primary rows normally represent task-critical motion. Ordinary FACE tracking
+/// uses both screen-normal axes and upright roll as primary, with translation secondary;
+/// compact PATH tracks the checked joint-space path as primary and enforces upright roll,
+/// pitch, and radius through hard velocity constraints. RETURN_FACE retains the roll-primary
+/// reacquisition task. Optional gaze and fixed-orientation tasks retain their own two-axis
+/// pointing primary and may place translation and screen roll in secondary.
 /// Each weight is a positive residual multiplier (the solver minimizes ||W(Ax-b)||^2).
 struct HierarchicalVelocityTask
 {
@@ -74,7 +78,7 @@ struct HierarchicalVelocityQpConfig
   double residual_command_latency_sec{0.02};
   double velocity_regularization{1.0e-6};
   double continuity_weight{1.0e-3};
-  double primary_preservation_tolerance{2.0e-3};
+  double primary_preservation_tolerance{2.0e-4};
   double solution_feasibility_tolerance{2.0e-5};
   double solver_absolute_tolerance{1.0e-6};
   double solver_relative_tolerance{1.0e-6};

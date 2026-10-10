@@ -27,7 +27,9 @@ public:
     const Eigen::VectorXd & lower, const Eigen::VectorXd & upper,
     Eigen::Index base_index, const IdleSearchConfig & config, bool local, double now);
   void update(const Eigen::VectorXd & current, double now);
-  void prepared();
+  /// Pick the opposite bounded endpoint after a stalled search path.
+  void retryFrom(const Eigen::VectorXd & current, double now);
+  void prepared(const Eigen::VectorXd & current, double now);
   [[nodiscard]] bool preparing() const;
   [[nodiscard]] const Eigen::VectorXd & goal() const;
   [[nodiscard]] std::string phase() const;
@@ -43,6 +45,8 @@ private:
   double local_lower_{0.0};
   double local_upper_{0.0};
   double started_at_{0.0};
+  double progress_since_{0.0};
+  double progress_anchor_{0.0};
   int direction_{1};
   enum class Phase {kLocal, kPrepare, kSweep};
   Phase phase_{Phase::kPrepare};

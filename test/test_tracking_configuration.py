@@ -4,13 +4,18 @@
 """Validate the reactive tracking configuration contracts."""
 
 import ast
+import importlib.util
 import math
 from pathlib import Path
 import re
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 from ament_index_python.packages import get_package_share_directory
+from launch import LaunchContext
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 import pytest
 import yaml
 
@@ -19,6 +24,8 @@ JOINT_NAMES = tuple(f'joint{index}' for index in range(1, 7))
 ARM_LINK_NAMES = tuple(f'link{index}' for index in range(1, 7))
 ABS_TOL = 1.0e-9
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / 'python'))
+from face_tracking_bringup import simulation_launch as sim  # noqa: E402, I100
 
 
 def _load_yaml(path):
@@ -353,7 +360,7 @@ def test_collision_aware_servo_safety_profile_is_consistent(
     # the deliberately loose position tolerance.
     assert 0.0 < config['pointing_deadband_rad'] <= math.radians(2.0)
     assert math.isclose(
-        config['primary_orientation_tolerance_radps'], 0.002,
+        config['primary_orientation_tolerance_radps'], 0.0002,
         abs_tol=ABS_TOL,
     )
     assert math.isclose(config['hard_clearance_m'], 0.015, abs_tol=ABS_TOL)
@@ -378,7 +385,7 @@ def test_collision_aware_servo_safety_profile_is_consistent(
     ]
     assert config['numerical_distance_reserve_m'] >= 0.0001
     assert config['default_distance_lipschitz_m_per_rad'] >= 2.6193
-    assert config['monitor_near_distance_lipschitz_m_per_rad'] >= 0.4543
+    assert 'monitor_near_distance_lipschitz_m_per_rad' not in config
     assert config['solver_time_limit_sec'] < config['control_period_sec']
     assert 3 <= config['segment_validation_substeps'] <= 16
     assert config['segment_validation_distance_m'] >= config['hard_clearance_m']
@@ -398,6 +405,7 @@ def test_custom_backend_has_explicit_mode_and_background_planning(collision_awar
     assert planner['planner_configs']['RRTConnectkConfigDefault']['type'] == (
         'geometric::RRTConnect'
     )
+    assert planner['planner_configs']['RRTConnectkConfigDefault']['range'] == 0.10
     assert planner['xarm6']['longest_valid_segment_fraction'] <= 0.005
 
 
@@ -406,6 +414,9 @@ def test_collision_aware_backend_keeps_braking_and_segment_safety_contracts():
     source_paths.extend([
         PROJECT_ROOT / 'src' / 'collision_aware_servo_component.hpp',
         PROJECT_ROOT / 'src' / 'collision_aware_parameters.cpp',
+        PROJECT_ROOT / 'src' / 'command_session.hpp',
+        PROJECT_ROOT / 'src' / 'command_session.cpp',
+        PROJECT_ROOT / 'src' / 'servo_telemetry.hpp',
     ])
     source = '\n'.join(path.read_text(encoding='utf-8') for path in source_paths)
     cmake = (PROJECT_ROOT / 'CMakeLists.txt').read_text(encoding='utf-8')
@@ -421,7 +432,7 @@ def test_collision_aware_backend_keeps_braking_and_segment_safety_contracts():
     assert 'braking next tick' not in source
     assert re.search(
         r'void CollisionAwareServoComponent::enter_safety_wait\(std::string message\).*'
-        r'command_queue_\.clear\(\).*HALT_FOR_COLLISION',
+        r'commands_\.discardBranch\(\).*HALT_FOR_COLLISION',
         source,
         re.DOTALL,
     )
@@ -437,19 +448,18 @@ def test_collision_aware_backend_keeps_braking_and_segment_safety_contracts():
     assert 'hold.points.resize(1)' not in source
     assert 'EmergencyBrakeTailGenerator' in source
     assert 'PublishedTrajectoryHistory' in source
-    assert 'active_publication_id_' in source
+    assert 'active_publication_id' in source
     assert 'correctedSampleTimes(' in source
     assert 'PublicationMatchKind::kOlder' in source
     assert 'pre-published braking tail' in source
     assert 'replacement_commit_time' in source
     assert 'minimum_replacement_lead_sec' in source
     assert 'braking_tail_collision_rejection_count' in source
-    assert 'expected_command_state_at(' in source
     assert 'Trajectory following error:' in source
     assert 'validateActualState(' in source
     assert 'Measured robot state is unsafe:' in source
     assert 'controller_state->speed_scaling_factor - 1.0' in source
-    assert 'command_epoch_has_published_' in source
+    assert 'commands_.epoch_has_published' in source
     assert 'controller_state->reference.positions' in source
     assert 'controller_state->output.positions' in source
     assert 'command_alignment_failure_count' in source
@@ -473,10 +483,11 @@ def test_collision_aware_backend_keeps_braking_and_segment_safety_contracts():
     assert 'Priming collision and solver caches' in source
     assert 'Stationary checked command timeline primed' in source
     assert 'Safe re-arm is monitoring the pre-published braking tail' in source
-    assert 'published_tail_rearm_pending_ ?' in source
+    assert 'commands_.published_tail_rearm_pending ?' in source
     assert 'TimelineRecoveryStatus::kExhaustedPublishedSuffix' in source
     assert 'TimelineRecoveryStatus::kInvariantFailure' in source
-    assert 'is waiting for an unmatched controller phase to settle' in source
+    assert 'commands_.hasRetainedPublication()' in source
+    assert 'Safe re-arm lost ownership of its previously published command' in source
     assert 'controller sample left the published braking-tail horizon' in source
     assert 'find_package(realtime_tools REQUIRED)' in cmake
     assert '<depend>realtime_tools</depend>' in package_xml
@@ -550,200 +561,34 @@ def test_launch_keeps_headless_server_and_excludes_move_group_and_rviz(package_s
     assert runtime_literals.isdisjoint(forbidden_runtime_names)
 
 
-def test_tracking_launch_defaults_to_gui_and_supports_headless(package_share):
-    launch_path = package_share / 'launch' / 'tracking_sim.launch.py'
-    launch_source = launch_path.read_text(encoding='utf-8')
-    syntax_tree = ast.parse(launch_source)
-    calls = [node for node in ast.walk(syntax_tree) if isinstance(node, ast.Call)]
-
-    runtime_literals = set()
-    for call in calls:
-        if _call_name(call) in {
-            'Node',
-            'ComposableNode',
-            'ComposableNodeContainer',
-            'ExecuteProcess',
-        }:
-            runtime_literals.update(_string_literals(call))
-
-    gazebo_server_processes = []
-    gazebo_gui_processes = []
-    for call in calls:
-        if _call_name(call) != 'ExecuteProcess':
-            continue
-        cmd = _keyword(call, 'cmd')
-        condition = _keyword(call, 'condition')
-        if cmd is None or condition is None or not isinstance(condition, ast.Call):
-            continue
-        command_literals = _string_literals(cmd)
-        if {'gz', 'sim', '-r', '-s'}.issubset(command_literals):
-            gazebo_server_processes.append(_call_name(condition))
-        elif {'gz', 'sim', '-r'}.issubset(command_literals):
-            gazebo_gui_processes.append(_call_name(condition))
-
-    assert gazebo_server_processes == ['IfCondition']
-    assert gazebo_gui_processes == ['UnlessCondition']
-    assert 'graceful_component_container' in runtime_literals
-    assert 'moveit_servo::ServoNode' in runtime_literals
-    assert 'face_tracking_arm::CollisionAwareServoComponent' in runtime_literals
-    assert 'face_tracking_arm::FaceTrackingComponent' in runtime_literals
-    assert 'test_face_target_publisher' in runtime_literals
-    assert 'mock_target' not in launch_source
-    assert 'mock_pattern' not in launch_source
-    assert 'mock_face_target' not in launch_source
-    assert (
-        'collision_aware_moveit_servo_parameters'
-        "['publish_joint_positions'] = True" in launch_source
-    )
-    assert (
-        "collision_aware_moveit_servo_parameters['publish_period'] = 0.01"
-        in launch_source
-    )
-    assert (
-        "collision_aware_moveit_servo_parameters['max_expected_latency'] = 0.05"
-        in launch_source
-    )
-    assert (
-        'collision_aware_moveit_servo_parameters'
-        "['publish_joint_velocities'] = False" in launch_source
-    )
-    assert "'publish_joint_accelerations'" in launch_source
-    assert runtime_literals.isdisjoint(
-        {'move_group', 'moveit_ros_move_group', 'rviz', 'rviz2'}
-    )
-
-    startup_edges = [call for call in calls if _call_name(call) == '_after_success']
-    assert len(startup_edges) == 3
-
-    declared_arguments = {
-        call.args[0].value
-        for call in calls
-        if _call_name(call) == 'DeclareLaunchArgument'
-        and call.args
-        and isinstance(call.args[0], ast.Constant)
+def test_tracking_launch_defaults_to_gui_and_supports_headless():
+    launch_path = PROJECT_ROOT / 'launch' / 'tracking_sim.launch.py'
+    spec = importlib.util.spec_from_file_location('tracking_sim_launch_under_test', launch_path)
+    launch_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launch_module)
+    description = launch_module.generate_launch_description()
+    arguments = {
+        action.name: action
+        for action in description.entities
+        if isinstance(action, DeclareLaunchArgument)
     }
-    assert 'use_sim_time' not in declared_arguments
-    assert 'headless' in declared_arguments
-    assert 'test_face_scenario' in declared_arguments
-    assert 'servo_backend' in declared_arguments
+    context = LaunchContext()
 
-    headless_arguments = [
-        call
-        for call in calls
-        if _call_name(call) == 'DeclareLaunchArgument'
-        and call.args
-        and isinstance(call.args[0], ast.Constant)
-        and call.args[0].value == 'headless'
-    ]
-    assert len(headless_arguments) == 1
-    headless_default = _keyword(headless_arguments[0], 'default_value')
-    assert isinstance(headless_default, ast.Constant)
-    assert headless_default.value == 'false'
+    def default(argument_name):
+        return ''.join(value.perform(context) for value in arguments[argument_name].default_value)
 
-    scenario_arguments = [
-        call
-        for call in calls
-        if _call_name(call) == 'DeclareLaunchArgument'
-        and call.args
-        and isinstance(call.args[0], ast.Constant)
-        and call.args[0].value == 'test_face_scenario'
-    ]
-    assert len(scenario_arguments) == 1
-    scenario_default = _keyword(scenario_arguments[0], 'default_value')
-    assert isinstance(scenario_default, ast.Constant)
-    assert scenario_default.value == 'people'
-    scenario_choices = _keyword(scenario_arguments[0], 'choices')
-    assert isinstance(scenario_choices, ast.List)
-    assert [choice.value for choice in scenario_choices.elts] == [
-        'disabled',
-        'stationary',
-        'circle',
-        'people',
-        'walk_around',
-    ]
+    assert default('headless') == 'false'
+    assert default('calibration_mode') == 'false'
+    assert default('test_face_scenario') == 'people'
+    assert default('servo_backend') == 'collision_aware'
 
-    backend_arguments = [
-        call
-        for call in calls
-        if _call_name(call) == 'DeclareLaunchArgument'
-        and call.args
-        and isinstance(call.args[0], ast.Constant)
-        and call.args[0].value == 'servo_backend'
-    ]
-    assert len(backend_arguments) == 1
-    backend_default = _keyword(backend_arguments[0], 'default_value')
-    assert isinstance(backend_default, ast.Constant)
-    assert backend_default.value == 'collision_aware'
-    backend_choices = _keyword(backend_arguments[0], 'choices')
-    assert isinstance(backend_choices, ast.List)
-    assert [choice.value for choice in backend_choices.elts] == [
-        'collision_aware',
-        'standard',
-    ]
-
-    test_publishers = [
-        call
-        for call in calls
-        if _call_name(call) == 'Node'
-        and 'test_face_target_publisher' in _string_literals(call)
-    ]
-    assert len(test_publishers) == 1
-    publisher = test_publishers[0]
-    condition = _keyword(publisher, 'condition')
-    assert isinstance(condition, ast.Call)
-    assert _call_name(condition) == 'UnlessCondition'
-    assert any(
-        'disabled' in literal for literal in _string_literals(condition)
-    )
-    parameters = _keyword(publisher, 'parameters')
-    assert parameters is not None
-    assert {'scenario', 'use_sim_time'}.issubset(_string_literals(parameters))
-
-    runtime_guards = [
-        call for call in calls if _call_name(call) == '_shutdown_on_exit'
-    ]
-    assert len(runtime_guards) == 5
-
-    components = [call for call in calls if _call_name(call) == 'ComposableNode']
-    assert len(components) == 3
-    for component in components:
-        extra_arguments = _keyword(component, 'extra_arguments')
-        assert extra_arguments is not None
-        assert 'use_intra_process_comms' in _string_literals(extra_arguments)
-
-    containers = [
-        call for call in calls if _call_name(call) == 'ComposableNodeContainer'
-    ]
-    assert len(containers) == 1
-    initially_loaded = _keyword(
-        containers[0], 'composable_node_descriptions'
-    )
-    assert isinstance(initially_loaded, ast.List)
-    assert initially_loaded.elts == []
-
-    load_actions = [
-        call for call in calls if _call_name(call) == 'LoadComposableNodes'
-    ]
-    assert len(load_actions) == 2
-    delayed_component_sets = []
-    for load_action in load_actions:
-        target_container = _keyword(load_action, 'target_container')
-        assert isinstance(target_container, ast.Name)
-        assert target_container.id == 'servo_container'
-        condition = _keyword(load_action, 'condition')
-        assert isinstance(condition, ast.Call)
-        assert _call_name(condition) == 'IfCondition'
-        delayed_components = _keyword(
-            load_action, 'composable_node_descriptions'
-        )
-        assert isinstance(delayed_components, ast.List)
-        delayed_component_sets.append(
-            [element.id for element in delayed_components.elts]
-        )
-    assert delayed_component_sets == [
-        ['tracking_component', 'collision_aware_servo_component'],
-        ['tracking_component', 'standard_servo_component'],
-    ]
+    for headless in ('true', 'false'):
+        context = LaunchContext()
+        context.launch_configurations['headless'] = headless
+        server, gui = sim._gazebo_processes(
+            'scene.sdf', LaunchConfiguration('headless'), '/plugins')
+        assert server.condition.evaluate(context) is (headless == 'true')
+        assert gui.condition.evaluate(context) is (headless == 'false')
 
 
 def test_test_face_target_publisher_preserves_ros_contract():

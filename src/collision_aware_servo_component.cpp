@@ -3,6 +3,9 @@
 
 #include "collision_aware_servo_component.hpp"
 
+#include "face_tracking_arm/face_target_age_policy.hpp"
+#include "face_tracking_arm/snapshot_timing.hpp"
+
 #include <rclcpp_components/register_node_macro.hpp>
 
 namespace face_tracking_arm
@@ -31,7 +34,7 @@ CollisionAwareServoComponent::CollisionAwareServoComponent(const rclcpp::NodeOpt
 {
   parameters_ = declareControllerParameters(*this);
   validateControllerParameters(parameters_);
-  control_time_grid_ = std::make_unique<control::ControlTimeGrid>(
+  commands_.time_grid = std::make_unique<control::ControlTimeGrid>(
     seconds_to_nanoseconds(parameters_.control_period_sec));
 
   use_tracking_target_ = declare_parameter<bool>("use_tracking_target", false);
@@ -107,7 +110,6 @@ void CollisionAwareServoComponent::shutdown_resources()
   }
   motion_reference_.reset();
   planning_scene_monitor_.reset();
-  servo_parameter_listener_.reset();
 }
 
 void CollisionAwareServoComponent::initialize()
@@ -129,9 +131,7 @@ void CollisionAwareServoComponent::initialize()
       }
     });
 
-  servo_parameter_listener_ = std::make_shared<servo::ParamListener>(
-    shared_from_this(), "moveit_servo");
-  servo_parameters_ = servo_parameter_listener_->get_params();
+  servo_parameters_ = declareCollisionAwareServoParameters(*this, parameters_);
   validate_servo_parameters();
 
   planning_scene_monitor_ = moveit_servo::createPlanningSceneMonitor(
@@ -202,6 +202,8 @@ void CollisionAwareServoComponent::initialize()
   collision_config.query_distance_m = parameters_.collision_query_distance_m;
   collision_config.maximum_constraint_rows = static_cast<std::size_t>(
     parameters_.maximum_collision_constraints);
+  collision_config.segment_validation_substeps = static_cast<std::size_t>(
+    parameters_.segment_validation_substeps);
   collision_config.minimum_gradient_norm = parameters_.collision_gradient_epsilon;
   collision_config.tracking_position_error_bound_rad =
     parameters_.collision_tracking_error_bound_rad;
@@ -209,8 +211,6 @@ void CollisionAwareServoComponent::initialize()
     parameters_.numerical_distance_reserve_m;
   collision_config.default_distance_lipschitz_m_per_rad =
     parameters_.default_distance_lipschitz_m_per_rad;
-  collision_config.monitor_near_distance_lipschitz_m_per_rad =
-    parameters_.monitor_near_distance_lipschitz_m_per_rad;
   // The generic joint braking envelope covers every axis. Keep the collision
   // builder's selected-axis row consistent with that same physical interval.
   const std::string guarded_joint = parameters_.monitor_guard_joint_name.empty() ?
@@ -234,7 +234,7 @@ void CollisionAwareServoComponent::initialize()
     servo_parameters_.command_out_topic, rclcpp::QoS(1).reliable());
   const double queue_span_periods = std::ceil(
     2.0 * servo_parameters_.max_expected_latency / parameters_.control_period_sec);
-  max_command_queue_points_ = static_cast<std::size_t>(queue_span_periods) + 3U;
+  commands_.max_queue_points = static_cast<std::size_t>(queue_span_periods) + 3U;
 
   publish_status(
     moveit_msgs::msg::ServoStatus::NO_WARNING,
@@ -258,11 +258,22 @@ void CollisionAwareServoComponent::complete_initialization_when_ready()
   {
     return;
   }
-  const rclcpp::Time oldest_allowed_state = current_time -
-    rclcpp::Duration::from_seconds(parameters_.state_feedback_timeout_sec);
-  const rclcpp::Time state_time = state_monitor->getCurrentStateTime();
-  if (state_time.nanoseconds() <= 0 || state_time > current_time ||
-    state_time < oldest_allowed_state || !state_monitor->haveCompleteState(oldest_allowed_state))
+  const auto [measured_state, state_validation_time] =
+    control::readSnapshotAtCurrentTime(
+    [state_monitor]() {return state_monitor->getCurrentStateAndTime();},
+    [this]() {return now();});
+  const auto & state_time = measured_state.second;
+  const auto feedback_timeout = rclcpp::Duration::from_seconds(
+    parameters_.state_feedback_timeout_sec);
+  const rclcpp::Time oldest_allowed_state = state_validation_time -
+    feedback_timeout;
+  if (!measured_state.first ||
+    !control::isInSameClockEpoch(
+      current_time.nanoseconds(), state_validation_time.nanoseconds()) ||
+    !control::isFreshSnapshotTimestamp(
+      state_time.nanoseconds(), state_validation_time.nanoseconds(),
+      feedback_timeout.nanoseconds()) ||
+    !state_monitor->haveCompleteState(oldest_allowed_state))
   {
     return;
   }
@@ -286,7 +297,7 @@ void CollisionAwareServoComponent::complete_initialization_when_ready()
     std::memory_order_acquire);
   // The first command epoch is opened only after several fresh controller
   // samples prove that its existing desired state is a stationary hold.
-  rearm_pending_ = true;
+  commands_.rearm_pending = true;
   initialized_.store(true, std::memory_order_release);
   stop_control_.store(false, std::memory_order_release);
   control_thread_ = std::thread([this]() {control_loop();});
@@ -307,14 +318,6 @@ void CollisionAwareServoComponent::validate_servo_parameters() const
     throw std::invalid_argument(
             "collision-aware Servo requires the calibrated speed-unit JTC topic contract");
   }
-  if (servo_parameters_.move_group_name != parameters_.planning_group_name) {
-    throw std::invalid_argument(
-            "moveit_servo.move_group_name and planning_group_name must match");
-  }
-  if (std::abs(servo_parameters_.publish_period - parameters_.control_period_sec) > 1.0e-9) {
-    throw std::invalid_argument(
-            "moveit_servo.publish_period and control_period_sec must match");
-  }
   if (!std::isfinite(servo_parameters_.max_expected_latency) ||
     servo_parameters_.max_expected_latency > kMaximumExpectedCommandLatencySec ||
     servo_parameters_.max_expected_latency <
@@ -328,17 +331,6 @@ void CollisionAwareServoComponent::validate_servo_parameters() const
   {
     throw std::invalid_argument(
             "state_feedback_timeout_sec must fit inside retained command history");
-  }
-  if (!servo_parameters_.publish_joint_positions ||
-    servo_parameters_.publish_joint_velocities ||
-    servo_parameters_.publish_joint_accelerations)
-  {
-    throw std::invalid_argument(
-            "collision-aware Servo requires position-only trajectory output");
-  }
-  if (servo_parameters_.check_collisions || servo_parameters_.use_smoothing) {
-    throw std::runtime_error(
-            "downstream Servo collision scaling and smoothing must remain disabled");
   }
 }
 
@@ -462,9 +454,16 @@ void CollisionAwareServoComponent::receive_target(const msg::TrackingTarget & ta
     const Eigen::Vector3d face(message->face.x, message->face.y, message->face.z);
     const rclcpp::Time face_stamp(message->face_stamp, get_clock()->get_clock_type());
     const rclcpp::Time command_stamp(message->header.stamp, get_clock()->get_clock_type());
-    if (!face.allFinite() || face_stamp.nanoseconds() <= 0 || face_stamp > command_stamp ||
-      (command_stamp - face_stamp).seconds() > 0.5)
-    {
+    const rclcpp::Time prediction_expiry(
+      message->face_prediction_expiry, get_clock()->get_clock_type());
+    const bool age_valid = control::validFaceTargetAge(
+      face_stamp.nanoseconds(), command_stamp.nanoseconds(), now().nanoseconds(),
+      static_cast<std::int64_t>(std::llround(
+        parameters_.face_target_freshness_timeout_sec * 1.0e9)),
+      message->face_is_prediction, prediction_expiry.nanoseconds(),
+      static_cast<std::int64_t>(std::llround(
+        parameters_.face_prediction_timeout_sec * 1.0e9)));
+    if (!face.allFinite() || !age_valid || face_stamp > command_stamp) {
       pose_invalid_count_.fetch_add(1U, std::memory_order_relaxed);
       return;
     }
@@ -557,20 +556,45 @@ void CollisionAwareServoComponent::set_paused(
 }
 
 std::optional<msg::TrackingTarget> CollisionAwareServoComponent::current_target(
-  const rclcpp::Time & current_time) const
+  const rclcpp::Time & tick_time) const
 {
-  std::lock_guard<std::mutex> lock(target_mutex_);
-  if (!latest_pose_.has_value()) {
+  const auto [snapshot, current_time] = control::readSnapshotAtCurrentTime(
+    [this]() {
+      std::lock_guard<std::mutex> lock(target_mutex_);
+      return latest_pose_;
+    },
+    [this]() {return now();});
+  if (!snapshot.has_value()) {
+    return std::nullopt;
+  }
+  if (!control::isInSameClockEpoch(
+      tick_time.nanoseconds(), current_time.nanoseconds()))
+  {
     return std::nullopt;
   }
   const rclcpp::Time stamp(
-    latest_pose_->header.stamp, get_clock()->get_clock_type());
+    snapshot->header.stamp, get_clock()->get_clock_type());
   if (stamp > current_time || current_time - stamp >=
     rclcpp::Duration::from_seconds(parameters_.incoming_command_timeout_sec))
   {
     return std::nullopt;
   }
-  return latest_pose_;
+  if (snapshot->mode == msg::TrackingTarget::FACE) {
+    const rclcpp::Time face_stamp(snapshot->face_stamp, get_clock()->get_clock_type());
+    const rclcpp::Time prediction_expiry(
+      snapshot->face_prediction_expiry, get_clock()->get_clock_type());
+    const bool face_is_current = control::validFaceTargetAge(
+      face_stamp.nanoseconds(), stamp.nanoseconds(), current_time.nanoseconds(),
+      static_cast<std::int64_t>(std::llround(
+        parameters_.face_target_freshness_timeout_sec * 1.0e9)),
+      snapshot->face_is_prediction, prediction_expiry.nanoseconds(),
+      static_cast<std::int64_t>(std::llround(
+        parameters_.face_prediction_timeout_sec * 1.0e9)));
+    if (!face_is_current) {
+      return std::nullopt;
+    }
+  }
+  return snapshot;
 }
 
 }  // namespace face_tracking_arm

@@ -17,6 +17,7 @@
 #include "face_tracking_arm/table_geometry.hpp"
 #include "face_tracking_arm/tracking_core.hpp"
 #include "face_tracking_arm/msg/tracking_target.hpp"
+#include "face_tracking_arm/msg/perception_status.hpp"
 
 #include <controller_manager_msgs/srv/list_controllers.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
@@ -59,6 +60,7 @@ constexpr std::int64_t kJointStateTimeoutNs = 100'000'000;
 constexpr std::int64_t kTcpPoseTimeoutNs = 30'000'000;
 constexpr std::int64_t kServoStatusTimeoutNs = 200'000'000;
 constexpr std::int64_t kMaximumClockSkewNs = 10'000'000;
+constexpr auto kReadinessRequestTimeout = 2s;
 constexpr std::array<const char *, 6> kArmJoints = {
   "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
 
@@ -214,6 +216,9 @@ public:
     const double freshness_sec =
       declare_parameter<double>("face_target_freshness_timeout_sec", 0.50);
     const double return_delay_sec = declare_parameter<double>("return_to_rest_delay_sec", 2.0);
+    const double prediction_timeout_sec = declare_parameter<double>(
+      "face_prediction_timeout_sec", 0.0);
+    require_perception_status_ = declare_parameter<bool>("require_perception_status", false);
     rcl_interfaces::msg::ParameterDescriptor idle_descriptor;
     idle_descriptor.read_only = true;
     table_ = tracking::make_table(
@@ -254,6 +259,12 @@ public:
     config.freshness_ns = freshness_timeout_ns_;
     config.return_delay_ns = seconds_to_nanoseconds(
       return_delay_sec, "return_to_rest_delay_sec");
+    if (!std::isfinite(prediction_timeout_sec) || prediction_timeout_sec < 0.0) {
+      throw std::invalid_argument("face_prediction_timeout_sec must be finite and non-negative");
+    }
+    config.prediction_timeout_ns = prediction_timeout_sec == 0.0 ? 0 :
+      seconds_to_nanoseconds(prediction_timeout_sec, "face_prediction_timeout_sec");
+    config_prediction_enabled_ = prediction_timeout_sec > 0.0;
     config.rest_position = {rest_position[0], rest_position[1], rest_position[2]};
     config.planning_frame = planning_frame_;
     core_ = std::make_unique<tracking::TrackingCore>(std::move(config));
@@ -274,6 +285,15 @@ public:
       [this](geometry_msgs::msg::PointStamped::ConstSharedPtr message) {
         receive_face(std::move(message));
       });
+    if (require_perception_status_) {
+      perception_status_subscription_ = create_subscription<msg::PerceptionStatus>(
+        "/face/perception_status", rclcpp::QoS(10).best_effort(),
+        [this](msg::PerceptionStatus::ConstSharedPtr message) {
+          std::lock_guard<std::mutex> lock(perception_mutex_);
+          latest_perception_status_ = *message;
+          perception_status_received_at_ = std::chrono::steady_clock::now();
+        });
+    }
     joint_state_subscription_ = create_subscription<sensor_msgs::msg::JointState>(
       kJointStateTopic, rclcpp::SensorDataQoS().keep_last(1),
       [this](const sensor_msgs::msg::JointState::ConstSharedPtr message) {
@@ -412,7 +432,22 @@ private:
     }
     last_control_time_ns_ = now_ns;
 
-    process_pending_face(now_ns);
+    if (require_perception_status_ && !perception_status_healthy(now_ns)) {
+      pending_face_.reset();
+      core_->reset();
+      last_adapter_status_ = perception_status_failure(now_ns);
+      const auto actual_pose = current_tcp_pose(now_ns);
+      if (actual_pose) {
+        last_known_tcp_pose_ = actual_pose->pose;
+      }
+      // HOLD carries no motion objective. A cached measured pose is used when
+      // available; the identity pose is only a valid stamped envelope when TF
+      // is temporarily missing and does not command an endpoint.
+      publish_pose(last_known_tcp_pose_.value_or(tracking::Pose3d{}), now_ns,
+        "PERCEPTION_HOLD");
+      return;
+    }
+
     const bool infrastructure_ready_now = infrastructure_ready(now_ns);
     ready_ = motion_ready(now_ns);
     if (!infrastructure_ready_now) {
@@ -427,6 +462,11 @@ private:
       last_adapter_status_ = "tcp_pose_unavailable";
       return;
     }
+    last_known_tcp_pose_ = actual_pose->pose;
+
+    update_perception_identity();
+
+    process_pending_face(now_ns);
 
     if (safety_hold_requested_ && !safety_hold_pose_.has_value()) {
       safety_hold_pose_ = actual_pose->pose;
@@ -447,7 +487,9 @@ private:
       }
     }
 
-    const tracking::TickResult result = core_->tick(now_ns, actual_pose);
+    const tracking::TickResult result = core_->tick(
+      now_ns, actual_pose,
+      require_perception_status_ && config_prediction_enabled_ && perception_no_face());
     if (!result.command.has_value()) {
       if (result.status == tracking::TickStatus::kHoldPoseUnavailable) {
         last_adapter_status_ = "hold_pose_unavailable";
@@ -482,6 +524,27 @@ private:
       reject_face("tf_unavailable_before_deadline");
       pending_face_.reset();
       return;
+    }
+
+    if (require_perception_status_) {
+      std::lock_guard<std::mutex> lock(perception_mutex_);
+      if (!latest_perception_status_) {
+        last_adapter_status_ = "waiting_perception_status";
+        return;
+      }
+      const std::int64_t source_stamp_ns = rclcpp::Time(
+        latest_perception_status_->source_stamp, get_clock()->get_clock_type()).nanoseconds();
+      if (source_stamp_ns < stamp_ns) {
+        last_adapter_status_ = "waiting_matching_perception_status";
+        return;
+      }
+      if (source_stamp_ns != stamp_ns ||
+        latest_perception_status_->state != msg::PerceptionStatus::OK)
+      {
+        reject_face("perception_status_mismatch");
+        pending_face_.reset();
+        return;
+      }
     }
 
     const auto sample = transform_face(pending_face_->message);
@@ -612,6 +675,7 @@ private:
       (command.mode == tracking::TargetMode::kSearch ? msg::TrackingTarget::SEARCH :
       msg::TrackingTarget::REST));
     detailed.allow_recovery = command.mode != tracking::TargetMode::kFace;
+    detailed.target_id = active_target_id_.value_or(-1);
     if (command.mode == tracking::TargetMode::kSearch) {
       detailed.search_pattern = idle_behavior_ == "search_local_then_sweep" &&
         last_accepted_face_stamp_ns_ ? "local_then_sweep" : "sweep";
@@ -622,13 +686,17 @@ private:
       detailed.face.z = command.face_in_planning_frame->z();
       detailed.face_stamp = rclcpp::Time(
         *command.source_face_stamp_ns, get_clock()->get_clock_type());
+      detailed.face_is_prediction = command.face_prediction_expiry_ns.has_value();
+      if (command.face_prediction_expiry_ns) {
+        detailed.face_prediction_expiry = rclcpp::Time(
+          *command.face_prediction_expiry_ns, get_clock()->get_clock_type());
+      }
     }
     tracking_target_publisher_->publish(detailed);
 
     const std::string new_mode = mode_name(command.mode);
     note_published_mode(new_mode);
     last_command_stamp_ns_ = command.command_stamp_ns;
-    last_source_face_stamp_ns_ = command.source_face_stamp_ns;
     if (command.mode == tracking::TargetMode::kFace && last_face_received_at_.has_value() &&
       command.source_face_stamp_ns == last_accepted_face_stamp_ns_)
     {
@@ -671,9 +739,48 @@ private:
 
   void readiness_tick()
   {
+    expire_readiness_requests();
     request_controller_state();
     request_planning_scene();
     request_pose_mode();
+  }
+
+  void expire_readiness_requests()
+  {
+    const auto now_steady = std::chrono::steady_clock::now();
+    if (controller_request_pending_ && controller_request_started_at_ &&
+      now_steady - *controller_request_started_at_ >= kReadinessRequestTimeout)
+    {
+      if (controller_request_id_) {
+        controller_client_->remove_pending_request(*controller_request_id_);
+      }
+      controller_request_pending_ = false;
+      controller_request_id_.reset();
+      ++controller_request_generation_;
+      RCLCPP_WARN(get_logger(), "Controller readiness request timed out; retrying");
+    }
+    if (scene_request_pending_ && scene_request_started_at_ &&
+      now_steady - *scene_request_started_at_ >= kReadinessRequestTimeout)
+    {
+      if (scene_request_id_) {
+        planning_scene_client_->remove_pending_request(*scene_request_id_);
+      }
+      scene_request_pending_ = false;
+      scene_request_id_.reset();
+      ++scene_request_generation_;
+      RCLCPP_WARN(get_logger(), "Planning scene readiness request timed out; retrying");
+    }
+    if (pose_mode_request_pending_ && pose_mode_request_started_at_ &&
+      now_steady - *pose_mode_request_started_at_ >= kReadinessRequestTimeout)
+    {
+      if (pose_mode_request_id_) {
+        command_type_client_->remove_pending_request(*pose_mode_request_id_);
+      }
+      pose_mode_request_pending_ = false;
+      pose_mode_request_id_.reset();
+      ++pose_mode_request_generation_;
+      RCLCPP_WARN(get_logger(), "Servo POSE mode request timed out; retrying");
+    }
   }
 
   void request_controller_state()
@@ -682,11 +789,24 @@ private:
       return;
     }
     controller_request_pending_ = true;
+    controller_request_started_at_ = std::chrono::steady_clock::now();
+    const auto generation = ++controller_request_generation_;
+    const auto weak_self = std::weak_ptr<FaceTrackingComponent>(
+      std::static_pointer_cast<FaceTrackingComponent>(shared_from_this()));
     auto request = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
-    controller_client_->async_send_request(
+    const auto handle = controller_client_->async_send_request(
       request,
-      [this](rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedFuture future) {
-        controller_request_pending_ = false;
+      [weak_self, generation](
+        rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedFuture future) {
+        const auto self = weak_self.lock();
+        if (!self || generation != self->controller_request_generation_ ||
+        !self->controller_request_pending_)
+        {
+          return;
+        }
+        self->controller_request_pending_ = false;
+        self->controller_request_id_.reset();
+        self->controller_request_started_at_.reset();
         bool joint_state_broadcaster_active = false;
         bool arm_controller_active = false;
         try {
@@ -699,10 +819,11 @@ private:
             }
           }
         } catch (const std::exception & error) {
-          RCLCPP_WARN(get_logger(), "Controller readiness request failed: %s", error.what());
+          RCLCPP_WARN(self->get_logger(), "Controller readiness request failed: %s", error.what());
         }
-        controllers_ready_ = joint_state_broadcaster_active && arm_controller_active;
+        self->controllers_ready_ = joint_state_broadcaster_active && arm_controller_active;
       });
+    controller_request_id_ = handle.request_id;
   }
 
   void request_planning_scene()
@@ -711,28 +832,43 @@ private:
       return;
     }
     scene_request_pending_ = true;
+    scene_request_started_at_ = std::chrono::steady_clock::now();
+    const auto generation = ++scene_request_generation_;
+    const auto weak_self = std::weak_ptr<FaceTrackingComponent>(
+      std::static_pointer_cast<FaceTrackingComponent>(shared_from_this()));
     auto request = std::make_shared<moveit_msgs::srv::GetPlanningScene::Request>();
     request->components.components =
       moveit_msgs::msg::PlanningSceneComponents::WORLD_OBJECT_GEOMETRY |
       moveit_msgs::msg::PlanningSceneComponents::ALLOWED_COLLISION_MATRIX;
-    planning_scene_client_->async_send_request(
+    const auto handle = planning_scene_client_->async_send_request(
       request,
-      [this](rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedFuture future) {
-        scene_request_pending_ = false;
+      [weak_self, generation](
+        rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedFuture future) {
+        const auto self = weak_self.lock();
+        if (!self || generation != self->scene_request_generation_ ||
+        !self->scene_request_pending_)
+        {
+          return;
+        }
+        self->scene_request_pending_ = false;
+        self->scene_request_id_.reset();
+        self->scene_request_started_at_.reset();
         try {
           const auto & scene = future.get()->scene;
-          const bool table_present = tracking::has_table(scene, table_);
+          const bool table_present = tracking::has_table(scene, self->table_);
           const bool mounting_contact_allowed =
-          table_.operation == moveit_msgs::msg::CollisionObject::REMOVE ||
-          collision_pair_allowed(scene.allowed_collision_matrix, base_frame_, kTableId);
-          scene_ready_ = table_present && mounting_contact_allowed;
-          if (!scene_ready_) {
-            publish_table_scene(scene.allowed_collision_matrix);
+          self->table_.operation == moveit_msgs::msg::CollisionObject::REMOVE ||
+          collision_pair_allowed(scene.allowed_collision_matrix, self->base_frame_, kTableId);
+          self->scene_ready_ = table_present && mounting_contact_allowed;
+          if (!self->scene_ready_) {
+            self->publish_table_scene(scene.allowed_collision_matrix);
           }
         } catch (const std::exception & error) {
-          RCLCPP_WARN(get_logger(), "Planning scene readiness request failed: %s", error.what());
+          RCLCPP_WARN(self->get_logger(), "Planning scene readiness request failed: %s",
+            error.what());
         }
       });
+    scene_request_id_ = handle.request_id;
   }
 
   void publish_table_scene(moveit_msgs::msg::AllowedCollisionMatrix collision_matrix)
@@ -762,21 +898,35 @@ private:
       return;
     }
     pose_mode_request_pending_ = true;
+    pose_mode_request_started_at_ = std::chrono::steady_clock::now();
+    const auto generation = ++pose_mode_request_generation_;
+    const auto weak_self = std::weak_ptr<FaceTrackingComponent>(
+      std::static_pointer_cast<FaceTrackingComponent>(shared_from_this()));
     auto request = std::make_shared<moveit_msgs::srv::ServoCommandType::Request>();
     request->command_type = moveit_msgs::srv::ServoCommandType::Request::POSE;
-    command_type_client_->async_send_request(
+    const auto handle = command_type_client_->async_send_request(
       request,
-      [this](rclcpp::Client<moveit_msgs::srv::ServoCommandType>::SharedFuture future) {
-        pose_mode_request_pending_ = false;
+      [weak_self, generation](
+        rclcpp::Client<moveit_msgs::srv::ServoCommandType>::SharedFuture future) {
+        const auto self = weak_self.lock();
+        if (!self || generation != self->pose_mode_request_generation_ ||
+        !self->pose_mode_request_pending_)
+        {
+          return;
+        }
+        self->pose_mode_request_pending_ = false;
+        self->pose_mode_request_id_.reset();
+        self->pose_mode_request_started_at_.reset();
         try {
-          pose_mode_ready_ = future.get()->success;
-          if (pose_mode_ready_) {
-            RCLCPP_INFO(get_logger(), "MoveIt Servo POSE mode is ready");
+          self->pose_mode_ready_ = future.get()->success;
+          if (self->pose_mode_ready_) {
+            RCLCPP_INFO(self->get_logger(), "MoveIt Servo POSE mode is ready");
           }
         } catch (const std::exception & error) {
-          RCLCPP_WARN(get_logger(), "Servo command-type request failed: %s", error.what());
+          RCLCPP_WARN(self->get_logger(), "Servo command-type request failed: %s", error.what());
         }
       });
+    pose_mode_request_id_ = handle.request_id;
   }
 
   bool joint_state_fresh(const std::int64_t now_ns) const
@@ -792,6 +942,103 @@ private:
            *last_servo_status_stamp_ns_ <= now_ns &&
            now_ns - *last_servo_status_stamp_ns_ < kServoStatusTimeoutNs &&
            is_known_servo_status(last_servo_code_);
+  }
+
+  bool perception_status_healthy(const std::int64_t now_ns) const
+  {
+    std::lock_guard<std::mutex> lock(perception_mutex_);
+    if (!latest_perception_status_ || !perception_status_received_at_) {
+      return false;
+    }
+    const auto wall_age = std::chrono::steady_clock::now() - *perception_status_received_at_;
+    if (wall_age >= std::chrono::nanoseconds(freshness_timeout_ns_)) {
+      return false;
+    }
+    const auto & status = *latest_perception_status_;
+    const std::int64_t publication_stamp_ns = rclcpp::Time(
+      status.header.stamp, get_clock()->get_clock_type()).nanoseconds();
+    const std::int64_t source_stamp_ns = rclcpp::Time(
+      status.source_stamp, get_clock()->get_clock_type()).nanoseconds();
+    if (publication_stamp_ns <= 0 || publication_stamp_ns > now_ns + kMaximumClockSkewNs ||
+      now_ns - std::min(now_ns, publication_stamp_ns) >= freshness_timeout_ns_ ||
+      source_stamp_ns <= 0 || source_stamp_ns > now_ns + kMaximumClockSkewNs ||
+      now_ns - std::min(now_ns, source_stamp_ns) >= freshness_timeout_ns_)
+    {
+      return false;
+    }
+    return status.state == msg::PerceptionStatus::OK ||
+           status.state == msg::PerceptionStatus::NO_FACE;
+  }
+
+  bool perception_no_face() const
+  {
+    std::lock_guard<std::mutex> lock(perception_mutex_);
+    return latest_perception_status_ &&
+           latest_perception_status_->state == msg::PerceptionStatus::NO_FACE;
+  }
+
+  void update_perception_identity()
+  {
+    std::optional<std::int64_t> target_id;
+    std::optional<std::int64_t> status_source_stamp_ns;
+    {
+      std::lock_guard<std::mutex> lock(perception_mutex_);
+      if (latest_perception_status_ &&
+        latest_perception_status_->state == msg::PerceptionStatus::OK &&
+        latest_perception_status_->target_id >= 0)
+      {
+        target_id = latest_perception_status_->target_id;
+        status_source_stamp_ns = rclcpp::Time(
+          latest_perception_status_->source_stamp, get_clock()->get_clock_type()).nanoseconds();
+      }
+    }
+    if (!target_id) {
+      return;
+    }
+    if (active_target_id_ && *active_target_id_ != *target_id) {
+      core_->reset();
+      if (pending_face_) {
+        const std::int64_t pending_stamp_ns = rclcpp::Time(
+          pending_face_->message.header.stamp, get_clock()->get_clock_type()).nanoseconds();
+        if (!status_source_stamp_ns || pending_stamp_ns != *status_source_stamp_ns) {
+          pending_face_.reset();
+        }
+      }
+      last_accepted_face_stamp_ns_.reset();
+      last_accepted_face_target_.reset();
+      last_face_received_at_.reset();
+      last_adapter_status_ = "target_identity_changed";
+    }
+    active_target_id_ = target_id;
+  }
+
+  std::string perception_status_failure(const std::int64_t now_ns) const
+  {
+    std::lock_guard<std::mutex> lock(perception_mutex_);
+    if (!latest_perception_status_ || !perception_status_received_at_) {
+      return "perception_status_waiting";
+    }
+    const auto & status = *latest_perception_status_;
+    const std::int64_t publication_stamp_ns = rclcpp::Time(
+      status.header.stamp, get_clock()->get_clock_type()).nanoseconds();
+    const std::int64_t source_stamp_ns = rclcpp::Time(
+      status.source_stamp, get_clock()->get_clock_type()).nanoseconds();
+    if (publication_stamp_ns <= 0 || publication_stamp_ns > now_ns + kMaximumClockSkewNs ||
+      now_ns - std::min(now_ns, publication_stamp_ns) >= freshness_timeout_ns_)
+    {
+      return "perception_status_stale";
+    }
+    if (source_stamp_ns <= 0 || source_stamp_ns > now_ns + kMaximumClockSkewNs ||
+      now_ns - std::min(now_ns, source_stamp_ns) >= freshness_timeout_ns_)
+    {
+      return "perception_source_stale";
+    }
+    if (std::chrono::steady_clock::now() - *perception_status_received_at_ >=
+      std::chrono::nanoseconds(freshness_timeout_ns_))
+    {
+      return "perception_heartbeat_lost";
+    }
+    return "perception_fault_" + std::to_string(status.state) + ":" + status.reason;
   }
 
   bool has_safe_retarget(const std::int64_t now_ns) const
@@ -853,6 +1100,12 @@ private:
         bool_string(servo_status_fresh(now_ns))));
     status.values.push_back(key_value("scene_ready", bool_string(scene_ready_)));
     status.values.push_back(key_value("pose_mode_ready", bool_string(pose_mode_ready_)));
+    if (require_perception_status_) {
+      status.values.push_back(key_value(
+        "perception_status_ready", bool_string(perception_status_healthy(now_ns))));
+      status.values.push_back(key_value(
+        "perception_status", perception_status_failure(now_ns)));
+    }
     status.values.push_back(key_value(
       "safety_hold", bool_string(safety_hold_pose_.has_value() || safety_hold_requested_)));
     status.values.push_back(key_value("safety_retarget_ready", bool_string(
@@ -932,6 +1185,7 @@ private:
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
   rclcpp::Publisher<moveit_msgs::msg::PlanningScene>::SharedPtr planning_scene_publisher_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr face_subscription_;
+  rclcpp::Subscription<msg::PerceptionStatus>::SharedPtr perception_status_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_subscription_;
   rclcpp::Subscription<moveit_msgs::msg::ServoStatus>::SharedPtr servo_status_subscription_;
   rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedPtr controller_client_;
@@ -942,25 +1196,40 @@ private:
   rclcpp::TimerBase::SharedPtr diagnostics_timer_;
 
   std::optional<PendingFace> pending_face_;
+  std::optional<std::int64_t> active_target_id_;
+  mutable std::mutex perception_mutex_;
+  std::optional<msg::PerceptionStatus> latest_perception_status_;
+  std::optional<std::chrono::steady_clock::time_point> perception_status_received_at_;
   std::optional<std::int64_t> last_accepted_face_stamp_ns_;
   std::optional<std::int64_t> last_joint_state_stamp_ns_;
   std::optional<std::int64_t> last_control_time_ns_;
   std::optional<std::int64_t> last_command_stamp_ns_;
-  std::optional<std::int64_t> last_source_face_stamp_ns_;
   std::optional<std::chrono::steady_clock::time_point> last_face_received_at_;
   std::string idle_behavior_{"rest"};
   moveit_msgs::msg::CollisionObject table_;
   std::optional<tracking::Pose3d> safety_hold_pose_;
   std::optional<tracking::FaceGeometry> last_accepted_face_target_;
+  std::optional<tracking::Pose3d> last_known_tcp_pose_;
 
   bool joint_state_complete_{false};
   bool controllers_ready_{false};
   bool scene_ready_{false};
   bool pose_mode_ready_{false};
   bool ready_{false};
+  bool require_perception_status_{false};
+  bool config_prediction_enabled_{false};
   bool controller_request_pending_{false};
   bool scene_request_pending_{false};
   bool pose_mode_request_pending_{false};
+  std::optional<std::int64_t> controller_request_id_;
+  std::optional<std::int64_t> scene_request_id_;
+  std::optional<std::int64_t> pose_mode_request_id_;
+  std::optional<std::chrono::steady_clock::time_point> controller_request_started_at_;
+  std::optional<std::chrono::steady_clock::time_point> scene_request_started_at_;
+  std::optional<std::chrono::steady_clock::time_point> pose_mode_request_started_at_;
+  std::uint64_t controller_request_generation_{0};
+  std::uint64_t scene_request_generation_{0};
+  std::uint64_t pose_mode_request_generation_{0};
   bool safety_hold_requested_{false};
   std::uint64_t received_face_count_{0};
   std::uint64_t accepted_face_count_{0};

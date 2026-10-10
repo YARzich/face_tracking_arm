@@ -59,6 +59,13 @@ public:
     std::int64_t now_ns, std::int64_t initial_lead_ns,
     std::int64_t minimum_lead_ns);
 
+  /// Number of fixed-grid periods by which the command branch must advance
+  /// before another stamp can meet target_lead_ns. The caller must confirm
+  /// that matching already-published points exist before adopting them.
+  /// Nullopt means no command epoch is active.
+  [[nodiscard]] std::optional<std::uint64_t> periodsUntilCommandLead(
+    std::int64_t now_ns, std::int64_t target_lead_ns) const;
+
   /// Move the active command epoch to an already-published future stamp.
   ///
   /// This is used when a late control callback adopts an immutable prefix of

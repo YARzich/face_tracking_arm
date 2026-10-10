@@ -64,14 +64,91 @@ TEST(TargetMotionEstimator, DuplicateStampsDoNotDifferentiateOrDecayAgain)
   }
 }
 
-TEST(TargetMotionEstimator, StaleInputReturnsZeroAndStartsAFreshEstimate)
+TEST(TargetMotionEstimator, AutoAgeTracksFifteenAndThirtyHertzWithFiftyMsDeliveryDelay)
+{
+  for (const double sample_period : {1.0 / 15.0, 1.0 / 30.0}) {
+    TargetMotionEstimatorConfig config;
+    config.timing_mode = MotionTimingMode::kAuto;
+    config.maximum_sample_interval_sec = 0.50;
+    config.maximum_source_gap_sec = 0.50;
+    TargetMotionEstimator estimator(config);
+    TargetMotionEstimate estimate;
+    for (int sample = 0; sample < 60; ++sample) {
+      const double stamp = sample * sample_period;
+      estimate = estimator.update(
+        Eigen::Vector3d(0.3, -0.1, 0.2) * stamp,
+        Eigen::Vector3d(0.06, 0.03, -0.02) * stamp,
+        stamp, stamp + 0.050);
+    }
+    EXPECT_NEAR(estimate.face_velocity.norm(), Eigen::Vector3d(0.3, -0.1, 0.2).norm(), 1.0e-3);
+    const auto predicted = estimator.predictFacePosition(0.050 + 59 * sample_period + 0.020);
+    ASSERT_TRUE(predicted);
+    EXPECT_TRUE(predicted->allFinite());
+  }
+}
+
+TEST(TargetMotionEstimator, AutoAgeRemainsBoundedAfterAStreamGap)
+{
+  TargetMotionEstimatorConfig config;
+  config.timing_mode = MotionTimingMode::kAuto;
+  config.maximum_sample_interval_sec = 0.30;
+  config.maximum_source_gap_sec = 0.30;
+  TargetMotionEstimator estimator(config);
+  for (int sample = 0; sample < 5; ++sample) {
+    const double stamp = sample / 15.0;
+    (void)estimator.update(Eigen::Vector3d(stamp, 0.0, 0.0), Eigen::Vector3d::Zero(),
+      stamp, stamp + 0.05);
+  }
+  expectZero(estimator.update(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+      0.60, 0.95));
+}
+
+TEST(TargetMotionEstimator, ManualLiveExpiryKeepsHistoryAcrossFifteenHertzDelivery)
+{
+  TargetMotionEstimatorConfig config;
+  config.timing_mode = MotionTimingMode::kManual;
+  config.stale_timeout_sec = 0.040;
+  config.maximum_sample_interval_sec = 0.20;
+  config.maximum_source_gap_sec = 0.20;
+  config.history_timeout_sec = 0.20;
+  TargetMotionEstimator estimator(config);
+  expectZero(movingSample(estimator, 0.0));
+  const double period = 1.0 / 15.0;
+  auto estimate = estimator.update(
+    Eigen::Vector3d(0.3, -0.1, 0.2) * period,
+    Eigen::Vector3d(0.06, 0.03, -0.02) * period,
+    period, period + 0.050);
+  EXPECT_GT(estimate.face_velocity.norm(), 0.0);
+  expectZero(estimator.update(
+      Eigen::Vector3d(0.3, -0.1, 0.2) * period,
+      Eigen::Vector3d(0.06, 0.03, -0.02) * period,
+      period, period + 0.090));
+  estimate = estimator.update(
+    Eigen::Vector3d(0.3, -0.1, 0.2) * 2.0 * period,
+    Eigen::Vector3d(0.06, 0.03, -0.02) * 2.0 * period,
+    2.0 * period, 2.0 * period + 0.050);
+  EXPECT_GT(estimate.face_velocity.norm(), 0.0);
+}
+
+TEST(TargetMotionEstimator, StaleOutputStopsButNewSampleUsesRetainedHistory)
 {
   TargetMotionEstimator estimator;
   expectZero(movingSample(estimator, 0.0));
   ASSERT_GT(movingSample(estimator, 0.02).face_velocity.norm(), 0.0);
   expectZero(estimator.update(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), 0.02, 0.121));
-  expectZero(movingSample(estimator, 0.14));
-  EXPECT_GT(movingSample(estimator, 0.16).face_velocity.norm(), 0.0);
+  EXPECT_GT(movingSample(estimator, 0.14).face_velocity.norm(), 0.0);
+}
+
+TEST(TargetMotionEstimator, LongHistoryGapStartsAZeroVelocityAnchor)
+{
+  TargetMotionEstimatorConfig config;
+  config.history_timeout_sec = 0.15;
+  TargetMotionEstimator estimator(config);
+  expectZero(movingSample(estimator, 0.0));
+  ASSERT_GT(movingSample(estimator, 0.02).face_velocity.norm(), 0.0);
+  expectZero(estimator.update(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), 0.02, 0.19));
+  expectZero(movingSample(estimator, 0.20));
+  EXPECT_GT(movingSample(estimator, 0.22).face_velocity.norm(), 0.0);
 }
 
 TEST(TargetMotionEstimator, StationaryNewMeasurementsDecayToExactZero)

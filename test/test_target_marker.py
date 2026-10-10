@@ -125,8 +125,11 @@ def test_marker_configuration_reuses_tracking_frame_and_freshness(package_share)
 
 
 def test_tracking_launch_bridges_and_starts_marker_by_default(package_share):
-    launch_path = package_share / 'launch' / 'tracking_sim.launch.py'
-    syntax_tree = ast.parse(launch_path.read_text(encoding='utf-8'))
+    launch_path = PROJECT_ROOT / 'launch' / 'tracking_sim.launch.py'
+    source = '\n'.join(path.read_text(encoding='utf-8') for path in (
+        launch_path,
+        PROJECT_ROOT / 'python/face_tracking_bringup/simulation_launch.py'))
+    syntax_tree = ast.parse(source)
     calls = [node for node in ast.walk(syntax_tree) if isinstance(node, ast.Call)]
 
     declared_arguments = [

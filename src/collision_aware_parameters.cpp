@@ -3,10 +3,16 @@
 
 #include "face_tracking_arm/collision_aware_parameters.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 
+#include <moveit_servo/moveit_servo_lib_parameters.hpp>
+#include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 
 namespace face_tracking_arm
@@ -27,18 +33,48 @@ constexpr int kMaximumCollisionConstraintRows = 64;
 constexpr double kMaximumCollisionGradientEpsilon = 1.0e-8;
 constexpr double kMinimumResidualCommandLatencySec = 0.020;
 constexpr double kMinimumNumericalDistanceReserveM = 0.0001;
-constexpr double kMaximumSingularityWarningCondition = 40.0;
-constexpr double kMaximumSingularityStopCondition = 80.0;
 constexpr double kMaximumSolverTolerance = 1.0e-5;
 constexpr double kMaximumSolverTimeSec = 0.003;
 constexpr double kMinimumSegmentValidationDistanceM = kMinimumHardClearanceM;
 constexpr int kMinimumSegmentValidationSubsteps = 3;
 constexpr int kMaximumSegmentValidationSubsteps = 16;
 
+void declareDeprecatedParameters(rclcpp::Node & node)
+{
+  constexpr std::array<std::pair<const char *, double>, 12> deprecated{{
+    {"joint_centering_activation_fraction", 0.35},
+    {"joint_centering_max_velocity_rad_s", 0.4},
+    {"joint_centering_weight", 3.0},
+    {"collision_avoidance_buffer_m", 0.04},
+    {"collision_avoidance_max_velocity_mps", 0.12},
+    {"collision_avoidance_lookahead_sec", 0.4},
+    {"collision_avoidance_weight", 4.0},
+    {"lower_singularity_threshold", 40.0},
+    {"hard_stop_singularity_threshold", 80.0},
+    {"singularity_recovery_gain", 2.0},
+    {"singularity_gradient_step_rad", 0.001},
+    {"monitor_near_distance_lipschitz_m_per_rad", 0.4543},
+  }};
+  rcl_interfaces::msg::ParameterDescriptor descriptor;
+  descriptor.description =
+    "Deprecated compatibility parameter: ignored by the collision-aware controller.";
+  const auto & overrides = node.get_node_parameters_interface()->get_parameter_overrides();
+  for (const auto & [name, default_value] : deprecated) {
+    node.declare_parameter<double>(name, default_value, descriptor);
+    if (overrides.find(name) != overrides.end()) {
+      RCLCPP_WARN(
+        node.get_logger(),
+        "Parameter '%s' is deprecated and has no effect on the collision-aware controller; "
+        "remove it from this controller's configuration.", name);
+    }
+  }
+}
+
 }  // namespace
 
 ControllerParameters declareControllerParameters(rclcpp::Node & node)
 {
+  declareDeprecatedParameters(node);
   ControllerParameters result;
   result.control_period_sec = node.declare_parameter<double>(
     "control_period_sec", result.control_period_sec);
@@ -73,23 +109,9 @@ ControllerParameters declareControllerParameters(rclcpp::Node & node)
     "secondary_roll_weight", result.secondary_roll_weight);
   result.velocity_regularization_weight = node.declare_parameter<double>(
     "velocity_regularization_weight", result.velocity_regularization_weight);
-  result.joint_centering_activation_fraction = node.declare_parameter<double>(
-    "joint_centering_activation_fraction", result.joint_centering_activation_fraction);
-  result.joint_centering_max_velocity_rad_s = node.declare_parameter<double>(
-    "joint_centering_max_velocity_rad_s", result.joint_centering_max_velocity_rad_s);
-  result.joint_centering_weight = node.declare_parameter<double>(
-    "joint_centering_weight", result.joint_centering_weight);
 
   result.hard_clearance_m = node.declare_parameter<double>(
     "hard_clearance_m", result.hard_clearance_m);
-  result.collision_avoidance_buffer_m = node.declare_parameter<double>(
-    "collision_avoidance_buffer_m", result.collision_avoidance_buffer_m);
-  result.collision_avoidance_max_velocity_mps = node.declare_parameter<double>(
-    "collision_avoidance_max_velocity_mps", result.collision_avoidance_max_velocity_mps);
-  result.collision_avoidance_lookahead_sec = node.declare_parameter<double>(
-    "collision_avoidance_lookahead_sec", result.collision_avoidance_lookahead_sec);
-  result.collision_avoidance_weight = node.declare_parameter<double>(
-    "collision_avoidance_weight", result.collision_avoidance_weight);
   result.collision_query_distance_m = node.declare_parameter<double>(
     "collision_query_distance_m", result.collision_query_distance_m);
   result.maximum_collision_constraints = node.declare_parameter<int>(
@@ -105,6 +127,14 @@ ControllerParameters declareControllerParameters(rclcpp::Node & node)
     "monitor_guard_max_position_rad", result.monitor_guard_max_position_rad);
   result.joint_position_margin_rad = node.declare_parameter<double>(
     "joint_position_margin_rad", result.joint_position_margin_rad);
+  result.timing_mode = node.declare_parameter<std::string>(
+    "timing_mode", result.timing_mode);
+  result.source_timeout_sec = node.declare_parameter<double>(
+    "source_timeout_sec", result.source_timeout_sec);
+  result.face_target_freshness_timeout_sec = node.declare_parameter<double>(
+    "face_target_freshness_timeout_sec", result.face_target_freshness_timeout_sec);
+  result.face_prediction_timeout_sec = node.declare_parameter<double>(
+    "face_prediction_timeout_sec", result.face_prediction_timeout_sec);
   result.residual_command_latency_sec = node.declare_parameter<double>(
     "residual_command_latency_sec", result.residual_command_latency_sec);
   result.state_feedback_timeout_sec = node.declare_parameter<double>(
@@ -120,19 +150,6 @@ ControllerParameters declareControllerParameters(rclcpp::Node & node)
   result.default_distance_lipschitz_m_per_rad = node.declare_parameter<double>(
     "default_distance_lipschitz_m_per_rad",
     result.default_distance_lipschitz_m_per_rad);
-  result.monitor_near_distance_lipschitz_m_per_rad = node.declare_parameter<double>(
-    "monitor_near_distance_lipschitz_m_per_rad",
-    result.monitor_near_distance_lipschitz_m_per_rad);
-
-  result.lower_singularity_threshold = node.declare_parameter<double>(
-    "lower_singularity_threshold", result.lower_singularity_threshold);
-  result.hard_stop_singularity_threshold = node.declare_parameter<double>(
-    "hard_stop_singularity_threshold", result.hard_stop_singularity_threshold);
-  result.singularity_recovery_gain = node.declare_parameter<double>(
-    "singularity_recovery_gain", result.singularity_recovery_gain);
-  result.singularity_gradient_step_rad = node.declare_parameter<double>(
-    "singularity_gradient_step_rad", result.singularity_gradient_step_rad);
-
   result.solver_max_iterations = node.declare_parameter<int>(
     "solver_max_iterations", result.solver_max_iterations);
   result.solver_absolute_tolerance = node.declare_parameter<double>(
@@ -154,6 +171,44 @@ ControllerParameters declareControllerParameters(rclcpp::Node & node)
     "max_joint_acceleration_rad_s2", std::vector<double>{});
   result.max_joint_jerk_rad_s3 = node.declare_parameter<std::vector<double>>(
     "max_joint_jerk_rad_s3", std::vector<double>{});
+  return result;
+}
+
+servo::Params declareCollisionAwareServoParameters(
+  rclcpp::Node & node, const ControllerParameters & controller)
+{
+  servo::Params result;
+  result.thread_priority = node.declare_parameter<std::int64_t>(
+    "moveit_servo.thread_priority", result.thread_priority);
+  result.max_expected_latency = node.declare_parameter<double>(
+    "moveit_servo.max_expected_latency", 0.05);
+  result.command_out_topic = node.declare_parameter<std::string>(
+    "moveit_servo.command_out_topic", "/lite6_arm_controller/joint_trajectory");
+  result.joint_topic = node.declare_parameter<std::string>(
+    "moveit_servo.joint_topic", "/joint_states");
+  result.monitored_planning_scene_topic = node.declare_parameter<std::string>(
+    "moveit_servo.monitored_planning_scene_topic", "/planning_scene");
+  result.is_primary_planning_scene_monitor = node.declare_parameter<bool>(
+    "moveit_servo.is_primary_planning_scene_monitor", true);
+
+  // composeTrajectoryMessage consumes these fields, but they are properties of
+  // this backend's fixed output contract, not user-selectable Servo settings.
+  result.publish_period = controller.control_period_sec;
+  result.move_group_name = controller.planning_group_name;
+  result.command_out_type = "trajectory_msgs/JointTrajectory";
+  result.command_in_type = "speed_units";
+  result.publish_joint_positions = true;
+  result.publish_joint_velocities = false;
+  result.publish_joint_accelerations = false;
+  result.check_collisions = false;
+  result.use_smoothing = false;
+  if (result.thread_priority < 0 ||
+    result.thread_priority > std::numeric_limits<int>::max() ||
+    result.command_out_topic.empty() || result.joint_topic.empty() ||
+    result.monitored_planning_scene_topic.empty())
+  {
+    throw std::invalid_argument("invalid shared MoveIt Servo runtime settings");
+  }
   return result;
 }
 
@@ -189,15 +244,7 @@ void validateControllerParameters(const ControllerParameters & parameters)
     kMaximumPrimaryPreservationToleranceRadps ||
     !positive(parameters.secondary_roll_weight) ||
     !positive(parameters.velocity_regularization_weight) ||
-    !positive(parameters.joint_centering_activation_fraction) ||
-    parameters.joint_centering_activation_fraction >= 1.0 ||
-    !positive(parameters.joint_centering_max_velocity_rad_s) ||
-    !positive(parameters.joint_centering_weight) ||
     !positive(parameters.hard_clearance_m) ||
-    !positive(parameters.collision_avoidance_buffer_m) ||
-    !positive(parameters.collision_avoidance_max_velocity_mps) ||
-    !positive(parameters.collision_avoidance_lookahead_sec) ||
-    !positive(parameters.collision_avoidance_weight) ||
     parameters.hard_clearance_m < kMinimumHardClearanceM ||
     !positive(parameters.collision_query_distance_m) ||
     parameters.collision_query_distance_m < kMinimumCollisionQueryDistanceM ||
@@ -207,11 +254,21 @@ void validateControllerParameters(const ControllerParameters & parameters)
     parameters.maximum_collision_constraints > kMaximumCollisionConstraintRows ||
     !positive(parameters.collision_gradient_epsilon) ||
     parameters.collision_gradient_epsilon > kMaximumCollisionGradientEpsilon ||
-    !std::isfinite(parameters.monitor_guard_min_position_rad) ||
+    (!parameters.monitor_guard_joint_name.empty() &&
+    (!std::isfinite(parameters.monitor_guard_min_position_rad) ||
     !std::isfinite(parameters.monitor_guard_max_position_rad) ||
-    parameters.monitor_guard_min_position_rad >= parameters.monitor_guard_max_position_rad ||
+    parameters.monitor_guard_min_position_rad >= parameters.monitor_guard_max_position_rad)) ||
     !std::isfinite(parameters.joint_position_margin_rad) ||
     parameters.joint_position_margin_rad < 0.0 ||
+    (parameters.timing_mode != "auto" && parameters.timing_mode != "manual") ||
+    !positive(parameters.source_timeout_sec) || parameters.source_timeout_sec > 1.0 ||
+    !positive(parameters.face_target_freshness_timeout_sec) ||
+    parameters.face_target_freshness_timeout_sec > 1.0 ||
+    !std::isfinite(parameters.face_prediction_timeout_sec) ||
+    parameters.face_prediction_timeout_sec < 0.0 ||
+    parameters.face_prediction_timeout_sec > 2.0 ||
+    (parameters.face_prediction_timeout_sec > 0.0 &&
+    parameters.face_prediction_timeout_sec <= parameters.face_target_freshness_timeout_sec) ||
     !std::isfinite(parameters.residual_command_latency_sec) ||
     parameters.residual_command_latency_sec < kMinimumResidualCommandLatencySec ||
     !positive(parameters.state_feedback_timeout_sec) ||
@@ -225,15 +282,6 @@ void validateControllerParameters(const ControllerParameters & parameters)
     parameters.numerical_distance_reserve_m < kMinimumNumericalDistanceReserveM ||
     !std::isfinite(parameters.default_distance_lipschitz_m_per_rad) ||
     parameters.default_distance_lipschitz_m_per_rad < 0.0 ||
-    !std::isfinite(parameters.monitor_near_distance_lipschitz_m_per_rad) ||
-    parameters.monitor_near_distance_lipschitz_m_per_rad < 0.0 ||
-    !positive(parameters.lower_singularity_threshold) ||
-    !positive(parameters.hard_stop_singularity_threshold) ||
-    parameters.lower_singularity_threshold >= parameters.hard_stop_singularity_threshold ||
-    parameters.lower_singularity_threshold > kMaximumSingularityWarningCondition ||
-    parameters.hard_stop_singularity_threshold > kMaximumSingularityStopCondition ||
-    !positive(parameters.singularity_recovery_gain) ||
-    !positive(parameters.singularity_gradient_step_rad) ||
     parameters.solver_max_iterations <= 0 ||
     !positive(parameters.solver_absolute_tolerance) ||
     parameters.solver_absolute_tolerance > kMaximumSolverTolerance ||

@@ -9,6 +9,13 @@
 
 namespace face_tracking_arm::control
 {
+namespace
+{
+
+constexpr double kSearchNoProgressTimeoutSec = 6.0;
+constexpr double kSearchProgressToleranceRad = 0.0001;
+
+}  // namespace
 
 void IdleSearch::start(
   const Eigen::VectorXd & current, const Eigen::VectorXd & posture,
@@ -54,6 +61,8 @@ void IdleSearch::start(
   local_lower_ = std::max(lower[base_index], current[base_index] - config.local_half_range_rad);
   local_upper_ = std::min(upper[base_index], current[base_index] + config.local_half_range_rad);
   started_at_ = now;
+  progress_since_ = now;
+  progress_anchor_ = current[base_index_];
   direction_ = current[base_index] >= upper_ - 0.10 ? -1 : 1;
   phase_ = local && config.local_duration_sec > 0.0 ? Phase::kLocal : Phase::kPrepare;
   goal_ = current;
@@ -73,11 +82,30 @@ void IdleSearch::prepare(const Eigen::VectorXd & current)
 
 void IdleSearch::update(const Eigen::VectorXd & current, const double now)
 {
+  if (current.size() != goal_.size() || !current.allFinite() || !std::isfinite(now)) {
+    throw std::invalid_argument("Idle search update requires a finite current position and time");
+  }
   if (phase_ == Phase::kLocal && now - started_at_ >= config_.local_duration_sec) {
     prepare(current);
+    progress_since_ = now;
+    progress_anchor_ = current[base_index_];
   }
   if (preparing()) {
     return;
+  }
+  const bool search_progress_detected =
+    std::abs(current[base_index_] - progress_anchor_) >= kSearchProgressToleranceRad;
+  if (phase_ == Phase::kSweep) {
+    if (now < progress_since_) {
+      progress_since_ = now;
+      progress_anchor_ = current[base_index_];
+    } else if (search_progress_detected) {
+      progress_since_ = now;
+      progress_anchor_ = current[base_index_];
+    } else if (now - progress_since_ >= kSearchNoProgressTimeoutSec) {
+      retryFrom(current, now);
+      return;
+    }
   }
   if (std::abs(current[base_index_] - goal_[base_index_]) < 0.03) {
     direction_ = -direction_;
@@ -87,10 +115,29 @@ void IdleSearch::update(const Eigen::VectorXd & current, const double now)
   goal_[base_index_] = direction_ > 0 ? high : low;
 }
 
-void IdleSearch::prepared()
+void IdleSearch::prepared(const Eigen::VectorXd & current, const double now)
 {
+  if (current.size() != goal_.size() || !current.allFinite() || !std::isfinite(now)) {
+    throw std::invalid_argument(
+            "Idle search preparation requires a finite current position and time");
+  }
   phase_ = Phase::kSweep;
+  progress_since_ = now;
+  progress_anchor_ = current[base_index_];
   goal_[base_index_] = direction_ > 0 ? upper_ : lower_;
+}
+
+void IdleSearch::retryFrom(const Eigen::VectorXd & current, const double now)
+{
+  if (current.size() != goal_.size() || !current.allFinite() || !std::isfinite(now)) {
+    throw std::invalid_argument("Idle search retry requires a finite current position and time");
+  }
+  const double low = phase_ == Phase::kLocal ? local_lower_ : lower_;
+  const double high = phase_ == Phase::kLocal ? local_upper_ : upper_;
+  direction_ = -direction_;
+  progress_since_ = now;
+  progress_anchor_ = current[base_index_];
+  goal_[base_index_] = direction_ > 0 ? high : low;
 }
 
 bool IdleSearch::preparing() const {return phase_ == Phase::kPrepare;}

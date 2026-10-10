@@ -3,6 +3,8 @@
 
 #include "collision_aware_servo_component.hpp"
 
+#include "face_tracking_arm/snapshot_timing.hpp"
+
 namespace face_tracking_arm
 {
 namespace
@@ -52,11 +54,11 @@ ActualFeedbackSafety CollisionAwareServoComponent::validate_controller_feedback_
   const control_msgs::msg::JointTrajectoryControllerState & controller_state,
   const std::string & context, std::string & reason)
 {
-  if ((command_epoch_active_ || published_tail_rearm_pending_) &&
+  if ((commands_.epoch_active || commands_.published_tail_rearm_pending) &&
     planning_scene_collision_revision_.load(std::memory_order_acquire) !=
     last_validated_scene_revision_)
   {
-    ++planning_scene_invalidation_count_;
+    ++telemetry_.planning_scene_invalidation_count;
     reason = context + " detected changed collision geometry for a published trajectory";
     return ActualFeedbackSafety::kUnsafe;
   }
@@ -80,23 +82,23 @@ ActualFeedbackSafety CollisionAwareServoComponent::validate_controller_feedback_
   const control::CollisionActualStateValidationResult validation =
     collision_constraint_builder_->validateActualState(
     *planning_scene, *measured_robot_state, *joint_model_group_);
-  ++actual_state_validation_count_;
-  last_actual_minimum_self_distance_m_ =
+  ++telemetry_.actual_state_validation_count;
+  telemetry_.last_actual_minimum_self_distance_m =
     std::isfinite(validation.minimum_self_distance_m) ?
     std::optional<double>{validation.minimum_self_distance_m} : std::nullopt;
-  last_actual_minimum_world_distance_m_ =
+  telemetry_.last_actual_minimum_world_distance_m =
     std::isfinite(validation.minimum_world_distance_m) ?
     std::optional<double>{validation.minimum_world_distance_m} : std::nullopt;
-  last_actual_closest_pair_ = validation.closest_pair.empty() ?
+  telemetry_.last_actual_closest_pair = validation.closest_pair.empty() ?
     "outside hard-clearance query" : validation.closest_pair;
-  observe_clearances(
+  telemetry_.observeClearances(
     validation.minimum_self_distance_m, validation.minimum_world_distance_m);
   if (!validation.input_valid || validation.unsafe) {
-    ++actual_state_validation_failure_count_;
+    ++telemetry_.actual_state_validation_failure_count;
     reason = !validation.input_valid ?
       context + " actual-state validation failed: " + validation.failure_reason :
       context + " measured a hard-clearance/corridor violation for " +
-      last_actual_closest_pair_;
+      telemetry_.last_actual_closest_pair;
     return ActualFeedbackSafety::kUnsafe;
   }
   return ActualFeedbackSafety::kSafe;
@@ -106,29 +108,42 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
   const rclcpp::Time & current_time, std::string & reason)
 {
   const auto state_monitor = planning_scene_monitor_->getStateMonitor();
-  const rclcpp::Time oldest_allowed_state = current_time -
-    rclcpp::Duration::from_seconds(parameters_.state_feedback_timeout_sec);
-  const auto [measured_robot_state, state_time] = state_monitor->getCurrentStateAndTime();
-  if (!measured_robot_state || state_time > current_time || state_time < oldest_allowed_state ||
+  const auto [measured_state, state_validation_time] =
+    control::readSnapshotAtCurrentTime(
+    [state_monitor]() {return state_monitor->getCurrentStateAndTime();},
+    [this]() {return now();});
+  const auto & state_time = measured_state.second;
+  const auto feedback_timeout = rclcpp::Duration::from_seconds(
+    parameters_.state_feedback_timeout_sec);
+  const rclcpp::Time oldest_allowed_state = state_validation_time -
+    feedback_timeout;
+  if (!measured_state.first ||
+    !control::isInSameClockEpoch(
+      current_time.nanoseconds(), state_validation_time.nanoseconds()) ||
+    !control::isFreshSnapshotTimestamp(
+      state_time.nanoseconds(), state_validation_time.nanoseconds(),
+      feedback_timeout.nanoseconds()) ||
     !state_monitor->haveCompleteState(oldest_allowed_state))
   {
-    stable_rearm_samples_ = 0;
+    commands_.stable_rearm_samples = 0;
     reason = "Safe re-arm is waiting for fresh complete robot feedback";
     return RearmReadiness::kWaiting;
   }
 
   const auto state = current_controller_state();
   if (!state.has_value()) {
-    stable_rearm_samples_ = 0;
+    commands_.stable_rearm_samples = 0;
     reason = "Safe re-arm is waiting for fresh finite controller feedback";
     return RearmReadiness::kWaiting;
   }
   const rclcpp::Time sample_time(state->header.stamp, current_time.get_clock_type());
-  if (last_rearm_sample_time_.has_value() && sample_time <= *last_rearm_sample_time_) {
+  if (commands_.last_rearm_sample_time.has_value() &&
+    sample_time <= *commands_.last_rearm_sample_time)
+  {
     reason = "Safe re-arm is waiting for the next controller feedback sample";
     return RearmReadiness::kWaiting;
   }
-  last_rearm_sample_time_ = sample_time;
+  commands_.last_rearm_sample_time = sample_time;
   observe_controller_feedback(*state, current_time.get_clock_type());
 
   const auto maximum_absolute_difference = [](
@@ -172,59 +187,62 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
   if (std::abs(state->speed_scaling_factor - 1.0) >
     kControllerSpeedScalingTolerance)
   {
-    ++controller_speed_scaling_failure_count_;
+    ++telemetry_.controller_speed_scaling_failure_count;
     reason = "Safe re-arm detected trajectory-controller speed scaling";
     return RearmReadiness::kUnsafe;
   }
 
   std::string feedback_failure;
   if (!feedback_motion_within_limits(*state, feedback_failure)) {
-    ++feedback_motion_limit_failure_count_;
+    ++telemetry_.feedback_motion_limit_failure_count;
     reason = "Safe re-arm measured unsafe motion: " + feedback_failure;
     return RearmReadiness::kUnsafe;
   }
   const ActualFeedbackSafety feedback_safety =
     validate_controller_feedback_collision_state(*state, "Safe re-arm", reason);
   if (feedback_safety == ActualFeedbackSafety::kWaiting) {
-    stable_rearm_samples_ = 0;
+    commands_.stable_rearm_samples = 0;
     return RearmReadiness::kWaiting;
   }
   if (feedback_safety == ActualFeedbackSafety::kUnsafe) {
     return RearmReadiness::kUnsafe;
   }
 
-  if (published_tail_rearm_pending_) {
+  // On startup/retry, a three-sample stationary reference/output pair is the
+  // controller-owned hold. Once this component has published, ownership must
+  // be proven by the retained trajectory and its acknowledged terminal point.
+  const bool retained_publication = commands_.hasRetainedPublication();
+  if (commands_.epoch_has_published && !retained_publication) {
+    commands_.stable_rearm_samples = 0;
+    reason = "Safe re-arm lost ownership of its previously published command";
+    return RearmReadiness::kUnsafe;
+  }
+  bool stationary_hold_owned = !commands_.epoch_has_published && !retained_publication;
+  if (commands_.epoch_has_published || retained_publication) {
     const rclcpp::Duration controller_period = rclcpp::Duration::from_nanoseconds(
       seconds_to_nanoseconds(parameters_.trajectory_controller_period_sec));
     const control::PublicationMatch publication_match =
-      published_trajectory_history_.match(
+      commands_.publications.match(
       *state, current_time.get_clock_type(), controller_period,
       kControllerCommandAlignmentToleranceRad);
     if (!publication_match.matched()) {
-      ++command_alignment_failure_count_;
-      const bool unmatched_state_is_settled =
-        reference_output_error <= kControllerCommandAlignmentToleranceRad &&
-        following_position_error <= parameters_.collision_tracking_error_bound_rad &&
-        reference_velocity <= kStoppedVelocityRadps &&
-        feedback_velocity <= kStoppedVelocityRadps;
-      if (!unmatched_state_is_settled) {
-        stable_rearm_samples_ = 0;
-        reason =
-          "Safe re-arm is waiting for an unmatched controller phase to settle";
-        return RearmReadiness::kWaiting;
-      }
+      ++telemetry_.command_alignment_failure_count;
+      commands_.stable_rearm_samples = 0;
+      reason =
+        "Safe re-arm is waiting for the controller to acknowledge its checked publication";
+      return RearmReadiness::kWaiting;
     } else {
-      const bool publication_changed = !active_publication_id_.has_value() ||
-        *active_publication_id_ != publication_match.publication_id;
+      const bool publication_changed = !commands_.active_publication_id.has_value() ||
+        *commands_.active_publication_id != publication_match.publication_id;
       if (publication_changed) {
-        stable_rearm_samples_ = 0;
+        commands_.stable_rearm_samples = 0;
         if (publication_match.kind == control::PublicationMatchKind::kOlder) {
-          ++older_publication_recovery_count_;
+          ++telemetry_.older_publication_recovery_count;
         }
-        active_publication_id_ = publication_match.publication_id;
+        commands_.active_publication_id = publication_match.publication_id;
       }
       const auto * published_record =
-        published_trajectory_history_.find(publication_match.publication_id);
+        commands_.publications.find(publication_match.publication_id);
       if (published_record == nullptr || published_record->execution_queue.size() < 3U) {
         reason = "Safe re-arm lost the published braking-tail record";
         return RearmReadiness::kUnsafe;
@@ -232,8 +250,10 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
       if (publication_changed) {
         const rclcpp::Time required_ros_deadline = published_record->stationary_time +
           rclcpp::Duration::from_seconds(kSafeRearmSettleBudgetSec);
-        if (!rearm_deadline_.has_value() || required_ros_deadline > *rearm_deadline_) {
-          rearm_deadline_ = required_ros_deadline;
+        if (!commands_.rearm_deadline.has_value() ||
+          required_ros_deadline > *commands_.rearm_deadline)
+        {
+          commands_.rearm_deadline = required_ros_deadline;
         }
         const double remaining_tail_sec = std::max(
           0.0, (published_record->stationary_time - current_time).seconds());
@@ -241,40 +261,40 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
           std::chrono::duration<double>(
             remaining_tail_sec + kSafeRearmSettleBudgetSec));
-        if (!rearm_wall_deadline_.has_value() ||
-          required_wall_deadline > *rearm_wall_deadline_)
+        if (!commands_.rearm_wall_deadline.has_value() ||
+          required_wall_deadline > *commands_.rearm_wall_deadline)
         {
-          rearm_wall_deadline_ = required_wall_deadline;
+          commands_.rearm_wall_deadline = required_wall_deadline;
         }
       }
       const auto & published_queue = published_record->execution_queue;
       const control::ControllerSampleTimes & corrected_times =
         publication_match.sample_times;
-      last_controller_reference_alignment_error_rad_ =
+      telemetry_.last_controller_reference_alignment_error_rad =
         publication_match.reference_error_rad;
-      last_controller_output_alignment_error_rad_ =
+      telemetry_.last_controller_output_alignment_error_rad =
         publication_match.output_error_rad;
-      max_controller_reference_alignment_error_rad_ = std::max(
-        max_controller_reference_alignment_error_rad_,
+      telemetry_.max_controller_reference_alignment_error_rad = std::max(
+        telemetry_.max_controller_reference_alignment_error_rad,
         publication_match.reference_error_rad);
-      max_controller_output_alignment_error_rad_ = std::max(
-        max_controller_output_alignment_error_rad_,
+      telemetry_.max_controller_output_alignment_error_rad = std::max(
+        telemetry_.max_controller_output_alignment_error_rad,
         publication_match.output_error_rad);
-      command_alignment_check_count_ += 2U;
+      telemetry_.command_alignment_check_count += 2U;
       const rclcpp::Time transmitted_end =
         std::prev(published_queue.end(), 2)->time_stamp;
       if (corrected_times.reference < published_queue.front().time_stamp ||
         (corrected_times.output > transmitted_end &&
         corrected_times.reference < published_record->stationary_time))
       {
-        ++command_alignment_failure_count_;
+        ++telemetry_.command_alignment_failure_count;
         reason = "Safe re-arm controller sample left the published braking-tail horizon";
-        stable_rearm_samples_ = 0;
+        commands_.stable_rearm_samples = 0;
         return RearmReadiness::kWaiting;
       }
 
       if (corrected_times.reference < published_record->stationary_time) {
-        stable_rearm_samples_ = 0;
+        commands_.stable_rearm_samples = 0;
         reason = "Safe re-arm is monitoring the pre-published braking tail";
         return RearmReadiness::kWaiting;
       }
@@ -288,29 +308,22 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
         reference_output_error > kControllerCommandAlignmentToleranceRad ||
         reference_velocity > kStoppedVelocityRadps)
       {
-        ++command_alignment_failure_count_;
-        const bool controller_is_settled_at_a_safe_state =
-          reference_output_error <= kControllerCommandAlignmentToleranceRad &&
-          following_position_error <= parameters_.collision_tracking_error_bound_rad &&
-          reference_velocity <= kStoppedVelocityRadps &&
-          feedback_velocity <= kStoppedVelocityRadps;
-        if (!controller_is_settled_at_a_safe_state) {
-          stable_rearm_samples_ = 0;
-          reason =
-            "Safe re-arm is waiting for the trajectory controller to settle";
-          return RearmReadiness::kWaiting;
-        }
+        ++telemetry_.command_alignment_failure_count;
+        commands_.stable_rearm_samples = 0;
+        reason =
+          "Safe re-arm is waiting for the checked braking hold to finish and be acknowledged";
+        return RearmReadiness::kWaiting;
       }
+      stationary_hold_owned = true;
     }
   }
 
-  const bool stopped_and_settled =
-    reference_output_error <= kControllerCommandAlignmentToleranceRad &&
-    following_position_error <= parameters_.collision_tracking_error_bound_rad &&
-    reference_velocity <= kStoppedVelocityRadps &&
-    feedback_velocity <= kStoppedVelocityRadps;
+  const bool stopped_and_settled = settled_rearm_state(
+    reference_output_error, following_position_error, reference_velocity, feedback_velocity,
+    kControllerCommandAlignmentToleranceRad, parameters_.collision_tracking_error_bound_rad,
+    true, true, stationary_hold_owned);
   if (!stopped_and_settled) {
-    stable_rearm_samples_ = 0;
+    commands_.stable_rearm_samples = 0;
     reason =
       "Safe re-arm requires a settled hold: command=" +
       std::to_string(reference_output_error) + " rad, following=" +
@@ -320,10 +333,10 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
     return RearmReadiness::kWaiting;
   }
 
-  ++stable_rearm_samples_;
-  if (stable_rearm_samples_ < kRequiredStableRearmSamples) {
+  ++commands_.stable_rearm_samples;
+  if (commands_.stable_rearm_samples < kRequiredStableRearmSamples) {
     reason = "Safe re-arm is confirming a settled hold (" +
-      std::to_string(stable_rearm_samples_) + "/" +
+      std::to_string(commands_.stable_rearm_samples) + "/" +
       std::to_string(kRequiredStableRearmSamples) + ")";
     return RearmReadiness::kWaiting;
   }
@@ -333,14 +346,34 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
 std::optional<moveit_servo::KinematicState> CollisionAwareServoComponent::
 predicted_or_measured_state(
   const rclcpp::Time & current_time, std::string & failure_reason,
-  bool & requires_latched_halt)
+  bool & requires_latched_halt,
+  std::optional<control::JointMotionState> * actual_feedback,
+  std::optional<rclcpp::Time> * actual_feedback_stamp)
 {
   requires_latched_halt = false;
+  if (actual_feedback != nullptr) {
+    actual_feedback->reset();
+  }
+  if (actual_feedback_stamp != nullptr) {
+    actual_feedback_stamp->reset();
+  }
   const auto state_monitor = planning_scene_monitor_->getStateMonitor();
-  const rclcpp::Time oldest_allowed_state = current_time -
-    rclcpp::Duration::from_seconds(parameters_.state_feedback_timeout_sec);
-  const auto [measured_robot_state, state_time] = state_monitor->getCurrentStateAndTime();
-  if (!measured_robot_state || state_time > current_time || state_time < oldest_allowed_state ||
+  const auto [measured_state, state_validation_time] =
+    control::readSnapshotAtCurrentTime(
+    [state_monitor]() {return state_monitor->getCurrentStateAndTime();},
+    [this]() {return now();});
+  const auto & measured_robot_state = measured_state.first;
+  const auto & state_time = measured_state.second;
+  const auto feedback_timeout = rclcpp::Duration::from_seconds(
+    parameters_.state_feedback_timeout_sec);
+  const rclcpp::Time oldest_allowed_state = state_validation_time -
+    feedback_timeout;
+  if (!measured_robot_state ||
+    !control::isInSameClockEpoch(
+      current_time.nanoseconds(), state_validation_time.nanoseconds()) ||
+    !control::isFreshSnapshotTimestamp(
+      state_time.nanoseconds(), state_validation_time.nanoseconds(),
+      feedback_timeout.nanoseconds()) ||
     !state_monitor->haveCompleteState(oldest_allowed_state))
   {
     return std::nullopt;
@@ -362,15 +395,15 @@ predicted_or_measured_state(
   }
   observe_controller_feedback(*controller_state, current_time.get_clock_type());
   if (!feedback_motion_within_limits(*controller_state, failure_reason)) {
-    ++feedback_motion_limit_failure_count_;
+    ++telemetry_.feedback_motion_limit_failure_count;
     requires_latched_halt = true;
     return std::nullopt;
   }
-  last_controller_speed_scaling_factor_ = controller_state->speed_scaling_factor;
+  telemetry_.last_controller_speed_scaling_factor = controller_state->speed_scaling_factor;
   if (std::abs(controller_state->speed_scaling_factor - 1.0) >
     kControllerSpeedScalingTolerance)
   {
-    ++controller_speed_scaling_failure_count_;
+    ++telemetry_.controller_speed_scaling_failure_count;
     failure_reason =
       "Trajectory controller speed scaling changed the checked command timeline: factor=" +
       std::to_string(controller_state->speed_scaling_factor);
@@ -378,25 +411,42 @@ predicted_or_measured_state(
     return std::nullopt;
   }
 
+  if (actual_feedback != nullptr) {
+    control::JointMotionState feedback_motion_state;
+    feedback_motion_state.position = Eigen::Map<const Eigen::VectorXd>(
+      controller_state->feedback.positions.data(),
+      static_cast<Eigen::Index>(controller_state->feedback.positions.size()));
+    feedback_motion_state.velocity = Eigen::Map<const Eigen::VectorXd>(
+      controller_state->feedback.velocities.data(),
+      static_cast<Eigen::Index>(controller_state->feedback.velocities.size()));
+    // JTC state has no measured acceleration field.
+    feedback_motion_state.acceleration.setZero(feedback_motion_state.position.size());
+    *actual_feedback = std::move(feedback_motion_state);
+    if (actual_feedback_stamp != nullptr) {
+      *actual_feedback_stamp = rclcpp::Time(
+        controller_state->header.stamp, current_time.get_clock_type());
+    }
+  }
+
   bool following_window_active = false;
-  if (command_epoch_has_published_) {
+  if (commands_.epoch_has_published) {
     const rclcpp::Duration controller_period = rclcpp::Duration::from_nanoseconds(
       seconds_to_nanoseconds(parameters_.trajectory_controller_period_sec));
     const auto corrected_times =
       control::PublishedTrajectoryHistory::correctedSampleTimes(
       *controller_state, current_time.get_clock_type(), controller_period);
-    const auto * latest_publication = published_trajectory_history_.latest();
+    const auto * latest_publication = commands_.publications.latest();
     if (latest_publication == nullptr) {
       failure_reason =
         "Published command epoch has no retained checked trajectory";
-      ++command_alignment_failure_count_;
+      ++telemetry_.command_alignment_failure_count;
       requires_latched_halt = true;
       return std::nullopt;
     }
     if (!corrected_times.has_value()) {
       failure_reason =
         "Trajectory controller state has no valid checked publication phase";
-      ++command_alignment_failure_count_;
+      ++telemetry_.command_alignment_failure_count;
       std::string collision_failure;
       const ActualFeedbackSafety feedback_safety =
         validate_controller_feedback_collision_state(
@@ -409,7 +459,7 @@ predicted_or_measured_state(
     }
 
     const control::PublicationMatch publication_match =
-      published_trajectory_history_.match(
+      commands_.publications.match(
       *controller_state, current_time.get_clock_type(), controller_period,
       kControllerCommandAlignmentToleranceRad);
     if (!publication_match.matched()) {
@@ -438,18 +488,18 @@ predicted_or_measured_state(
       // old hold is valid only while it still equals the immutable bootstrap
       // seed, not whichever replacement happens to be latest in history.
       const bool preserving_validated_bootstrap_hold =
-        bootstrap_ack_pending_ &&
-        bootstrap_trajectory_origin_.has_value() &&
-        bootstrap_seed_positions_.has_value() &&
-        corrected_times->reference < *bootstrap_trajectory_origin_ &&
+        commands_.bootstrap_ack_pending &&
+        commands_.bootstrap_trajectory_origin.has_value() &&
+        commands_.bootstrap_seed_positions.has_value() &&
+        corrected_times->reference < *commands_.bootstrap_trajectory_origin &&
         maximum_expected_difference(
-          controller_state->reference.positions, *bootstrap_seed_positions_) <=
+          controller_state->reference.positions, *commands_.bootstrap_seed_positions) <=
         kControllerCommandAlignmentToleranceRad &&
         maximum_expected_difference(
-          controller_state->output.positions, *bootstrap_seed_positions_) <=
+          controller_state->output.positions, *commands_.bootstrap_seed_positions) <=
         kControllerCommandAlignmentToleranceRad &&
         maximum_expected_difference(
-          controller_state->feedback.positions, *bootstrap_seed_positions_) <=
+          controller_state->feedback.positions, *commands_.bootstrap_seed_positions) <=
         parameters_.collision_tracking_error_bound_rad &&
         maximum_absolute(controller_state->reference.velocities) <=
         kStoppedVelocityRadps &&
@@ -461,7 +511,7 @@ predicted_or_measured_state(
         failure_reason =
           "Trajectory controller reference/output do not match any retained checked "
           "publication";
-        ++command_alignment_failure_count_;
+        ++telemetry_.command_alignment_failure_count;
         std::string collision_failure;
         const ActualFeedbackSafety feedback_safety =
           validate_controller_feedback_collision_state(
@@ -473,39 +523,40 @@ predicted_or_measured_state(
         return std::nullopt;
       }
     } else {
-      last_controller_reference_alignment_error_rad_ =
+      telemetry_.last_controller_reference_alignment_error_rad =
         publication_match.reference_error_rad;
-      last_controller_output_alignment_error_rad_ = publication_match.output_error_rad;
-      max_controller_reference_alignment_error_rad_ = std::max(
-        max_controller_reference_alignment_error_rad_,
+      telemetry_.last_controller_output_alignment_error_rad = publication_match.output_error_rad;
+      telemetry_.max_controller_reference_alignment_error_rad = std::max(
+        telemetry_.max_controller_reference_alignment_error_rad,
         publication_match.reference_error_rad);
-      max_controller_output_alignment_error_rad_ = std::max(
-        max_controller_output_alignment_error_rad_, publication_match.output_error_rad);
-      command_alignment_check_count_ += 2U;
+      telemetry_.max_controller_output_alignment_error_rad = std::max(
+        telemetry_.max_controller_output_alignment_error_rad, publication_match.output_error_rad);
+      telemetry_.command_alignment_check_count += 2U;
       following_window_active = true;
 
       if (publication_match.kind == control::PublicationMatchKind::kOlder) {
-        active_publication_id_ = publication_match.publication_id;
-        ++older_publication_recovery_count_;
+        commands_.active_publication_id = publication_match.publication_id;
+        ++telemetry_.older_publication_recovery_count;
         failure_reason =
           "Trajectory controller is executing an older checked publication";
         return std::nullopt;
       }
-      active_publication_id_ = publication_match.publication_id;
-      if (bootstrap_ack_pending_) {
-        if (bootstrap_trajectory_origin_.has_value() &&
-          *bootstrap_trajectory_origin_ == publication_match.sample_times.trajectory_origin)
+      commands_.active_publication_id = publication_match.publication_id;
+      if (commands_.bootstrap_ack_pending) {
+        if (commands_.bootstrap_trajectory_origin.has_value() &&
+          *commands_.bootstrap_trajectory_origin ==
+          publication_match.sample_times.trajectory_origin)
         {
-          ++bootstrap_acknowledgement_count_;
-          clear_bootstrap_ack_state();
-          clear_rearm_deadlines();
+          ++telemetry_.bootstrap_acknowledgement_count;
+          commands_.clearBootstrap();
+          commands_.clearRearmDeadlines();
         }
       }
     }
   }
 
   if (following_window_active) {
-    ++following_check_count_;
+    ++telemetry_.following_check_count;
     const auto maximum_absolute_difference = [](
       const std::vector<double> & reference, const std::vector<double> & feedback) {
         double maximum = 0.0;
@@ -523,17 +574,19 @@ predicted_or_measured_state(
       controller_state->reference.positions, controller_state->feedback.positions);
     const auto [velocity_error, velocity_error_index] = maximum_absolute_difference(
       controller_state->reference.velocities, controller_state->feedback.velocities);
-    last_following_position_error_rad_ = position_error;
-    last_following_velocity_error_rad_s_ = velocity_error;
-    last_following_position_error_joint_ = parameters_.joint_names[position_error_index];
-    last_following_velocity_error_joint_ = parameters_.joint_names[velocity_error_index];
-    if (position_error > max_following_position_error_rad_) {
-      max_following_position_error_rad_ = position_error;
-      max_following_position_error_joint_ = last_following_position_error_joint_;
+    telemetry_.last_following_position_error_rad = position_error;
+    telemetry_.last_following_velocity_error_rad_s = velocity_error;
+    telemetry_.last_following_position_error_joint = parameters_.joint_names[position_error_index];
+    telemetry_.last_following_velocity_error_joint = parameters_.joint_names[velocity_error_index];
+    if (position_error > telemetry_.max_following_position_error_rad) {
+      telemetry_.max_following_position_error_rad = position_error;
+      telemetry_.max_following_position_error_joint =
+        telemetry_.last_following_position_error_joint;
     }
-    if (velocity_error > max_following_velocity_error_rad_s_) {
-      max_following_velocity_error_rad_s_ = velocity_error;
-      max_following_velocity_error_joint_ = last_following_velocity_error_joint_;
+    if (velocity_error > telemetry_.max_following_velocity_error_rad_s) {
+      telemetry_.max_following_velocity_error_rad_s = velocity_error;
+      telemetry_.max_following_velocity_error_joint =
+        telemetry_.last_following_velocity_error_joint;
     }
     const control::FollowingErrorPolicy following_policy{
       parameters_.following_position_tolerance_rad,
@@ -542,12 +595,12 @@ predicted_or_measured_state(
     const control::FollowingErrorAction following_action =
       control::classifyFollowingError(position_error, velocity_error, following_policy);
     if (following_action != control::FollowingErrorAction::kContinue) {
-      ++following_error_count_;
+      ++telemetry_.following_error_count;
       failure_reason =
         "Trajectory following error: position=" + std::to_string(position_error) +
-        " rad (" + last_following_position_error_joint_ + "), velocity=" +
+        " rad (" + telemetry_.last_following_position_error_joint + "), velocity=" +
         std::to_string(velocity_error) + " rad/s (" +
-        last_following_velocity_error_joint_ + ")";
+        telemetry_.last_following_velocity_error_joint + ")";
       // Validate the exact JTC feedback sample that triggered recovery. The
       // independently updated PlanningSceneMonitor state can be one callback
       // behind and is not sufficient for this transition.
@@ -570,21 +623,21 @@ predicted_or_measured_state(
     }
   }
 
-  while (!command_queue_.empty() &&
-    command_queue_.front().time_stamp <
+  while (!commands_.queue.empty() &&
+    commands_.queue.front().time_stamp <
     current_time - rclcpp::Duration::from_seconds(servo_parameters_.max_expected_latency))
   {
-    command_queue_.pop_front();
+    commands_.queue.pop_front();
   }
-  if (!command_queue_.empty() && command_queue_.back().time_stamp > current_time) {
+  if (!commands_.queue.empty() && commands_.queue.back().time_stamp > current_time) {
     initial_state_received_ = true;
-    return command_queue_.back();
+    return commands_.queue.back();
   }
-  if (command_epoch_active_) {
+  if (commands_.epoch_active) {
     failure_reason = "Buffered command timeline was exhausted";
     return std::nullopt;
   }
-  command_queue_.clear();
+  commands_.queue.clear();
   measured.time_stamp = current_time;
   initial_state_received_ = true;
   return measured;
@@ -603,9 +656,9 @@ void CollisionAwareServoComponent::observe_controller_feedback(
     static_cast<Eigen::Index>(state.feedback.velocities.size()));
   Eigen::Index velocity_index = 0;
   const double maximum_velocity = velocity.cwiseAbs().maxCoeff(&velocity_index);
-  if (maximum_velocity > max_feedback_joint_velocity_rad_s_) {
-    max_feedback_joint_velocity_rad_s_ = maximum_velocity;
-    max_feedback_joint_velocity_name_ =
+  if (maximum_velocity > telemetry_.max_feedback_joint_velocity_rad_s) {
+    telemetry_.max_feedback_joint_velocity_rad_s = maximum_velocity;
+    telemetry_.max_feedback_joint_velocity_name =
       parameters_.joint_names[static_cast<std::size_t>(velocity_index)];
   }
 
@@ -617,9 +670,9 @@ void CollisionAwareServoComponent::observe_controller_feedback(
       Eigen::Index acceleration_index = 0;
       const double maximum_acceleration =
         acceleration.cwiseAbs().maxCoeff(&acceleration_index);
-      if (maximum_acceleration > max_feedback_joint_acceleration_rad_s2_) {
-        max_feedback_joint_acceleration_rad_s2_ = maximum_acceleration;
-        max_feedback_joint_acceleration_name_ =
+      if (maximum_acceleration > telemetry_.max_feedback_joint_acceleration_rad_s2) {
+        telemetry_.max_feedback_joint_acceleration_rad_s2 = maximum_acceleration;
+        telemetry_.max_feedback_joint_acceleration_name =
           parameters_.joint_names[static_cast<std::size_t>(acceleration_index)];
       }
       if (last_feedback_acceleration_.has_value()) {
@@ -628,12 +681,11 @@ void CollisionAwareServoComponent::observe_controller_feedback(
         if (jerk.allFinite()) {
           Eigen::Index jerk_index = 0;
           const double maximum_jerk = jerk.cwiseAbs().maxCoeff(&jerk_index);
-          if (maximum_jerk > max_feedback_joint_jerk_rad_s3_) {
-            max_feedback_joint_jerk_rad_s3_ = maximum_jerk;
-            max_feedback_joint_jerk_name_ =
+          if (maximum_jerk > telemetry_.max_feedback_joint_jerk_rad_s3) {
+            telemetry_.max_feedback_joint_jerk_rad_s3 = maximum_jerk;
+            telemetry_.max_feedback_joint_jerk_name =
               parameters_.joint_names[static_cast<std::size_t>(jerk_index)];
           }
-          last_feedback_jerk_ = jerk;
         }
       }
       last_feedback_acceleration_ = acceleration;

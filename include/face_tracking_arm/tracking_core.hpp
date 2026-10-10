@@ -12,6 +12,8 @@
 #include <string>
 #include <variant>
 
+#include "face_tracking_arm/target_motion_estimator.hpp"
+
 namespace face_tracking_arm::tracking
 {
 
@@ -38,6 +40,7 @@ struct TrackingGeometryConfig
   double minimum_face_distance_m{0.40};
   double safe_reach_radius_m{0.42};
   double direction_epsilon_m{1.0e-6};
+  /// Deprecated compatibility field; pointingRotation does not use this value.
   double up_projection_epsilon{1.0e-6};
 };
 
@@ -46,6 +49,8 @@ struct TrackingConfig
   TrackingGeometryConfig geometry;
   RosTimeNanoseconds freshness_ns{200'000'000};
   RosTimeNanoseconds return_delay_ns{2'000'000'000};
+  /// Zero disables short face-loss extrapolation.
+  RosTimeNanoseconds prediction_timeout_ns{0};
   Eigen::Vector3d rest_position{0.20, 0.00, 1.05};
   std::string planning_frame{"world"};
   bool search_when_idle{false};
@@ -117,6 +122,7 @@ struct TargetCommand
   Pose3d pose;
   RosTimeNanoseconds command_stamp_ns{0};
   std::optional<RosTimeNanoseconds> source_face_stamp_ns;
+  std::optional<RosTimeNanoseconds> face_prediction_expiry_ns;
   std::optional<Eigen::Vector3d> face_in_planning_frame;
 };
 
@@ -155,7 +161,8 @@ public:
 
   [[nodiscard]] TickResult tick(
     RosTimeNanoseconds now_ns,
-    const std::optional<ActualTcpPose> & actual_tcp_pose = std::nullopt);
+    const std::optional<ActualTcpPose> & actual_tcp_pose = std::nullopt,
+    bool allow_prediction = false);
 
   /// Replace the REST supplier output without changing arbitration state.
   [[nodiscard]] bool update_rest_target(const Pose3d & pose) noexcept;
@@ -168,6 +175,8 @@ private:
   struct AcceptedFace
   {
     FaceGeometry geometry;
+    Eigen::Vector3d base_in_planning_frame{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d reach_center_in_planning_frame{Eigen::Vector3d::Zero()};
     RosTimeNanoseconds measurement_stamp_ns{0};
   };
 
@@ -189,6 +198,7 @@ private:
   std::optional<RosTimeNanoseconds> last_observed_time_ns_;
   std::optional<Pose3d> hold_pose_;
   std::optional<Eigen::Quaterniond> previous_orientation_;
+  control::TargetMotionEstimator target_motion_estimator_;
   TargetMode mode_{TargetMode::kRest};
 };
 

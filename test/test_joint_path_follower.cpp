@@ -5,6 +5,7 @@
 
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "face_tracking_arm/joint_path_follower.hpp"
@@ -15,6 +16,7 @@ namespace
 using face_tracking_arm::control::JointPathFollower;
 using face_tracking_arm::control::JointPathFollowerConfig;
 using face_tracking_arm::control::JointPathStatus;
+using face_tracking_arm::control::JointPathUpdate;
 
 Eigen::VectorXd point(const double first, const double second = 0.0)
 {
@@ -64,6 +66,75 @@ TEST(JointPathFollower, LookaheadUsesPolylineArcAcrossACorner)
   EXPECT_TRUE(result.reference_position.isApprox(point(0.2, 0.05), 1.0e-12));
   EXPECT_NEAR(result.progress_rad, 0.15, 1.0e-12);
   EXPECT_NEAR(result.total_length_rad, 0.5, 1.0e-12);
+}
+
+TEST(JointPathFollower, ProjectionWindowCoversLookaheadArcIndependentOfWaypointDensity)
+{
+  std::vector<Eigen::VectorXd> coarse_path;
+  std::vector<Eigen::VectorXd> dense_path;
+  constexpr double kQuarterTurnRad{1.5707963267948966};
+  constexpr double kRadius{0.10};
+  constexpr int kCoarseSegments{4};
+  for (int index = 0; index <= kCoarseSegments; ++index) {
+    const double angle = kQuarterTurnRad * static_cast<double>(index) /
+      static_cast<double>(kCoarseSegments);
+    coarse_path.push_back(point(kRadius * std::sin(angle), kRadius * (1.0 - std::cos(angle))));
+  }
+  for (std::size_t segment = 0U; segment + 1U < coarse_path.size(); ++segment) {
+    for (int subdivision = 0; subdivision < 10; ++subdivision) {
+      const double fraction = static_cast<double>(subdivision) / 10.0;
+      dense_path.push_back(
+        coarse_path[segment] + fraction * (coarse_path[segment + 1U] - coarse_path[segment]));
+    }
+  }
+  dense_path.push_back(coarse_path.back());
+  const auto referenceAtArc = [](
+    const std::vector<Eigen::VectorXd> & path, double arc) -> Eigen::VectorXd {
+      for (std::size_t index = 0U; index + 1U < path.size(); ++index) {
+        const Eigen::VectorXd delta = path[index + 1U] - path[index];
+        const double length = delta.norm();
+        if (arc <= length) {
+          return path[index] + (arc / length) * delta;
+        }
+        arc -= length;
+      }
+      return path.back();
+    };
+
+  const auto run_to_end = [](const std::vector<Eigen::VectorXd> & path) {
+      JointPathFollower follower;
+      EXPECT_TRUE(follower.setPath(path, path.front(), 0.0));
+      Eigen::VectorXd current = path.front();
+      JointPathUpdate update;
+      int updates = 0;
+      for (; updates < 10; ++updates) {
+        update = follower.update(current, 0.01 * static_cast<double>(updates + 1));
+        EXPECT_NE(update.status, JointPathStatus::kInvalid);
+        EXPECT_NE(update.status, JointPathStatus::kStalled);
+        if (update.status == JointPathStatus::kArrived) {
+          break;
+        }
+        current = update.reference_position;
+      }
+      return std::make_pair(update, updates + 1);
+    };
+
+  JointPathFollower dense_follower;
+  JointPathFollower coarse_follower;
+  ASSERT_TRUE(dense_follower.setPath(dense_path, dense_path.front(), 0.0));
+  ASSERT_TRUE(coarse_follower.setPath(coarse_path, coarse_path.front(), 0.0));
+  const auto dense_first = dense_follower.update(dense_path.front(), 0.01);
+  const auto coarse_first = coarse_follower.update(coarse_path.front(), 0.01);
+  ASSERT_EQ(dense_first.status, JointPathStatus::kTracking);
+  ASSERT_EQ(coarse_first.status, JointPathStatus::kTracking);
+  EXPECT_TRUE(dense_first.reference_position.isApprox(coarse_first.reference_position, 1.0e-12));
+  EXPECT_TRUE(dense_first.reference_position.isApprox(referenceAtArc(coarse_path, 0.10), 1.0e-12));
+
+  const auto dense_result = run_to_end(dense_path);
+  const auto coarse_result = run_to_end(coarse_path);
+  EXPECT_EQ(dense_result.first.status, JointPathStatus::kArrived);
+  EXPECT_EQ(coarse_result.first.status, JointPathStatus::kArrived);
+  EXPECT_EQ(dense_result.second, coarse_result.second);
 }
 
 TEST(JointPathFollower, DoesNotJumpToADistantSelfIntersectionOrClosedPathEnd)

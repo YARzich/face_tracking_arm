@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -35,9 +36,7 @@ bool valid_geometry_config(const TrackingGeometryConfig & config)
          std::isfinite(config.safe_reach_radius_m) &&
          config.safe_reach_radius_m > 0.0 &&
          std::isfinite(config.direction_epsilon_m) &&
-         config.direction_epsilon_m > 0.0 &&
-         std::isfinite(config.up_projection_epsilon) &&
-         config.up_projection_epsilon > 0.0;
+         config.direction_epsilon_m > 0.0;
 }
 
 std::optional<Eigen::Quaterniond> look_at_orientation(
@@ -141,6 +140,23 @@ TrackingCore::TrackingCore(TrackingConfig config)
   if (config_.return_delay_ns <= config_.freshness_ns) {
     throw std::invalid_argument("return_delay_ns must be greater than freshness_ns");
   }
+  if (config_.prediction_timeout_ns < 0 ||
+    (config_.prediction_timeout_ns > 0 &&
+    config_.prediction_timeout_ns <= config_.freshness_ns))
+  {
+    throw std::invalid_argument(
+      "prediction_timeout_ns must be zero or greater than freshness_ns");
+  }
+  if (config_.prediction_timeout_ns > 0) {
+    control::TargetMotionEstimatorConfig estimator_config;
+    // This estimator has a separate, source-stamped prediction horizon. AUTO
+    // cadence expiry is appropriate for servo feed-forward, but would discard
+    // the history before this longer, explicitly configured forecast expires.
+    estimator_config.timing_mode = control::MotionTimingMode::kManual;
+    estimator_config.stale_timeout_sec =
+      static_cast<double>(config_.prediction_timeout_ns) * 1.0e-9;
+    target_motion_estimator_ = control::TargetMotionEstimator(estimator_config);
+  }
   if (!is_finite(config_.rest_position)) {
     throw std::invalid_argument("rest_position must be finite");
   }
@@ -194,7 +210,15 @@ IngestResult TrackingCore::ingest_face(
   }
 
   const FaceGeometry geometry = std::get<FaceGeometry>(geometry_result);
-  latest_face_ = AcceptedFace{geometry, sample.measurement_stamp_ns};
+  latest_face_ = AcceptedFace{
+    geometry, sample.base_in_planning_frame, sample.reach_center_in_planning_frame,
+    sample.measurement_stamp_ns};
+  if (config_.prediction_timeout_ns > 0) {
+    (void)target_motion_estimator_.update(
+      sample.face_in_planning_frame, geometry.monitor_pose.position,
+      static_cast<double>(sample.measurement_stamp_ns) * 1.0e-9,
+      static_cast<double>(now_ns) * 1.0e-9);
+  }
   last_accepted_stamp_ns_ = sample.measurement_stamp_ns;
   hold_pose_.reset();
   return {RejectReason::kNone, geometry};
@@ -202,7 +226,8 @@ IngestResult TrackingCore::ingest_face(
 
 TickResult TrackingCore::tick(
   const RosTimeNanoseconds now_ns,
-  const std::optional<ActualTcpPose> & actual_tcp_pose)
+  const std::optional<ActualTcpPose> & actual_tcp_pose,
+  const bool allow_prediction)
 {
   const bool clock_was_reset = observe_clock(now_ns);
   const TickStatus regular_status =
@@ -217,6 +242,51 @@ TickResult TrackingCore::tick(
   }
 
   const RosTimeNanoseconds age_ns = now_ns - latest_face_->measurement_stamp_ns;
+
+  // The adapter enables prediction only for an explicitly healthy no-face
+  // report. Continue from the source stamp immediately in that case, rather
+  // than waiting for freshness expiry and then jumping to a delayed forecast.
+  if (allow_prediction && config_.prediction_timeout_ns > 0 &&
+    age_ns < config_.prediction_timeout_ns)
+  {
+    const auto predicted_face = target_motion_estimator_.predictFacePosition(
+      static_cast<double>(now_ns) * 1.0e-9);
+    if (predicted_face) {
+      const GeometryResult predicted_geometry = compute_face_geometry(
+        *predicted_face, latest_face_->base_in_planning_frame,
+        latest_face_->reach_center_in_planning_frame, config_.geometry);
+      if (const auto * geometry = std::get_if<FaceGeometry>(&predicted_geometry)) {
+        Pose3d target_pose = geometry->monitor_pose;
+        if (actual_tcp_pose.has_value()) {
+          if (actual_tcp_pose->measurement_stamp_ns < 0 ||
+            actual_tcp_pose->measurement_stamp_ns > now_ns ||
+            !is_finite(actual_tcp_pose->pose.position) ||
+            !is_finite(actual_tcp_pose->pose.orientation))
+          {
+            return {TickStatus::kInvalidActualPose, std::nullopt};
+          }
+          if (const auto orientation = look_at_orientation(
+              actual_tcp_pose->pose.position, *predicted_face, config_.geometry))
+          {
+            target_pose.orientation = *orientation;
+          }
+        }
+        mode_ = TargetMode::kFace;
+        hold_pose_.reset();
+        TargetCommand command = make_pose_command(TargetMode::kFace, target_pose, now_ns);
+        // Preserve the measurement stamp from the last real sample. Only the
+        // predicted point changes; forecasts never refresh observation time.
+        command.face_in_planning_frame = *predicted_face;
+        const auto maximum_stamp = std::numeric_limits<RosTimeNanoseconds>::max();
+        command.face_prediction_expiry_ns =
+          latest_face_->measurement_stamp_ns >
+          maximum_stamp - config_.prediction_timeout_ns ? maximum_stamp :
+          latest_face_->measurement_stamp_ns + config_.prediction_timeout_ns;
+        return {regular_status, std::move(command)};
+      }
+    }
+  }
+
   if (age_ns < config_.freshness_ns) {
     mode_ = TargetMode::kFace;
     hold_pose_.reset();
@@ -283,6 +353,7 @@ void TrackingCore::reset() noexcept
   last_observed_time_ns_.reset();
   hold_pose_.reset();
   previous_orientation_.reset();
+  target_motion_estimator_.reset();
   mode_ = TargetMode::kRest;
 }
 

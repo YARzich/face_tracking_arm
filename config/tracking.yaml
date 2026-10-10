@@ -8,6 +8,10 @@ face_tracking_controller:
     # when the age of the last accepted observation reaches return_to_rest_delay_sec.
     face_target_freshness_timeout_sec: &face_target_freshness_timeout_sec 0.50
     return_to_rest_delay_sec: 2.0
+    # Continue only from a real tracked face when camera status says the streams
+    # are healthy and there is temporarily no face; zero disables prediction.
+    face_prediction_timeout_sec: 0.80
+    # PoseStamped REST target for standard MoveIt Servo; collision_aware REST uses motion.rest_joints_deg.
     rest_position_m: [0.37, 0.00, 1.15]
     planning_frame: &planning_frame world
     base_frame: link_base
