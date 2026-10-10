@@ -1,13 +1,11 @@
-# Отдельный тест лица в Gazebo Harmonic
+# Найти лицо в Gazebo: тест 2D
 
-Сцена содержит статического человека OSRF Standing person и RGB-камеру
-640×480, 30 кадров/с на высоте 1.65 м. Один выбранный детектор обрабатывает
-изображение на CPU. Рамка и красная точка показывают результат нейросети;
-поза человека из симулятора детектору неизвестна.
+Этот тест запускает Gazebo, RGB-камеру и один детектор YuNet. Детектор находит
+рамки лица в пикселях. Он не оценивает расстояние и не запускает руку.
 
 ## Запуск
 
-При первом запуске выполните [подготовку ниже](#подготовка).
+Сначала выполните [подготовку](#подготовка). Затем откройте терминал:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -15,75 +13,74 @@ source ~/ros2_ws/install/setup.bash
 ros2 launch face_tracking_arm face_detection_test.launch.py detector:=yunet
 ```
 
-Открываются Gazebo и RViz с панелью изображения, рамкой, центральной точкой,
-уверенностью и временем обработки. В Gazebo можно перемещать и поворачивать
-**человека** стандартным инструментом Transform. Камера фиксирована; её
-статический TF соответствует позе в SDF.
+Gazebo показывает модель человека. RViz показывает кадр, рамки лиц, центр
+рамки, уверенность и время обработки. Камера неподвижна. Перемещайте в Gazebo
+только человека.
 
-Другие модели выбираются при новом запуске:
+Чтобы закрыть тест, нажмите Ctrl+C. Аргумент `headless:=true` отключает оба
+окна. Аргумент `show_image:=false` отключает только RViz.
 
-```bash
-ros2 launch face_tracking_arm face_detection_test.launch.py detector:=yolov5n_face
-ros2 launch face_tracking_arm face_detection_test.launch.py detector:=yolo_facev2n
-```
-
-Сначала завершите предыдущий запуск через Ctrl+C. `headless:=true` отключает оба
-графических окна, сохраняя рендеринг камеры и ROS-выходы. `show_image:=false`
-отключает только окно изображения. Дополнительные аргументы:
+Параметры запуска:
 
 | Аргумент | По умолчанию | Назначение |
 |---|---|---|
-| `confidence` | `0.6` | Минимальная уверенность обнаружения |
-| `threads` | `2` | Потоки CPU для расчёта модели |
-| `model_dir` | `~/.cache/face_tracking_arm/models` | Каталог весов |
-| `assets_dir` | `~/.cache/face_tracking_arm/gazebo_models` | Каталог модели человека |
+| `detector` | `yunet` | `yunet`, `yolov5n_face` или `yolo_facev2n` |
+| `confidence` | `0.6` | Минимальная уверенность детектора |
+| `threads` | `2` | Потоки CPU для OpenCV |
+| `model_dir` | `~/.cache/face_tracking_arm/models` | Каталог ONNX-файлов |
+| `assets_dir` | `~/.cache/face_tracking_arm/gazebo_models` | Модель человека и текстуры |
 | `python_executable` | `~/.cache/face_tracking_arm/perception_venv/bin/python` | Python с зависимостями |
+| `headless` | `false` | Отключить оба окна |
+| `show_image` | `true` | Показать окно RViz |
 
-## ROS-контракт
+Один запуск использует один детектор. Завершите текущий запуск клавишами Ctrl+C,
+прежде чем выбирать другую модель. Для проверки замените значение detector на
+yolov5n_face или yolo_facev2n.
 
-- `/face_test/image_raw`: `sensor_msgs/Image`, RGB из Gazebo.
-- `/face_test/camera_info`: `sensor_msgs/CameraInfo`, параметры камеры.
-- `/face_test/detections`: `vision_msgs/Detection2DArray`; каждая рамка содержит
-  `bbox.center.position.x/y` — **точку в пикселях исходного изображения**,
-  `bbox.size_x/y` — размер рамки, `results[0].hypothesis.score` — уверенность.
-  Ось X направлена вправо, Y вниз. Пустой массив явно означает отсутствие лица.
-  При нескольких лицах публикуются все рамки. Выбор ближайшего человека
-  выполняется в [3D-сценариях](face_depth_tests.md).
-- `/face_test/debug_image`: `sensor_msgs/Image`, результат с разметкой.
-  Рисуется только при наличии подписчиков.
-- `/clock`, `/tf_static`: время симуляции и неподвижная камера.
+## Проверить результат
 
-Детекции и изображение результата сохраняют `stamp` и `frame_id` исходного
-кадра. Frame: `face_test_camera_optical_frame`; TF-цепочка:
-`world → face_test_camera_link → face_test_camera_optical_frame`.
-Все ROS-ноды используют симуляционное время. Подписка на изображения и выходы
-детектора имеют `best_effort`, `keep_last=1`: медленный расчёт пропускает кадры,
-а не накапливает очередь. Потребитель обязан проверять свежесть stamp: при
-остановке камеры новые результаты не появляются.
+Проверьте рамки и метки кадра:
 
 ```bash
 ros2 topic echo /face_test/detections --qos-reliability best_effort
 ```
 
-Это только 2D-детектор: расстояние не оценивается, `/face/center` не публикуется,
-кинематический сценарий не запускается.
+Топик `/face_test/detections` имеет тип `vision_msgs/Detection2DArray`.
+Координаты центра и размеры рамки заданы в пикселях исходного изображения.
+X растёт вправо, Y — вниз. Пустой массив означает, что детектор не нашёл лицо.
+Если лиц несколько, сообщение содержит все рамки.
+
+Топик `/face_test/debug_image` содержит изображение с рамками. Узел публикует
+его только при наличии подписчика. Топики `/face_test/image_raw` и
+`/face_test/camera_info` содержат RGB-кадр и параметры камеры.
+
+Кадр использует `face_test_camera_optical_frame`: X направлена вправо,
+Y — вниз, Z — вперёд. Изображение и рамки сохраняют время `stamp` кадра и его
+`frame_id`. Очередь имеет глубину 1. Медленная обработка пропускает кадры,
+а не накапливает их. Сравнивайте метки времени, чтобы заметить устаревший
+результат или остановку камеры.
+
+Этот тест публикует только данные 2D. Он не публикует `/face/center` и не
+проверяет оценку глубины. Для 3D-точки используйте
+[тест оценки глубины](face_depth_tests.md).
 
 ## Подготовка
 
-Выполните [сборку пакета и установку ROS-зависимостей](../CONTRIBUTING.md).
-Затем из папки репозитория:
+Соберите пакет по [инструкции](../CONTRIBUTING.md). Из корня репозитория
+создайте отдельное Python-окружение и установите зависимости:
 
 ```bash
 python3 -m venv --system-site-packages ~/.cache/face_tracking_arm/perception_venv
-~/.cache/face_tracking_arm/perception_venv/bin/python -m pip install -r config/perception_requirements.txt
+~/.cache/face_tracking_arm/perception_venv/bin/python -m pip install \
+  -r config/perception_requirements.txt
 python3 scripts/prepare_face_test_assets.py
 ```
 
-Скрипт загружает модель человека и текстуры, около 25 МБ, с закреплённой версией
-и атрибуцией. Python-библиотеки устанавливаются только в отдельное окружение;
-`--system-site-packages` даёт ему доступ к установленным ROS-пакетам.
+Скрипт загружает модель человека и текстуры, около 25 МБ, в
+`~/.cache/face_tracking_arm/gazebo_models`. Версия модели закреплена; скрипт
+записывает источник в каталог.
 
-Загрузите YuNet, около 233 КБ, если файла ещё нет:
+Загрузите YuNet и проверьте SHA-256:
 
 ```bash
 mkdir -p ~/.cache/face_tracking_arm/models
@@ -95,20 +92,15 @@ printf '%s  %s\n' \
   "$HOME/.cache/face_tracking_arm/models/face_detection_yunet_2023mar.onnx" | sha256sum -c -
 ```
 
-Проверка должна завершиться с `OK`. YOLO-модели для обычного запуска не нужны.
+Проверка должна вывести `OK`. YuNet нужен для обычного запуска. YOLO-веса
+не входят в это окружение и для YuNet не нужны.
 
-## Экспериментальные ONNX-модели
+## Другие ONNX-модели
 
-Параметр `detector` также принимает `yolov5n_face` и `yolo_facev2n`.
-Для них поместите соответственно `yolov5n-face.onnx` или
-`yolo-facev2n-preweight.onnx` в каталог `model_dir`.
-Если есть только совместимый FaceV2 checkpoint, см. [инструкцию экспорта](facev2_export.md).
-Эти модели не требуются для запуска YuNet.
+`yolov5n_face` и `yolo_facev2n` требуют ONNX-файл в `model_dir`:
+`yolov5n-face.onnx` или `yolo-facev2n-preweight.onnx`. Экспорт совместимого
+FaceV2 checkpoint описан в [отдельном руководстве](facev2_export.md).
 
-## Ограничения и лицензии
-
-YuNet используется по умолчанию. YOLO-варианты требуют своих ONNX-весов.
-Проверенные веса `yolo-facev2n-preweight.onnx` не дают детекций в этой сцене.
-Для основного запуска используйте YuNet.
-
-[Источники моделей и условия использования](../THIRD_PARTY_NOTICES.md).
+Проверенный FaceV2 checkpoint в этой сцене не выдаёт детекций. Для обычного
+использования выберите YuNet. Условия использования моделей указаны в
+[списке сторонних ресурсов](../THIRD_PARTY_NOTICES.md).
