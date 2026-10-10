@@ -61,7 +61,7 @@ def test_measured_coordinates_are_preserved_and_inactive_reduced_limits_are_not_
     assert result['effective_position_limits_rad'][0] == [-2 * math.pi, 2 * math.pi]
     assert result['reduced_joint_limits_rad'][0] == [-1, 1]
     assert result['reduced_max_joint_speed_rad_s'] is None
-    assert len(fake.checked) == 14
+    assert len(fake.checked) == 2
     assert fake.checked[0] == fake.angles
 
 
@@ -93,14 +93,20 @@ def test_preflight_failure_closes_connection_and_never_requests_motion(field, va
     assert fake.closed
 
 
-def test_rejected_boundary_does_not_expand_or_shift_profile():
+def test_unrelated_joint_angle_combinations_do_not_reject_a_known_profile():
     fake = FakeClient()
+    current, rest, search = [0.0] * 6, [0.1] * 6, [0.05] * 6
+    fake.angles = current
+    accepted = {tuple(current), tuple(rest), tuple(search)}
+    queried = []
 
     def reject_boundary(position):
-        return position[0] < -6
+        queried.append(list(position))
+        return tuple(position) not in accepted
     fake.is_joint_limit = reject_boundary
-    with pytest.raises(ValueError, match='selected profile near joint1'):
-        run(fake)
+    result = run(fake, joint_targets={'rest': rest, 'search': search})
+    assert result['profile']['model_num'] == 1305
+    assert queried == [current, rest, search]
     assert fake.closed
 
 

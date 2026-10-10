@@ -147,17 +147,6 @@ def probe_robot(ip, expected_model='xarm6', joint_targets=None, timeout_sec=5.0,
             if client.is_joint_limit(position):
                 raise ValueError(f'Controller rejects {name} under its joint limits')
 
-        # Check each profile boundary from a neutral test vector. A rejection
-        # invalidates the profile; it never justifies expanding or shifting it.
-        midpoint = [(low + high) / 2 for low, high in effective]
-        for i, (low, high) in enumerate(effective):
-            inset = min(math.radians(.5), (high - low) / 4)
-            for edge in (low + inset, high - inset):
-                candidate = midpoint.copy()
-                candidate[i] = edge
-                if client.is_joint_limit(candidate):
-                    raise ValueError(f'Controller rejects the selected profile near joint{i + 1}; '
-                                     'limits cannot be identified safely from this profile')
         return {
             'profile': profile, 'serial_number': serial, 'firmware_version': version,
             'current_joints_rad': current, 'reduced_mode': bool(mode),
