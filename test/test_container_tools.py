@@ -121,6 +121,19 @@ def test_missing_calibration_stops_before_any_robot_launch(resources, tmp_path):
         host.resources(resources, tmp_path / 'hardware.yaml', 'cpu')
 
 
+def test_image_id_reads_immutable_docker_config_id(monkeypatch):
+    commands = []
+
+    def capture(command):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout='sha256:' + 'b' * 64 + '\n', stderr='')
+
+    monkeypatch.setattr(host, 'capture', capture)
+    assert host.image_id(['docker']) == 'sha256:' + 'b' * 64
+    assert commands == [[
+        'docker', 'image', 'inspect', '--format', '{{.Id}}', host.IMAGE]]
+
+
 @pytest.mark.parametrize('mode', ['cpu', 'stereo'])
 def test_missing_calibration_command_uses_selected_config_with_shell_quoting(
         resources, tmp_path, mode):
@@ -162,6 +175,7 @@ def test_control_priority_permissions_are_only_granted_for_arm_launch(
     path.write_text(yaml.safe_dump(config))
     config['mono_cpu']['source'] = 'ros'
     monkeypatch.setattr(host, 'metadata', lambda *args: runtime.describe(config, 'cpu'))
+    monkeypatch.setattr(host, 'image_id', lambda *args: 'sha256:' + 'a' * 64)
     commands = []
 
     def start(command, *, start_new_session):
@@ -177,6 +191,7 @@ def test_control_priority_permissions_are_only_granted_for_arm_launch(
     assert ('rtprio=50' in commands[0]) == (not camera_only)
     assert '--privileged' not in commands[0]
     assert '--mock' in commands[0]
+    assert 'FACE_TRACKING_DOCKER_IMAGE_ID=sha256:' + 'a' * 64 in commands[0]
     if point_filter is None:
         assert '--point-filter' not in commands[0]
     else:

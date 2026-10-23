@@ -23,6 +23,7 @@
 #include <moveit/robot_state/robot_state.hpp>
 
 #include "face_tracking_arm/collision_constraints.hpp"
+#include "face_tracking_arm/emergency_brake_tail.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -136,6 +137,10 @@ JointMotionState twoDofMotion(const double common, const double relative)
   limits.max_velocity = Eigen::VectorXd::Constant(1, 1.0);
   limits.max_acceleration = Eigen::VectorXd::Constant(1, 2.0);
   limits.max_jerk = Eigen::VectorXd::Constant(1, 20.0);
+  limits.numerical_policy = NumericalPolicy{
+    Radians{1.0e-12}, RadiansPerSecond{1.0e-12},
+    RadiansPerSecondSquared{1.0e-12}, RadiansPerSecondCubed{1.0e-12},
+    SolverResidual{1.0e-6}};
   return limits;
 }
 
@@ -148,6 +153,10 @@ JointMotionState twoDofMotion(const double common, const double relative)
   limits.max_velocity = Eigen::VectorXd::Constant(2, 1.0);
   limits.max_acceleration = Eigen::VectorXd::Constant(2, 2.0);
   limits.max_jerk = Eigen::VectorXd::Constant(2, 20.0);
+  limits.numerical_policy = NumericalPolicy{
+    Radians{1.0e-12}, RadiansPerSecond{1.0e-12},
+    RadiansPerSecondSquared{1.0e-12}, RadiansPerSecondCubed{1.0e-12},
+    SolverResidual{1.0e-6}};
   return limits;
 }
 
@@ -169,6 +178,10 @@ JointMotionState twoDofMotion(const double common, const double relative)
   config.protected_joint_name = "slide";
   config.protected_joint_lower_rad = -0.8;
   config.protected_joint_upper_rad = 0.8;
+  config.numerical_policy = NumericalPolicy{
+    Radians{1.0e-12}, RadiansPerSecond{1.0e-12},
+    RadiansPerSecondSquared{1.0e-12}, RadiansPerSecondCubed{1.0e-12},
+    SolverResidual{1.0e-6}};
   config.monitor_link_name = "moving";
   config.monitor_near_link_name = "near";
   config.invariant_mount_neighbor_name = "mount_neighbor";
@@ -718,7 +731,7 @@ TEST(CollisionConstraints, QpNextStepReserveMatchesSegmentValidator)
   const CollisionPairDiagnostic * wall_pair = findWorldPair(collision, "wall");
   ASSERT_NE(wall_pair, nullptr);
   ASSERT_EQ(collision.diagnostics.active_distance_constraints, 1U);
-  ASSERT_EQ(collision.constraints.size(), 2U);
+  ASSERT_EQ(collision.constraints.size(), 1U);
   const Eigen::VectorXd actual_distance_gradient = collision.constraints.back().coefficients;
   ASSERT_EQ(actual_distance_gradient.size(), 1);
   EXPECT_NEAR(actual_distance_gradient[0], distance_gradient[0], 1.0e-12);
@@ -906,7 +919,7 @@ TEST(CollisionConstraints, WorldDistanceGradientMatchesFiniteDifference)
     *fixture.scene, robot_state, *fixture.group,
     nominal_motion, oneDofLimits(), 0.01);
   ASSERT_TRUE(nominal.diagnostics.valid) << nominal.diagnostics.failure_reason;
-  ASSERT_GE(nominal.constraints.size(), 2U);
+  ASSERT_GE(nominal.constraints.size(), 1U);
   ASSERT_TRUE(std::isfinite(nominal.diagnostics.minimum_world_distance_m));
   const auto * wall_pair = findWorldPair(nominal, "wall");
   ASSERT_NE(wall_pair, nullptr);
@@ -919,8 +932,8 @@ TEST(CollisionConstraints, WorldDistanceGradientMatchesFiniteDifference)
     oneDofReachableVelocityInterval(nominal_motion, oneDofLimits(), 0.01);
   EXPECT_LE(lower_velocity, upper_velocity);
   EXPECT_GE(
-    nominal.constraints[1].coefficients[0] * lower_velocity + 1.0e-12,
-    nominal.constraints[1].lower_bound);
+    nominal.constraints[0].coefficients[0] * lower_velocity + 1.0e-12,
+    nominal.constraints[0].lower_bound);
 
   constexpr double epsilon = 1.0e-5;
   robot_state.setJointGroupPositions(
@@ -936,8 +949,7 @@ TEST(CollisionConstraints, WorldDistanceGradientMatchesFiniteDifference)
   const double finite_difference =
     (perturbed.diagnostics.minimum_world_distance_m -
     nominal.diagnostics.minimum_world_distance_m) / epsilon;
-  // Row zero is the protected-joint braking corridor; row one is the wall distance.
-  EXPECT_NEAR(nominal.constraints[1].coefficients[0], finite_difference, 2.0e-3);
+  EXPECT_NEAR(nominal.constraints[0].coefficients[0], finite_difference, 2.0e-3);
   EXPECT_NEAR(finite_difference, -1.0, 2.0e-3);
 }
 
@@ -970,8 +982,8 @@ TEST(CollisionConstraints, CollisionRowHasExactSignMirrorAtTheLowerSide)
   const CollisionConstraintResult lower_side = build_case(0.30, -0.18, 0.184);
   ASSERT_TRUE(upper_side.diagnostics.valid) << upper_side.diagnostics.failure_reason;
   ASSERT_TRUE(lower_side.diagnostics.valid) << lower_side.diagnostics.failure_reason;
-  ASSERT_GE(upper_side.constraints.size(), 2U);
-  ASSERT_GE(lower_side.constraints.size(), 2U);
+  ASSERT_GE(upper_side.constraints.size(), 1U);
+  ASSERT_GE(lower_side.constraints.size(), 1U);
   const auto * upper_pair = findWorldPair(upper_side, "wall");
   const auto * lower_pair = findWorldPair(lower_side, "wall");
   ASSERT_NE(upper_pair, nullptr);
@@ -989,11 +1001,11 @@ TEST(CollisionConstraints, CollisionRowHasExactSignMirrorAtTheLowerSide)
     lower_pair->applied_approach_speed_cap_mps, 1.0e-12);
   EXPECT_EQ(upper_pair->outside_viability, lower_pair->outside_viability);
   EXPECT_NEAR(
-    upper_side.constraints[1].coefficients[0],
-    -lower_side.constraints[1].coefficients[0], 1.0e-12);
+    upper_side.constraints[0].coefficients[0],
+    -lower_side.constraints[0].coefficients[0], 1.0e-12);
   EXPECT_NEAR(
-    upper_side.constraints[1].lower_bound,
-    lower_side.constraints[1].lower_bound, 1.0e-12);
+    upper_side.constraints[0].lower_bound,
+    lower_side.constraints[0].lower_bound, 1.0e-12);
 }
 
 TEST(CollisionConstraints, QueryBoundaryApproachBrakesWithoutCrossingHardClearance)
@@ -1041,7 +1053,7 @@ TEST(CollisionConstraints, QueryBoundaryApproachBrakesWithoutCrossingHardClearan
       EXPECT_NEAR(wall_pair->distance_m, 0.080, 1.0e-12);
       EXPECT_FALSE(wall_pair->constraint_added);
       EXPECT_EQ(result.diagnostics.active_distance_constraints, 0U);
-      EXPECT_EQ(result.constraints.size(), 1U);
+      EXPECT_TRUE(result.constraints.empty());
       EXPECT_GE(
         wall_pair->jerk_aware_safe_approach_speed_mps + 1.0e-12,
         upper_velocity);
@@ -2408,6 +2420,137 @@ TEST(CollisionConstraints, ActualStateCheckRejectsProtectedJointOutsideCorridor)
   EXPECT_TRUE(result.protected_joint_corridor_violated);
   EXPECT_DOUBLE_EQ(result.protected_joint_position_rad, 0.81);
   EXPECT_FALSE(result.hard_clearance_violated);
+}
+
+TEST(CollisionConstraints, DoubleFeedbackBoundaryToleranceDoesNotExpandNominalBounds)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  const auto config = sliderConfig();
+  const CollisionConstraintBuilder builder(config);
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  const auto validate_at = [&](const double position) {
+      robot_state.setJointGroupPositions(
+        fixture.group, Eigen::VectorXd::Constant(1, position));
+      robot_state.update(true);
+      return builder.validateActualState(*fixture.scene, robot_state, *fixture.group);
+    };
+  const double feedback_tolerance = kControllerPositionFeedbackTolerance.value;
+
+  for (const double boundary : {config.protected_joint_lower_rad,
+      config.protected_joint_upper_rad})
+  {
+    for (const double offset : {0.0, -1.0e-12, 1.0e-12}) {
+      const auto result = validate_at(boundary + offset);
+      ASSERT_TRUE(result.input_valid) << result.failure_reason;
+      EXPECT_EQ(result.protected_joint_boundary_class, BoundaryClass::kBoundary);
+      EXPECT_FALSE(result.protected_joint_corridor_violated);
+      EXPECT_FALSE(result.unsafe);
+      EXPECT_FALSE(result.collision_detected);
+      EXPECT_FALSE(result.hard_clearance_violated);
+    }
+
+    const double outside = boundary < 0.0 ?
+      boundary - 1.1 * feedback_tolerance : boundary + 1.1 * feedback_tolerance;
+    const auto outside_result = validate_at(outside);
+    ASSERT_TRUE(outside_result.input_valid) << outside_result.failure_reason;
+    EXPECT_EQ(outside_result.protected_joint_boundary_class, BoundaryClass::kOutside);
+    EXPECT_TRUE(outside_result.protected_joint_corridor_violated);
+    EXPECT_TRUE(outside_result.unsafe);
+    EXPECT_FALSE(outside_result.collision_detected);
+    EXPECT_FALSE(outside_result.hard_clearance_violated);
+  }
+}
+
+TEST(CollisionConstraints, BuilderKeepsCorridorDiagnosticsWithoutJ5LatencyRow)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+
+  auto inside = motionAt(0.7991);
+  robot_state.setJointGroupPositions(fixture.group, inside.position);
+  robot_state.update(true);
+  const auto inside_result = builder.build(
+    *fixture.scene, robot_state, *fixture.group, inside, oneDofLimits(), 0.01);
+  ASSERT_TRUE(inside_result.diagnostics.valid) << inside_result.diagnostics.failure_reason;
+  EXPECT_FALSE(inside_result.diagnostics.protected_joint_corridor_violated);
+  EXPECT_EQ(inside_result.diagnostics.protected_joint_index, 0U);
+  EXPECT_EQ(
+    inside_result.constraints.size(), inside_result.diagnostics.active_distance_constraints);
+
+  const auto [minimum_velocity, maximum_velocity] =
+    oneDofReachableVelocityInterval(inside, oneDofLimits(), 0.01);
+  const double old_j5_cap = maximumSafeVelocityTowardBoundary(
+    sliderConfig().protected_joint_upper_rad - inside.position[0], inside.velocity[0],
+    minimum_velocity, maximum_velocity, oneDofLimits().max_acceleration[0],
+    oneDofLimits().max_jerk[0], 0.01, 0.02);
+  EXPECT_LT(old_j5_cap, maximum_velocity);
+
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = 0.01;
+  qp_config.solver_time_limit_sec = 0.1;
+  qp_config.solver_max_iterations = 2000;
+  const HierarchicalVelocityQp solver(qp_config);
+  HierarchicalVelocityTask task;
+  task.primary_matrix = Eigen::MatrixXd::Identity(1, 1);
+  task.primary_reference = Eigen::VectorXd::Constant(1, 1.0);
+  task.primary_weights = Eigen::VectorXd::Ones(1);
+  task.secondary_matrix = Eigen::MatrixXd(0, 1);
+  task.secondary_reference = Eigen::VectorXd(0);
+  task.secondary_weights = Eigen::VectorXd(0);
+  const QpResult qp_result = solver.solve(
+    task, inside, oneDofLimits(), inside_result.constraints);
+  ASSERT_TRUE(qp_result.command_available());
+  EXPECT_NEAR(qp_result.joint_velocity[0], maximum_velocity, 1.0e-6);
+  EXPECT_GT(qp_result.joint_velocity[0], old_j5_cap);
+
+  JointMotionState candidate;
+  candidate.position = inside.position + qp_result.joint_velocity * 0.01;
+  candidate.velocity = qp_result.joint_velocity;
+  candidate.acceleration = (candidate.velocity - inside.velocity) / 0.01;
+  const EmergencyBrakeTail tail = EmergencyBrakeTailGenerator().generate(
+    candidate, oneDofLimits());
+  ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
+  for (const auto & point : tail.points) {
+    EXPECT_GE(point.position[0], oneDofLimits().lower_position[0]);
+    EXPECT_LE(point.position[0], sliderConfig().protected_joint_upper_rad);
+  }
+
+  auto outside = motionAt(0.81);
+  robot_state.setJointGroupPositions(fixture.group, outside.position);
+  robot_state.update(true);
+  const auto outside_result = builder.build(
+    *fixture.scene, robot_state, *fixture.group, outside, oneDofLimits(), 0.01);
+  ASSERT_TRUE(outside_result.diagnostics.valid) << outside_result.diagnostics.failure_reason;
+  EXPECT_TRUE(outside_result.diagnostics.protected_joint_corridor_violated);
+}
+
+TEST(CollisionConstraints, FloatEncodedProtectedBoundaryIsReportedUnresolved)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  const auto config = sliderConfig();
+  const double measured = static_cast<double>(static_cast<float>(config.protected_joint_upper_rad));
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(fixture.group, Eigen::VectorXd::Constant(1, measured));
+  robot_state.update(true);
+
+  const auto result = CollisionConstraintBuilder(config).validateActualState(
+    *fixture.scene, robot_state, *fixture.group,
+    ActualPositionEncoding::kSdkFloatPromotedToDouble);
+
+  ASSERT_TRUE(result.input_valid) << result.failure_reason;
+  EXPECT_EQ(result.protected_joint_boundary_class, BoundaryClass::kBoundary);
+  EXPECT_TRUE(result.protected_joint_corridor_violated);
+  EXPECT_TRUE(result.unsafe);
 }
 
 TEST(CollisionConstraints, InvalidActualStateCheckFailsClosed)

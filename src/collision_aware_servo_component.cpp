@@ -3,10 +3,14 @@
 
 #include "collision_aware_servo_component.hpp"
 
-#include "face_tracking_arm/face_target_age_policy.hpp"
-#include "face_tracking_arm/snapshot_timing.hpp"
-
+#include <cstdlib>
+#include <filesystem>
 #include <rclcpp_components/register_node_macro.hpp>
+
+#include "face_tracking_arm/face_target_age_policy.hpp"
+#include "face_tracking_arm/execution_error_budget.hpp"
+#include "face_tracking_arm/joint_boundary_policy.hpp"
+#include "face_tracking_arm/snapshot_timing.hpp"
 
 namespace face_tracking_arm
 {
@@ -38,6 +42,143 @@ CollisionAwareServoComponent::CollisionAwareServoComponent(const rclcpp::NodeOpt
     seconds_to_nanoseconds(parameters_.control_period_sec));
 
   use_tracking_target_ = declare_parameter<bool>("use_tracking_target", false);
+  require_hardware_io_status_ = declare_parameter<bool>("require_hardware_io_status", false);
+  hardware_io_status_topic_ = declare_parameter<std::string>(
+    "hardware_io_status_topic", "/xarm/hardware_io_status");
+  hardware_factory_position_limits_rad_ = declare_parameter<std::vector<double>>(
+    "hardware_factory_position_limits_rad", std::vector<double>{});
+  hardware_position_limits_rad_ = declare_parameter<std::vector<double>>(
+    "hardware_position_limits_rad", std::vector<double>{});
+  const int execution_budget_source = declare_parameter<int>(
+    "hardware_execution_budget_source", 0);
+  control::ExecutionErrorBudget execution_budget;
+  if (execution_budget_source == 1) {
+    execution_budget.source = control::ExecutionBudgetSource::kSyntheticTest;
+  } else if (execution_budget_source == 2) {
+    execution_budget.source = control::ExecutionBudgetSource::kHardwareProfile;
+  } else if (execution_budget_source != 0) {
+    execution_budget.source = static_cast<control::ExecutionBudgetSource>(
+      execution_budget_source);
+  }
+  execution_budget.identity.profile_id = declare_parameter<std::string>(
+    "hardware_execution_budget_profile_id", "");
+  execution_budget.identity.robot_model = declare_parameter<std::string>(
+    "hardware_execution_budget_robot_model", "");
+  execution_budget.identity.robot_model_num = declare_parameter<int>(
+    "hardware_execution_budget_model_num", 0);
+  execution_budget.identity.firmware = declare_parameter<std::string>(
+    "hardware_execution_budget_firmware", "");
+  execution_budget.identity.controller_mode = declare_parameter<std::string>(
+    "hardware_execution_budget_controller_mode", "");
+  execution_budget.identity.conditions_fingerprint = declare_parameter<std::string>(
+    "hardware_execution_budget_conditions_fingerprint", "");
+  execution_budget.identity.evidence_reference = declare_parameter<std::string>(
+    "hardware_execution_budget_evidence_reference", "");
+  execution_budget.identity.reduced_mode_known = declare_parameter<bool>(
+    "hardware_execution_budget_reduced_mode_known", false);
+  execution_budget.identity.reduced_mode_enabled = declare_parameter<bool>(
+    "hardware_execution_budget_reduced_mode", false);
+  execution_budget.total_error_rad = declare_parameter<double>(
+    "hardware_execution_error_bound_rad", 0.0);
+  execution_budget.reaction_threshold_rad = declare_parameter<double>(
+    "hardware_reaction_threshold_rad", 0.0);
+  execution_budget.post_threshold_growth_rad = declare_parameter<double>(
+    "hardware_post_threshold_growth_rad", 0.0);
+  control::ExecutionBudgetExpectedIdentity expected_execution_identity;
+  expected_execution_identity.profile_id = declare_parameter<std::string>(
+    "hardware_execution_expected_profile_id", "");
+  expected_execution_identity.robot_model = declare_parameter<std::string>(
+    "hardware_execution_expected_robot_model", "");
+  expected_execution_identity.robot_model_num = declare_parameter<int>(
+    "hardware_execution_expected_model_num", 0);
+  expected_execution_identity.firmware = declare_parameter<std::string>(
+    "hardware_execution_expected_firmware", "");
+  expected_execution_identity.controller_mode = declare_parameter<std::string>(
+    "hardware_execution_expected_controller_mode", "");
+  expected_execution_identity.conditions_fingerprint = declare_parameter<std::string>(
+    "hardware_execution_expected_conditions_fingerprint", "");
+  expected_execution_identity.reduced_mode_enabled = declare_parameter<bool>(
+    "hardware_execution_expected_reduced_mode", false);
+  hardware_inhibit_service_ = declare_parameter<std::string>(
+    "hardware_inhibit_service", "/xarm/_inhibit_servoj");
+  const double requested_io_sample_timeout_sec = declare_parameter<double>(
+    "hardware_io_sample_timeout_sec", 0.1);
+  const double requested_io_transport_timeout_sec = declare_parameter<double>(
+    "hardware_io_transport_timeout_sec", 0.02);
+  const double robot_msg_timeout_sec = declare_parameter<double>(
+    "hardware_robot_msg_timeout_sec", 0.5);
+  const double io_sample_timeout_sec = std::min(
+    requested_io_sample_timeout_sec, parameters_.state_feedback_timeout_sec);
+  const double io_transport_timeout_sec = std::min(
+    requested_io_transport_timeout_sec, io_sample_timeout_sec);
+  if (!std::isfinite(requested_io_sample_timeout_sec) ||
+    requested_io_sample_timeout_sec <= 0.0 ||
+    !std::isfinite(requested_io_transport_timeout_sec) ||
+    requested_io_transport_timeout_sec < 0.0 || !std::isfinite(robot_msg_timeout_sec) ||
+    robot_msg_timeout_sec <= 0.0 || hardware_io_status_topic_.empty() ||
+    hardware_inhibit_service_.empty() ||
+    (require_hardware_io_status_ &&
+    (hardware_factory_position_limits_rad_.size() != 12U ||
+    hardware_position_limits_rad_.size() != 12U)))
+  {
+    throw std::invalid_argument("Hardware I/O status policy parameters are invalid");
+  }
+  if (require_hardware_io_status_) {
+    const auto validation = control::validateExecutionErrorBudget(
+      execution_budget, expected_execution_identity, false);
+    if (!validation.valid || !validation.physical_profile) {
+      throw std::invalid_argument(std::string("Hardware execution budget rejected: ") +
+        control::executionBudgetFailureName(validation.failure));
+    }
+    hardware_execution_budget_ = execution_budget;
+    hardware_reaction_threshold_rad_ = execution_budget.reaction_threshold_rad;
+    hardware_post_threshold_growth_rad_ = execution_budget.post_threshold_growth_rad;
+  }
+  hardware_io_status_policy_ = std::make_unique<hardware::HardwareIoStatusPolicy>(
+    seconds_to_nanoseconds(io_sample_timeout_sec),
+    seconds_to_nanoseconds(io_transport_timeout_sec),
+    seconds_to_nanoseconds(robot_msg_timeout_sec));
+  hardware_io_status_subscription_ = create_subscription<msg::HardwareIoStatus>(
+    hardware_io_status_topic_, rclcpp::QoS(1).best_effort(),
+    [this](msg::HardwareIoStatus::ConstSharedPtr message) {
+      receive_hardware_io_status(*message);
+    });
+  hardware_inhibit_client_ = create_client<std_srvs::srv::Trigger>(
+    hardware_inhibit_service_);
+  hardware_inhibit_timer_ = create_wall_timer(
+    50ms, [this]() {dispatch_pending_hardware_inhibit();});
+  const std::string qp_failure_snapshot_root = declare_parameter<std::string>(
+    "qp_failure_snapshot_directory", "/tmp/face_tracking_arm_qp_failures");
+  if (qp_failure_snapshot_root.empty()) {
+    throw std::invalid_argument("qp_failure_snapshot_directory must not be empty");
+  }
+  std::filesystem::create_directories(qp_failure_snapshot_root);
+  const auto session_stamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  qp_failure_snapshot_path_ = (std::filesystem::path(qp_failure_snapshot_root) /
+    ("session_" + std::to_string(session_stamp_ns))).string();
+  std::filesystem::create_directory(qp_failure_snapshot_path_);
+  qp_failure_snapshot_timer_ = create_wall_timer(
+    50ms, [this]() {process_qp_failure_snapshots();});
+  const std::string execution_context_topic = declare_parameter<std::string>(
+    "servo_execution_context_topic", "~/execution_context");
+  if (execution_context_topic.empty()) {
+    throw std::invalid_argument("servo_execution_context_topic must not be empty");
+  }
+  execution_context_publisher_ = create_publisher<msg::ServoExecutionContext>(
+    execution_context_topic, rclcpp::QoS(512).reliable());
+  execution_context_timer_ = create_wall_timer(
+    25ms, [this]() {drain_execution_context();});
+  const std::string trajectory_publications_topic = declare_parameter<std::string>(
+    "servo_trajectory_publications_topic", "~/trajectory_publications");
+  if (trajectory_publications_topic.empty()) {
+    throw std::invalid_argument("servo_trajectory_publications_topic must not be empty");
+  }
+  trajectory_publication_publisher_ =
+    create_publisher<msg::ServoTrajectoryPublication>(
+    trajectory_publications_topic, rclcpp::QoS(64).reliable());
+  trajectory_publication_timer_ = create_wall_timer(
+    25ms, [this]() {drain_trajectory_publications();});
   tracking_target_subscription_ = create_subscription<msg::TrackingTarget>(
     "~/tracking_target_cmds", rclcpp::QoS(1).reliable(),
     [this](msg::TrackingTarget::ConstSharedPtr message) {
@@ -107,6 +248,18 @@ void CollisionAwareServoComponent::shutdown_resources()
   }
   if (initialization_timer_) {
     initialization_timer_->cancel();
+  }
+  if (hardware_inhibit_timer_) {
+    hardware_inhibit_timer_->cancel();
+  }
+  if (qp_failure_snapshot_timer_) {
+    qp_failure_snapshot_timer_->cancel();
+  }
+  if (execution_context_timer_) {
+    execution_context_timer_->cancel();
+  }
+  if (trajectory_publication_timer_) {
+    trajectory_publication_timer_->cancel();
   }
   motion_reference_.reset();
   planning_scene_monitor_.reset();
@@ -179,6 +332,19 @@ void CollisionAwareServoComponent::initialize()
   qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
   qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
   qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const control::PositionInterval numerical_interval{
+    motion_limits_.lower_position.minCoeff(), motion_limits_.upper_position.maxCoeff()};
+  const auto maximum_value = [](const Eigen::VectorXd & values) {
+      return values.maxCoeff();
+    };
+  motion_limits_.numerical_policy = control::NumericalPolicy::fromDiscreteMotionLimits(
+    numerical_interval, maximum_value(motion_limits_.max_velocity),
+    maximum_value(motion_limits_.max_acceleration), maximum_value(motion_limits_.max_jerk),
+    parameters_.control_period_sec,
+    control::SolverResidual{qp_config.solution_feasibility_tolerance});
+  if (!motion_limits_.numerical_policy.has_value()) {
+    throw std::invalid_argument("Unable to derive shared motion numerical policy");
+  }
   velocity_qp_ = std::make_unique<control::HierarchicalVelocityQp>(qp_config);
 
   control::EmergencyBrakeTailConfig braking_tail_config;
@@ -189,11 +355,6 @@ void CollisionAwareServoComponent::initialize()
   // the final state as its interpolation sentinel.
   braking_tail_config.terminal_hold_points = static_cast<std::size_t>(std::ceil(
     2.0 * servo_parameters_.max_expected_latency / parameters_.control_period_sec)) + 1U;
-  // Use the same numerical boundary as the QP. Otherwise a sub-microradian
-  // discretization residual can make the QP's valid brake suffix fail its
-  // second, stricter reconstruction check and latch the controller.
-  braking_tail_config.comparison_tolerance =
-    2.0 * qp_config.solution_feasibility_tolerance;
   emergency_brake_tail_generator_ =
     std::make_unique<control::EmergencyBrakeTailGenerator>(braking_tail_config);
 
@@ -205,24 +366,26 @@ void CollisionAwareServoComponent::initialize()
   collision_config.segment_validation_substeps = static_cast<std::size_t>(
     parameters_.segment_validation_substeps);
   collision_config.minimum_gradient_norm = parameters_.collision_gradient_epsilon;
-  collision_config.tracking_position_error_bound_rad =
-    parameters_.collision_tracking_error_bound_rad;
+  collision_config.tracking_position_error_bound_rad = execution_error_bound_rad();
   collision_config.numerical_distance_reserve_m =
     parameters_.numerical_distance_reserve_m;
   collision_config.default_distance_lipschitz_m_per_rad =
     parameters_.default_distance_lipschitz_m_per_rad;
-  // The generic joint braking envelope covers every axis. Keep the collision
-  // builder's selected-axis row consistent with that same physical interval.
+  // The generic joint bounds and full brake-tail validation cover every axis.
+  // The selected protected-joint interval remains for corridor diagnostics.
   const std::string guarded_joint = parameters_.monitor_guard_joint_name.empty() ?
     parameters_.joint_names.at(4) : parameters_.monitor_guard_joint_name;
   const auto guarded_index = static_cast<Eigen::Index>(std::distance(
     parameters_.joint_names.begin(), std::find(
       parameters_.joint_names.begin(), parameters_.joint_names.end(), guarded_joint)));
   collision_config.protected_joint_name = guarded_joint;
-  collision_config.protected_joint_lower_rad = motion_limits_.lower_position[guarded_index];
-  collision_config.protected_joint_upper_rad = motion_limits_.upper_position[guarded_index];
+  collision_config.protected_joint_lower_rad =
+    position_bound_sets_.at(static_cast<std::size_t>(guarded_index)).working.lower_rad;
+  collision_config.protected_joint_upper_rad =
+    position_bound_sets_.at(static_cast<std::size_t>(guarded_index)).working.upper_rad;
   collision_config.invariant_mount_neighbor_name = "link6";
   collision_config.residual_latency_sec = parameters_.residual_command_latency_sec;
+  collision_config.numerical_policy = motion_limits_.numerical_policy;
   control::configureGeometryBounds(collision_config, *robot_model, *joint_model_group_);
   collision_constraint_builder_ =
     std::make_unique<control::CollisionConstraintBuilder>(collision_config);
@@ -252,6 +415,17 @@ void CollisionAwareServoComponent::complete_initialization_when_ready()
 
   const rclcpp::Time current_time = now();
   const auto state_monitor = planning_scene_monitor_->getStateMonitor();
+  if (require_hardware_io_status_) {
+    const auto status = current_hardware_io_status();
+    if (!status || !status->valid) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Waiting for valid hardware provenance: %s",
+        hardware::hardwareIoStatusFailureName(status ? status->failure :
+        hardware::HardwareIoStatusFailure::kInvalidEpochOrSequence));
+      return;
+    }
+  }
   if (current_time.nanoseconds() <= 0 || trajectory_publisher_->get_subscription_count() == 0U ||
     !controller_activity_received_.load(std::memory_order_acquire) ||
     !trajectory_controller_active_.load(std::memory_order_acquire))
@@ -343,6 +517,28 @@ void CollisionAwareServoComponent::initialize_motion_limits(
             "joint_names must exactly match the planning group's variable order");
   }
   const std::size_t size = group_variables.size();
+  if (require_hardware_io_status_) {
+    if (hardware_factory_position_limits_rad_.size() != 2U * size ||
+      hardware_position_limits_rad_.size() != 2U * size)
+    {
+      throw std::invalid_argument(
+        "Hardware I/O profile bounds must contain one low/high pair per joint");
+    }
+    for (std::size_t index = 0; index < size; ++index) {
+      const std::size_t offset = 2U * index;
+      const control::PositionInterval factory{
+        hardware_factory_position_limits_rad_[offset],
+        hardware_factory_position_limits_rad_[offset + 1U]};
+      const control::PositionInterval hardware{
+        hardware_position_limits_rad_[offset], hardware_position_limits_rad_[offset + 1U]};
+      if (!factory.valid() || !hardware.valid() ||
+        hardware.lower_rad < factory.lower_rad || hardware.upper_rad > factory.upper_rad)
+      {
+        throw std::invalid_argument(
+          "Hardware position bounds must be valid and contained by the factory profile");
+      }
+    }
+  }
   if (parameters_.max_joint_velocity_rad_s.size() != size ||
     parameters_.max_joint_acceleration_rad_s2.size() != size ||
     parameters_.max_joint_jerk_rad_s3.size() != size)
@@ -396,30 +592,61 @@ void CollisionAwareServoComponent::initialize_motion_limits(
       urdf_joint->limits->velocity;
   }
 
-  if (parameters_.monitor_guard_joint_name.empty()) {
-    return;
+  if (!parameters_.monitor_guard_joint_name.empty()) {
+    const auto guard_iterator = std::find(
+      group_variables.begin(), group_variables.end(), parameters_.monitor_guard_joint_name);
+    if (guard_iterator == group_variables.end()) {
+      throw std::invalid_argument("monitor_guard_joint_name is absent from joint_names");
+    }
+    const Eigen::Index guard_index = static_cast<Eigen::Index>(
+      std::distance(group_variables.begin(), guard_iterator));
+    if (parameters_.monitor_guard_min_position_rad <
+      motion_limits_.lower_position[guard_index] ||
+      parameters_.monitor_guard_max_position_rad >
+      motion_limits_.upper_position[guard_index])
+    {
+      throw std::invalid_argument("monitor guard corridor exceeds the URDF joint bounds");
+    }
+    motion_limits_.lower_position[guard_index] =
+      parameters_.monitor_guard_min_position_rad;
+    motion_limits_.upper_position[guard_index] =
+      parameters_.monitor_guard_max_position_rad;
+    // The corridor is already a calibrated safety margin inside the URDF range.
+    // Applying the generic joint margin again would unnecessarily shrink it.
+    motion_limits_.position_margin[guard_index] = 0.0;
   }
-  const auto guard_iterator = std::find(
-    group_variables.begin(), group_variables.end(), parameters_.monitor_guard_joint_name);
-  if (guard_iterator == group_variables.end()) {
-    throw std::invalid_argument("monitor_guard_joint_name is absent from joint_names");
+
+  position_bound_sets_.clear();
+  position_bound_sets_.reserve(size);
+  hardware_execution_error_rad_.assign(
+    size, hardware_execution_budget_ ? hardware_execution_budget_->total_error_rad : 0.0);
+  for (std::size_t index = 0; index < size; ++index) {
+    const std::size_t offset = 2U * index;
+    const control::PositionInterval model_interval{
+      robot_model.getVariableBounds(group_variables[index]).min_position_,
+      robot_model.getVariableBounds(group_variables[index]).max_position_};
+    const control::PositionInterval working{
+      motion_limits_.lower_position[static_cast<Eigen::Index>(index)],
+      motion_limits_.upper_position[static_cast<Eigen::Index>(index)]};
+    if (!require_hardware_io_status_) {
+      position_bound_sets_.push_back({model_interval, model_interval, working, working});
+      continue;
+    }
+    const control::PositionInterval factory{
+      hardware_factory_position_limits_rad_[offset],
+      hardware_factory_position_limits_rad_[offset + 1U]};
+    const control::PositionInterval hardware{
+      hardware_position_limits_rad_[offset], hardware_position_limits_rad_[offset + 1U]};
+    const auto bounds = control::makePositionBoundSet(
+      factory, hardware, working, control::Radians{execution_error_bound_rad()});
+    if (!bounds.has_value()) {
+      throw std::invalid_argument("Unable to construct hardware wire interval for " +
+        group_variables[index]);
+    }
+    position_bound_sets_.push_back(*bounds);
+    motion_limits_.lower_position[static_cast<Eigen::Index>(index)] = bounds->wire.lower_rad;
+    motion_limits_.upper_position[static_cast<Eigen::Index>(index)] = bounds->wire.upper_rad;
   }
-  const Eigen::Index guard_index = static_cast<Eigen::Index>(
-    std::distance(group_variables.begin(), guard_iterator));
-  if (parameters_.monitor_guard_min_position_rad <
-    motion_limits_.lower_position[guard_index] ||
-    parameters_.monitor_guard_max_position_rad >
-    motion_limits_.upper_position[guard_index])
-  {
-    throw std::invalid_argument("monitor guard corridor exceeds the URDF joint bounds");
-  }
-  motion_limits_.lower_position[guard_index] =
-    parameters_.monitor_guard_min_position_rad;
-  motion_limits_.upper_position[guard_index] =
-    parameters_.monitor_guard_max_position_rad;
-  // The corridor is already a calibrated safety margin inside the URDF range.
-  // Applying the generic joint margin again would unnecessarily shrink it.
-  motion_limits_.position_margin[guard_index] = 0.0;
 }
 
 void CollisionAwareServoComponent::receive_pose(
@@ -516,6 +743,182 @@ void CollisionAwareServoComponent::receive_controller_activity(
   }
   trajectory_controller_active_.store(controller_active, std::memory_order_release);
   controller_activity_received_.store(true, std::memory_order_release);
+}
+
+void CollisionAwareServoComponent::receive_hardware_io_status(
+  const msg::HardwareIoStatus & status)
+{
+  if (status.inhibit_latched) {
+    hardware_io_inhibit_requested_.store(true, std::memory_order_release);
+    hardware_inhibit_pending_.store(false, std::memory_order_release);
+  }
+  std::lock_guard<std::mutex> lock(hardware_io_status_mutex_);
+  const auto assessment = hardware_io_status_policy_->observe(
+    status, now().nanoseconds(), std::chrono::steady_clock::now());
+  if (status.hardware_active && assessment.valid) {
+    hardware_active_seen_.store(true, std::memory_order_release);
+  }
+  hardware_io_status_buffer_.writeFromNonRT(assessment);
+}
+
+std::optional<hardware::HardwareIoStatusAssessment>
+CollisionAwareServoComponent::current_hardware_io_status() const
+{
+  if (!require_hardware_io_status_) {
+    return std::nullopt;
+  }
+  auto assessment = cycle_hardware_io_status_.has_value() ?
+    *cycle_hardware_io_status_ : *hardware_io_status_buffer_.readFromRT();
+  if (!assessment.valid) {
+    return assessment;
+  }
+  const std::int64_t current_ros_ns = now().nanoseconds();
+  const auto current_steady = std::chrono::steady_clock::now();
+  if (current_ros_ns < assessment.receive_ros_time_ns ||
+    current_ros_ns < assessment.header_stamp_ns ||
+    current_steady < assessment.receive_steady_time)
+  {
+    assessment.valid = false;
+    assessment.failure = hardware::HardwareIoStatusFailure::kFutureOrRewoundTime;
+    return assessment;
+  }
+  const auto elapsed_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    current_steady - assessment.receive_steady_time).count();
+  const auto elapsed_ros_ns = current_ros_ns - assessment.receive_ros_time_ns;
+  if (std::llabs(elapsed_ros_ns - elapsed_steady_ns) >
+    assessment.maximum_transport_age_ns)
+  {
+    assessment.valid = false;
+    assessment.failure = hardware::HardwareIoStatusFailure::kInvalidTimestamp;
+    return assessment;
+  }
+  if (assessment.age_at_receive_ns + elapsed_steady_ns >
+    assessment.maximum_sample_age_ns)
+  {
+    assessment.valid = false;
+    assessment.failure = hardware::HardwareIoStatusFailure::kSampleTooOld;
+    return assessment;
+  }
+  if (assessment.robot_age_at_receive_ns + elapsed_steady_ns >
+    assessment.maximum_robot_message_age_ns)
+  {
+    assessment.valid = false;
+    assessment.failure = hardware::HardwareIoStatusFailure::kRobotMessageUnavailable;
+    return assessment;
+  }
+  for (std::size_t index = 0; index < parameters_.joint_names.size(); ++index) {
+    const std::size_t bounds_offset = 2U * index;
+    const control::PositionInterval factory{
+      hardware_factory_position_limits_rad_[bounds_offset],
+      hardware_factory_position_limits_rad_[bounds_offset + 1U]};
+    const control::PositionInterval hardware{
+      hardware_position_limits_rad_[bounds_offset],
+      hardware_position_limits_rad_[bounds_offset + 1U]};
+    if (!factory.valid() || !hardware.valid() ||
+      hardware.lower_rad < factory.lower_rad || hardware.upper_rad > factory.upper_rad)
+    {
+      assessment.valid = false;
+      assessment.failure = hardware::HardwareIoStatusFailure::kInvalidEpochOrSequence;
+      assessment.failure_joint_index = static_cast<std::uint32_t>(index);
+      return assessment;
+    }
+    const control::PositionInterval working = position_bound_sets_.size() ==
+      parameters_.joint_names.size() ? position_bound_sets_[index].working : hardware;
+    if (!working.valid() || working.lower_rad < hardware.lower_rad ||
+      working.upper_rad > hardware.upper_rad)
+    {
+      assessment.valid = false;
+      assessment.failure = hardware::HardwareIoStatusFailure::kInvalidEpochOrSequence;
+      assessment.failure_joint_index = static_cast<std::uint32_t>(index);
+      return assessment;
+    }
+    const auto classification = control::classifyMeasuredPosition(
+      assessment.sample.position[index], working);
+    if (classification != control::BoundaryClass::kInterior) {
+      assessment.valid = false;
+      assessment.failure = classification == control::BoundaryClass::kBoundary ?
+        hardware::HardwareIoStatusFailure::kJointBoundaryUnresolved :
+        hardware::HardwareIoStatusFailure::kJointOutsideLimit;
+      assessment.failure_joint_index = static_cast<std::uint32_t>(index);
+      return assessment;
+    }
+  }
+  return assessment;
+}
+
+void CollisionAwareServoComponent::request_hardware_inhibit()
+{
+  if (!require_hardware_io_status_ ||
+    hardware_io_inhibit_requested_.load(std::memory_order_acquire))
+  {
+    return;
+  }
+  hardware_inhibit_pending_.store(true, std::memory_order_release);
+}
+
+void CollisionAwareServoComponent::dispatch_pending_hardware_inhibit()
+{
+  if (!hardware_inhibit_pending_.load(std::memory_order_acquire) ||
+    hardware_io_inhibit_requested_.load(std::memory_order_acquire))
+  {
+    return;
+  }
+  const auto now_steady = std::chrono::steady_clock::now();
+  bool in_flight = hardware_inhibit_request_in_flight_.load(std::memory_order_acquire);
+  if (in_flight && now_steady - hardware_inhibit_request_started_ < 500ms) {
+    return;
+  }
+  if (in_flight) {
+    if (hardware_inhibit_request_id_.has_value()) {
+      (void)hardware_inhibit_client_->remove_pending_request(
+        *hardware_inhibit_request_id_);
+      hardware_inhibit_request_id_.reset();
+    }
+    ++hardware_inhibit_attempt_id_;  // Ignore any late response from the expired request.
+    hardware_inhibit_request_in_flight_.store(false, std::memory_order_release);
+  }
+  if (!hardware_inhibit_client_->service_is_ready()) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "Hardware inhibit service is unavailable; delivery remains pending");
+    return;
+  }
+  bool expected = false;
+  if (!hardware_inhibit_request_in_flight_.compare_exchange_strong(
+      expected, true, std::memory_order_acq_rel))
+  {
+    return;
+  }
+  hardware_inhibit_request_started_ = now_steady;
+  const std::uint64_t attempt_id = ++hardware_inhibit_attempt_id_;
+  const auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  const auto pending_request = hardware_inhibit_client_->async_send_request(
+    request,
+    [this, attempt_id](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      if (attempt_id != hardware_inhibit_attempt_id_) {
+        return;
+      }
+      try {
+        const auto response = future.get();
+        hardware_inhibit_request_id_.reset();
+        if (response->success) {
+          hardware_io_inhibit_requested_.store(true, std::memory_order_release);
+          hardware_inhibit_pending_.store(false, std::memory_order_release);
+          hardware_inhibit_request_in_flight_.store(false, std::memory_order_release);
+        } else if (attempt_id == hardware_inhibit_attempt_id_) {
+          hardware_inhibit_request_in_flight_.store(false, std::memory_order_release);
+          RCLCPP_ERROR(get_logger(), "Hardware ServoJ inhibit request was rejected: %s",
+            response->message.c_str());
+        }
+      } catch (const std::exception & error) {
+        if (attempt_id == hardware_inhibit_attempt_id_) {
+          hardware_inhibit_request_id_.reset();
+          hardware_inhibit_request_in_flight_.store(false, std::memory_order_release);
+          RCLCPP_ERROR(get_logger(), "Hardware ServoJ inhibit request failed: %s", error.what());
+        }
+      }
+    });
+  hardware_inhibit_request_id_ = pending_request.request_id;
 }
 
 void CollisionAwareServoComponent::switch_command_type(

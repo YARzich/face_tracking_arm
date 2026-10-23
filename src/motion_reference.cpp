@@ -32,10 +32,13 @@ constexpr double kCompactReserveRad{0.35};
 constexpr double kCompactRadiusFloorM{0.40};
 constexpr double kCompactMinimumPitchCapRad{0.5235987755982988};
 constexpr double kCompactRollLimitRad{0.0890117918517108};
+const double kCompactEdgeSineLimit{std::sin(kCompactRollLimitRad)};
 constexpr double kCompactMetricTolerance{1.0e-6};
 constexpr double kFaceReturnDwellSec{0.30};
 constexpr double kPairYawProbePositionRelaxationRad{0.17453292519943295};  // 10 deg
 constexpr double kPairYawProbePoseHoldToleranceRad{0.017453292519943295};  // 1 deg
+constexpr double kCompactPathCrossTrackGain{6.0};
+constexpr double kCompactPathCruiseArcReferenceRadps{0.60};
 // Compact constraints act at the predicted queue tail. Its published remainder
 // through stop is included in the immutable entry envelope, so it must not be
 // charged a second command-latency interval. Collision constraints still use
@@ -394,6 +397,46 @@ CompactPathReferenceSettings scaleCompactPathReference(
   return {scaled_gain, scaled_velocity};
 }
 
+std::optional<Eigen::VectorXd> makeCompactPathVelocityReference(
+  const Eigen::VectorXd & current_position, const JointPathUpdate & path,
+  const double lookahead_distance_rad, const double speed_scale)
+{
+  const auto positive_finite = [](const double value) {
+      return std::isfinite(value) && value > 0.0;
+    };
+  if (path.status != JointPathStatus::kTracking || current_position.size() == 0 ||
+    path.projected_position.size() != current_position.size() ||
+    path.reference_position.size() != current_position.size() ||
+    !current_position.allFinite() || !path.projected_position.allFinite() ||
+    !path.reference_position.allFinite() || !std::isfinite(path.remaining_distance_rad) ||
+    path.remaining_distance_rad < 0.0 || !positive_finite(lookahead_distance_rad) ||
+    !positive_finite(speed_scale))
+  {
+    return std::nullopt;
+  }
+
+  double along_path_gain = kCompactPathCruiseArcReferenceRadps * speed_scale /
+    lookahead_distance_rad;
+  if (!std::isfinite(along_path_gain)) {
+    return std::nullopt;
+  }
+  if (path.lookahead_crosses_corner) {
+    along_path_gain = std::min(along_path_gain, kCompactPathCrossTrackGain);
+  }
+  Eigen::VectorXd feedforward = along_path_gain *
+    (path.reference_position - path.projected_position);
+  const double terminal_feedforward_limit =
+    kCompactPathCrossTrackGain * path.remaining_distance_rad;
+  const double feedforward_norm = feedforward.norm();
+  if (feedforward_norm > terminal_feedforward_limit && feedforward_norm > 0.0) {
+    feedforward *= terminal_feedforward_limit / feedforward_norm;
+  }
+  const Eigen::VectorXd reference = feedforward + kCompactPathCrossTrackGain *
+    (path.projected_position - current_position);
+  return reference.allFinite() ?
+         std::optional<Eigen::VectorXd>{reference} : std::nullopt;
+}
+
 double preferredBaseJointAngle(
   const Eigen::Vector3d & face_in_planning_frame,
   const Eigen::Isometry3d & base_pose_in_planning_frame)
@@ -461,7 +504,10 @@ MotionReference::MotionReference(
   if (!std::isfinite(compact_speed_scale_) || compact_speed_scale_ <= 0.0) {
     throw std::invalid_argument("compact_maneuver.speed_scale must be finite and positive");
   }
-  compact_path_settings_ = scaleCompactPathReference(6.0, 0.70, compact_speed_scale_);
+  const auto scaled_compact_path =
+    scaleCompactPathReference(6.0, 0.70, compact_speed_scale_);
+  compact_path_settings_ = {kCompactPathCrossTrackGain,
+    scaled_compact_path.maximum_velocity_radps};
   compact_goal_settings_ = scaleCompactPathReference(3.0, 0.10, compact_speed_scale_);
   if (search_enabled_) {
     if (!named_state.setToDefaultValues(group_, "search")) {
@@ -911,24 +957,21 @@ bool MotionReference::maybeArmFaceUprightRollGuard(
     return false;
   }
 
-  const auto roll_at = [this, &state](const Eigen::VectorXd & position)
+  const auto edge_tilt_at = [this, &state](const Eigen::VectorXd & position)
     -> std::optional<double> {
       moveit::core::RobotState candidate(state);
       candidate.setJointGroupPositions(group_, position);
       candidate.update(true);
-      const auto pose = evaluateCompactUprightPose(
-        candidate.getGlobalLinkTransform(command_link_).linear());
-      if (!pose || !std::isfinite(pose->signed_roll_error_rad)) {
+      const auto edge = evaluateHorizontalEdgeUprightWithSineCap(
+        candidate.getGlobalLinkTransform(command_link_).linear(), kCompactEdgeSineLimit);
+      if (!edge) {
         return std::nullopt;
       }
-      return std::abs(pose->signed_roll_error_rad);
+      return std::abs(std::asin(std::clamp(edge->signed_edge_sine, -1.0, 1.0)));
     };
-  const auto actual_roll = roll_at(actual_feedback->position);
-  const auto command_roll = roll_at(command_queue_state->position);
-  if (!actual_roll || !command_roll ||
-    *actual_roll > kCompactRollLimitRad + kCompactPitchValidationToleranceRad ||
-    *command_roll > kCompactRollLimitRad + kCompactPitchValidationToleranceRad)
-  {
+  const auto actual_roll = edge_tilt_at(actual_feedback->position);
+  const auto command_roll = edge_tilt_at(command_queue_state->position);
+  if (!actual_roll || !command_roll) {
     return false;
   }
 
@@ -978,10 +1021,85 @@ bool MotionReference::maybeArmFaceUprightRollGuard(
   }
 
   double maximum_abs_roll_rad = std::max(*actual_roll, *command_roll);
-  if (!includeCompactEntryEnvelope(
-      state, time_sec, active_publication, latest_publication,
-      nullptr, nullptr, &maximum_abs_roll_rad) ||
-    maximum_abs_roll_rad > kCompactRollLimitRad + kCompactPitchValidationToleranceRad)
+  const auto include_edge_publication = [time_sec, &edge_tilt_at,
+      &maximum_abs_roll_rad](const PublishedTrajectoryRecord * publication) {
+      if (publication == nullptr || publication->execution_queue.empty()) {
+        return true;
+      }
+      const double stop_time = publication->stationary_time.seconds();
+      if (!std::isfinite(stop_time)) {
+        return false;
+      }
+      if (time_sec >= stop_time) {
+        return true;
+      }
+      const moveit_servo::KinematicState * previous = nullptr;
+      std::size_t next_index = publication->execution_queue.size();
+      for (std::size_t index = 0; index < publication->execution_queue.size(); ++index) {
+        const auto & sample = publication->execution_queue[index];
+        const double sample_time = sample.time_stamp.seconds();
+        if (!std::isfinite(sample_time)) {
+          return false;
+        }
+        if (sample_time < time_sec) {
+          previous = &sample;
+        } else {
+          next_index = index;
+          break;
+        }
+      }
+      const auto include_position = [&edge_tilt_at, &maximum_abs_roll_rad](
+        const Eigen::VectorXd & position) {
+          const auto tilt = edge_tilt_at(position);
+          if (!tilt) {
+            return false;
+          }
+          maximum_abs_roll_rad = std::max(maximum_abs_roll_rad, *tilt);
+          return true;
+        };
+      if (previous != nullptr && next_index < publication->execution_queue.size()) {
+        const auto & next = publication->execution_queue[next_index];
+        const double before_time = previous->time_stamp.seconds();
+        const double after_time = next.time_stamp.seconds();
+        if (!std::isfinite(before_time) || !std::isfinite(after_time) ||
+          after_time <= before_time || previous->positions.size() != next.positions.size() ||
+          !previous->positions.allFinite() || !next.positions.allFinite() ||
+          !include_position(previous->positions))
+        {
+          return false;
+        }
+        const auto include_interpolated = [&](const double at_time) {
+            const double fraction = std::clamp(
+              (at_time - before_time) / (after_time - before_time), 0.0, 1.0);
+            return include_position(
+              previous->positions + fraction * (next.positions - previous->positions));
+          };
+        if (!include_interpolated(time_sec) ||
+          (after_time > stop_time && before_time < stop_time &&
+          !include_interpolated(stop_time)))
+        {
+          return false;
+        }
+      } else if (previous != nullptr && !include_position(previous->positions)) {
+        return false;
+      }
+      for (std::size_t index = next_index;
+        index < publication->execution_queue.size(); ++index)
+      {
+        const auto & sample = publication->execution_queue[index];
+        const double sample_time = sample.time_stamp.seconds();
+        if (sample_time > stop_time) {
+          break;
+        }
+        if (sample_time >= time_sec && !include_position(sample.positions)) {
+          return false;
+        }
+      }
+      return true;
+    };
+  if (!include_edge_publication(active_publication) ||
+    (latest_publication != active_publication &&
+    !include_edge_publication(latest_publication)))
   {
     return false;
   }
@@ -1113,6 +1231,17 @@ bool MotionReference::validateCompactPathPosition(
 bool MotionReference::validateUprightRollPose(
   const moveit::core::RobotState & state, std::string * violation) const
 {
+  if (!compactManeuverActive() || compact_face_return_pending_) {
+    const auto edge = evaluateHorizontalEdgeUprightWithSineCap(
+      state.getGlobalLinkTransform(command_link_).linear(), kCompactEdgeSineLimit);
+    if (!edge) {
+      if (violation) {
+        *violation = "screen roll";
+      }
+      return false;
+    }
+    return true;
+  }
   const auto pose = evaluateCompactUprightPose(
     state.getGlobalLinkTransform(command_link_).linear());
   if (!pose || !std::isfinite(pose->signed_roll_error_rad)) {
@@ -1158,14 +1287,83 @@ bool MotionReference::validateCommandPosition(
   const moveit::core::RobotState & state, const Eigen::VectorXd & position,
   std::string * violation) const
 {
+  Eigen::VectorXd previous_position;
+  if (group_) {
+    state.copyJointGroupPositions(group_, previous_position);
+  }
+  return validateCommandTransition(state, previous_position, position, violation);
+}
+
+bool MotionReference::validateCommandTransition(
+  const moveit::core::RobotState & state, const Eigen::VectorXd & previous_position,
+  const Eigen::VectorXd & position, std::string * violation) const
+{
+  if (violation) {
+    violation->clear();
+  }
   if (compactManeuverActive()) {
     return validateCompactPathPosition(state, position, violation);
   }
   if (upright_roll_guard_armed_) {
     return validateUprightRollPosition(state, position, violation);
   }
-  if (violation) {
-    violation->clear();
+  if (rest_mode_ != RestMode::kRest) {
+    return true;
+  }
+  if (!group_ || !command_link_) {
+    if (violation) {
+      *violation = "screen roll state is unavailable";
+    }
+    return false;
+  }
+  const Eigen::Index joint_count = static_cast<Eigen::Index>(group_->getVariableCount());
+  if (previous_position.size() != joint_count ||
+    position.size() != joint_count || !previous_position.allFinite() || !position.allFinite())
+  {
+    if (violation) {
+      *violation = "screen roll state is unavailable";
+    }
+    return false;
+  }
+  const auto edge_measure = [this, &state](const Eigen::VectorXd & candidate_position)
+    -> std::optional<std::pair<double, double>>
+    {
+      moveit::core::RobotState candidate(state);
+      candidate.setJointGroupPositions(group_, candidate_position);
+      candidate.update(true);
+      const Eigen::Matrix3d rotation =
+        candidate.getGlobalLinkTransform(command_link_).linear();
+      if (!validEdgeRotation(rotation)) {
+        return std::nullopt;
+      }
+      return std::make_pair(std::abs(rotation(2, 1)), rotation(2, 2));
+    };
+  const auto previous_edge = edge_measure(previous_position);
+  const auto next_edge = edge_measure(position);
+  if (!previous_edge || !next_edge || previous_edge->second < 0.0 ||
+    next_edge->second < 0.0)
+  {
+    if (violation) {
+      *violation = "screen roll";
+    }
+    return false;
+  }
+  const bool previous_is_valid =
+    previous_edge->first <= kCompactEdgeSineLimit && previous_edge->second >= 0.0;
+  if (previous_is_valid) {
+    if (next_edge->first <= kCompactEdgeSineLimit) {
+      return true;
+    }
+    if (violation) {
+      *violation = "screen roll";
+    }
+    return false;
+  }
+  if (next_edge->first > previous_edge->first) {
+    if (violation) {
+      *violation = "screen roll acquisition must not worsen";
+    }
+    return false;
   }
   return true;
 }
@@ -1187,6 +1385,7 @@ void MotionReference::reset(const bool preserve_compact_maneuver)
   face_return_dwell_sec_ = 0.0;
   compact_return_full_face_active_ = false;
   rest_mode_ = RestMode::kNone;
+  rest_upright_start_active_ = false;
   search_pattern_.clear();
   rest_completed_ = false;
   rest_settling_ = false;
@@ -1354,7 +1553,8 @@ void MotionReference::updateBaseHandoff(
   double predicted_hold_position = 0.0;
   bool have_brake_endpoint = false;
   const auto & brake_state = command_queue_state ? command_queue_state : actual_feedback;
-  if (brake_state && brake_state->position.size() == limits_.lower_position.size() &&
+  if (brake_state &&
+    brake_state->position.size() == limits_.lower_position.size() &&
     brake_state->velocity.size() == limits_.lower_position.size() &&
     brake_state->acceleration.size() == limits_.lower_position.size())
   {
@@ -1442,6 +1642,8 @@ std::optional<HierarchicalVelocityTask> MotionReference::faceTask(
   config.maximum_linear_reference_mps = parameters_.maximum_linear_reference_mps;
   config.maximum_angular_reference_radps = parameters_.maximum_angular_reference_radps;
   config.roll_weight = parameters_.secondary_roll_weight;
+  config.horizontal_edge_primary =
+    !compactManeuverActive() || compact_face_return_pending_;
   const Eigen::Quaterniond orientation(
     target.pose.orientation.w, target.pose.orientation.x,
     target.pose.orientation.y, target.pose.orientation.z);
@@ -1504,9 +1706,11 @@ MotionReference::measureActualFaceAlignment(
   const double ray_norm = face_ray.norm();
   const Eigen::Isometry3d actual_screen_pose =
     actual_state.getGlobalLinkTransform(command_link_);
-  const auto actual_roll_error = measureUprightRollError(actual_screen_pose);
+  const auto actual_roll_error = measureHorizontalEdgeTiltError(actual_screen_pose);
+  const bool edge_is_up = evaluateHorizontalEdgeUpright(
+    actual_screen_pose.linear(), 0.5 * std::acos(-1.0)).has_value();
   if (!face_ray.allFinite() || !std::isfinite(ray_norm) || ray_norm <= 1.0e-9 ||
-    !actual_roll_error)
+    !actual_roll_error || !edge_is_up)
   {
     return std::nullopt;
   }
@@ -1521,6 +1725,23 @@ MotionReference::measureActualFaceAlignment(
   return MotionReferenceResult::FaceAlignmentMeasurement{
     pointing_error, *actual_roll_error,
     static_cast<std::int64_t>(std::llround(feedback_time * 1.0e9))};
+}
+
+std::optional<Eigen::Vector2d> MotionReference::pairYawProbeEdgeDeltaInterval(
+  const double initial_edge_sine) noexcept
+{
+  if (!std::isfinite(initial_edge_sine) ||
+    std::abs(initial_edge_sine) > kCompactEdgeSineLimit)
+  {
+    return std::nullopt;
+  }
+  const double local_hold = std::sin(kPairYawProbePoseHoldToleranceRad);
+  const double lower = std::max(-local_hold, -kCompactEdgeSineLimit - initial_edge_sine);
+  const double upper = std::min(local_hold, kCompactEdgeSineLimit - initial_edge_sine);
+  if (lower > upper) {
+    return std::nullopt;
+  }
+  return Eigen::Vector2d{lower, upper};
 }
 
 PairYawResourceAssessment MotionReference::evaluatePairYawResource(
@@ -1713,7 +1934,7 @@ PairYawResourceAssessment MotionReference::evaluatePairYawResource(
   upright_config.orientation_gain = parameters_.orientation_gain;
   upright_config.maximum_angular_reference_radps =
     parameters_.maximum_angular_reference_radps;
-  const auto roll_task = makeUprightRollPathTask(
+  const auto roll_task = makeHorizontalEdgePathTask(
     command_pose, command_jacobian,
     Eigen::VectorXd::Zero(probe_state.position.size()), upright_config);
   if (!roll_task || roll_task->task.primary_matrix.rows() != 1 ||
@@ -1777,22 +1998,34 @@ PairYawResourceAssessment MotionReference::evaluatePairYawResource(
 
   std::vector<LinearVelocityConstraint> upright_constraints;
   const auto add_hold_constraint = [&upright_constraints, horizon](
-    const Eigen::VectorXd & gradient) {
+    const Eigen::VectorXd & gradient, const double allowed_change) {
       if (gradient.size() == 0 || !gradient.allFinite() || gradient.norm() <= 1.0e-9) {
         return false;
       }
       LinearVelocityConstraint row;
       row.coefficients = gradient;
-      row.lower_bound = -kPairYawProbePoseHoldToleranceRad / horizon;
-      row.upper_bound = kPairYawProbePoseHoldToleranceRad / horizon;
+      row.lower_bound = -allowed_change / horizon;
+      row.upper_bound = allowed_change / horizon;
       upright_constraints.push_back(std::move(row));
       return true;
     };
   const Eigen::VectorXd roll_gradient =
     roll_task->task.primary_matrix.row(0).transpose();
-  if (!add_hold_constraint(elevation_gradient) || !add_hold_constraint(roll_gradient)) {
+  if (!add_hold_constraint(elevation_gradient, kPairYawProbePoseHoldToleranceRad)) {
     return assessment;
   }
+  // Keep the pair-resource probe inside the same horizontal-edge cap as FACE
+  // execution. Its local one-degree roll allowance is asymmetric near either
+  // cap: only the remaining inward/outward room is available in each direction.
+  const auto edge_delta = pairYawProbeEdgeDeltaInterval(roll_task->signed_edge_sine);
+  if (!edge_delta) {
+    return assessment;
+  }
+  LinearVelocityConstraint edge_constraint;
+  edge_constraint.coefficients = roll_gradient;
+  edge_constraint.lower_bound = (*edge_delta)[0] / horizon;
+  edge_constraint.upper_bound = (*edge_delta)[1] / horizon;
+  upright_constraints.push_back(std::move(edge_constraint));
 
   // Bound the one-second local linearization to 10 degrees per joint. This
   // trust region prevents large joint deltas from overstating useful yaw reserve.
@@ -1858,13 +2091,40 @@ PairYawResourceAssessment MotionReference::evaluatePairYawResource(
       -std::copysign(1.0, assessment.yaw_demand_radps) *
       actual_probe.achieved_primary_velocity[0] * horizon);
   }
-  const auto pose_residual = [&](const QpResult & probe, const Eigen::VectorXd & row) {
-      return probe.command_available() ?
-             std::abs(row.dot(probe.joint_velocity)) * horizon :
-             kPairYawProbePoseHoldToleranceRad * 2.0;
+  const auto pose_residual = [&](const QpResult & probe, const Eigen::VectorXd & row,
+    const bool edge_height_coordinate, const double initial_edge_sine) {
+      if (!probe.command_available()) {
+        return std::optional<double>{};
+      }
+      const double predicted_change = row.dot(probe.joint_velocity) * horizon;
+      if (!edge_height_coordinate) {
+        return std::optional<double>{std::abs(predicted_change)};
+      }
+      moveit::core::RobotState predicted_state(actual_state);
+      predicted_state.setJointGroupPositions(
+        group_, probe_state.position + probe.joint_velocity * horizon);
+      predicted_state.update(true);
+      const auto predicted_edge = evaluateHorizontalEdgeUprightWithSineCap(
+        predicted_state.getGlobalLinkTransform(command_link_).linear(),
+        kCompactEdgeSineLimit);
+      if (!predicted_edge) {
+        return std::optional<double>{};
+      }
+      return std::optional<double>{std::abs(
+          std::asin(predicted_edge->signed_edge_sine) - std::asin(initial_edge_sine))};
     };
-  assessment.actual_roll_residual_rad = pose_residual(actual_probe, roll_gradient);
-  assessment.actual_elevation_residual_rad = pose_residual(actual_probe, elevation_gradient);
+  const auto actual_roll_residual = pose_residual(
+    actual_probe, roll_gradient, true, roll_task->signed_edge_sine);
+  if (assessment.actual_probe_solved && !actual_roll_residual) {
+    // Do not count a locally linear yaw solution whose actual FK endpoint
+    // violates the upright edge cap or points the vertical edge downward.
+    assessment.actual_available_yaw_rad = 0.0;
+  }
+  assessment.actual_roll_residual_rad = actual_roll_residual.value_or(
+    kPairYawProbePoseHoldToleranceRad * 2.0);
+  assessment.actual_elevation_residual_rad = pose_residual(
+    actual_probe, elevation_gradient, false, 0.0).value_or(
+    kPairYawProbePoseHoldToleranceRad * 2.0);
 
   JointMotionLimits relaxed_limits = probe_limits;
   Eigen::VectorXd relaxed_lower = working_lower;
@@ -1894,10 +2154,17 @@ PairYawResourceAssessment MotionReference::evaluatePairYawResource(
       -std::copysign(1.0, assessment.yaw_demand_radps) *
       relaxed_probe.achieved_primary_velocity[0] * horizon);
   }
-  assessment.relaxed_roll_residual_rad = pose_residual(relaxed_probe, roll_gradient);
+  const auto relaxed_roll_residual = pose_residual(
+    relaxed_probe, roll_gradient, true, roll_task->signed_edge_sine);
+  if (assessment.relaxed_probe_solved && !relaxed_roll_residual) {
+    assessment.pair_relaxed_available_yaw_rad = 0.0;
+  }
+  assessment.relaxed_roll_residual_rad = relaxed_roll_residual.value_or(
+    kPairYawProbePoseHoldToleranceRad * 2.0);
   assessment.relaxed_elevation_residual_rad =
-    pose_residual(relaxed_probe, elevation_gradient);
-  assessment.probe_valid = assessment.actual_probe_solved;
+    pose_residual(relaxed_probe, elevation_gradient, false, 0.0).value_or(
+    kPairYawProbePoseHoldToleranceRad * 2.0);
+  assessment.probe_valid = assessment.actual_probe_solved && actual_roll_residual.has_value();
   assessment.pair_bound_cause = pairYawProbeShowsPairBoundCause(assessment);
   assessment.exhausted = assessment.pair_bound_cause;
   return assessment;
@@ -2000,6 +2267,11 @@ void MotionReference::recordFaceCommand(
       forecast.signed_error_rad = tracking.signed_face_primary_error_rad;
       forecast.desired_feedforward_radps = tracking.face_primary_feedforward_radps;
       forecast.achieved_primary_radps = qp_result.achieved_primary_velocity;
+      forecast.horizontal_edge_axis = true;
+      forecast.signed_edge_error = std::sin(tracking.signed_face_primary_error_rad[2]);
+      forecast.desired_edge_rate = 0.0;
+      forecast.achieved_edge_rate = qp_result.achieved_primary_velocity[2];
+      forecast.edge_guard = std::sin(kFaceTrackingErrorGuardRad);
       forecast.horizon_sec = kFaceTrackingForecastHorizonSec;
       forecast.pointing_guard_rad = kFaceTrackingErrorGuardRad;
       forecast.roll_guard_rad = kFaceTrackingErrorGuardRad;
@@ -2095,7 +2367,9 @@ void MotionReference::requestCompactManeuver(
   {
     return;
   }
-  if (!pair_yaw_assessment_.valid || !pair_yaw_assessment_.exhausted) {
+  const PairYawResourceState pair_resource_state =
+    pairYawResourceState(pair_yaw_assessment_);
+  if (pair_resource_state == PairYawResourceState::kAvailable) {
     planner_->cancel();
     pending_generation_.reset();
     compact_preparation_.reset();
@@ -2111,6 +2385,12 @@ void MotionReference::requestCompactManeuver(
     appendCompactEvent("preparation_cancelled", time_sec,
       "pair_yaw_resource_available", pairYawAssessmentJson(pair_yaw_assessment_));
     active_scene_revision_.reset();
+    return;
+  }
+  if (pair_resource_state != PairYawResourceState::kExhausted) {
+    diagnostics_.compact_phase = compact_preparation_ ? "PREPARING" : "COMMIT_WAIT";
+    diagnostics_.state = compact_preparation_ ?
+      "FACE_COMPACT_PREPARING" : "FACE_COMPACT_PREPARING_WAIT";
     return;
   }
   if (!upright_roll_guard_armed_) {
@@ -2281,7 +2561,8 @@ void MotionReference::submitCompactPlan(
   (void)time_sec;
 }
 
-void MotionReference::submitCompactPreparationPlan(
+MotionReference::CompactPreparationSubmitOutcome
+MotionReference::submitCompactPreparationPlan(
   const moveit::core::RobotState & state, const double time_sec,
   const std::uint64_t scene_revision,
   const std::optional<JointMotionState> & actual_feedback,
@@ -2292,7 +2573,7 @@ void MotionReference::submitCompactPreparationPlan(
   if (!compact_preparation_ || compact_preparation_->exhausted || pending_generation_ ||
     planner_->isBusy() || !actual_feedback || !command_queue_state)
   {
-    return;
+    return CompactPreparationSubmitOutcome::kNotSubmitted;
   }
   const auto valid_motion_state = [this](const JointMotionState & motion) {
       const auto size = static_cast<Eigen::Index>(group_->getVariableCount());
@@ -2304,13 +2585,13 @@ void MotionReference::submitCompactPreparationPlan(
     diagnostics_.compact_phase = "PREPARING";
     diagnostics_.tracking_phase = "FACE";
     diagnostics_.state = "FACE_COMPACT_PREPARING_WAITING_FOR_VALID_MOTION_STATE";
-    return;
+    return CompactPreparationSubmitOutcome::kNotSubmitted;
   }
   auto & preparation = *compact_preparation_;
   if (scene_revision != preparation.scene_revision ||
     preparation.candidate_index >= preparation.candidates.size())
   {
-    return;
+    return CompactPreparationSubmitOutcome::kNotSubmitted;
   }
 
   double entry_radius_cap = kCompactRadiusFloorM;
@@ -2334,7 +2615,7 @@ void MotionReference::submitCompactPreparationPlan(
     diagnostics_.compact_phase = "PREPARING";
     diagnostics_.tracking_phase = "FACE";
     diagnostics_.state = "FACE_COMPACT_PREPARING_ENTRY_UNSAFE";
-    return;
+    return CompactPreparationSubmitOutcome::kEntryEnvelopeUnsafe;
   }
 
   CompactGoal request = preparation.candidates[preparation.candidate_index];
@@ -2363,7 +2644,7 @@ void MotionReference::submitCompactPreparationPlan(
       diagnostics_.tracking_phase = "FACE";
       diagnostics_.state = "FACE_COMPACT_PREPARATION_EXHAUSTED";
     }
-    return;
+    return CompactPreparationSubmitOutcome::kCandidateRejected;
   }
   const double pitch_cap = std::max({
       kCompactMinimumPitchCapRad, maximum_abs_pitch,
@@ -2387,6 +2668,7 @@ void MotionReference::submitCompactPreparationPlan(
   diagnostics_.tracking_phase = "FACE";
   diagnostics_.state = "FACE_COMPACT_PREPARING";
   diagnostics_.last_plan_message = "compact candidate path submitted: " + request.profile_id;
+  return CompactPreparationSubmitOutcome::kSubmitted;
 }
 
 bool MotionReference::compactSettled(
@@ -2516,11 +2798,15 @@ bool MotionReference::appendUprightConstraints(
   if (constrain_pitch && (!pitch_cap || !std::isfinite(*pitch_cap))) {
     return false;
   }
-  const auto upright_pose = evaluateCompactUprightPose(
-    task_state.getGlobalLinkTransform(command_link_).linear());
+  const Eigen::Matrix3d screen_rotation =
+    task_state.getGlobalLinkTransform(command_link_).linear();
+  std::optional<CompactUprightPose> upright_pose;
+  if (constrain_pitch) {
+    upright_pose = evaluateCompactUprightPose(screen_rotation);
+  }
   Eigen::MatrixXd jacobian;
-  if (!upright_pose ||
-    (constrain_pitch && !std::isfinite(upright_pose->signed_pitch_rad)) ||
+  if (!screen_rotation.allFinite() ||
+    (constrain_pitch && (!upright_pose || !std::isfinite(upright_pose->signed_pitch_rad))) ||
     !task_state.getJacobian(
       group_, command_link_, Eigen::Vector3d::Zero(), jacobian, false))
   {
@@ -2535,49 +2821,79 @@ bool MotionReference::appendUprightConstraints(
   TrackingVelocityTaskConfig roll_config;
   roll_config.orientation_gain = parameters_.orientation_gain;
   roll_config.maximum_angular_reference_radps = parameters_.maximum_angular_reference_radps;
-  const auto roll_task = makeUprightRollPathTask(
-    task_state.getGlobalLinkTransform(command_link_), jacobian,
-    Eigen::VectorXd::Zero(motion_state.position.size()), roll_config);
-  if (!roll_task || roll_task->task.primary_matrix.rows() != 1 ||
-    roll_task->task.primary_matrix.cols() != motion_state.position.size() ||
-    !roll_task->task.primary_matrix.allFinite() ||
-    !std::isfinite(roll_task->roll_error_rad))
-  {
-    return false;
-  }
-  const double signed_roll_error = roll_task->roll_error_rad;
-  if (std::abs(signed_roll_error) >
-    kCompactRollLimitRad + kCompactPitchValidationToleranceRad)
-  {
-    return false;
-  }
-  const Eigen::VectorXd signed_roll_gradient =
-    -roll_task->task.primary_matrix.row(0).transpose();
-  if (!signed_roll_gradient.allFinite()) {
-    return false;
-  }
   std::vector<LinearVelocityConstraint> roll_constraints;
-  roll_constraints.reserve(2U);
-  for (const double direction : {1.0, -1.0}) {
-    const double signed_roll = direction * signed_roll_error;
-    const Eigen::VectorXd outward_gradient = direction * signed_roll_gradient;
-    if (signed_roll > kCompactRollLimitRad + kCompactPitchValidationToleranceRad) {
+  roll_constraints.reserve(3U);
+  if (constrain_pitch) {
+    const auto compact_roll_task = makeUprightRollPathTask(
+      task_state.getGlobalLinkTransform(command_link_), jacobian,
+      Eigen::VectorXd::Zero(motion_state.position.size()), roll_config);
+    if (!compact_roll_task || !std::isfinite(compact_roll_task->roll_error_rad)) {
       return false;
     }
-    if (outward_gradient.norm() <= 1.0e-10) {
-      if (signed_roll > kCompactRollLimitRad) {
+    const Eigen::VectorXd roll_gradient =
+      compact_roll_task->task.primary_matrix.row(0).transpose();
+    for (const double direction : {1.0, -1.0}) {
+      const double signed_roll = direction * compact_roll_task->roll_error_rad;
+      const Eigen::VectorXd outward_gradient = direction * roll_gradient;
+      if (outward_gradient.norm() <= 1.0e-10) {
+        if (signed_roll > kCompactRollLimitRad + kCompactPitchValidationToleranceRad) {
+          return false;
+        }
+        continue;
+      }
+      const double remaining_roll = std::max(0.0, kCompactRollLimitRad - signed_roll);
+      const auto row = makeOutwardStoppingConstraint(
+        outward_gradient, remaining_roll, motion_state, limits_,
+        parameters_.control_period_sec, kCompactQueueTailResidualLatencySec);
+      if (!row) {
         return false;
       }
-      continue;
+      roll_constraints.push_back(*row);
     }
-    const double remaining_roll_rad = std::max(0.0, kCompactRollLimitRad - signed_roll);
-    const auto row = makeOutwardStoppingConstraint(
-      outward_gradient, remaining_roll_rad, motion_state, limits_,
-      parameters_.control_period_sec, kCompactQueueTailResidualLatencySec);
-    if (!row) {
+  } else {
+    const auto edge_task = makeHorizontalEdgePathTask(
+      task_state.getGlobalLinkTransform(command_link_), jacobian,
+      Eigen::VectorXd::Zero(motion_state.position.size()), roll_config);
+    if (!edge_task || !std::isfinite(edge_task->edge_tilt_error_rad)) {
       return false;
     }
-    roll_constraints.push_back(*row);
+    const Eigen::RowVectorXd edge_gradient = edge_task->task.primary_matrix.row(0);
+    for (const double direction : {1.0, -1.0}) {
+      const double signed_edge_sine = direction * edge_task->signed_edge_sine;
+      const Eigen::VectorXd outward_gradient = direction * edge_gradient.transpose();
+      if (outward_gradient.norm() <= 1.0e-10) {
+        if (signed_edge_sine > kCompactEdgeSineLimit) {
+          return false;
+        }
+        continue;
+      }
+      const double remaining_edge_sine =
+        std::max(0.0, kCompactEdgeSineLimit - signed_edge_sine);
+      const auto row = makeOutwardStoppingConstraint(
+        outward_gradient, remaining_edge_sine, motion_state, limits_,
+        parameters_.control_period_sec, kCompactQueueTailResidualLatencySec);
+      if (!row) {
+        return false;
+      }
+      roll_constraints.push_back(*row);
+    }
+    const Eigen::Vector3d vertical_edge = screen_rotation.col(2);
+    const Eigen::RowVectorXd vertical_edge_z_gradient =
+      vertical_edge.cross(Eigen::Vector3d::UnitZ()).transpose() * jacobian.bottomRows(3);
+    const Eigen::VectorXd vertical_edge_outward_gradient =
+      -vertical_edge_z_gradient.transpose();
+    if (vertical_edge.z() < 0.0 || !vertical_edge_outward_gradient.allFinite()) {
+      return false;
+    }
+    if (vertical_edge_outward_gradient.norm() > 1.0e-10) {
+      const auto row = makeOutwardStoppingConstraint(
+        vertical_edge_outward_gradient, vertical_edge.z(), motion_state, limits_,
+        parameters_.control_period_sec, kCompactQueueTailResidualLatencySec);
+      if (!row) {
+        return false;
+      }
+      roll_constraints.push_back(*row);
+    }
   }
   result.compact_roll_constraints = std::move(roll_constraints);
 
@@ -2629,7 +2945,7 @@ bool MotionReference::appendFaceRollGuardConstraints(
   const std::optional<JointMotionState> & command_queue_state,
   MotionReferenceResult & result) const
 {
-  if (!upright_roll_guard_armed_) {
+  if (!upright_roll_guard_armed_ || compactManeuverActive()) {
     return true;
   }
   if (!command_queue_state || !appendUprightConstraints(
@@ -2693,7 +3009,8 @@ bool MotionReference::compactGoalPositionReached(
 std::optional<HierarchicalVelocityTask> MotionReference::pathTask(
   const moveit::core::RobotState & state, const Eigen::VectorXd & position,
   const Eigen::VectorXd & waypoint, const double gain, const double speed,
-  const bool upright_roll_primary, double * measured_roll_error)
+  const bool upright_roll_primary, double * measured_roll_error,
+  const bool horizontal_edge_primary)
 {
   const auto joint_task = makeJointPathVelocityTask(position, waypoint, gain, speed);
   if (!joint_task) {
@@ -2715,9 +3032,20 @@ std::optional<HierarchicalVelocityTask> MotionReference::pathTask(
   TrackingVelocityTaskConfig config;
   config.orientation_gain = parameters_.orientation_gain;
   config.maximum_angular_reference_radps = parameters_.maximum_angular_reference_radps;
+  const Eigen::Isometry3d screen_pose = state.getGlobalLinkTransform(command_link_);
+  if (horizontal_edge_primary) {
+    const auto edge_task = makeHorizontalEdgePathTask(
+      screen_pose, jacobian, joint_task->primary_reference, config);
+    if (!edge_task) {
+      return std::nullopt;
+    }
+    if (measured_roll_error) {
+      *measured_roll_error = edge_task->edge_tilt_error_rad;
+    }
+    return edge_task->task;
+  }
   const auto roll_task = makeUprightRollPathTask(
-    state.getGlobalLinkTransform(command_link_), jacobian,
-    joint_task->primary_reference, config);
+    screen_pose, jacobian, joint_task->primary_reference, config);
   if (!roll_task) {
     return std::nullopt;
   }
@@ -2741,10 +3069,14 @@ std::optional<HierarchicalVelocityTask> MotionReference::compactTask(
         appendCompactEvent("path_started", time_sec, diagnostics_.compact_reason);
         compact_path_started_event_emitted_ = true;
       }
+      const auto path_reference = makeCompactPathVelocityReference(
+        position, path, follower_.lookaheadDistanceRad(), compact_speed_scale_);
+      if (!path_reference) {
+        return std::nullopt;
+      }
       return pathTask(
-        state, position, path.reference_position,
-        compact_path_settings_.gain,
-        compact_path_settings_.maximum_velocity_radps, false);
+        state, position, position + *path_reference / kCompactPathCrossTrackGain,
+        kCompactPathCrossTrackGain, compact_path_settings_.maximum_velocity_radps, false);
     }
     if (path.status == JointPathStatus::kArrived) {
       ++diagnostics_.paths_completed;
@@ -2884,7 +3216,7 @@ void MotionReference::consumeCompactPreparationResult(
     diagnostics_.tracking_phase = "FACE";
     diagnostics_.state = "FACE_COMPACT_PREPARING_WAITING_FOR_FRESH_STATE";
     diagnostics_.last_plan_message =
-      "compact candidate will be resubmitted after fresh actual and queue state";
+      "compact candidate awaits fresh actual and queue state";
     return;
   }
   if (plan.path.size() < 2U ||
@@ -3093,7 +3425,9 @@ void MotionReference::consumeCompactPreparationResult(
     reject_candidate("compact candidate attachment leaves no path to its goal");
     return;
   }
-  if (!pair_yaw_assessment_.valid || !pair_yaw_assessment_.exhausted) {
+  const PairYawResourceState pair_resource_state =
+    pairYawResourceState(pair_yaw_assessment_);
+  if (pair_resource_state == PairYawResourceState::kAvailable) {
     planner_->cancel();
     pending_generation_.reset();
     compact_preparation_.reset();
@@ -3105,6 +3439,12 @@ void MotionReference::consumeCompactPreparationResult(
     appendCompactEvent("preparation_cancelled", time_sec,
       "pair_yaw_resource_available_before_commit",
       pairYawAssessmentJson(pair_yaw_assessment_));
+    return;
+  }
+  if (pair_resource_state != PairYawResourceState::kExhausted) {
+    diagnostics_.compact_phase = "PREPARING";
+    diagnostics_.tracking_phase = "FACE";
+    diagnostics_.state = "FACE_COMPACT_PREPARING_WAIT";
     return;
   }
   if (!follower_.setPath(attached_path, command_queue_state->position, time_sec)) {
@@ -3291,16 +3631,7 @@ void MotionReference::updateFaceTargetIdentity(
 bool MotionReference::hasAvailablePairYawResource(
   const PairYawResourceAssessment & assessment) noexcept
 {
-  if (!assessment.valid) {
-    return false;
-  }
-  if (!assessment.demand_present || !assessment.pair_bound_candidate) {
-    return true;
-  }
-  return assessment.probe_valid && assessment.actual_probe_solved &&
-         !assessment.actual_probe_infeasible &&
-         std::isfinite(assessment.actual_available_yaw_rad) &&
-         assessment.actual_available_yaw_rad >= 0.80 * kPairYawProbeDisplacementRad;
+  return pairYawResourceState(assessment) == PairYawResourceState::kAvailable;
 }
 
 void MotionReference::updatePairYawResourceAndLimitHold(
@@ -3365,8 +3696,9 @@ bool MotionReference::handleCompactPreparation(
   const moveit::core::RobotState & state,
   const std::optional<msg::TrackingTarget> & target,
   const TargetMotionEstimate & target_motion,
-  const planning_scene::PlanningScene & scene, const double time_sec,
-  const std::uint64_t scene_revision, const Eigen::VectorXd & position,
+  const planning_scene::PlanningScene & scene,
+  const double time_sec, const std::uint64_t scene_revision,
+  const Eigen::VectorXd & position,
   const bool fresh_actual_state,
   const std::optional<JointMotionState> & actual_feedback,
   const std::optional<double> & actual_feedback_time_sec,
@@ -3407,7 +3739,9 @@ bool MotionReference::handleCompactPreparation(
     diagnostics_.compact_return_face_qualified = false;
   }
   bool preparation_cancelled = false;
-  if (!pair_yaw_assessment_.valid || !pair_yaw_assessment_.exhausted) {
+  const PairYawResourceState pair_resource_state =
+    pairYawResourceState(pair_yaw_assessment_);
+  if (pair_resource_state == PairYawResourceState::kAvailable) {
     planner_->cancel();
     pending_generation_.reset();
     compact_preparation_.reset();
@@ -3441,6 +3775,65 @@ bool MotionReference::handleCompactPreparation(
     }
   }
 
+  // FACE's armed guard is measured against the horizontal screen edge. Compact
+  // admission intentionally keeps its older gravity-roll, pitch and radius
+  // envelope. When yaw is exhausted, retain that old gravity-roll acquisition
+  // before the existing full-envelope compact planner admission.
+  if (!preparation_cancelled && upright_roll_guard_armed_ &&
+    pair_resource_state == PairYawResourceState::kExhausted)
+  {
+    const auto valid_joint_state = [this](const JointMotionState & joint_state) {
+        const auto expected = static_cast<Eigen::Index>(group_->getVariableCount());
+        return joint_state.position.size() == expected &&
+               joint_state.velocity.size() == expected &&
+               joint_state.acceleration.size() == expected &&
+               joint_state.position.allFinite() && joint_state.velocity.allFinite() &&
+               joint_state.acceleration.allFinite();
+      };
+    if (!fresh_actual_state || !actual_feedback || !command_queue_state ||
+      !valid_joint_state(*actual_feedback) || !valid_joint_state(*command_queue_state))
+    {
+      diagnostics_.compact_phase = "PREPARING_WAIT";
+      diagnostics_.state = "COMPACT_PREPARATION_ROLL_ENVELOPE_UNAVAILABLE";
+      diagnostics_.last_plan_message =
+        "compact gravity-roll admission unavailable for fresh actual/queue envelope";
+      result.motion_reference_support_unavailable = true;
+      static_cast<void>(appendFaceRollGuardConstraints(
+          state, command_queue_state, result));
+      return true;
+    }
+
+    const double compact_roll_cap =
+      compact_goal_.path_requirements.maximum_roll_error_rad +
+      kCompactPitchValidationToleranceRad;
+    double state_roll_error = std::numeric_limits<double>::infinity();
+    auto upright_recovery = pathTask(
+      state, position, position, 1.0, 0.01, true, &state_roll_error);
+    if (!upright_recovery || !std::isfinite(state_roll_error)) {
+      diagnostics_.compact_phase = "PREPARING_WAIT";
+      diagnostics_.state = "COMPACT_PREPARATION_ROLL_RECOVERY_UNAVAILABLE";
+      diagnostics_.last_plan_message =
+        "compact gravity-roll metric unavailable for current control pose";
+      result.motion_reference_support_unavailable = true;
+      static_cast<void>(appendFaceRollGuardConstraints(
+        state, command_queue_state, result));
+      return true;
+    }
+    if (std::abs(state_roll_error) > compact_roll_cap) {
+      diagnostics_.compact_phase = "UPRIGHT_START";
+      diagnostics_.tracking_phase = "FACE";
+      diagnostics_.state = "COMPACT_UPRIGHT_START";
+      result.task = std::move(upright_recovery);
+      static_cast<void>(appendFaceRollGuardConstraints(
+        state, command_queue_state, result));
+      return true;
+    }
+    // If the control pose is already inside the old compact cap, continue to
+    // the existing submission/consume path. Those paths recheck the complete
+    // actual, queue and active/latest-publication envelope before planning or
+    // adopting a compact path.
+  }
+
   if (!preparation_cancelled) {
     requestCompactManeuver(state, time_sec, scene, scene_revision,
       diagnostics_.compact_reason.empty() ? "pair_yaw_resource_exhausted" :
@@ -3448,7 +3841,11 @@ bool MotionReference::handleCompactPreparation(
       fresh_actual_state ? actual_feedback : std::nullopt,
       command_queue_state, active_publication, latest_publication);
   }
-  if (!preparation_cancelled && compact_preparation_ && pending_generation_) {
+  if (!preparation_cancelled &&
+    pair_resource_state == PairYawResourceState::kExhausted &&
+    compact_preparation_ && pending_generation_ && fresh_actual_state &&
+    actual_feedback && command_queue_state)
+  {
     if (auto plan = planner_->takeResult()) {
       consumeCompactPreparationResult(
         *plan, state, time_sec, scene, scene_revision, actual_feedback,
@@ -3464,9 +3861,15 @@ bool MotionReference::handleCompactPreparation(
       moveit::core::RobotState start(state);
       start.setJointGroupPositions(group_, actual_feedback->position);
       start.update(true);
-      submitCompactPreparationPlan(
+      const auto submit_outcome = submitCompactPreparationPlan(
         start, time_sec, scene_revision, actual_feedback, command_queue_state,
         active_publication, latest_publication);
+      if (submit_outcome == CompactPreparationSubmitOutcome::kEntryEnvelopeUnsafe) {
+        diagnostics_.state = "COMPACT_PREPARING_WAITING_FOR_ROLL_SAFE_ENVELOPE";
+        static_cast<void>(appendFaceRollGuardConstraints(
+            state, command_queue_state, result));
+        return true;
+      }
     }
     result.task = faceTask(state, *target, target_motion, result);
     result.actual_face_alignment = fresh_actual_state ?
@@ -3488,13 +3891,275 @@ bool MotionReference::handleCompactPreparation(
       diagnostics_.state = "FACE_COMPACT_PREPARATION_CANCELLED_PAIR_RESOURCE_RESTORED";
     } else if (!compact_preparation_) {
       diagnostics_.state = face_policy_.phase() == FaceTrackingPhase::kCompactManeuver ?
-        "FACE_PAIR_YAW_RESOURCE_EXHAUSTED" : "FACE_COMPACT_PREPARING_WAIT";
+        (pair_resource_state == PairYawResourceState::kExhausted ?
+        "FACE_PAIR_YAW_RESOURCE_EXHAUSTED" : "FACE_COMPACT_PREPARING_WAIT") :
+        "FACE_COMPACT_PREPARING_WAIT";
     } else if (!compact_preparation_->exhausted) {
       diagnostics_.state = pending_generation_ || planner_->isBusy() ?
         "FACE_COMPACT_PREPARING" : "FACE_COMPACT_PREPARING_WAIT";
     }
     return true;
   }
+  return false;
+}
+
+bool MotionReference::handleRestSearchMode(
+  const moveit::core::RobotState & state,
+  const std::optional<msg::TrackingTarget> & target,
+  const double time_sec, const std::uint64_t scene_revision,
+  const Eigen::VectorXd & position,
+  const bool settled, const bool fresh_actual_state,
+  const std::optional<JointMotionState> & actual_feedback,
+  const std::optional<JointMotionState> & command_queue_state,
+  MotionReferenceResult & result)
+{
+  if (target && (target->mode == msg::TrackingTarget::REST ||
+    target->mode == msg::TrackingTarget::SEARCH))
+  {
+    const RestMode requested = target->mode == msg::TrackingTarget::REST ? RestMode::kRest :
+      RestMode::kSearch;
+    if (rest_mode_ != requested ||
+      (requested == RestMode::kSearch && search_pattern_ != target->search_pattern))
+    {
+      planner_->cancel();
+      pending_generation_.reset();
+      follower_.reset();
+      rest_mode_ = requested;
+      rest_upright_start_active_ = false;
+      rest_completed_ = false;
+      rest_settling_ = false;
+      if (requested == RestMode::kSearch) {
+        search_pattern_ = target->search_pattern;
+        search_->start(position, search_positions_, limits_.lower_position +
+          limits_.position_margin, limits_.upper_position - limits_.position_margin,
+          search_base_index_, search_config_, search_pattern_ == "local_then_sweep", time_sec);
+      }
+    }
+    if (search_ && requested == RestMode::kSearch) {
+      search_->update(position, time_sec);
+      if (!search_->preparing()) {
+        result.task = pathTask(
+          state, position, search_->goal(), 2.0, search_config_.speed_rad_s, true);
+        result.follows_path = result.task.has_value();
+        diagnostics_.state = search_->phase();
+        return true;
+      }
+    }
+    if (requested == RestMode::kRest) {
+      if (!group_ || !command_link_) {
+        result.motion_reference_support_unavailable = true;
+        diagnostics_.state = "REST_UPRIGHT_START_UNAVAILABLE";
+        diagnostics_.tracking_phase = "REST";
+        return true;
+      }
+      moveit::core::RobotState acquisition_state(state);
+      acquisition_state.setJointGroupPositions(group_, position);
+      acquisition_state.update(true);
+      const Eigen::Matrix3d rotation =
+        acquisition_state.getGlobalLinkTransform(command_link_).linear();
+      if (!evaluateHorizontalEdgeUprightWithSineCap(rotation, kCompactEdgeSineLimit)) {
+        if (!rest_upright_start_active_) {
+          if (!fresh_actual_state || !actual_feedback || !command_queue_state ||
+            !motionSettled(*actual_feedback, command_queue_state))
+          {
+            result.motion_reference_support_unavailable = true;
+            diagnostics_.state = "REST_UPRIGHT_START_REQUIRES_SETTLED_STATE";
+            diagnostics_.tracking_phase = "REST";
+            return true;
+          }
+          rest_upright_start_active_ = true;
+        }
+        if (!group_ || !command_link_) {
+          result.motion_reference_support_unavailable = true;
+          diagnostics_.state = "REST_UPRIGHT_START_UNAVAILABLE";
+          diagnostics_.tracking_phase = "REST";
+          return true;
+        }
+        result.task = pathTask(
+          acquisition_state, position, position, 1.0, 0.01, true, nullptr, true);
+        if (!result.task) {
+          result.motion_reference_support_unavailable = true;
+          diagnostics_.state = "REST_UPRIGHT_START_UNAVAILABLE";
+          diagnostics_.tracking_phase = "REST";
+          return true;
+        }
+        diagnostics_.state = "REST_UPRIGHT_START";
+        diagnostics_.tracking_phase = "REST";
+        return true;
+      }
+      rest_upright_start_active_ = false;
+    }
+    const Eigen::VectorXd & goal = requested == RestMode::kSearch ?
+      search_->goal() : rest_positions_;
+    const auto append_rest_edge_guard = [&]() {
+        if (requested != RestMode::kRest) {
+          return true;
+        }
+        if (!command_queue_state) {
+          return false;
+        }
+        return appendUprightConstraints(state, *command_queue_state, result, false);
+      };
+    const auto valid_rest_edge_path = [&](const BackgroundPathResult & plan) {
+        if (plan.path.empty()) {
+          return false;
+        }
+        moveit::core::RobotState path_state(state);
+        for (const Eigen::VectorXd & waypoint : plan.path) {
+          if (waypoint.size() != static_cast<Eigen::Index>(group_->getVariableCount()) ||
+            !waypoint.allFinite())
+          {
+            return false;
+          }
+          path_state.setJointGroupPositions(group_, waypoint);
+          path_state.update(true);
+          const Eigen::Matrix3d rotation =
+            path_state.getGlobalLinkTransform(command_link_).linear();
+          if (!evaluateHorizontalEdgeUprightWithSineCap(rotation, kCompactEdgeSineLimit)) {
+            return false;
+          }
+        }
+        return true;
+      };
+    if (follower_.active()) {
+      const auto path = follower_.update(position, time_sec);
+      diagnostics_.path_progress_rad = path.progress_rad;
+      diagnostics_.path_distance_rad = path.distance_from_path_rad;
+      if (path.status == JointPathStatus::kTracking) {
+        result.task = pathTask(
+          state, position, path.reference_position, 3.0, 0.35, true, nullptr,
+          requested == RestMode::kRest);
+        if (requested == RestMode::kRest &&
+          (!result.task || !append_rest_edge_guard()))
+        {
+          result.task.reset();
+          result.motion_reference_support_unavailable = true;
+          diagnostics_.state = "REST_EDGE_GUARD_UNAVAILABLE";
+          return true;
+        }
+        result.follows_path = true;
+        diagnostics_.state = requested == RestMode::kSearch ? "SEARCH_PATH" : "REST_PATH";
+        return true;
+      }
+      follower_.reset();
+      if (path.status == JointPathStatus::kArrived) {
+        ++diagnostics_.paths_completed;
+        rest_settling_ = true;
+      } else if (requested == RestMode::kSearch) {
+        ++diagnostics_.paths_abandoned;
+        search_->retryFrom(position, time_sec);
+      }
+    }
+    const Eigen::VectorXd & arrival_position = fresh_actual_state ?
+      actual_feedback->position : position;
+    const double error = (arrival_position - goal).lpNorm<Eigen::Infinity>();
+    const bool actual_settled = fresh_actual_state ?
+      (actual_feedback->velocity.lpNorm<Eigen::Infinity>() < kSettledVelocityRadps &&
+      actual_feedback->acceleration.lpNorm<Eigen::Infinity>() < kSettledAccelerationRadps2) :
+      settled;
+    moveit::core::RobotState actual_edge_state(state);
+    if (fresh_actual_state) {
+      actual_edge_state.setJointGroupPositions(group_, actual_feedback->position);
+      actual_edge_state.update(true);
+    }
+    const auto current_edge_error = measureHorizontalEdgeTiltError(
+      actual_edge_state.getGlobalLinkTransform(command_link_));
+    const bool current_edge_inside = current_edge_error &&
+      std::abs(*current_edge_error) <= kCompactRollLimitRad &&
+      actual_edge_state.getGlobalLinkTransform(command_link_).linear()(2, 2) >= 0.0;
+    if (error < kRestArrivalRad && actual_settled &&
+      (requested != RestMode::kRest || (fresh_actual_state && current_edge_inside)))
+    {
+      if (requested == RestMode::kRest) {
+        rest_completed_ = true;
+        rest_settling_ = false;
+        upright_roll_guard_armed_ = false;
+        diagnostics_.upright_roll_guard_armed = false;
+      } else {
+        search_->prepared(position, time_sec);
+        rest_settling_ = false;
+        result.task = pathTask(state, position, search_->goal(), 2.0,
+          search_config_.speed_rad_s, true);
+        result.follows_path = result.task.has_value();
+      }
+      diagnostics_.state = requested == RestMode::kSearch ? search_->phase() : "REST_HOLD";
+      return true;
+    }
+    if (requested == RestMode::kRest && rest_completed_ && error > kRestReleaseRad) {
+      rest_completed_ = false;
+    }
+    if (requested == RestMode::kRest && rest_completed_ && !actual_settled) {
+      rest_settling_ = true;
+    }
+    if (requested == RestMode::kRest && rest_settling_) {
+      diagnostics_.state = "REST_SETTLING";
+      if (error >= kRestArrivalRad) {
+        result.task = pathTask(state, position, goal, 3.0, 0.10, true, nullptr, true);
+        result.follows_path = result.task.has_value();
+        if (!result.task || !append_rest_edge_guard()) {
+          result.task.reset();
+          result.motion_reference_support_unavailable = true;
+          diagnostics_.state = "REST_EDGE_GUARD_UNAVAILABLE";
+        }
+      }
+      return true;
+    }
+    if (requested == RestMode::kSearch && search_->preparing()) {
+      if (!pending_generation_ && !planner_->isBusy()) {
+        pending_generation_ = planner_->submit(state, goal, scene_revision);
+        ++diagnostics_.plans_requested;
+      }
+      if (auto plan = planner_->takeResult()) {
+        if (pending_generation_ && plan->generation == *pending_generation_) {
+          pending_generation_.reset();
+          if (plan->success && plan->scene_revision == scene_revision &&
+            follower_.setPath(plan->path, position, time_sec))
+          {
+            ++diagnostics_.plans_accepted;
+          } else {
+            ++diagnostics_.plans_rejected;
+            search_->retryFrom(position, time_sec);
+          }
+        }
+      }
+      diagnostics_.state = "SEARCH_PLANNING";
+      return true;
+    }
+    if (requested == RestMode::kRest && pending_generation_) {
+      if (auto plan = planner_->takeResult()) {
+        if (plan->generation == *pending_generation_) {
+          pending_generation_.reset();
+          diagnostics_.last_plan_message = plan->message;
+          if (plan->success && plan->scene_revision == scene_revision &&
+            valid_rest_edge_path(*plan) &&
+            follower_.setPath(plan->path, position, time_sec))
+          {
+            ++diagnostics_.plans_accepted;
+          } else {
+            ++diagnostics_.plans_rejected;
+            diagnostics_.last_plan_message = "REST path rejected: " + plan->message;
+          }
+        }
+      }
+    }
+    if (requested == RestMode::kRest && !rest_completed_ && !follower_.active() &&
+      !pending_generation_ && !planner_->isBusy())
+    {
+      pending_generation_ = planner_->submit(
+        state, goal, HorizontalEdgePathRequirement{
+          command_link_->getName(), kCompactEdgeSineLimit}, scene_revision);
+      ++diagnostics_.plans_requested;
+      diagnostics_.state = "REST_PLANNING";
+      return true;
+    }
+    if (requested == RestMode::kRest && !rest_completed_ && !follower_.active()) {
+      diagnostics_.state = "REST_PLANNING";
+      return true;
+    }
+    diagnostics_.state = "SEARCH_SETTLING";
+    return true;
+  }
+
   return false;
 }
 
@@ -3536,6 +4201,7 @@ MotionReferenceResult MotionReference::update(
     pending_generation_.reset();
     follower_.reset();
     rest_mode_ = RestMode::kNone;
+    rest_upright_start_active_ = false;
     rest_settling_ = false;
   }
   updateFaceTargetIdentity(target, time_sec);
@@ -3712,7 +4378,7 @@ MotionReferenceResult MotionReference::update(
     }
     double current_roll_error = std::numeric_limits<double>::infinity();
     auto upright_hold = pathTask(state, position, position, 1.0, 0.01, true,
-      &current_roll_error);
+      &current_roll_error, true);
     if (!upright_hold) {
       diagnostics_.state = "COMPACT_UPRIGHT_UNAVAILABLE";
       return result;
@@ -3823,139 +4489,10 @@ MotionReferenceResult MotionReference::update(
     diagnostics_.last_plan_message = "SEARCH rejected: search is disabled";
     return result;
   }
-  if (mode == msg::TrackingTarget::REST || mode == msg::TrackingTarget::SEARCH) {
-    const RestMode requested = mode == msg::TrackingTarget::REST ? RestMode::kRest :
-      RestMode::kSearch;
-    if (rest_mode_ != requested ||
-      (requested == RestMode::kSearch && search_pattern_ != target->search_pattern))
-    {
-      planner_->cancel();
-      pending_generation_.reset();
-      follower_.reset();
-      rest_mode_ = requested;
-      rest_completed_ = false;
-      rest_settling_ = false;
-      if (requested == RestMode::kSearch) {
-        search_pattern_ = target->search_pattern;
-        search_->start(position, search_positions_, limits_.lower_position +
-          limits_.position_margin, limits_.upper_position - limits_.position_margin,
-          search_base_index_, search_config_, search_pattern_ == "local_then_sweep", time_sec);
-      }
-    }
-    if (search_ && requested == RestMode::kSearch) {
-      search_->update(position, time_sec);
-      if (!search_->preparing()) {
-        result.task = pathTask(
-          state, position, search_->goal(), 2.0, search_config_.speed_rad_s, true);
-        result.follows_path = result.task.has_value();
-        diagnostics_.state = search_->phase();
-        return result;
-      }
-    }
-    const Eigen::VectorXd & goal = requested == RestMode::kSearch ?
-      search_->goal() : rest_positions_;
-    if (follower_.active()) {
-      const auto path = follower_.update(position, time_sec);
-      diagnostics_.path_progress_rad = path.progress_rad;
-      diagnostics_.path_distance_rad = path.distance_from_path_rad;
-      if (path.status == JointPathStatus::kTracking) {
-        result.task = pathTask(state, position, path.reference_position, 3.0, 0.35, true);
-        result.follows_path = true;
-        diagnostics_.state = requested == RestMode::kSearch ? "SEARCH_PATH" : "REST_PATH";
-        return result;
-      }
-      follower_.reset();
-      if (path.status == JointPathStatus::kArrived) {
-        ++diagnostics_.paths_completed;
-        rest_settling_ = true;
-      } else if (requested == RestMode::kSearch) {
-        ++diagnostics_.paths_abandoned;
-        search_->retryFrom(position, time_sec);
-      }
-    }
-    const double error = (position - goal).lpNorm<Eigen::Infinity>();
-    const bool actual_settled = actual_feedback ?
-      (actual_feedback->velocity.lpNorm<Eigen::Infinity>() < kSettledVelocityRadps &&
-      actual_feedback->acceleration.lpNorm<Eigen::Infinity>() < kSettledAccelerationRadps2) :
-      settled;
-    if (error < kRestArrivalRad && actual_settled) {
-      if (requested == RestMode::kRest) {
-        rest_completed_ = true;
-        rest_settling_ = false;
-      } else {
-        search_->prepared(position, time_sec);
-        rest_settling_ = false;
-        result.task = pathTask(state, position, search_->goal(), 2.0,
-          search_config_.speed_rad_s, true);
-        result.follows_path = result.task.has_value();
-      }
-      diagnostics_.state = requested == RestMode::kSearch ? search_->phase() : "REST_HOLD";
-      return result;
-    }
-    if (requested == RestMode::kRest && rest_completed_ && error > kRestReleaseRad) {
-      rest_completed_ = false;
-    }
-    if (requested == RestMode::kRest && rest_completed_ && !actual_settled) {
-      rest_settling_ = true;
-    }
-    if (requested == RestMode::kRest && rest_settling_) {
-      diagnostics_.state = "REST_SETTLING";
-      if (error >= kRestArrivalRad) {
-        result.task = pathTask(state, position, goal, 3.0, 0.10, true);
-        result.follows_path = result.task.has_value();
-      }
-      return result;
-    }
-    if (requested == RestMode::kSearch && search_->preparing()) {
-      if (!pending_generation_ && !planner_->isBusy()) {
-        pending_generation_ = planner_->submit(state, goal, scene_revision);
-        ++diagnostics_.plans_requested;
-      }
-      if (auto plan = planner_->takeResult()) {
-        if (pending_generation_ && plan->generation == *pending_generation_) {
-          pending_generation_.reset();
-          if (plan->success && plan->scene_revision == scene_revision &&
-            follower_.setPath(plan->path, position, time_sec))
-          {
-            ++diagnostics_.plans_accepted;
-          } else {
-            ++diagnostics_.plans_rejected;
-            search_->retryFrom(position, time_sec);
-          }
-        }
-      }
-      diagnostics_.state = "SEARCH_PLANNING";
-      return result;
-    }
-    if (requested == RestMode::kRest && pending_generation_) {
-      if (auto plan = planner_->takeResult()) {
-        if (plan->generation == *pending_generation_) {
-          pending_generation_.reset();
-          diagnostics_.last_plan_message = plan->message;
-          if (plan->success && plan->scene_revision == scene_revision &&
-            follower_.setPath(plan->path, position, time_sec))
-          {
-            ++diagnostics_.plans_accepted;
-          } else {
-            ++diagnostics_.plans_rejected;
-            diagnostics_.last_plan_message = "REST path rejected: " + plan->message;
-          }
-        }
-      }
-    }
-    if (requested == RestMode::kRest && !rest_completed_ && !follower_.active() &&
-      !pending_generation_ && !planner_->isBusy())
-    {
-      pending_generation_ = planner_->submit(state, goal, scene_revision);
-      ++diagnostics_.plans_requested;
-      diagnostics_.state = "REST_PLANNING";
-      return result;
-    }
-    if (requested == RestMode::kRest && !rest_completed_ && !follower_.active()) {
-      diagnostics_.state = "REST_PLANNING";
-      return result;
-    }
-    diagnostics_.state = "SEARCH_SETTLING";
+  if (handleRestSearchMode(
+      state, target, time_sec, scene_revision, position, settled,
+      fresh_actual_state, actual_feedback, command_queue_state, result))
+  {
     return result;
   }
 

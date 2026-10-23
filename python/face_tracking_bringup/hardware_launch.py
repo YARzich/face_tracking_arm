@@ -4,12 +4,15 @@
 """Assemble the configured robot and cameras through their ROS contracts."""
 
 from functools import partial
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, EmitEvent, OpaqueFunction, RegisterEventHandler
 from launch.actions import GroupAction, IncludeLaunchDescription
@@ -17,11 +20,15 @@ from launch.event_handlers import OnProcessExit, OnProcessStart, OnShutdown
 from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+
 from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node, SetRemap
 from launch_ros.descriptions import ComposableNode
+
 import yaml
 
 from .camera_controls import configure_controls
+from .execution_budget_profile import (
+    validate_active_hardware_profile)
 from .hardware_config import validate_config
 from .hardware_description import (
     control_parameters, load_yaml, perception_parameters, robot_parameters)
@@ -42,7 +49,83 @@ def guard(node, actions=()):
         target_action=node, on_exit=partial(exit_actions, actions=actions)))
 
 
-def _monitor_actions(config, probe_result, *, use_sim_time=False, after_ready=()):
+def build_artifact_manifest(config_path, share, model, controllers, profile,
+                            probe_result=None, effective_parameters=None):
+    """Hash runtime artifacts and retain redacted launch inputs for offline review."""
+    def digest_bytes(value):
+        return hashlib.sha256(value).hexdigest()
+
+    def digest_file(path):
+        try:
+            return digest_bytes(Path(path).read_bytes())
+        except OSError:
+            return None
+
+    def redact(value, key=''):
+        if isinstance(value, dict):
+            return {name: redact(item, str(name).lower()) for name, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [redact(item, key) for item in value]
+        if any(part in key for part in ('password', 'token', 'secret', 'credential', 'api_key')):
+            return '<redacted>'
+        if key in ('ip', 'robot_ip'):
+            return '<redacted>'
+        return value
+
+    descriptions = {
+        'expanded_urdf_sha256': digest_bytes(
+            model[0]['robot_description'].encode()),
+        'expanded_srdf_sha256': digest_bytes(
+            model[1]['robot_description_semantic'].encode()),
+        'effective_controllers_sha256': digest_bytes(
+            yaml.safe_dump(controllers, sort_keys=True).encode()),
+        'effective_parameters_sha256': {
+            name: digest_bytes(yaml.safe_dump(value, sort_keys=True).encode())
+            for name, value in (effective_parameters or {}).items()},
+        'hardware_config_sha256': digest_file(config_path),
+        'source_yaml_sha256': {
+            name: digest_file(Path(share) / name) for name in (
+                'config/moveit/servo.yaml',
+                'config/moveit/collision_aware_servo.yaml',
+                'config/moveit/kinematics.yaml',
+                'config/control/controllers.yaml',
+                'config/tracking.yaml')},
+    }
+    source_sha256 = os.environ.get('FACE_TRACKING_SOURCE_SHA256')
+    if (not source_sha256 or len(source_sha256) != 64
+            or any(character not in '0123456789abcdef' for character in source_sha256.lower())):
+        source_sha256 = None
+    effective_parameters = effective_parameters or {}
+    resolved_config = yaml.safe_dump(redact(yaml.safe_load(Path(config_path).read_text())),
+                                     sort_keys=True)
+    controllers_yaml = yaml.safe_dump(controllers, sort_keys=True)
+    effective_parameters_yaml = {
+        name: yaml.safe_dump(value, sort_keys=True)
+        for name, value in effective_parameters.items()}
+    return {
+        'schema': 1,
+        'robot_model': profile['model'],
+        'model_num': profile['model_num'],
+        'firmware_version': (probe_result or {}).get('firmware_version'),
+        'robot_serial': (probe_result or {}).get('serial_number'),
+        'source_tree_sha256': source_sha256,
+        'docker_image_id': os.environ.get('FACE_TRACKING_DOCKER_IMAGE_ID'),
+        'image_digest': None,
+        'image_digest_status': 'manifest_digest_unavailable',
+        'replay_inputs': {
+            'resolved_hardware_yaml_redacted': resolved_config,
+            'expanded_urdf': model[0]['robot_description'],
+            'expanded_srdf': model[1]['robot_description_semantic'],
+            'effective_controllers_yaml': controllers_yaml,
+            'effective_parameters_yaml': effective_parameters_yaml,
+        },
+        'artifacts': descriptions,
+    }
+
+
+def _monitor_actions(config, probe_result, *, artifact_manifest=None,
+                     servo_execution_context_topic='/servo_node/execution_context',
+                     use_sim_time=False, after_ready=()):
     """Arm the read-only hardware monitor and gate downstream control on readiness."""
     profile = get_robot_profile(config['robot']['model'], config['robot']['model_num'])
     namespace = 'xarm' if profile['model'] == 'xarm6' else 'ufactory'
@@ -57,7 +140,15 @@ def _monitor_actions(config, probe_result, *, use_sim_time=False, after_ready=()
         parameters=[{'robot_ip': config['robot']['ip'], 'expected_mode': 1,
                      'robot_state_topic': f'/{namespace}/robot_states',
                      'set_state_service': f'/{namespace}/set_state',
+                     'hardware_inhibit_service': f'/{namespace}/_inhibit_servoj',
+                     'servo_execution_context_topic': servo_execution_context_topic,
+                     'face_transform_provenance_topic':
+                         '/tracking/face_transform_provenance',
+                     'servo_trajectory_publications_topic':
+                         '/servo_node/trajectory_publications',
                      'preflight_snapshot_json': json.dumps(snapshot),
+                     'artifact_manifest_json': json.dumps(
+                         artifact_manifest or {}, sort_keys=True),
                      'sdk_request_timeout_sec': .5,
                      'sdk_state_timeout_sec': .75,
                      'sdk_poll_period_sec': .5,
@@ -108,6 +199,8 @@ def camera_actions(config, mode, driver_only):
         params = {
             'camera_namespace': settings['camera_namespace'], 'camera_name': name,
             'serial_no': settings['serial_no'],
+            # Do not inherit the driver's external YAML config_file launch arg.
+            'config_file': '',
             'rgb_camera.color_profile': settings['color_profile'],
             'depth_module.depth_profile': settings['depth_profile'],
             'enable_color': True, 'enable_depth': True, 'enable_sync': True,
@@ -159,6 +252,44 @@ def robot_actions(config, mode, share, config_path, directory, mock, probe_resul
         api_config = str(Path(get_package_share_directory('xarm_api')) / 'config/xarm_params.yaml')
     model, limits = robot_parameters(config, mode, share, config_path, mock, probe_result)
     servo, motion, tracking, controllers = control_parameters(config, share, limits, mode)
+    profile = get_robot_profile(config['robot']['model'], config['robot']['model_num'])
+    if not mock:
+        profile = probe_result['profile']
+        budget, fingerprint, controller_mode = validate_active_hardware_profile(
+            config, probe_result, profile, servo, motion, controllers,
+            model[0]['robot_description'], model[1]['robot_description_semantic'])
+        motion.update(
+            hardware_execution_budget_source=2,
+            hardware_execution_budget_profile_id=budget['profile_id'],
+            hardware_execution_budget_robot_model=budget['robot_model'],
+            hardware_execution_budget_model_num=budget['model_num'],
+            hardware_execution_budget_firmware=budget['firmware_version'],
+            hardware_execution_budget_controller_mode=budget['controller_mode'],
+            hardware_execution_budget_conditions_fingerprint=fingerprint,
+            hardware_execution_budget_evidence_reference=budget['evidence_reference'],
+            hardware_execution_budget_reduced_mode_known=True,
+            hardware_execution_budget_reduced_mode=budget['reduced_mode'],
+            hardware_execution_error_bound_rad=budget['execution_error_bound_rad'],
+            hardware_reaction_threshold_rad=budget['reaction_threshold_rad'],
+            hardware_post_threshold_growth_rad=budget['post_threshold_growth_rad'],
+            hardware_execution_expected_profile_id=budget['profile_id'],
+            hardware_execution_expected_robot_model=probe_result['profile']['model'],
+            hardware_execution_expected_model_num=probe_result['profile']['model_num'],
+            hardware_execution_expected_firmware=probe_result['firmware_version'],
+            hardware_execution_expected_controller_mode=controller_mode,
+            hardware_execution_expected_conditions_fingerprint=fingerprint,
+            hardware_execution_expected_reduced_mode=probe_result['reduced_mode'])
+    hw_namespace = 'xarm' if profile['model'] == 'xarm6' else 'ufactory'
+    motion.update(
+        require_hardware_io_status=not mock,
+        hardware_io_status_topic=f'/{hw_namespace}/hardware_io_status',
+        hardware_inhibit_service=f'/{hw_namespace}/_inhibit_servoj',
+        servo_execution_context_topic='/servo_node/execution_context')
+    if not mock:
+        motion['hardware_factory_position_limits_rad'] = [
+            value for pair in profile['position_limits_rad'] for value in pair]
+        motion['hardware_position_limits_rad'] = [
+            value for pair in probe_result['effective_position_limits_rad'] for value in pair]
     controllers_path = Path(directory.name) / 'controllers.yaml'
     controllers_path.write_text(yaml.safe_dump(controllers))
     state = Node(package='robot_state_publisher', executable='robot_state_publisher',
@@ -191,8 +322,12 @@ def robot_actions(config, mode, share, config_path, directory, mock, probe_resul
         extra_arguments=[{'use_intra_process_comms': True}])
     load = LoadComposableNodes(target_container=container,
                                composable_node_descriptions=[tracker, executor])
+    artifact_manifest = build_artifact_manifest(
+        config_path, share, model, controllers, profile, probe_result,
+        {'servo': servo, 'motion': motion, 'tracking': tracking})
     activation = ([load] if mock else _monitor_actions(
-        config, probe_result, after_ready=[load]))
+        config, probe_result, artifact_manifest=artifact_manifest,
+        servo_execution_context_topic='/servo_node/execution_context', after_ready=[load]))
     return [guard(state), guard(manager), guard(container),
             guard(spawners[0], [spawners[1]]), guard(spawners[1], activation),
             state, manager, container, spawners[0]]

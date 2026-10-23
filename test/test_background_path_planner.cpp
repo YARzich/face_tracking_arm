@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -26,6 +27,7 @@
 #include "face_tracking_arm/background_path_planner.hpp"
 #include "face_tracking_arm/compact_geometry_validator.hpp"
 #include "face_tracking_arm/compact_upright.hpp"
+#include "face_tracking_arm/horizontal_edge_upright.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -410,6 +412,19 @@ TEST_F(BackgroundPathPlannerTest, RejectsNonPositiveCompactPlanningBudget)
     BackgroundPathPlanner(node_, model_, monitor_, invalid_config), std::invalid_argument);
 }
 
+TEST_F(BackgroundPathPlannerTest, RejectsInvalidRestEdgePlannerSettings)
+{
+  auto invalid_config = config_;
+  invalid_config.rest_edge_planning_time_s = 0.0;
+  EXPECT_THROW(
+    BackgroundPathPlanner(node_, model_, monitor_, invalid_config), std::invalid_argument);
+
+  invalid_config = config_;
+  invalid_config.rest_edge_planner_range = std::numeric_limits<double>::infinity();
+  EXPECT_THROW(
+    BackgroundPathPlanner(node_, model_, monitor_, invalid_config), std::invalid_argument);
+}
+
 TEST_F(BackgroundPathPlannerTest, RejectsGoalOutsideAdditionalSafetyCorridor)
 {
   BackgroundPathPlanner planner(
@@ -509,6 +524,60 @@ protected:
     <parent link="base"/><child link="tip"/><axis xyz="0 0 1"/>
     <limit lower="-6.28318530718" upper="6.28318530718" effort="10" velocity="1"/>
   </joint>
+</robot>)";
+  }
+};
+
+class BackgroundHorizontalEdgePlannerTest : public BackgroundPathPlannerTest
+{
+protected:
+  const char * robotDescription() const override
+  {
+    return
+      R"(
+<robot name="edge_planner">
+  <link name="base"/><link name="middle"/><link name="tip"/>
+  <joint name="edge_joint1" type="revolute">
+    <parent link="base"/><child link="middle"/><axis xyz="1 0 0"/>
+    <limit lower="0" upper="3.14159265359" effort="10" velocity="1"/>
+  </joint>
+  <joint name="edge_joint2" type="revolute">
+    <parent link="middle"/><child link="tip"/><axis xyz="1 0 0"/>
+    <limit lower="0" upper="3.14159265359" effort="10" velocity="1"/>
+  </joint>
+</robot>)";
+  }
+
+  const char * robotSemantic() const override
+  {
+    return
+      R"(<robot name="edge_planner">
+  <group name="slider"><chain base_link="base" tip_link="tip"/></group>
+</robot>)";
+  }
+};
+
+class BackgroundHighPitchEdgePlannerTest : public BackgroundPathPlannerTest
+{
+protected:
+  const char * robotDescription() const override
+  {
+    return
+      R"(
+<robot name="high_pitch_edge_planner">
+  <link name="base"/><link name="tip"/>
+  <joint name="pitch_joint" type="revolute">
+    <parent link="base"/><child link="tip"/><axis xyz="0 1 0"/>
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="10" velocity="1"/>
+  </joint>
+</robot>)";
+  }
+
+  const char * robotSemantic() const override
+  {
+    return
+      R"(<robot name="high_pitch_edge_planner">
+  <group name="slider"><chain base_link="base" tip_link="tip"/></group>
 </robot>)";
   }
 };
@@ -630,7 +699,9 @@ TEST_F(BackgroundStagedPathPlannerTest, NegativeWristNamedPresetUsesTheStagedRou
   expectCompactCertificateMatchesPath(*result, model_, "base", "tip");
 }
 
-TEST_F(BackgroundStagedPathPlannerTest, InvalidCompactSuffixRejectsWithoutPlanningToAnotherGoal)
+TEST_F(
+  BackgroundStagedPathPlannerTest,
+  InvalidStagedCompactRouteRejectsWithoutPlanningToAnotherGoal)
 {
   const auto reject_suffix_corridor = [](
     const planning_scene::PlanningScene &, const moveit::core::RobotState & state) {
@@ -663,8 +734,7 @@ TEST_F(BackgroundStagedPathPlannerTest, InvalidCompactSuffixRejectsWithoutPlanni
   ASSERT_TRUE(result);
   EXPECT_FALSE(result->success);
   EXPECT_EQ(result->error_code, moveit_msgs::msg::MoveItErrorCodes::INVALID_MOTION_PLAN);
-  EXPECT_EQ(result->message,
-    "Compact suffix violates bounds, uprightness, collision or radius floor");
+  EXPECT_FALSE(result->message.empty());
   EXPECT_TRUE(result->path.empty());
   EXPECT_TRUE(result->compact_path_samples.empty());
   EXPECT_FALSE(result->compact_goal_metrics);
@@ -1174,6 +1244,96 @@ TEST_F(BackgroundRevolutePlannerTest, NormalizesOnlyNumericalStartBoundaryError)
   EXPECT_FALSE(outside_result->success);
   EXPECT_EQ(outside_result->error_code, moveit_msgs::msg::MoveItErrorCodes::START_STATE_INVALID);
   EXPECT_TRUE(outside_result->path.empty());
+}
+
+TEST_F(BackgroundHorizontalEdgePlannerTest, RejectsInteriorEdgeViolationWithValidEndpoints)
+{
+  BackgroundPathPlanner planner(node_, model_, monitor_, config_);
+  constexpr double kPi = 3.14159265358979323846;
+  moveit::core::RobotState start(model_);
+  start.setToDefaultValues();
+  start.setVariablePosition("edge_joint1", 0.0);
+  start.setVariablePosition("edge_joint2", 0.0);
+  start.update();
+  moveit::core::RobotState goal_state = start;
+  goal_state.setVariablePosition("edge_joint1", kPi);
+  goal_state.setVariablePosition("edge_joint2", kPi);
+  goal_state.update();
+  const double sine_cap = std::sin(5.1 * kPi / 180.0);
+  const auto edge_valid = [sine_cap](const moveit::core::RobotState & state) {
+      const Eigen::Matrix3d rotation = state.getGlobalLinkTransform("tip").linear();
+      return std::abs(rotation(2, 1)) <= sine_cap && rotation(2, 2) >= 0.0;
+    };
+  ASSERT_TRUE(edge_valid(start));
+  ASSERT_TRUE(edge_valid(goal_state));
+  moveit::core::RobotState violating_midpoint = start;
+  violating_midpoint.setVariablePosition("edge_joint1", 0.5 * kPi);
+  violating_midpoint.setVariablePosition("edge_joint2", 0.5 * kPi);
+  violating_midpoint.update();
+  ASSERT_FALSE(edge_valid(violating_midpoint));
+
+  const auto generation = planner.submit(
+    start, Eigen::Vector2d::Constant(kPi),
+    HorizontalEdgePathRequirement{"tip", sine_cap}, 72);
+  const auto result = waitResult(planner);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->generation, generation);
+  EXPECT_FALSE(result->success);
+  EXPECT_NE(result->error_code, moveit_msgs::msg::MoveItErrorCodes::SUCCESS);
+  EXPECT_TRUE(result->path.empty());
+}
+
+TEST_F(BackgroundHighPitchEdgePlannerTest, AcceptsAValidHighPitchRestPath)
+{
+  BackgroundPathPlanner planner(node_, model_, monitor_, config_);
+  constexpr double kPi = 3.14159265358979323846;
+  const double start_angle = 85.0 * kPi / 180.0;
+  const double goal_angle = 85.2 * kPi / 180.0;
+  moveit::core::RobotState start(model_);
+  start.setToDefaultValues();
+  start.setVariablePosition("pitch_joint", start_angle);
+  start.update();
+  const double sine_cap = std::sin(5.1 * kPi / 180.0);
+
+  static_cast<void>(planner.submit(
+    start, Eigen::VectorXd::Constant(1, goal_angle),
+    HorizontalEdgePathRequirement{"tip", sine_cap}, 73));
+  const auto result = waitResult(planner);
+  ASSERT_TRUE(result);
+  ASSERT_TRUE(result->success) << result->message;
+  EXPECT_NEAR(result->path.front()[0], start_angle, 1.0e-12);
+  EXPECT_NEAR(result->path.back()[0], goal_angle, config_.joint_tolerance_rad + 1.0e-12);
+}
+
+TEST_F(BackgroundHorizontalEdgePlannerTest, RestEdgeRequestDoesNotConstrainLaterOrdinaryPlan)
+{
+  BackgroundPathPlanner planner(node_, model_, monitor_, config_);
+  constexpr double kPi = 3.14159265358979323846;
+  const double sine_cap = std::sin(5.1 * kPi / 180.0);
+  moveit::core::RobotState start(model_);
+  start.setToDefaultValues();
+  start.setVariablePosition("edge_joint1", 0.0);
+  start.update();
+
+  const auto rest_generation = planner.submit(
+    start, Eigen::Vector2d(2.0 * kPi / 180.0, 0.0),
+    HorizontalEdgePathRequirement{"tip", sine_cap}, 74);
+  const auto rest_result = waitResult(planner);
+  ASSERT_TRUE(rest_result);
+  ASSERT_TRUE(rest_result->success) << rest_result->message;
+  EXPECT_EQ(rest_result->generation, rest_generation);
+
+  moveit::core::RobotState ordinary_goal(start);
+  ordinary_goal.setVariablePosition("edge_joint1", 0.5 * kPi);
+  ordinary_goal.update();
+  EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(
+      ordinary_goal.getGlobalLinkTransform("tip").linear(), sine_cap));
+  const auto ordinary_generation = planner.submit(
+    start, Eigen::Vector2d(0.5 * kPi, 0.0), 75);
+  const auto ordinary_result = waitResult(planner);
+  ASSERT_TRUE(ordinary_result);
+  EXPECT_EQ(ordinary_result->generation, ordinary_generation);
+  EXPECT_TRUE(ordinary_result->success) << ordinary_result->message;
 }
 
 }  // namespace

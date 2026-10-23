@@ -29,14 +29,12 @@ namespace
 [[nodiscard]] bool validConfig(const EmergencyBrakeTailConfig & config)
 {
   return std::isfinite(config.period_sec) && config.period_sec > 0.0 &&
-         config.maximum_braking_steps > 0U && config.terminal_hold_points >= 2U &&
-         std::isfinite(config.comparison_tolerance) &&
-         config.comparison_tolerance > 0.0;
+         config.maximum_braking_steps > 0U && config.terminal_hold_points >= 2U;
 }
 
 [[nodiscard]] bool validInput(
   const JointMotionState & state, const JointMotionLimits & limits,
-  const double tolerance, std::string & failure_reason)
+  std::string & failure_reason)
 {
   const Eigen::Index joint_count = state.position.size();
   if (joint_count <= 0 || state.velocity.size() != joint_count ||
@@ -49,6 +47,10 @@ namespace
     limits.max_jerk.size() != joint_count)
   {
     failure_reason = "motion state and limit dimensions do not match";
+    return false;
+  }
+  if (!limits.numerical_policy.has_value() || !limits.numerical_policy->valid()) {
+    failure_reason = "joint numerical policy is missing or invalid";
     return false;
   }
   if (!finite(state.position) || !finite(state.velocity) ||
@@ -74,15 +76,16 @@ namespace
       failure_reason = "joint motion limits are invalid";
       return false;
     }
-    if (state.position[index] < safe_lower - tolerance ||
-      state.position[index] > safe_upper + tolerance)
-    {
-      failure_reason = "branch position is outside the safe joint interval";
+    if (!PositionInterval{safe_lower, safe_upper}.contains(state.position[index])) {
+      failure_reason = "branch position is outside the nominal safe joint interval";
       return false;
     }
-    if (std::abs(state.velocity[index]) > limits.max_velocity[index] + tolerance ||
-      std::abs(state.acceleration[index]) >
-      limits.max_acceleration[index] + tolerance)
+    if (classifyVelocity(RadiansPerSecond{state.velocity[index]},
+        RadiansPerSecond{limits.max_velocity[index]},
+        limits.numerical_policy->velocity_error) == BoundaryClass::kOutside ||
+      classifyAcceleration(RadiansPerSecondSquared{state.acceleration[index]},
+        RadiansPerSecondSquared{limits.max_acceleration[index]},
+        limits.numerical_policy->acceleration_error) == BoundaryClass::kOutside)
     {
       failure_reason = "branch velocity or acceleration exceeds its joint limit";
       return false;
@@ -111,9 +114,7 @@ EmergencyBrakeTail EmergencyBrakeTailGenerator::generate(
   const JointMotionState & branch_state, const JointMotionLimits & limits) const
 {
   EmergencyBrakeTail result;
-  if (!validInput(
-      branch_state, limits, config_.comparison_tolerance, result.failure_reason))
-  {
+  if (!validInput(branch_state, limits, result.failure_reason)) {
     return result;
   }
 
@@ -123,7 +124,7 @@ EmergencyBrakeTail EmergencyBrakeTailGenerator::generate(
   for (Eigen::Index index = 0; index < branch_state.position.size(); ++index) {
     detail::ScalarBrakingOptions options;
     options.period_sec = config_.period_sec;
-    options.comparison_tolerance = config_.comparison_tolerance;
+    options.numerical_policy = *limits.numerical_policy;
     options.maximum_braking_steps = config_.maximum_braking_steps;
     const detail::ScalarBrakingRollout rollout = detail::rolloutScalarBraking(
       detail::ScalarBrakingState{
@@ -150,8 +151,9 @@ EmergencyBrakeTail EmergencyBrakeTailGenerator::generate(
       limits.lower_position[index];
     const double safe_upper =
       limits.upper_position[index];
-    if (rollout.minimum_position < safe_lower - config_.comparison_tolerance ||
-      rollout.maximum_position > safe_upper + config_.comparison_tolerance)
+    const PositionInterval safe_interval{safe_lower, safe_upper};
+    if (!safe_interval.contains(rollout.minimum_position) ||
+      !safe_interval.contains(rollout.maximum_position))
     {
       result.status = EmergencyBrakeTailStatus::kInfeasible;
       result.failure_reason =

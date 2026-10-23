@@ -56,6 +56,12 @@ struct CompactPathReferenceSettings
   double maximum_velocity_radps{0.0};
 };
 
+/// Build the compact PATH velocity reference from measured path progress and
+/// lookahead, before the existing maximum-velocity cap is applied.
+[[nodiscard]] std::optional<Eigen::VectorXd> makeCompactPathVelocityReference(
+  const Eigen::VectorXd & current_position, const JointPathUpdate & path,
+  double lookahead_distance_rad, double speed_scale);
+
 /// Apply one positive scale to the existing compact path gain and speed cap.
 [[nodiscard]] CompactPathReferenceSettings scaleCompactPathReference(
   double gain, double maximum_velocity_radps, double speed_scale);
@@ -157,6 +163,9 @@ public:
   [[nodiscard]] bool validateCommandPosition(
     const moveit::core::RobotState & state, const Eigen::VectorXd & position,
     std::string * violation = nullptr) const;
+  [[nodiscard]] bool validateCommandTransition(
+    const moveit::core::RobotState & state, const Eigen::VectorXd & previous_position,
+    const Eigen::VectorXd & position, std::string * violation = nullptr) const;
   [[nodiscard]] bool validateCompactPathPosition(
     const moveit::core::RobotState & state, const Eigen::VectorXd & position,
     std::string * violation = nullptr) const;
@@ -175,6 +184,14 @@ private:
     kNone,
     kRest,
     kSearch
+  };
+
+  enum class CompactPreparationSubmitOutcome
+  {
+    kNotSubmitted,
+    kEntryEnvelopeUnsafe,
+    kCandidateRejected,
+    kSubmitted
   };
 
   static constexpr std::size_t kCompactEventCapacity{64U};
@@ -208,8 +225,9 @@ private:
     const moveit::core::RobotState & state,
     const std::optional<msg::TrackingTarget> & target,
     const TargetMotionEstimate & target_motion,
-    const planning_scene::PlanningScene & scene, double time_sec,
-    std::uint64_t scene_revision, const Eigen::VectorXd & position,
+    const planning_scene::PlanningScene & scene,
+    double time_sec, std::uint64_t scene_revision,
+    const Eigen::VectorXd & position,
     bool fresh_actual_state,
     const std::optional<JointMotionState> & actual_feedback,
     const std::optional<double> & actual_feedback_time_sec,
@@ -217,12 +235,21 @@ private:
     const PublishedTrajectoryRecord * active_publication,
     const PublishedTrajectoryRecord * latest_publication,
     MotionReferenceResult & result);
+  [[nodiscard]] bool handleRestSearchMode(
+    const moveit::core::RobotState & state,
+    const std::optional<msg::TrackingTarget> & target,
+    double time_sec, std::uint64_t scene_revision,
+    const Eigen::VectorXd & position,
+    bool settled, bool fresh_actual_state,
+    const std::optional<JointMotionState> & actual_feedback,
+    const std::optional<JointMotionState> & command_queue_state,
+    MotionReferenceResult & result);
   void updateFaceTargetIdentity(
     const std::optional<msg::TrackingTarget> & target, double time_sec);
   void submitCompactPlan(
     const moveit::core::RobotState & state, std::uint64_t scene_revision,
     double time_sec);
-  void submitCompactPreparationPlan(
+  [[nodiscard]] CompactPreparationSubmitOutcome submitCompactPreparationPlan(
     const moveit::core::RobotState & state, double time_sec,
     std::uint64_t scene_revision,
     const std::optional<JointMotionState> & actual_feedback,
@@ -315,7 +342,8 @@ private:
   [[nodiscard]] std::optional<HierarchicalVelocityTask> pathTask(
     const moveit::core::RobotState & state, const Eigen::VectorXd & position,
     const Eigen::VectorXd & waypoint, double gain, double speed,
-    bool upright_roll_primary, double * measured_roll_error = nullptr);
+    bool upright_roll_primary, double * measured_roll_error = nullptr,
+    bool horizontal_edge_primary = false);
   [[nodiscard]] Eigen::VectorXd groupPosition(
     const moveit::core::RobotState & state) const;
   void updateBaseHandoff(
@@ -340,6 +368,8 @@ private:
     const TargetMotionEstimate & target_motion,
     const std::optional<JointMotionState> & actual_feedback,
     const std::optional<JointMotionState> & command_queue_state) const;
+  [[nodiscard]] static std::optional<Eigen::Vector2d> pairYawProbeEdgeDeltaInterval(
+    double initial_edge_sine) noexcept;
   [[nodiscard]] std::optional<HierarchicalVelocityTask> faceReturnTask(
     const moveit::core::RobotState & state, const msg::TrackingTarget & target,
     const TargetMotionEstimate & target_motion, MotionReferenceResult & result,
@@ -377,6 +407,7 @@ private:
   BaseJointHandoffPolicy base_handoff_policy_;
   MotionReferenceDiagnostics diagnostics_;
   RestMode rest_mode_{RestMode::kNone};
+  bool rest_upright_start_active_{false};
   std::optional<std::uint64_t> pending_generation_;
   std::optional<std::uint64_t> active_scene_revision_;
   PairYawResourceAssessment pair_yaw_assessment_;

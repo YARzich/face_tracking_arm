@@ -274,6 +274,16 @@ PublicationMatch PublishedTrajectoryHistory::match(
   return result;
 }
 
+std::optional<ExpectedPositionState> PublishedTrajectoryHistory::expectedAt(
+  const PublicationId id, const rclcpp::Time & sample_time) const
+{
+  const auto * record = find(id);
+  if (record == nullptr) {
+    return std::nullopt;
+  }
+  return expectedStateAt(*record, sample_time, true);
+}
+
 std::optional<ExpectedPositionState> PublishedTrajectoryHistory::expectedStateAt(
   const PublishedTrajectoryRecord & record, const rclcpp::Time & sample_time,
   const bool allow_terminal_extrapolation)

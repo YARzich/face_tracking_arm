@@ -216,6 +216,28 @@ std::optional<TrackingGeometry> computeTrackingGeometry(
 
 }  // namespace
 
+std::optional<HierarchicalVelocityTask> makeFaceEdgeOnlyRecoveryTask(
+  const HierarchicalVelocityTask & face_task, const bool has_face_primary_roll)
+{
+  const Eigen::Index joints = face_task.primary_matrix.cols();
+  if (!has_face_primary_roll || joints <= 0 || face_task.primary_matrix.rows() != 3 ||
+    face_task.primary_reference.size() != 3 || face_task.primary_weights.size() != 3 ||
+    !face_task.primary_matrix.allFinite() || !face_task.primary_reference.allFinite() ||
+    !face_task.primary_weights.allFinite() || (face_task.primary_weights.array() <= 0.0).any())
+  {
+    return std::nullopt;
+  }
+
+  HierarchicalVelocityTask recovery;
+  recovery.primary_matrix = face_task.primary_matrix.row(2);
+  recovery.primary_reference = Eigen::VectorXd::Constant(1, face_task.primary_reference[2]);
+  recovery.primary_weights = Eigen::VectorXd::Constant(1, face_task.primary_weights[2]);
+  recovery.secondary_matrix = Eigen::MatrixXd::Identity(joints, joints);
+  recovery.secondary_reference = Eigen::VectorXd::Zero(joints);
+  recovery.secondary_weights = Eigen::VectorXd::Ones(joints);
+  return recovery;
+}
+
 std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
   const Eigen::Isometry3d & current,
   const Eigen::MatrixXd & jacobian,
@@ -245,7 +267,7 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
 
   const TrackingGeometry * primary_geometry = &*screen_geometry;
   std::optional<TrackingGeometry> gaze_geometry;
-  std::optional<UprightRollPathTaskResult> screen_upright_roll;
+  std::optional<HorizontalEdgePathTaskResult> screen_horizontal_edge;
   if (use_gaze_primary) {
     if (gaze->jacobian.cols() != jacobian.cols()) {
       return std::nullopt;
@@ -258,9 +280,12 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
     }
     primary_geometry = &*gaze_geometry;
   }
-  if (face_position) {
-    screen_upright_roll = makeUprightRollPathTask(
+  if (face_position && config.horizontal_edge_primary) {
+    screen_horizontal_edge = makeHorizontalEdgePathTask(
       current, jacobian, Eigen::VectorXd::Zero(jacobian.cols()), config);
+    if (!screen_horizontal_edge) {
+      return std::nullopt;
+    }
   }
 
   const Eigen::Vector3d position_error = target_position - current.translation();
@@ -268,22 +293,20 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
   TrackingVelocityTaskResult result;
   result.position_error_m = position_error.norm();
   result.pointing_error_rad = primary_geometry->pointing_error_rad;
-  result.roll_error_rad = face_position && screen_upright_roll ?
-    std::abs(screen_upright_roll->roll_error_rad) :
+  result.roll_error_rad = face_position && screen_horizontal_edge ?
+    std::abs(screen_horizontal_edge->edge_tilt_error_rad) :
     std::abs(screen_geometry->signed_roll_error);
   result.signed_face_primary_error_rad = primary_geometry->signed_primary_error;
   result.face_primary_feedforward_radps = primary_geometry->primary_feedforward;
   result.has_face_primary_roll = face_position.has_value();
   if (face_position) {
-    if (screen_upright_roll) {
-      result.signed_face_primary_error_rad[2] = screen_upright_roll->roll_error_rad;
-      // PATH's gravity-upright roll row accounts for the projected-up frame
-      // motion as the normal changes, so it has no separate target-only term.
+    if (screen_horizontal_edge) {
+      result.signed_face_primary_error_rad[2] = screen_horizontal_edge->edge_tilt_error_rad;
+      // The edge-height task depends only on the current screen rotation.
       result.face_primary_feedforward_radps[2] = 0.0;
     } else {
-      // Near the upright-roll pole, retain the old authority-faded face-ray
-      // residual so ordinary FACE remains finite without claiming a gravity
-      // roll measurement exists there.
+      // Keep the existing finite face-ray fallback when the edge task is not
+      // defined; the fallback is not treated as a valid edge-upright measure.
       result.signed_face_primary_error_rad[2] = screen_geometry->signed_roll_error;
       result.face_primary_feedforward_radps[2] =
         screen_geometry->primary_feedforward[2];
@@ -303,16 +326,17 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
   if (face_position) {
     result.task.primary_matrix.resize(3, jacobian.cols());
     result.task.primary_matrix.topRows(2) = primary_geometry->primary_matrix.topRows(2);
-    if (screen_upright_roll) {
-      result.task.primary_matrix.row(2) = screen_upright_roll->task.primary_matrix.row(0);
+    if (screen_horizontal_edge) {
+      result.task.primary_matrix.row(2) =
+        screen_horizontal_edge->task.primary_matrix.row(0);
     } else {
       result.task.primary_matrix.row(2) = screen_geometry->roll_authority *
         screen_geometry->normal.transpose() * screen_geometry->relative_angular_jacobian;
     }
     result.task.primary_reference.resize(3);
     result.task.primary_reference.head<2>() = primary_geometry->primary_reference.head<2>();
-    result.task.primary_reference[2] = screen_upright_roll ?
-      screen_upright_roll->task.primary_reference[0] : screen_geometry->roll_reference;
+    result.task.primary_reference[2] = screen_horizontal_edge ?
+      screen_horizontal_edge->task.primary_reference[0] : screen_geometry->roll_reference;
     result.task.primary_weights = Eigen::Vector3d(1.0, 1.0, config.roll_weight);
     result.task.secondary_matrix = linear_jacobian;
     result.task.secondary_reference = linear_reference;
@@ -333,7 +357,7 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
   {
     return std::nullopt;
   }
-  const bool roll_is_observable = face_position ? screen_upright_roll.has_value() :
+  const bool roll_is_observable = face_position ? screen_horizontal_edge.has_value() :
     screen_geometry->roll_authority > kGeometryEpsilon;
   result.accepted = result.position_error_m <= config.position_deadband_m &&
     result.pointing_error_rad <= config.pointing_deadband_rad &&
@@ -562,6 +586,62 @@ std::optional<UprightRollPathTaskResult> makeUprightRollPathTask(
     return std::nullopt;
   }
   return result;
+}
+
+std::optional<HorizontalEdgePathTaskResult> makeHorizontalEdgePathTask(
+  const Eigen::Isometry3d & current_screen_pose,
+  const Eigen::MatrixXd & screen_jacobian,
+  const Eigen::VectorXd & path_velocity_reference,
+  const TrackingVelocityTaskConfig & config)
+{
+  if (!valid_config(config) || !current_screen_pose.matrix().allFinite() ||
+    screen_jacobian.rows() != 6 ||
+    screen_jacobian.cols() == 0 || !screen_jacobian.allFinite() ||
+    path_velocity_reference.size() != screen_jacobian.cols() ||
+    !path_velocity_reference.allFinite())
+  {
+    return std::nullopt;
+  }
+  const Eigen::Matrix3d rotation = current_screen_pose.rotation();
+  if (!validEdgeRotation(rotation) || rotation(2, 2) < 0.0) {
+    return std::nullopt;
+  }
+  const double edge_tilt_rad = std::asin(std::clamp(rotation(2, 1), -1.0, 1.0));
+  const Eigen::RowVectorXd sine_gradient =
+    (rotation.col(1).cross(Eigen::Vector3d::UnitZ())).transpose() *
+    screen_jacobian.bottomRows(3);
+  const double edge_deadband_sine = std::sin(std::min(
+    config.roll_deadband_rad, 0.5 * std::acos(-1.0)));
+
+  HorizontalEdgePathTaskResult result;
+  result.signed_edge_sine = rotation(2, 1);
+  result.edge_tilt_error_rad = -edge_tilt_rad;
+  result.task.primary_matrix.resize(1, screen_jacobian.cols());
+  result.task.primary_matrix.row(0) = sine_gradient;
+  result.task.primary_reference.resize(1);
+  result.task.primary_reference[0] = std::clamp(
+    config.orientation_gain * outside_deadband(-rotation(2, 1), edge_deadband_sine),
+    -config.maximum_angular_reference_radps, config.maximum_angular_reference_radps);
+  result.task.primary_weights = Eigen::VectorXd::Ones(1);
+  result.task.secondary_matrix = Eigen::MatrixXd::Identity(
+    screen_jacobian.cols(), screen_jacobian.cols());
+  result.task.secondary_reference = path_velocity_reference;
+  result.task.secondary_weights = Eigen::VectorXd::Ones(screen_jacobian.cols());
+  if (!result.task.primary_matrix.allFinite() || !result.task.primary_reference.allFinite()) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+std::optional<double> measureHorizontalEdgeTiltError(
+  const Eigen::Isometry3d & current_screen_pose)
+{
+  if (!current_screen_pose.matrix().allFinite() ||
+    !validEdgeRotation(current_screen_pose.rotation()))
+  {
+    return std::nullopt;
+  }
+  return -std::asin(std::clamp(current_screen_pose.rotation()(2, 1), -1.0, 1.0));
 }
 
 std::optional<double> measureUprightRollError(

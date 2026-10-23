@@ -262,6 +262,21 @@ TEST_F(CommandSessionTest, DeadlinesIncludePublishedStopAndExpireOnEitherClock)
   EXPECT_FALSE(session_.rearmDeadlineExpired(stamp(10'000'000'000), wall_start + 10s));
 }
 
+TEST_F(CommandSessionTest, RearmTimeoutReportIsOneShotAndNewWindowCanRecover)
+{
+  const auto wall_start = CommandSession::WallTime{} + 10s;
+  session_.startRearmDeadline(stamp(), wall_start);
+  ASSERT_TRUE(session_.rearmDeadlineExpired(stamp(2'000'000'000), wall_start + 2s));
+  EXPECT_TRUE(session_.claimRearmTimeoutReport());
+  EXPECT_FALSE(session_.claimRearmTimeoutReport());
+
+  // Reporting a timeout does not disable readiness checks or poison a later window.
+  session_.clearRearmDeadlines();
+  session_.startRearmDeadline(stamp(3'000'000'000), wall_start + 3s);
+  EXPECT_FALSE(session_.rearmDeadlineExpired(stamp(3'100'000'000), wall_start + 3100ms));
+  EXPECT_TRUE(session_.claimRearmTimeoutReport());
+}
+
 TEST_F(CommandSessionTest, NewSettlingBudgetStartsAtNowWhenPublishedStopIsInThePast)
 {
   const auto wall_start = CommandSession::WallTime{} + 10s;

@@ -3,9 +3,15 @@
 
 #include "collision_aware_servo_component.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <vector>
+
+#include "face_tracking_arm/qp_failure_snapshot_recorder.hpp"
 
 namespace face_tracking_arm
 {
@@ -226,6 +232,15 @@ void CollisionAwareServoComponent::publish_runtime_diagnostics()
   status.values.reserve(128);
   status.values.push_back(key_value("mode", controller_mode_name(controller_mode_)));
   status.values.push_back(key_value(
+    "hardware_io_provenance_required", require_hardware_io_status_ ? "true" : "false"));
+  status.values.push_back(key_value(
+    "hardware_io_provenance_failure", hardware_io_halt_failure_.has_value() ?
+    hardware::hardwareIoStatusFailureName(*hardware_io_halt_failure_) : "none"));
+  status.values.push_back(key_value(
+    "hardware_io_failure_joint", hardware_io_failure_joint_index_.has_value() &&
+    *hardware_io_failure_joint_index_ < parameters_.joint_names.size() ?
+    parameters_.joint_names[*hardware_io_failure_joint_index_] : "none"));
+  status.values.push_back(key_value(
     "servo_status_code", std::to_string(telemetry_.last_servo_status_code)));
   status.values.push_back(key_value("servo_status_message", telemetry_.last_servo_status_message));
   const auto & reference = motion_reference_->diagnostics();
@@ -285,6 +300,23 @@ void CollisionAwareServoComponent::publish_runtime_diagnostics()
   status.values.push_back(key_value("qp_mean_ms", optional_double_string(qp_mean_ms)));
   status.values.push_back(key_value("qp_p99_ms", optional_double_string(qp_p99_ms)));
   status.values.push_back(key_value("qp_max_ms", optional_double_string(qp_max_ms)));
+  status.values.push_back(key_value(
+    "qp_failure_snapshot_session_directory", qp_failure_snapshot_path_));
+  status.values.push_back(key_value(
+    "qp_failure_snapshot_events_dropped",
+    std::to_string(qp_failure_snapshot_mailbox_.droppedCount())));
+  status.values.push_back(key_value(
+    "qp_failure_snapshot_write_count",
+    std::to_string(qp_snapshot_write_count_.load(std::memory_order_relaxed))));
+  status.values.push_back(key_value(
+    "qp_failure_snapshot_write_failures",
+    std::to_string(qp_snapshot_write_failure_count_.load(std::memory_order_relaxed))));
+  status.values.push_back(key_value(
+    "qp_failure_snapshot_event_write_failures",
+    std::to_string(qp_snapshot_event_write_failure_count_.load(std::memory_order_relaxed))));
+  status.values.push_back(key_value(
+    "qp_failure_snapshot_rotation_drops",
+    std::to_string(qp_snapshot_rotation_drop_count_.load(std::memory_order_relaxed))));
   status.values.push_back(key_value(
     "collision_build_mean_ms", optional_double_string(collision_build_mean_ms)));
   status.values.push_back(key_value(
@@ -595,8 +627,16 @@ void CollisionAwareServoComponent::publish_runtime_diagnostics()
   status.values.push_back(key_value(
     "last_braking_tail_uncertified_segment_count",
     std::to_string(telemetry_.last_braking_tail_uncertified_segment_count)));
-  status.values.push_back(key_value(
-    "task_failure_count", "unavailable"));
+  appendSegmentDiagnostics(status);
+
+  array.status.push_back(std::move(status));
+  diagnostics_publisher_->publish(array);
+}
+
+void CollisionAwareServoComponent::appendSegmentDiagnostics(
+  diagnostic_msgs::msg::DiagnosticStatus & status) const
+{
+  status.values.push_back(key_value("task_failure_count", "unavailable"));
   status.values.push_back(key_value(
     "moveit_validation_failure_count",
     std::to_string(telemetry_.moveit_validation_failure_count)));
@@ -642,9 +682,165 @@ void CollisionAwareServoComponent::publish_runtime_diagnostics()
   status.values.push_back(key_value(
     "last_segment_rejection_minimum_distance_m",
     optional_double_string(telemetry_.last_segment_rejection_minimum_distance_m)));
+}
 
-  array.status.push_back(std::move(status));
-  diagnostics_publisher_->publish(array);
+void CollisionAwareServoComponent::process_qp_failure_snapshots()
+{
+  auto event = qp_failure_snapshot_mailbox_.tryTake();
+  if (!event.has_value()) {
+    return;
+  }
+  constexpr std::uint64_t kMaximumPersistedEvents = 256U;
+  if (qp_snapshot_events_written_ >= kMaximumPersistedEvents) {
+    qp_snapshot_rotation_drop_count_.fetch_add(1U, std::memory_order_relaxed);
+    return;
+  }
+  ++qp_snapshot_events_written_;
+  control::QpFailureSnapshotEventWriteResult write_result;
+  try {
+    write_result = control::writeQpFailureSnapshotEvent(
+      qp_failure_snapshot_path_, *event);
+  } catch (const std::exception & error) {
+    write_result.snapshots_ok = false;
+    write_result.index_ok = false;
+    const std::string event_id = std::to_string(event->event_id);
+    RCLCPP_ERROR(get_logger(), "Could not persist QP failure snapshot event %s: %s",
+      event_id.c_str(), error.what());
+  }
+  if (event->primary.has_value() || event->secondary.has_value()) {
+    if (write_result.snapshots_ok) {
+      qp_snapshot_write_count_.fetch_add(1U, std::memory_order_relaxed);
+    } else {
+      qp_snapshot_write_failure_count_.fetch_add(1U, std::memory_order_relaxed);
+    }
+  }
+  if (!write_result.index_ok) {
+    qp_snapshot_event_write_failure_count_.fetch_add(1U, std::memory_order_relaxed);
+  }
+}
+
+void CollisionAwareServoComponent::record_execution_context()
+{
+  current_tick_context_.controller_mode = static_cast<std::uint8_t>(controller_mode_);
+  current_tick_context_.dropped_publication_events =
+    trajectory_publication_ring_.droppedCount();
+  current_tick_context_.active_publication_id =
+    commands_.active_publication_id.value_or(0U);
+  if (const auto * latest = commands_.publications.latest(); latest != nullptr) {
+    current_tick_context_.latest_publication_id = latest->id;
+  }
+  if (const auto * active = commands_.activePublication(); active != nullptr) {
+    current_tick_context_.tail_publication_id = active->id;
+    current_tick_context_.tail_stationary_stamp_ns = active->stationary_time.nanoseconds();
+  }
+  (void)execution_context_ring_.tryPush(current_tick_context_);
+}
+
+void CollisionAwareServoComponent::drain_execution_context()
+{
+  diagnostics::ServoExecutionContextRecord record;
+  while (execution_context_ring_.tryPop(record)) {
+    msg::ServoExecutionContext message;
+    const auto set_stamp = [](builtin_interfaces::msg::Time & stamp, const std::int64_t ns) {
+        const std::int64_t billion = 1'000'000'000LL;
+        std::int64_t seconds = ns / billion;
+        std::int64_t nanoseconds = ns % billion;
+        if (nanoseconds < 0) {
+          --seconds;
+          nanoseconds += billion;
+        }
+        stamp.sec = static_cast<std::int32_t>(seconds);
+        stamp.nanosec = static_cast<std::uint32_t>(nanoseconds);
+      };
+    set_stamp(message.header.stamp, record.control_stamp_ns);
+    message.tick_sequence = record.tick_sequence;
+    message.cycle_duration_ns = record.cycle_duration_ns;
+    message.controller_mode = record.controller_mode;
+    message.face_tracking_published = record.face_tracking_published;
+    message.active_collision_rows = record.active_collision_rows;
+    message.collision_distance_available = record.collision_distance_available;
+    message.minimum_world_distance_m = record.minimum_world_distance_m;
+    message.closest_pair.assign(record.closest_pair);
+    message.active_world_pair_available = record.active_world_pair_available;
+    message.active_world_pair_distance_m = record.active_world_pair_distance_m;
+    message.active_world_pair.assign(record.active_world_pair);
+    message.hardware_epoch = record.hardware_epoch;
+    message.hardware_read_sequence = record.hardware_read_sequence;
+    message.target_available = record.target_available;
+    message.target_used_for_reference = record.target_used_for_reference;
+    message.target_mode = record.target_mode;
+    message.target_id = record.target_id;
+    set_stamp(message.target_source_stamp, record.target_source_stamp_ns);
+    set_stamp(message.face_stamp, record.face_stamp_ns);
+    message.target_frame.assign(record.target_frame);
+    message.target_position.x = record.target_position[0];
+    message.target_position.y = record.target_position[1];
+    message.target_position.z = record.target_position[2];
+    message.face_position.x = record.face_position[0];
+    message.face_position.y = record.face_position[1];
+    message.face_position.z = record.face_position[2];
+    message.tf_provenance_available = false;
+    message.active_publication_id = record.active_publication_id;
+    message.latest_publication_id = record.latest_publication_id;
+    message.braking_tail_publication_id = record.tail_publication_id;
+    set_stamp(message.braking_tail_stationary_stamp, record.tail_stationary_stamp_ns);
+    message.dropped_context_records = static_cast<std::uint32_t>(
+      std::min<std::uint64_t>(execution_context_ring_.droppedCount(),
+      std::numeric_limits<std::uint32_t>::max()));
+    message.dropped_publication_events = record.dropped_publication_events;
+    execution_context_publisher_->publish(message);
+  }
+}
+
+void CollisionAwareServoComponent::drain_trajectory_publications()
+{
+  const auto set_time = [](builtin_interfaces::msg::Time & output,
+    const std::int32_t seconds, const std::uint32_t nanoseconds) {
+      output.sec = seconds;
+      output.nanosec = nanoseconds;
+    };
+  while (trajectory_publication_ring_.tryConsume(
+      [this, &set_time](const diagnostics::ServoTrajectoryPublicationRecord & record) {
+        msg::ServoTrajectoryPublication message;
+        message.publication_kind = record.publication_kind;
+        set_time(message.header.stamp, record.stamp_sec, record.stamp_nanosec);
+        message.header.frame_id.assign(
+          record.event_frame_id.data(), record.event_frame_id_size);
+        message.publication_id = record.publication_id;
+        set_time(message.stationary_time, record.stationary_sec, record.stationary_nanosec);
+        message.tail_start_index = record.tail_start_index;
+        message.hardware_epoch = record.hardware_epoch;
+        message.hardware_read_sequence = record.hardware_read_sequence;
+        message.control_tick_sequence = record.control_tick_sequence;
+        set_time(message.trajectory.header.stamp, record.trajectory_stamp_sec,
+          record.trajectory_stamp_nanosec);
+        message.trajectory.header.frame_id.assign(
+          record.trajectory_frame_id.data(), record.trajectory_frame_id_size);
+        message.trajectory.joint_names.reserve(record.joint_count);
+        for (std::size_t joint = 0; joint < record.joint_count; ++joint) {
+          message.trajectory.joint_names.emplace_back(
+            record.joint_names[joint].data(), record.joint_name_sizes[joint]);
+        }
+        message.trajectory.points.resize(record.point_count);
+        for (std::size_t point_index = 0; point_index < record.point_count; ++point_index) {
+          const auto & stored = record.points[point_index];
+          auto & point = message.trajectory.points[point_index];
+          point.positions.assign(stored.positions.begin(), stored.positions.end());
+          if (stored.has_velocities) {
+            point.velocities.assign(diagnostics::kTrajectoryJointCount, 0.0);
+          }
+          if (stored.has_accelerations) {
+            point.accelerations.assign(diagnostics::kTrajectoryJointCount, 0.0);
+          }
+          point.time_from_start.sec = stored.time_sec;
+          point.time_from_start.nanosec = stored.time_nanosec;
+        }
+        message.dropped_publication_events =
+        trajectory_publication_ring_.droppedCount();
+        trajectory_publication_publisher_->publish(message);
+      }))
+  {
+  }
 }
 
 void CollisionAwareServoComponent::log_qp_failure(

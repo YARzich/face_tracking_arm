@@ -90,6 +90,17 @@ def image_exists(docker):
     return True
 
 
+def image_id(docker):
+    """Return the immutable local Docker image ID for the running container."""
+    result = capture(docker + ['image', 'inspect', '--format', '{{.Id}}', IMAGE])
+    if result.returncode:
+        raise ValueError('Не удалось прочитать ID Docker-образа: ' + result.stderr.strip())
+    value = result.stdout.strip()
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', value):
+        raise ValueError('Docker вернул некорректный ID образа')
+    return value
+
+
 def archive_path():
     return ROOT / 'dist' / f'face-tracking-arm-v2-{architecture()}.tar.gz'
 
@@ -315,11 +326,14 @@ def execute(docker, args):
     if not calibration and not args.camera_only:
         # Permit the existing 50/40-priority control threads without host configuration.
         flags += ['--ulimit', 'rtprio=50', '--ulimit', 'memlock=-1']
+    image_identity = ([] if calibration else [
+        '--env', 'FACE_TRACKING_DOCKER_IMAGE_ID=' + image_id(docker)])
     command = docker + ['run', '--rm', '--init', '--name', CONTAINER,
                         '--network', 'host', '--cap-drop', 'ALL',
                         '--security-opt', 'no-new-privileges',
                         '--user', f'{os.getuid()}:{os.getgid()}',
                         '--env', f'ROS_DOMAIN_ID={args.domain}',
+                        *image_identity,
                         '--stop-signal', 'SIGINT', '--stop-timeout', '20']
     command += flags + [IMAGE, 'calibrate' if calibration else 'launch', mode]
     if calibration:
@@ -365,6 +379,7 @@ def execute_mount_setup(docker, args, config):
                         '--security-opt', 'no-new-privileges',
                         '--user', f'{os.getuid()}:{os.getgid()}',
                         '--env', f'ROS_DOMAIN_ID={args.domain}',
+                        '--env', 'FACE_TRACKING_DOCKER_IMAGE_ID=' + image_id(docker),
                         '--stop-signal', 'SIGINT', '--stop-timeout', '20']
     if args.action == 'manual':
         command.append('--interactive')

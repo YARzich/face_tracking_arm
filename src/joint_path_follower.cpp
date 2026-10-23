@@ -72,6 +72,35 @@ std::size_t projectionWindowSegments(
     available_segments, std::max(minimum_segments, segments_to_lookahead));
 }
 
+bool crossesDirectionChange(
+  const std::vector<Eigen::VectorXd> & path,
+  const std::vector<double> & cumulative_length, const std::size_t first_segment,
+  const double progress, const double lookahead)
+{
+  if (path.size() < 3U) {
+    return false;
+  }
+  const double direction_tolerance = 64.0 * std::numeric_limits<double>::epsilon() *
+    static_cast<double>(std::max<Eigen::Index>(1, path.front().size()));
+  const double target_progress = std::min(progress + lookahead, cumulative_length.back());
+  for (std::size_t vertex = first_segment + 1U; vertex + 1U < path.size(); ++vertex) {
+    const double vertex_progress = cumulative_length[vertex];
+    if (vertex_progress <= progress + kLengthEpsilon) {
+      continue;
+    }
+    if (vertex_progress >= target_progress - kLengthEpsilon) {
+      break;
+    }
+    const Eigen::VectorXd incoming = path[vertex] - path[vertex - 1U];
+    const Eigen::VectorXd outgoing = path[vertex + 1U] - path[vertex];
+    const double cosine = incoming.dot(outgoing) / (incoming.norm() * outgoing.norm());
+    if (cosine < 1.0 - direction_tolerance) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 JointPathFollower::JointPathFollower(JointPathFollowerConfig config)
@@ -193,6 +222,12 @@ JointPathUpdate JointPathFollower::update(
   }
   last_update_.reference_position = positionAt(
     last_update_.progress_rad + config_.lookahead_distance_rad);
+  last_update_.projected_position = positionAt(last_update_.progress_rad);
+  last_update_.remaining_distance_rad = std::max(
+    0.0, last_update_.total_length_rad - last_update_.progress_rad);
+  last_update_.lookahead_crosses_corner = crossesDirectionChange(
+    path_, cumulative_length_, segment_, last_update_.progress_rad,
+    config_.lookahead_distance_rad);
   if (last_update_.total_length_rad - last_update_.progress_rad <= config_.arrival_tolerance_rad &&
     (current_position - path_.back()).norm() <= config_.arrival_tolerance_rad)
   {
@@ -232,6 +267,11 @@ void JointPathFollower::reset() noexcept
 bool JointPathFollower::active() const noexcept
 {
   return last_update_.status == JointPathStatus::kTracking;
+}
+
+double JointPathFollower::lookaheadDistanceRad() const noexcept
+{
+  return config_.lookahead_distance_rad;
 }
 
 }  // namespace face_tracking_arm::control

@@ -182,6 +182,18 @@ void validateConfig(const CollisionConstraintConfig & config)
   if (!finite(config.residual_latency_sec) || config.residual_latency_sec < 0.0) {
     throw std::invalid_argument("residual_latency_sec must be finite and non-negative");
   }
+  if (!config.numerical_policy.has_value() || !config.numerical_policy->valid()) {
+    throw std::invalid_argument("collision numerical policy is missing or invalid");
+  }
+}
+
+bool sameMotionNumericalPolicy(
+  const NumericalPolicy & left, const NumericalPolicy & right) noexcept
+{
+  return left.position_error.value == right.position_error.value &&
+         left.velocity_error.value == right.velocity_error.value &&
+         left.acceleration_error.value == right.acceleration_error.value &&
+         left.jerk_error.value == right.jerk_error.value;
 }
 
 void setFailure(CollisionConstraintDiagnostics & diagnostics, const std::string & message)
@@ -225,6 +237,13 @@ CollisionConstraintResult CollisionConstraintBuilder::build(
   if (!validateMotionInput(motion_state, motion_limits, variable_count,
       diagnostics.failure_reason))
   {
+    return result;
+  }
+  if (!motion_limits.numerical_policy.has_value() ||
+    !sameMotionNumericalPolicy(*motion_limits.numerical_policy, *config_.numerical_policy))
+  {
+    setFailure(diagnostics,
+      "collision and motion limits must share one q/v/a/jerk numerical policy");
     return result;
   }
 
@@ -278,37 +297,9 @@ CollisionConstraintResult CollisionConstraintBuilder::build(
   }
 
   const double q = motion_state.position[protected_index];
-  const double qdot = motion_state.velocity[protected_index];
-  const double max_velocity = motion_limits.max_velocity[protected_index];
-  const double max_acceleration = motion_limits.max_acceleration[protected_index];
-  const double max_jerk = motion_limits.max_jerk[protected_index];
-
-  const double upper_remaining = config_.protected_joint_upper_rad - q;
-  const double lower_remaining = q - config_.protected_joint_lower_rad;
-  double safe_upper_velocity = maximumSafeVelocityTowardBoundary(
-    upper_remaining, qdot,
-    reachable_velocity.lower[protected_index], reachable_velocity.upper[protected_index],
-    max_acceleration, max_jerk, period_sec, config_.residual_latency_sec);
-  double safe_lower_velocity = maximumSafeVelocityTowardBoundary(
-    lower_remaining, -qdot,
-    -reachable_velocity.upper[protected_index], -reachable_velocity.lower[protected_index],
-    max_acceleration, max_jerk, period_sec, config_.residual_latency_sec);
-
-  if (upper_remaining < 0.0) {
+  if (q > config_.protected_joint_upper_rad || q < config_.protected_joint_lower_rad) {
     diagnostics.protected_joint_corridor_violated = true;
-    safe_upper_velocity = std::max(-max_velocity, upper_remaining / period_sec);
   }
-  if (lower_remaining < 0.0) {
-    diagnostics.protected_joint_corridor_violated = true;
-    safe_lower_velocity = std::max(-max_velocity, lower_remaining / period_sec);
-  }
-
-  LinearVelocityConstraint protected_joint_row;
-  protected_joint_row.coefficients = Eigen::VectorXd::Zero(variable_count);
-  protected_joint_row.coefficients[protected_index] = 1.0;
-  protected_joint_row.lower_bound = -safe_lower_velocity;
-  protected_joint_row.upper_bound = safe_upper_velocity;
-  result.constraints.push_back(std::move(protected_joint_row));
 
   collision_detection::AllowedCollisionMatrix query_acm(
     scene.getAllowedCollisionMatrix());
@@ -532,7 +523,7 @@ CollisionConstraintResult CollisionConstraintBuilder::build(
       continue;
     }
 
-    if (result.constraints.size() - 1U >= config_.maximum_constraint_rows) {
+    if (result.constraints.size() >= config_.maximum_constraint_rows) {
       ++diagnostics.truncated_constraints;
       diagnostics.pairs.push_back(std::move(pair_diagnostic));
       continue;

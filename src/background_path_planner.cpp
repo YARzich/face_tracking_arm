@@ -18,6 +18,7 @@
 #include "face_tracking_arm/compact_upright.hpp"
 #include "face_tracking_arm/compact_geometry_validator.hpp"
 #include "face_tracking_arm/compact_upright_path.hpp"
+#include "face_tracking_arm/horizontal_edge_upright.hpp"
 
 #include <moveit/kinematic_constraints/utils.hpp>
 #include <moveit/planning_interface/planning_interface.hpp>
@@ -91,6 +92,16 @@ std::optional<double> uprightRollError(
   return pose ? std::optional<double>(std::abs(pose->signed_roll_error_rad)) : std::nullopt;
 }
 
+bool horizontalEdgePathValid(
+  const moveit::core::RobotState & state,
+  const HorizontalEdgePathRequirement & requirement)
+{
+  const Eigen::Matrix3d rotation =
+    state.getGlobalLinkTransform(requirement.screen_link_name).linear();
+  return evaluateHorizontalEdgeUprightWithSineCap(
+    rotation, requirement.maximum_abs_edge_sine).has_value();
+}
+
 std::optional<double> screenPitch(
   const moveit::core::RobotState & state, const std::string & screen_link_name)
 {
@@ -147,6 +158,7 @@ struct BackgroundPathPlanner::Impl
     moveit::core::RobotState start;
     Eigen::VectorXd goal;
     std::optional<CompactGoal> compact_goal;
+    std::optional<HorizontalEdgePathRequirement> edge_requirement;
     std::uint64_t generation;
     std::uint64_t scene_revision;
   };
@@ -199,6 +211,8 @@ struct BackgroundPathPlanner::Impl
       scene_monitor->getRobotModel().get() != robot_model.get() ||
       !positiveFinite(config.planning_time_s) ||
       !positiveFinite(config.compact_planning_time_s) ||
+      !positiveFinite(config.rest_edge_planning_time_s) ||
+      !positiveFinite(config.rest_edge_planner_range) ||
       !positiveFinite(config.joint_tolerance_rad) ||
       !positiveFinite(config.validation_joint_step_rad) ||
       config.maximum_validation_samples < 2)
@@ -353,20 +367,24 @@ struct BackgroundPathPlanner::Impl
                *roll_error <= requirements.maximum_roll_error_rad &&
                radius <= requirements.maximum_assembly_radius_m;
       };
-    if (prior || additional_validity) {
+    const auto edge_valid = [this, &request](
+      const moveit::core::RobotState & state) -> bool
+      {
+        return !request.edge_requirement ||
+               horizontalEdgePathValid(state, *request.edge_requirement);
+      };
+    if (prior || additional_validity || request.compact_goal || request.edge_requirement) {
       // A raw scene pointer avoids a cycle: the private scene owns its predicate
-      // and outlives every use during this synchronous planning call.
+      // and outlives every use during this synchronous planning call. Apply
+      // path-specific predicates during OMPL sampling as well as final auditing,
+      // so REST planning searches inside the horizontal-edge-valid state set.
       scene->setStateFeasibilityPredicate(
-        [prior, extra = additional_validity, compact_valid, snapshot = scene.get()](
+        [prior, extra = additional_validity, compact_valid, edge_valid,
+        snapshot = scene.get()](
           const moveit::core::RobotState & state, bool verbose)
         {
           return (!prior || prior(state, verbose)) && (!extra || extra(*snapshot, state)) &&
-                 compact_valid(state);
-        });
-    } else if (request.compact_goal) {
-      scene->setStateFeasibilityPredicate(
-        [compact_valid](const moveit::core::RobotState & state, bool) {
-          return compact_valid(state);
+                 compact_valid(state) && edge_valid(state);
         });
     }
 
@@ -379,6 +397,13 @@ struct BackgroundPathPlanner::Impl
     }
     start.copyJointGroupPositions(group, result.start_positions);
     scene->setCurrentState(start);
+    if (request.edge_requirement &&
+      !horizontalEdgePathValid(start, *request.edge_requirement))
+    {
+      result.error_code = ErrorCode::START_STATE_INVALID;
+      result.message = "REST start violates the sampled horizontal-edge requirement";
+      return result;
+    }
     if (request.compact_goal) {
       const auto & requirements = request.compact_goal->path_requirements;
       const auto roll = uprightRollError(start, requirements.screen_link_name);
@@ -427,6 +452,13 @@ struct BackgroundPathPlanner::Impl
     if (!goal.satisfiesBounds(group)) {
       result.error_code = ErrorCode::GOAL_IN_COLLISION;
       result.message = "Goal violates bounded joint limits";
+      return result;
+    }
+    if (request.edge_requirement &&
+      !horizontalEdgePathValid(goal, *request.edge_requirement))
+    {
+      result.error_code = ErrorCode::GOAL_IN_COLLISION;
+      result.message = "REST goal violates the sampled horizontal-edge requirement";
       return result;
     }
     if (request.compact_goal) {
@@ -775,7 +807,28 @@ struct BackgroundPathPlanner::Impl
         }
         planner_manager->setPlannerConfigurations(default_planner_configurations);
       } else {
-        planned = pipeline->generatePlan(scene, motion_request, response, false);
+        if (request.edge_requirement) {
+          motion_request.allowed_planning_time = config.rest_edge_planning_time_s;
+          auto rest_configurations = default_planner_configurations;
+          auto rest_config = rest_configurations.find(planner_key);
+          if (rest_config == rest_configurations.end()) {
+            result.error_code = ErrorCode::FAILURE;
+            result.message = "REST planner configuration is unavailable";
+            return result;
+          }
+          rest_config->second.config["range"] =
+            std::to_string(config.rest_edge_planner_range);
+          planner_manager->setPlannerConfigurations(rest_configurations);
+          try {
+            planned = pipeline->generatePlan(scene, motion_request, response, false);
+          } catch (...) {
+            planner_manager->setPlannerConfigurations(default_planner_configurations);
+            throw;
+          }
+          planner_manager->setPlannerConfigurations(default_planner_configurations);
+        } else {
+          planned = pipeline->generatePlan(scene, motion_request, response, false);
+        }
       }
       result.error_code = response.error_code.val;
       if (!planned || !response || !response.trajectory ||
@@ -835,6 +888,15 @@ struct BackgroundPathPlanner::Impl
             !scene->isStateValid(sample, config.move_group_name))
           {
             result.message = "An interpolated path sample violates safety constraints";
+            result.path.clear();
+            result.error_code = ErrorCode::INVALID_MOTION_PLAN;
+            return result;
+          }
+          if (request.edge_requirement &&
+            !horizontalEdgePathValid(sample, *request.edge_requirement))
+          {
+            result.message =
+              "An interpolated REST sample violates the horizontal-edge requirement";
             result.path.clear();
             result.error_code = ErrorCode::INVALID_MOTION_PLAN;
             return result;
@@ -1120,7 +1182,37 @@ std::uint64_t BackgroundPathPlanner::submit(
   }
   const std::lock_guard<std::mutex> lock(impl_->mutex);
   const std::uint64_t generation = ++impl_->latest_generation;
-  impl_->pending.emplace(Impl::Request{start, goal_positions, {}, generation, scene_revision});
+  impl_->pending.emplace(Impl::Request{
+      start, goal_positions, {}, {}, generation, scene_revision});
+  impl_->completed.reset();
+  impl_->condition.notify_one();
+  return generation;
+}
+
+std::uint64_t BackgroundPathPlanner::submit(
+  const moveit::core::RobotState & start, const Eigen::VectorXd & goal_positions,
+  const HorizontalEdgePathRequirement & edge_requirement,
+  const std::uint64_t scene_revision)
+{
+  if (start.getRobotModel().get() != impl_->robot_model.get() ||
+    goal_positions.size() != static_cast<Eigen::Index>(impl_->group->getVariableCount()) ||
+    !goal_positions.allFinite() || edge_requirement.screen_link_name.empty() ||
+    !impl_->robot_model->hasLinkModel(edge_requirement.screen_link_name) ||
+    !std::isfinite(edge_requirement.maximum_abs_edge_sine) ||
+    edge_requirement.maximum_abs_edge_sine < 0.0 ||
+    edge_requirement.maximum_abs_edge_sine > 1.0)
+  {
+    throw std::invalid_argument("REST edge path request has invalid model, goal or requirement");
+  }
+  Eigen::VectorXd start_positions;
+  start.copyJointGroupPositions(impl_->group, start_positions);
+  if (!start_positions.allFinite()) {
+    throw std::invalid_argument("Background planner start contains non-finite joint positions");
+  }
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  const std::uint64_t generation = ++impl_->latest_generation;
+  impl_->pending.emplace(Impl::Request{
+      start, goal_positions, {}, edge_requirement, generation, scene_revision});
   impl_->completed.reset();
   impl_->condition.notify_one();
   return generation;
@@ -1164,7 +1256,7 @@ std::uint64_t BackgroundPathPlanner::submit(
   const std::lock_guard<std::mutex> lock(impl_->mutex);
   const std::uint64_t generation = ++impl_->latest_generation;
   impl_->pending.emplace(Impl::Request{
-      start, goal.bounded_positions, goal, generation, scene_revision});
+      start, goal.bounded_positions, goal, {}, generation, scene_revision});
   impl_->completed.reset();
   impl_->condition.notify_one();
   return generation;

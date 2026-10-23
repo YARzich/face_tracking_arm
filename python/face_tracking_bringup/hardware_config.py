@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from .camera_controls import validate_control_values, validate_driver_parameters
+from .execution_budget_profile import validate_execution_budget_keys
 from .hardware_schema import (
     CAMERA_FIELDS, COMPACT_MANEUVER_FIELDS, CONTROLLER_FIELDS, KALMAN_FIELDS,
     MODE_OPTIONAL, MOUNT_SETUP_FIELDS, ONE_EURO_FIELDS, PERCEPTION_OPTIONAL,
@@ -55,6 +56,8 @@ def validate_structure(config, mode, *, camera_only=False, driver_only=False, se
     known_keys(config, 'hardware', set(SECTIONS) | {'point_filter'} | ROOT_FIELDS)
     if 'mount_setup' in config:
         known_keys(config['mount_setup'], 'mount_setup', MOUNT_SETUP_FIELDS)
+    if 'execution_error_budget' in config:
+        validate_execution_budget_keys(config['execution_error_budget'])
     if 'compact_maneuver' in config:
         known_keys(config['compact_maneuver'], 'compact_maneuver',
                    COMPACT_MANEUVER_FIELDS)

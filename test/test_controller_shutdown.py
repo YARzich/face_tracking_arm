@@ -18,7 +18,55 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
-from face_tracking_bringup.hardware_launch import robot_actions  # noqa: E402, I100
+from face_tracking_bringup.hardware_launch import (  # noqa: E402, I100
+    build_artifact_manifest, robot_actions)
+
+
+def test_fault_artifact_manifest_hashes_effective_launch_inputs(monkeypatch, tmp_path):
+    share = tmp_path / 'share'
+    (share / 'config/moveit').mkdir(parents=True)
+    (share / 'config/control').mkdir(parents=True)
+    for relative in ('config/moveit/servo.yaml',
+                     'config/moveit/collision_aware_servo.yaml',
+                     'config/moveit/kinematics.yaml',
+                     'config/control/controllers.yaml',
+                     'config/tracking.yaml'):
+        path = share / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative)
+    config_path = tmp_path / 'resolved.yaml'
+    config_path.write_text(
+        'robot:\n  model: xarm6\n  ip: 192.0.2.1\n  secret: test-secret\n')
+    monkeypatch.setenv('FACE_TRACKING_SOURCE_SHA256', 'f' * 64)
+    monkeypatch.setenv('FACE_TRACKING_DOCKER_IMAGE_ID', 'sha256:' + 'a' * 64)
+    manifest = build_artifact_manifest(
+        config_path, share,
+        [{'robot_description': '<robot/>'},
+         {'robot_description_semantic': '<robot name="arm"/>'}],
+        {'controller_manager': {'ros__parameters': {'update_rate': 100}}},
+        {'model': 'xarm6', 'model_num': 1300},
+        {'firmware_version': '2.4.0', 'serial_number': 'serial-test'},
+        {'servo': {'publish_period': .01}, 'motion': {'gate': True},
+         'tracking': {'require_perception_status': True}})
+
+    assert manifest['source_tree_sha256'] == 'f' * 64
+    assert manifest['docker_image_id'] == 'sha256:' + 'a' * 64
+    assert manifest['image_digest'] is None
+    assert manifest['image_digest_status'] == 'manifest_digest_unavailable'
+    assert manifest['firmware_version'] == '2.4.0'
+    assert manifest['robot_serial'] == 'serial-test'
+    assert len(manifest['artifacts']['expanded_urdf_sha256']) == 64
+    assert len(manifest['artifacts']['expanded_srdf_sha256']) == 64
+    assert len(manifest['artifacts']['effective_controllers_sha256']) == 64
+    assert all(len(value) == 64 for value in
+               manifest['artifacts']['effective_parameters_sha256'].values())
+    assert len(manifest['artifacts']['hardware_config_sha256']) == 64
+    assert all(len(value) == 64 for value in manifest['artifacts']['source_yaml_sha256'].values())
+    assert '192.0.2.1' not in str(manifest)
+    assert 'test-secret' not in str(manifest)
+    assert '<robot/>' in manifest['replay_inputs']['expanded_urdf']
+    assert 'ip: <redacted>' in manifest['replay_inputs']['resolved_hardware_yaml_redacted']
+    assert 'secret: <redacted>' in manifest['replay_inputs']['resolved_hardware_yaml_redacted']
 
 
 @pytest.mark.parametrize('omit_monitor,table_shape', [

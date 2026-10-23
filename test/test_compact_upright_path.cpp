@@ -328,6 +328,10 @@ TEST_F(CompactUprightPathTest, BackgroundPlannerReturnsCollisionAndRadiusValidat
   }
 
   CollisionConstraintConfig collision_config;
+  const auto numerical_policy = NumericalPolicy::fromDiscreteMotionLimits(
+    PositionInterval{-3.14, 3.14}, 1.0, 2.0, 20.0, 0.01, SolverResidual{1.0e-6});
+  ASSERT_TRUE(numerical_policy.has_value());
+  collision_config.numerical_policy = *numerical_policy;
   const auto & joint_names = group_->getVariableNames();
   const auto joint5 = std::find(joint_names.begin(), joint_names.end(), "joint5");
   ASSERT_NE(joint5, joint_names.end());

@@ -3,6 +3,8 @@
 
 #include "collision_aware_servo_component.hpp"
 
+#include <cstring>
+
 #include <builtin_interfaces/msg/duration.hpp>
 #include <builtin_interfaces/msg/time.hpp>
 
@@ -14,6 +16,36 @@ namespace
 using namespace std::chrono_literals;
 
 constexpr std::size_t kRequiredStartupWarmupCycles = 5;
+constexpr std::uint64_t kBootstrapResetIdPrefix = std::uint64_t{1} << 63U;
+constexpr std::uint64_t kBootstrapResetSequenceMask = ~kBootstrapResetIdPrefix;
+
+builtin_interfaces::msg::Time to_builtin_time(const rclcpp::Time & time)
+{
+  const auto ns = time.nanoseconds();
+  builtin_interfaces::msg::Time result;
+  result.sec = static_cast<std::int32_t>(ns / 1'000'000'000LL);
+  result.nanosec = static_cast<std::uint32_t>(ns % 1'000'000'000LL);
+  return result;
+}
+
+struct TrajectoryHeaderView
+{
+  builtin_interfaces::msg::Time stamp;
+  const std::string & frame_id;
+};
+
+struct TrajectoryPublicationView
+{
+  TrajectoryHeaderView header;
+  std::uint64_t publication_id;
+  std::uint8_t publication_kind;
+  builtin_interfaces::msg::Time stationary_time;
+  std::uint32_t tail_start_index;
+  std::uint64_t hardware_epoch;
+  std::uint64_t hardware_read_sequence;
+  std::uint64_t control_tick_sequence;
+  const trajectory_msgs::msg::JointTrajectory & trajectory;
+};
 
 control::JointMotionState to_motion_state(const moveit_servo::KinematicState & state)
 {
@@ -25,6 +57,29 @@ control::JointMotionState to_motion_state(const moveit_servo::KinematicState & s
 }
 
 }  // namespace
+
+void CollisionAwareServoComponent::record_trajectory_publication(
+  const trajectory_msgs::msg::JointTrajectory & trajectory,
+  const std::uint64_t publication_id, const std::uint8_t publication_kind,
+  const rclcpp::Time & stationary_time, const std::uint32_t tail_start_index)
+{
+  const TrajectoryHeaderView header{to_builtin_time(now()), trajectory.header.frame_id};
+  const auto hardware_epoch = cycle_hardware_io_status_.has_value() ?
+    cycle_hardware_io_status_->sample.epoch : 0U;
+  const auto hardware_read_sequence = cycle_hardware_io_status_.has_value() ?
+    cycle_hardware_io_status_->sample.read_sequence : 0U;
+  const TrajectoryPublicationView publication{
+    header,
+    publication_id,
+    publication_kind,
+    to_builtin_time(stationary_time),
+    tail_start_index,
+    hardware_epoch,
+    hardware_read_sequence,
+    execution_context_tick_sequence_,
+    trajectory};
+  (void)trajectory_publication_ring_.tryEncodeAndPush(publication);
+}
 
 std::optional<BootstrapCommand> CollisionAwareServoComponent::make_stationary_bootstrap(
   const moveit_servo::KinematicState & measured_state,
@@ -72,6 +127,46 @@ std::optional<BootstrapCommand> CollisionAwareServoComponent::make_stationary_bo
     failure_reason =
       "trajectory controller or measured state left its stationary hold before bootstrap";
     return std::nullopt;
+  }
+
+  if (require_hardware_io_status_) {
+    const std::size_t joint_count = parameters_.joint_names.size();
+    const auto hardware_status = current_hardware_io_status();
+    if (measured_state.positions.size() != static_cast<Eigen::Index>(joint_count) ||
+      hardware_execution_error_rad_.size() != joint_count ||
+      !motion_limits_.numerical_policy.has_value() || !hardware_status ||
+      !hardware_status->valid)
+    {
+      failure_kind = BootstrapFailureKind::kRetryableState;
+      failure_reason = !hardware_status ?
+        "hardware stationary bootstrap lacks a fresh status" :
+        (!hardware_status->valid ? "hardware stationary bootstrap status is invalid: " +
+        std::string(hardware::hardwareIoStatusFailureName(hardware_status->failure)) :
+        "hardware stationary bootstrap lacks a complete execution proof");
+      return std::nullopt;
+    }
+    const double arithmetic_error = motion_limits_.numerical_policy->position_error.value;
+    for (std::size_t index = 0; index < joint_count; ++index) {
+      const double reference = controller_state->reference.positions[index];
+      const double output = controller_state->output.positions[index];
+      const double seed = measured_state.positions[static_cast<Eigen::Index>(index)];
+      const double actual = hardware_status->sample.position[index];
+      const auto measurement_error = control::floatMeasurementHalfUlp(actual);
+      const double execution_error = hardware_execution_error_rad_[index];
+      if (!measurement_error || !std::isfinite(execution_error) || execution_error < 0.0 ||
+        std::abs(reference - output) > kControllerCommandAlignmentToleranceRad ||
+        std::abs(seed - reference) > kControllerCommandAlignmentToleranceRad ||
+        std::abs(actual - reference) >
+        execution_error + measurement_error->value + arithmetic_error)
+      {
+        failure_kind = BootstrapFailureKind::kRetryableState;
+        failure_reason = "hardware stationary bootstrap lost controller ownership or "
+          "actual-to-command proof for " + parameters_.joint_names[index] +
+          " seed=" + std::to_string(seed) + " reference=" + std::to_string(reference) +
+          " raw=" + std::to_string(actual) + " E=" + std::to_string(execution_error);
+        return std::nullopt;
+      }
+    }
   }
 
   moveit_servo::KinematicState stationary_state(
@@ -142,13 +237,17 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
   const control::JointMotionState candidate_motion_state = to_motion_state(*next_state);
   if (motion_reference_) {
     std::string motion_reference_violation;
-    if (!motion_reference_->validateCommandPosition(
-        *robot_state, candidate_motion_state.position, &motion_reference_violation))
+    if (!motion_reference_->validateCommandTransition(
+        *robot_state, current_motion_state.position, candidate_motion_state.position,
+        &motion_reference_violation))
     {
       failure_reason = motion_reference_->compactManeuverActive() ?
         "Compact command violates its committed " + motion_reference_violation +
         " constraint" :
         "FACE command violates its armed " + motion_reference_violation + " guard";
+      if (!motion_reference_->compactManeuverActive()) {
+        rejection_kind = CandidateRejectionKind::kReferenceGuard;
+      }
       ++telemetry_.moveit_validation_failure_count;
       return std::nullopt;
     }
@@ -202,10 +301,13 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
     return std::nullopt;
   }
   if (motion_reference_) {
-    for (const auto & point : braking_tail.points) {
+    const Eigen::VectorXd * previous_guarded_position = &candidate_motion_state.position;
+    for (std::size_t tail_index = 0U; tail_index < braking_tail.points.size(); ++tail_index) {
+      const auto & point = braking_tail.points[tail_index];
       std::string motion_reference_violation;
-      if (!motion_reference_->validateCommandPosition(
-          *robot_state, point.position, &motion_reference_violation))
+      if (!motion_reference_->validateCommandTransition(
+          *robot_state, *previous_guarded_position, point.position,
+          &motion_reference_violation))
       {
         failure_reason = motion_reference_->compactManeuverActive() ?
           "Compact emergency-braking suffix violates its committed " +
@@ -214,10 +316,13 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
           motion_reference_violation + " guard";
         if (motion_reference_->compactManeuverActive()) {
           rejection_kind = CandidateRejectionKind::kCompactStopEnvelope;
+        } else {
+          rejection_kind = CandidateRejectionKind::kReferenceGuard;
         }
         ++telemetry_.braking_tail_generation_failure_count;
         return std::nullopt;
       }
+      previous_guarded_position = &point.position;
     }
   }
 
@@ -296,25 +401,42 @@ std::optional<moveit_servo::KinematicState> CollisionAwareServoComponent::make_n
     return std::nullopt;
   }
 
-  const double tolerance = 2.0 * velocity_qp_->config().solution_feasibility_tolerance;
-  const Eigen::VectorXd safe_lower =
-    motion_limits_.lower_position;
-  const Eigen::VectorXd safe_upper =
-    motion_limits_.upper_position;
-  if ((next_state.positions.array() < safe_lower.array() - tolerance).any() ||
-    (next_state.positions.array() > safe_upper.array() + tolerance).any() ||
-    (next_state.velocities.cwiseAbs().array() >
-    motion_limits_.max_velocity.array() + tolerance).any() ||
-    (next_state.accelerations.cwiseAbs().array() >
-    motion_limits_.max_acceleration.array() + tolerance).any())
-  {
-    failure_reason = "direct fixed-period integration exceeded a checked motion bound";
+  if (!motion_limits_.numerical_policy.has_value()) {
+    failure_reason = "Direct integration has no shared numerical policy";
     return std::nullopt;
+  }
+  const auto & numerical = *motion_limits_.numerical_policy;
+  const double dt = parameters_.control_period_sec;
+  for (std::size_t index = 0; index < parameters_.joint_names.size(); ++index) {
+    const Eigen::Index axis = static_cast<Eigen::Index>(index);
+    const control::PositionInterval position_interval{
+      motion_limits_.lower_position[axis], motion_limits_.upper_position[axis]};
+    const double jerk =
+      (next_state.accelerations[axis] - current_state.accelerations[axis]) / dt;
+    const auto acceleration_class = control::classifyMagnitude(
+      control::RadiansPerSecondSquared{next_state.accelerations[axis]},
+      control::RadiansPerSecondSquared{motion_limits_.max_acceleration[axis]},
+      numerical.acceleration_error);
+    const auto jerk_class = control::classifyMagnitude(
+      control::RadiansPerSecondCubed{jerk},
+      control::RadiansPerSecondCubed{motion_limits_.max_jerk[axis]},
+      numerical.jerk_error);
+    if (!control::isNominalPosition(next_state.positions[axis], position_interval) ||
+      std::abs(next_state.velocities[axis]) > motion_limits_.max_velocity[axis] ||
+      acceleration_class == control::BoundaryClass::kOutside ||
+      acceleration_class == control::BoundaryClass::kInvalid ||
+      jerk_class == control::BoundaryClass::kOutside ||
+      jerk_class == control::BoundaryClass::kInvalid)
+    {
+      failure_reason = "Direct fixed-period integration is outside the shared q/v/a/j "
+        "command policy for " + parameters_.joint_names[index];
+      return std::nullopt;
+    }
   }
 
   moveit::core::RobotState bound_check(*robot_state);
   bound_check.setJointGroupPositions(joint_model_group_, next_state.positions);
-  if (!bound_check.satisfiesBounds(joint_model_group_, tolerance)) {
+  if (!bound_check.satisfiesBounds(joint_model_group_, 0.0)) {
     failure_reason = "integrated state violates the MoveIt robot model bounds";
     return std::nullopt;
   }
@@ -435,6 +557,42 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
     publication_queue.push_back(std::move(state));
   }
 
+  for (std::size_t point_index = 0; point_index < publication_queue.size(); ++point_index) {
+    const auto & point = publication_queue[point_index];
+    if (point.positions.size() != static_cast<Eigen::Index>(position_bound_sets_.size())) {
+      failure_reason = "Published trajectory point has the wrong joint count";
+      return CommandPublicationStatus::kInvariantFailure;
+    }
+    for (std::size_t joint_index = 0; joint_index < position_bound_sets_.size(); ++joint_index) {
+      const Eigen::Index axis = static_cast<Eigen::Index>(joint_index);
+      const double nominal = point.positions[axis];
+      const control::PositionInterval working_interval{
+        motion_limits_.lower_position[axis], motion_limits_.upper_position[axis]};
+      if (!control::isNominalPosition(nominal, working_interval)) {
+        failure_reason = "Published point " + std::to_string(point_index) +
+          " leaves nominal q bounds for " + parameters_.joint_names[joint_index];
+        return CommandPublicationStatus::kInvariantFailure;
+      }
+      if (!require_hardware_io_status_) {
+        continue;
+      }
+      const double transmitted = static_cast<double>(static_cast<float>(nominal));
+      if (!control::isWireCommand(nominal, position_bound_sets_[joint_index].wire)) {
+        failure_reason = "Published point " + std::to_string(point_index) +
+          " violates the strict float wire interval for " +
+          parameters_.joint_names[joint_index];
+        return CommandPublicationStatus::kInvariantFailure;
+      }
+      if (std::abs(transmitted - nominal) >
+        execution_error_bound_rad())
+      {
+        failure_reason = "Float wire quantization exceeds the collision uncertainty budget for " +
+          parameters_.joint_names[joint_index];
+        return CommandPublicationStatus::kInvariantFailure;
+      }
+    }
+  }
+
   if (const auto trajectory = moveit_servo::composeTrajectoryMessage(
       servo_parameters_, publication_queue))
   {
@@ -479,6 +637,15 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
       failure_reason = "Published trajectory history rejected a checked command";
       return CommandPublicationStatus::kInvariantFailure;
     }
+    if ((*publication_id & kBootstrapResetIdPrefix) != 0U) {
+      failure_reason = "Published trajectory identity exhausted its diagnostic ID range";
+      return CommandPublicationStatus::kInvariantFailure;
+    }
+    const std::size_t tail_start_index = commands_.queue.size() - 1U +
+      command.braking_tail.first_stationary_point;
+    record_trajectory_publication(
+      *trajectory, *publication_id, msg::ServoTrajectoryPublication::KIND_SERVO_TRAJECTORY,
+      stationary_time, static_cast<std::uint32_t>(tail_start_index));
     trajectory_publisher_->publish(*trajectory);
     commands_.active_publication_id = *publication_id;
     telemetry_.last_replacement_lead_sec = replacement_lead_sec;
@@ -547,7 +714,7 @@ void CollisionAwareServoComponent::process_startup_cycle(
     const bool measured_state_matches_reset = measured_positions.size() ==
       commands_.bootstrap_reset_positions->size() && measured_positions.allFinite() &&
       (measured_positions - *commands_.bootstrap_reset_positions).cwiseAbs().maxCoeff() <=
-      parameters_.collision_tracking_error_bound_rad;
+      execution_error_bound_rad();
     const bool acknowledged = commands_.observeBootstrapResetAcknowledgement(
       rclcpp::Time(controller_state->header.stamp, get_clock()->get_clock_type()),
       *commands_.bootstrap_reset_positions,
@@ -557,7 +724,7 @@ void CollisionAwareServoComponent::process_startup_cycle(
       map_values(controller_state->reference.velocities),
       map_values(controller_state->feedback.velocities),
       kControllerCommandAlignmentToleranceRad,
-      parameters_.collision_tracking_error_bound_rad, kStoppedVelocityRadps,
+      execution_error_bound_rad(), kStoppedVelocityRadps,
       measured_state_matches_reset);
     if (!acknowledged) {
       publish_status(
@@ -600,7 +767,7 @@ void CollisionAwareServoComponent::process_startup_cycle(
         map_values(controller_state->reference.velocities),
         map_values(controller_state->feedback.velocities),
         kControllerCommandAlignmentToleranceRad,
-        parameters_.collision_tracking_error_bound_rad, kStoppedVelocityRadps, true);
+        execution_error_bound_rad(), kStoppedVelocityRadps, true);
       if (!source_hold_ready) {
         publish_status(
           moveit_msgs::msg::ServoStatus::NO_WARNING,
@@ -636,11 +803,34 @@ void CollisionAwareServoComponent::process_startup_cycle(
       reset_point.positions.assign(
         bootstrap->seed_state.positions.data(),
         bootstrap->seed_state.positions.data() + bootstrap->seed_state.positions.size());
+      for (std::size_t joint_index = 0; require_hardware_io_status_ &&
+        joint_index < position_bound_sets_.size();
+        ++joint_index)
+      {
+        if (!control::isWireCommand(
+            bootstrap->seed_state.positions[static_cast<Eigen::Index>(joint_index)],
+            position_bound_sets_[joint_index].wire))
+        {
+          enter_safety_wait(
+            "Bootstrap hold violates the strict float wire interval for " +
+            parameters_.joint_names[joint_index]);
+          return;
+        }
+      }
       reset_point.velocities.assign(parameters_.joint_names.size(), 0.0);
       reset_point.accelerations.assign(parameters_.joint_names.size(), 0.0);
       reset_point.time_from_start = builtin_interfaces::msg::Duration{};
       reset_trajectory.points.push_back(std::move(reset_point));
       commands_.bootstrap_reset_published_time = bootstrap_time;
+      if (bootstrap_reset_event_sequence_ >= kBootstrapResetSequenceMask) {
+        enter_safety_wait("Bootstrap reset diagnostic event ID space exhausted");
+        return;
+      }
+      const std::uint64_t reset_event_id = kBootstrapResetIdPrefix |
+        ++bootstrap_reset_event_sequence_;
+      record_trajectory_publication(
+        reset_trajectory, reset_event_id,
+        msg::ServoTrajectoryPublication::KIND_BOOTSTRAP_RESET, bootstrap_time, 0U);
       trajectory_publisher_->publish(reset_trajectory);
       commands_.bootstrap_reset_positions = bootstrap->seed_state.positions;
       commands_.bootstrap_reset_ack_pending = true;
@@ -672,6 +862,9 @@ void CollisionAwareServoComponent::process_startup_cycle(
     if (bootstrap_record == nullptr || bootstrap_record->execution_queue.empty() ||
       !commands_.active_publication_id.has_value())
     {
+      if (require_hardware_io_status_) {
+        request_hardware_inhibit();
+      }
       enter_safety_wait("Published bootstrap record is unavailable");
       return;
     }

@@ -6,6 +6,7 @@
 #include <osqp.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -47,6 +48,9 @@ struct StageResult
   QpStageStatus status{QpStageStatus::kSolverError};
   Eigen::VectorXd velocity;
   int iterations{0};
+  std::optional<QpFailureSnapshot> failure_snapshot;
+  QpFailureSnapshotDisposition snapshot_disposition{
+    QpFailureSnapshotDisposition::kNotNeeded};
 };
 
 struct WorkspaceDeleter
@@ -114,6 +118,7 @@ bool discrete_stopping_envelope(
   const double max_velocity,
   const double max_acceleration,
   const double max_jerk,
+  const NumericalPolicy & numerical_policy,
   const HierarchicalVelocityQpConfig & config,
   DiscreteStoppingEnvelope & envelope)
 {
@@ -128,10 +133,8 @@ bool discrete_stopping_envelope(
   const auto residual_ticks = static_cast<std::size_t>(residual_ticks_value);
   detail::ScalarBrakingOptions options;
   options.period_sec = config.period_sec;
-  // The tail validator uses this same margin. Keeping the policy decision on
-  // one tolerance prevents the QP and its reconstructed suffix from selecting
-  // different terminal acceleration samples at a numerical boundary.
-  options.comparison_tolerance = 2.0 * config.solution_feasibility_tolerance;
+  // QP residual is a solver-domain tolerance, not a q/v/a/j allowance.
+  options.numerical_policy = numerical_policy;
   options.maximum_braking_steps = kMaximumSimulationTicks;
   options.adverse_ticks = residual_ticks;
   const detail::ScalarBrakingRollout rollout = detail::rolloutScalarBraking(
@@ -153,6 +156,7 @@ bool safe_before_velocity_limit(
   const double max_velocity,
   const double max_acceleration,
   const double max_jerk,
+  const NumericalPolicy & numerical_policy,
   const HierarchicalVelocityQpConfig & config)
 {
   const double candidate_acceleration =
@@ -161,17 +165,15 @@ bool safe_before_velocity_limit(
   if (!discrete_stopping_envelope(
     signed_direction * candidate_velocity,
     signed_direction * candidate_acceleration,
-    max_velocity,
-    max_acceleration,
-    max_jerk,
-    config, envelope))
+    max_velocity, max_acceleration, max_jerk, numerical_policy, config, envelope))
   {
     return false;
   }
   // Solver feasibility tolerance is not extra physical velocity.  Keep the
   // recursively feasible envelope inside the real joint limit so the next
   // control tick cannot start outside the strict collision-builder box.
-  return envelope.maximum_velocity <= max_velocity;
+  return envelope.maximum_velocity <=
+         max_velocity - numerical_policy.velocity_error.value;
 }
 
 InputCheck enforce_velocity_braking_invariant(
@@ -182,15 +184,13 @@ InputCheck enforce_velocity_braking_invariant(
   double & lower_velocity,
   double & upper_velocity)
 {
-  // 32 halvings are already substantially finer than the configured QP
-  // feasibility tolerance, while these checks run in the 100 Hz hot path.
+  // Keep the existing bounded 32-step search in the 100 Hz hot path.
   constexpr int kBisectionIterations = 32;
-  const double interior_margin = 2.0 * config.solution_feasibility_tolerance;
   const auto safe_upper = [&](const double candidate_velocity) {
       return safe_before_velocity_limit(
         candidate_velocity, state.velocity[index], 1.0,
-        limits.max_velocity[index], limits.max_acceleration[index],
-        limits.max_jerk[index], config);
+        limits.max_velocity[index], limits.max_acceleration[index], limits.max_jerk[index],
+        *limits.numerical_policy, config);
     };
   if (!safe_upper(upper_velocity)) {
     if (!safe_upper(lower_velocity)) {
@@ -206,17 +206,14 @@ InputCheck enforce_velocity_braking_invariant(
         unsafe = candidate;
       }
     }
-    // Keep the selected command just inside the bisection boundary. Otherwise
-    // a sub-microradian conversion difference in MoveIt can place the next
-    // recursive solve infinitesimally outside the same viability set.
-    upper_velocity = std::max(lower_velocity, safe - interior_margin);
+    upper_velocity = safe;
   }
 
   const auto safe_lower = [&](const double candidate_velocity) {
       return safe_before_velocity_limit(
         candidate_velocity, state.velocity[index], -1.0,
-        limits.max_velocity[index], limits.max_acceleration[index],
-        limits.max_jerk[index], config);
+        limits.max_velocity[index], limits.max_acceleration[index], limits.max_jerk[index],
+        *limits.numerical_policy, config);
     };
   if (!safe_lower(lower_velocity)) {
     if (!safe_lower(upper_velocity)) {
@@ -232,7 +229,7 @@ InputCheck enforce_velocity_braking_invariant(
         unsafe = candidate;
       }
     }
-    lower_velocity = std::min(upper_velocity, safe + interior_margin);
+    lower_velocity = safe;
   }
 
   return lower_velocity <= upper_velocity ? InputCheck::kValid : InputCheck::kInfeasible;
@@ -247,6 +244,7 @@ bool safe_before_position_limit(
   const double max_velocity,
   const double max_acceleration,
   const double max_jerk,
+  const NumericalPolicy & numerical_policy,
   const HierarchicalVelocityQpConfig & config)
 {
   const double candidate_acceleration =
@@ -258,16 +256,19 @@ bool safe_before_position_limit(
   if (!discrete_stopping_envelope(
     signed_direction * candidate_velocity,
     signed_direction * candidate_acceleration,
-    max_velocity,
-    max_acceleration,
-    max_jerk,
-    config, envelope))
+    max_velocity, max_acceleration, max_jerk, numerical_policy, config, envelope))
   {
     return false;
   }
-  // As above, the numerical solver tolerance must not consume joint travel.
-  // The bisection caller moves the selected bound into the safe interior.
-  return next_signed_position + envelope.maximum_position_excursion <= signed_limit;
+  // For a true stationary hold, q + 0 * dt is exact and has no arithmetic
+  // position uncertainty. Keep inclusive limit endpoints holdable; moving
+  // candidates still reserve the typed q-operation budget. Solver residual
+  // remains in QP units and is not part of this position check.
+  const double position_operation_error =
+    candidate_velocity == 0.0 && envelope.maximum_position_excursion == 0.0 ?
+    0.0 : numerical_policy.position_error.value;
+  return next_signed_position + envelope.maximum_position_excursion <=
+         signed_limit - position_operation_error;
 }
 
 InputCheck enforce_braking_invariant(
@@ -281,7 +282,6 @@ InputCheck enforce_braking_invariant(
   // Keep the hot-path search bounded without chasing irrelevant
   // machine-precision digits.
   constexpr int kBisectionIterations = 32;
-  const double interior_margin = 2.0 * config.solution_feasibility_tolerance;
   const double safe_lower_position =
     limits.lower_position[index];
   const double safe_upper_position =
@@ -291,8 +291,8 @@ InputCheck enforce_braking_invariant(
       return safe_before_position_limit(
         candidate_velocity, state.position[index], state.velocity[index],
         1.0, safe_upper_position,
-        limits.max_velocity[index],
-        limits.max_acceleration[index], limits.max_jerk[index], config);
+        limits.max_velocity[index], limits.max_acceleration[index], limits.max_jerk[index],
+        *limits.numerical_policy, config);
     };
   if (!safe_upper(upper_velocity)) {
     if (!safe_upper(lower_velocity)) {
@@ -308,15 +308,15 @@ InputCheck enforce_braking_invariant(
         unsafe = candidate;
       }
     }
-    upper_velocity = std::max(lower_velocity, safe - interior_margin);
+    upper_velocity = safe;
   }
 
   const auto safe_lower = [&](const double candidate_velocity) {
       return safe_before_position_limit(
         candidate_velocity, state.position[index], state.velocity[index],
         -1.0, safe_lower_position,
-        limits.max_velocity[index],
-        limits.max_acceleration[index], limits.max_jerk[index], config);
+        limits.max_velocity[index], limits.max_acceleration[index], limits.max_jerk[index],
+        *limits.numerical_policy, config);
     };
   if (!safe_lower(lower_velocity)) {
     if (!safe_lower(upper_velocity)) {
@@ -332,7 +332,7 @@ InputCheck enforce_braking_invariant(
         unsafe = candidate;
       }
     }
-    lower_velocity = std::min(upper_velocity, safe + interior_margin);
+    lower_velocity = safe;
   }
 
   return lower_velocity <= upper_velocity ? InputCheck::kValid : InputCheck::kInfeasible;
@@ -344,7 +344,8 @@ InputCheck validate_common_inputs(
   const std::vector<LinearVelocityConstraint> & constraints)
 {
   const Eigen::Index joint_count = state.position.size();
-  if (joint_count <= 0 || state.velocity.size() != joint_count ||
+  if (!limits.numerical_policy.has_value() || !limits.numerical_policy->valid() ||
+    joint_count <= 0 || state.velocity.size() != joint_count ||
     state.acceleration.size() != joint_count ||
     limits.lower_position.size() != joint_count ||
     limits.upper_position.size() != joint_count ||
@@ -376,6 +377,18 @@ InputCheck validate_common_inputs(
     }
     if (limits.lower_position[index] + limits.position_margin[index] >
       limits.upper_position[index] - limits.position_margin[index])
+    {
+      return InputCheck::kInvalid;
+    }
+    if (classifyPosition(state.position[index],
+        PositionInterval{limits.lower_position[index], limits.upper_position[index]},
+        limits.numerical_policy->position_error) == BoundaryClass::kOutside ||
+      classifyVelocity(RadiansPerSecond{state.velocity[index]},
+        RadiansPerSecond{limits.max_velocity[index]},
+        limits.numerical_policy->velocity_error) == BoundaryClass::kOutside ||
+      classifyAcceleration(RadiansPerSecondSquared{state.acceleration[index]},
+        RadiansPerSecondSquared{limits.max_acceleration[index]},
+        limits.numerical_policy->acceleration_error) == BoundaryClass::kOutside)
     {
       return InputCheck::kInvalid;
     }
@@ -445,10 +458,8 @@ InputCheck build_constraint_matrix(
       limits.max_velocity[index],
       state.velocity[index] + maximum_acceleration * config.period_sec);
 
-    const double safe_lower_position =
-      limits.lower_position[index];
-    const double safe_upper_position =
-      limits.upper_position[index];
+    const double safe_lower_position = limits.lower_position[index];
+    const double safe_upper_position = limits.upper_position[index];
     lower_velocity = std::max(
       lower_velocity,
       (safe_lower_position - state.position[index]) / config.period_sec);
@@ -551,10 +562,11 @@ QpStageStatus classify_stage_status(const c_int status)
     case OSQP_DUAL_INFEASIBLE_INACCURATE:
       return QpStageStatus::kInfeasible;
     case OSQP_MAX_ITER_REACHED:
+      return QpStageStatus::kMaxIterations;
 #ifdef OSQP_TIME_LIMIT_REACHED
     case OSQP_TIME_LIMIT_REACHED:
+      return QpStageStatus::kTimeLimit;
 #endif
-      return QpStageStatus::kMaxIterations;
     default:
       return QpStageStatus::kSolverError;
   }
@@ -592,7 +604,8 @@ StageResult solve_stage(
   const Eigen::VectorXd & gradient,
   const ConstraintMatrix & constraints,
   const Eigen::VectorXd & warm_start,
-  const HierarchicalVelocityQpConfig & config)
+  const HierarchicalVelocityQpConfig & config,
+  const QpSolveStage solve_stage_kind)
 {
   StageResult result;
   const Eigen::Index variable_count = gradient.size();
@@ -699,24 +712,109 @@ StageResult solve_stage(
   settings.eps_rel = static_cast<c_float>(config.solver_relative_tolerance);
   settings.time_limit = static_cast<c_float>(config.solver_time_limit_sec);
 
-  OSQPWorkspace * raw_workspace = nullptr;
-  const c_int setup_result = osqp_setup(&raw_workspace, &data, &settings);
-  WorkspacePtr workspace{raw_workspace};
-  if (setup_result != 0 || workspace == nullptr) {
-    return result;
-  }
-
   std::vector<c_float> initial_velocity(static_cast<std::size_t>(variable_count));
   for (Eigen::Index index = 0; index < variable_count; ++index) {
     initial_velocity[static_cast<std::size_t>(index)] =
       static_cast<c_float>(solver_warm_start[index]);
   }
+
+  const auto capture_failure = [&](const int setup_code, const int solve_code,
+    const int raw_status, const double observed_solve_time) {
+      constexpr std::size_t kMaximumControllerJoints =
+        kQpFailureSnapshotMaximumJoints;
+      constexpr std::size_t kMaximumControllerRows =
+        kQpFailureSnapshotMaximumRows;
+      constexpr std::size_t kMaximumControllerPNonzeros = 21U;
+      constexpr std::size_t kMaximumControllerANonzeros =
+        kQpFailureSnapshotMaximumANonzeros;
+      if (variable_count > static_cast<Eigen::Index>(kMaximumControllerJoints) ||
+        constraints.matrix.rows() > static_cast<Eigen::Index>(kMaximumControllerRows) ||
+        p_sparse.values.size() > kMaximumControllerPNonzeros ||
+        a_sparse.values.size() > kMaximumControllerANonzeros)
+      {
+        result.snapshot_disposition = QpFailureSnapshotDisposition::kShapeLimitExceeded;
+        return;
+      }
+      QpFailureSnapshot snapshot;
+      snapshot.stage = solve_stage_kind;
+      snapshot.classified_status = result.status;
+      snapshot.setup_return_code = setup_code;
+      snapshot.solve_return_code = solve_code;
+      snapshot.raw_status_value = raw_status;
+      snapshot.osqp_version = OSQP_VERSION;
+      snapshot.c_int_size = sizeof(c_int);
+      snapshot.c_float_size = sizeof(c_float);
+      snapshot.observed_solve_time_sec = observed_solve_time;
+      snapshot.solver_budget_sec = config.solver_time_limit_sec;
+      snapshot.variable_count = data.n;
+      snapshot.constraint_count = data.m;
+      snapshot.p_column_pointers = std::move(p_sparse.column_pointers);
+      snapshot.p_row_indices = std::move(p_sparse.row_indices);
+      snapshot.p_values = std::move(p_sparse.values);
+      snapshot.a_column_pointers = std::move(a_sparse.column_pointers);
+      snapshot.a_row_indices = std::move(a_sparse.row_indices);
+      snapshot.a_values = std::move(a_sparse.values);
+      snapshot.q = std::move(linear_cost);
+      snapshot.lower = std::move(lower);
+      snapshot.upper = std::move(upper);
+      snapshot.centered_warm_start = std::move(initial_velocity);
+      snapshot.variable_shift.resize(static_cast<std::size_t>(variable_count));
+      for (Eigen::Index i = 0; i < variable_count; ++i) {
+        snapshot.variable_shift[static_cast<std::size_t>(i)] = variable_shift[i];
+      }
+      snapshot.rho = settings.rho;
+      snapshot.sigma = settings.sigma;
+      snapshot.scaling = settings.scaling;
+#if EMBEDDED != 1
+      snapshot.adaptive_rho = settings.adaptive_rho;
+      snapshot.adaptive_rho_interval = settings.adaptive_rho_interval;
+      snapshot.adaptive_rho_tolerance = settings.adaptive_rho_tolerance;
+#ifdef PROFILING
+      snapshot.adaptive_rho_fraction = settings.adaptive_rho_fraction;
+#endif
+#endif
+      snapshot.max_iter = settings.max_iter;
+      snapshot.eps_abs = settings.eps_abs;
+      snapshot.eps_rel = settings.eps_rel;
+      snapshot.eps_prim_inf = settings.eps_prim_inf;
+      snapshot.eps_dual_inf = settings.eps_dual_inf;
+      snapshot.alpha = settings.alpha;
+      snapshot.linsys_solver = static_cast<int>(settings.linsys_solver);
+#ifndef EMBEDDED
+      snapshot.delta = settings.delta;
+      snapshot.polish = settings.polish;
+      snapshot.polish_refine_iter = settings.polish_refine_iter;
+      snapshot.verbose = settings.verbose;
+#endif
+      snapshot.scaled_termination = settings.scaled_termination;
+      snapshot.check_termination = settings.check_termination;
+      snapshot.warm_start = settings.warm_start;
+#ifdef PROFILING
+      snapshot.time_limit_sec = settings.time_limit;
+#endif
+      result.failure_snapshot = std::move(snapshot);
+      result.snapshot_disposition = QpFailureSnapshotDisposition::kCaptured;
+    };
+
+  OSQPWorkspace * raw_workspace = nullptr;
+  const c_int setup_result = osqp_setup(&raw_workspace, &data, &settings);
+  WorkspacePtr workspace{raw_workspace};
+  if (setup_result != 0 || workspace == nullptr) {
+    capture_failure(static_cast<int>(setup_result), 0, OSQP_UNSOLVED, 0.0);
+    return result;
+  }
+  if (workspace->settings != nullptr) {
+    settings = *workspace->settings;
+  }
+
   if (osqp_warm_start_x(workspace.get(), initial_velocity.data()) != 0) {
+    capture_failure(0, -1, OSQP_UNSOLVED, 0.0);
     return result;
   }
 
   const c_int solve_result = osqp_solve(workspace.get());
   if (solve_result != 0 || workspace->info == nullptr) {
+    capture_failure(0, static_cast<int>(solve_result), OSQP_UNSOLVED, 0.0);
     return result;
   }
   result.status = classify_stage_status(workspace->info->status_val);
@@ -724,10 +822,16 @@ StageResult solve_stage(
   if (result.status != QpStageStatus::kSolved &&
     result.status != QpStageStatus::kSolvedInaccurate)
   {
+    capture_failure(0, static_cast<int>(solve_result),
+      static_cast<int>(workspace->info->status_val),
+      static_cast<double>(workspace->info->solve_time));
     return result;
   }
   if (workspace->solution == nullptr || workspace->solution->x == nullptr) {
     result.status = QpStageStatus::kSolverError;
+    capture_failure(0, static_cast<int>(solve_result),
+      static_cast<int>(workspace->info->status_val),
+      static_cast<double>(workspace->info->solve_time));
     return result;
   }
 
@@ -747,6 +851,9 @@ StageResult solve_stage(
   {
     result.velocity.resize(0);
     result.status = QpStageStatus::kSolverError;
+    capture_failure(0, static_cast<int>(solve_result),
+      static_cast<int>(workspace->info->status_val),
+      static_cast<double>(workspace->info->solve_time));
   }
   return result;
 }
@@ -787,6 +894,8 @@ QpStatus top_level_status(const QpStageStatus status)
       return QpStatus::kInfeasible;
     case QpStageStatus::kMaxIterations:
       return QpStatus::kMaxIterations;
+    case QpStageStatus::kTimeLimit:
+      return QpStatus::kTimeLimit;
     case QpStageStatus::kNotRun:
     case QpStageStatus::kSolverError:
       return QpStatus::kSolverError;
@@ -795,6 +904,180 @@ QpStatus top_level_status(const QpStageStatus status)
 }
 
 }  // namespace
+
+QpReplayResult replayQpFailureSnapshot(const QpFailureSnapshot & snapshot)
+{
+  QpReplayResult result;
+  result.compatible_solver_build = snapshot.osqp_version == OSQP_VERSION &&
+    snapshot.c_int_size == sizeof(c_int) && snapshot.c_float_size == sizeof(c_float);
+  if (!result.compatible_solver_build) {
+    result.setup_return_code = -2;
+    return result;
+  }
+  const auto n = snapshot.variable_count;
+  const auto m = snapshot.constraint_count;
+  if (n <= 0 || m <= 0 || snapshot.p_column_pointers.size() !=
+    static_cast<std::size_t>(n + 1) || snapshot.a_column_pointers.size() !=
+    static_cast<std::size_t>(n + 1) || snapshot.q.size() != static_cast<std::size_t>(n) ||
+    snapshot.lower.size() != static_cast<std::size_t>(m) ||
+    snapshot.upper.size() != static_cast<std::size_t>(m) ||
+    snapshot.centered_warm_start.size() != static_cast<std::size_t>(n) ||
+    snapshot.variable_shift.size() != static_cast<std::size_t>(n) ||
+    snapshot.p_row_indices.size() != snapshot.p_values.size() ||
+    snapshot.a_row_indices.size() != snapshot.a_values.size())
+  {
+    result.setup_return_code = -1;
+    return result;
+  }
+  const auto valid_csc = [](const std::vector<c_int> & indptr,
+    const std::vector<c_int> & indices, const std::size_t nonzeros,
+    const int rows, const bool upper_triangular) {
+      if (indptr.empty() || indptr.front() != 0 ||
+        indptr.back() != static_cast<c_int>(nonzeros))
+      {
+        return false;
+      }
+      for (std::size_t column = 0; column + 1U < indptr.size(); ++column) {
+        if (indptr[column] < 0 || indptr[column] > indptr[column + 1U] ||
+          indptr[column + 1U] > static_cast<c_int>(nonzeros))
+        {
+          return false;
+        }
+        for (c_int offset = indptr[column]; offset < indptr[column + 1U]; ++offset) {
+          const c_int row = indices[static_cast<std::size_t>(offset)];
+          if (row < 0 || row >= rows ||
+            (upper_triangular && static_cast<std::size_t>(row) > column))
+          {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+  if (!valid_csc(snapshot.p_column_pointers, snapshot.p_row_indices,
+      snapshot.p_values.size(), n, true) ||
+    !valid_csc(snapshot.a_column_pointers, snapshot.a_row_indices,
+      snapshot.a_values.size(), m, false) ||
+    !std::all_of(snapshot.p_values.begin(), snapshot.p_values.end(),
+    [](const c_float value) {return std::isfinite(static_cast<double>(value));}) ||
+    !std::all_of(snapshot.a_values.begin(), snapshot.a_values.end(),
+    [](const c_float value) {return std::isfinite(static_cast<double>(value));}) ||
+    !std::all_of(snapshot.q.begin(), snapshot.q.end(),
+    [](const c_float value) {return std::isfinite(static_cast<double>(value));}) ||
+    !std::all_of(snapshot.lower.begin(), snapshot.lower.end(),
+    [](const c_float value) {return !std::isnan(static_cast<double>(value));}) ||
+    !std::all_of(snapshot.upper.begin(), snapshot.upper.end(),
+    [](const c_float value) {return !std::isnan(static_cast<double>(value));}) ||
+    !std::all_of(snapshot.centered_warm_start.begin(), snapshot.centered_warm_start.end(),
+    [](const c_float value) {return std::isfinite(static_cast<double>(value));}) ||
+    !std::all_of(snapshot.variable_shift.begin(), snapshot.variable_shift.end(),
+    [](const double value) {return std::isfinite(value);}))
+  {
+    result.setup_return_code = -1;
+    return result;
+  }
+  for (int row = 0; row < m; ++row) {
+    if (snapshot.lower[static_cast<std::size_t>(row)] >
+      snapshot.upper[static_cast<std::size_t>(row)])
+    {
+      result.setup_return_code = -1;
+      return result;
+    }
+  }
+
+  std::vector<c_int> p_indptr(snapshot.p_column_pointers.begin(), snapshot.p_column_pointers.end());
+  std::vector<c_int> p_indices(snapshot.p_row_indices.begin(), snapshot.p_row_indices.end());
+  std::vector<c_float> p_values(snapshot.p_values.begin(), snapshot.p_values.end());
+  std::vector<c_int> a_indptr(snapshot.a_column_pointers.begin(), snapshot.a_column_pointers.end());
+  std::vector<c_int> a_indices(snapshot.a_row_indices.begin(), snapshot.a_row_indices.end());
+  std::vector<c_float> a_values(snapshot.a_values.begin(), snapshot.a_values.end());
+  std::vector<c_float> q(snapshot.q.begin(), snapshot.q.end());
+  std::vector<c_float> lower(snapshot.lower.begin(), snapshot.lower.end());
+  std::vector<c_float> upper(snapshot.upper.begin(), snapshot.upper.end());
+  std::vector<c_float> warm_start(snapshot.centered_warm_start.begin(),
+    snapshot.centered_warm_start.end());
+  csc p_matrix{static_cast<c_int>(p_values.size()), static_cast<c_int>(n), static_cast<c_int>(n),
+    p_indptr.data(), p_indices.data(), p_values.data(), -1};
+  csc a_matrix{static_cast<c_int>(a_values.size()), static_cast<c_int>(m), static_cast<c_int>(n),
+    a_indptr.data(), a_indices.data(), a_values.data(), -1};
+  OSQPData data{};
+  data.n = static_cast<c_int>(n);
+  data.m = static_cast<c_int>(m);
+  data.P = &p_matrix;
+  data.A = &a_matrix;
+  data.q = q.data();
+  data.l = lower.data();
+  data.u = upper.data();
+
+  OSQPSettings settings{};
+  osqp_set_default_settings(&settings);
+  settings.rho = static_cast<c_float>(snapshot.rho);
+  settings.sigma = static_cast<c_float>(snapshot.sigma);
+  settings.scaling = static_cast<c_int>(snapshot.scaling);
+#if EMBEDDED != 1
+  settings.adaptive_rho = static_cast<c_int>(snapshot.adaptive_rho);
+  settings.adaptive_rho_interval = static_cast<c_int>(snapshot.adaptive_rho_interval);
+  settings.adaptive_rho_tolerance = static_cast<c_float>(snapshot.adaptive_rho_tolerance);
+#ifdef PROFILING
+  settings.adaptive_rho_fraction = static_cast<c_float>(snapshot.adaptive_rho_fraction);
+#endif
+#endif
+  settings.max_iter = static_cast<c_int>(snapshot.max_iter);
+  settings.eps_abs = static_cast<c_float>(snapshot.eps_abs);
+  settings.eps_rel = static_cast<c_float>(snapshot.eps_rel);
+  settings.eps_prim_inf = static_cast<c_float>(snapshot.eps_prim_inf);
+  settings.eps_dual_inf = static_cast<c_float>(snapshot.eps_dual_inf);
+  settings.alpha = static_cast<c_float>(snapshot.alpha);
+  settings.linsys_solver = static_cast<enum linsys_solver_type>(snapshot.linsys_solver);
+#ifndef EMBEDDED
+  settings.delta = static_cast<c_float>(snapshot.delta);
+  settings.polish = static_cast<c_int>(snapshot.polish);
+  settings.polish_refine_iter = static_cast<c_int>(snapshot.polish_refine_iter);
+  settings.verbose = static_cast<c_int>(snapshot.verbose);
+#endif
+  settings.scaled_termination = static_cast<c_int>(snapshot.scaled_termination);
+  settings.check_termination = static_cast<c_int>(snapshot.check_termination);
+  settings.warm_start = static_cast<c_int>(snapshot.warm_start);
+#ifdef PROFILING
+  settings.time_limit = static_cast<c_float>(snapshot.time_limit_sec);
+#endif
+
+  OSQPWorkspace * raw_workspace = nullptr;
+  result.setup_return_code = static_cast<int>(osqp_setup(&raw_workspace, &data, &settings));
+  WorkspacePtr workspace{raw_workspace};
+  if (result.setup_return_code != 0 || workspace == nullptr) {
+    return result;
+  }
+  result.setup_return_code = static_cast<int>(osqp_warm_start_x(workspace.get(),
+      warm_start.data()));
+  if (result.setup_return_code != 0) {
+    return result;
+  }
+  result.solve_return_code = static_cast<int>(osqp_solve(workspace.get()));
+  if (workspace->info == nullptr) {
+    return result;
+  }
+  result.raw_status_value = static_cast<int>(workspace->info->status_val);
+  result.status = classify_stage_status(workspace->info->status_val);
+  result.iterations = static_cast<int>(workspace->info->iter);
+  result.solve_time_sec = static_cast<double>(workspace->info->solve_time);
+  result.primal_residual = static_cast<double>(workspace->info->pri_res);
+  result.dual_residual = static_cast<double>(workspace->info->dua_res);
+  if (workspace->solution != nullptr && workspace->solution->x != nullptr) {
+    result.physical_solution.resize(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      result.physical_solution[static_cast<std::size_t>(i)] =
+        static_cast<double>(workspace->solution->x[i]) +
+        snapshot.variable_shift[static_cast<std::size_t>(i)];
+    }
+  }
+  return result;
+}
+
+QpStageStatus classifyQpSolverStatus(const int raw_status_value) noexcept
+{
+  return classify_stage_status(static_cast<c_int>(raw_status_value));
+}
 
 bool QpResult::command_available() const noexcept
 {
@@ -876,11 +1159,13 @@ QpResult HierarchicalVelocityQp::solve(
   const auto primary_objective = make_tracking_objective(
     task.primary_matrix, task.primary_reference, task.primary_weights,
     state.velocity, config_);
-  const StageResult primary = solve_stage(
+  StageResult primary = solve_stage(
     primary_objective.first, primary_objective.second, base_constraints,
-    state.velocity, config_);
+    state.velocity, config_, QpSolveStage::kPrimary);
   result.primary_status = primary.status;
   result.primary_iterations = primary.iterations;
+  result.primary_failure_snapshot = std::move(primary.failure_snapshot);
+  result.primary_snapshot_disposition = primary.snapshot_disposition;
   if (primary.status != QpStageStatus::kSolved &&
     primary.status != QpStageStatus::kSolvedInaccurate)
   {
@@ -914,11 +1199,13 @@ QpResult HierarchicalVelocityQp::solve(
   const auto secondary_objective = make_tracking_objective(
     task.secondary_matrix, task.secondary_reference, task.secondary_weights,
     state.velocity, config_);
-  const StageResult secondary = solve_stage(
+  StageResult secondary = solve_stage(
     secondary_objective.first, secondary_objective.second,
-    secondary_constraints, primary.velocity, config_);
+    secondary_constraints, primary.velocity, config_, QpSolveStage::kSecondary);
   result.secondary_status = secondary.status;
   result.secondary_iterations = secondary.iterations;
+  result.secondary_failure_snapshot = std::move(secondary.failure_snapshot);
+  result.secondary_snapshot_disposition = secondary.snapshot_disposition;
   if (secondary.status != QpStageStatus::kSolved &&
     secondary.status != QpStageStatus::kSolvedInaccurate)
   {
@@ -966,10 +1253,12 @@ QpResult HierarchicalVelocityQp::brake(
     2.0 * (1.0 + config_.velocity_regularization) *
     Eigen::MatrixXd::Identity(joint_count, joint_count);
   const Eigen::VectorXd gradient = Eigen::VectorXd::Zero(joint_count);
-  const StageResult braking = solve_stage(
-    hessian, gradient, hard_constraints, state.velocity, config_);
+  StageResult braking = solve_stage(
+    hessian, gradient, hard_constraints, state.velocity, config_, QpSolveStage::kBrake);
   result.primary_status = braking.status;
   result.primary_iterations = braking.iterations;
+  result.primary_failure_snapshot = std::move(braking.failure_snapshot);
+  result.primary_snapshot_disposition = braking.snapshot_disposition;
   result.status = top_level_status(braking.status);
   if (braking.status == QpStageStatus::kSolved ||
     braking.status == QpStageStatus::kSolvedInaccurate)

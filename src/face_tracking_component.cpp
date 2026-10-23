@@ -18,12 +18,15 @@
 #include "face_tracking_arm/tracking_core.hpp"
 #include "face_tracking_arm/msg/tracking_target.hpp"
 #include "face_tracking_arm/msg/perception_status.hpp"
+#include "face_tracking_arm/msg/face_transform_provenance.hpp"
 
+#include <builtin_interfaces/msg/time.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <moveit_msgs/msg/allowed_collision_matrix.hpp>
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <moveit_msgs/msg/planning_scene.hpp>
@@ -76,6 +79,24 @@ bool finite_point(const geometry_msgs::msg::Point & point)
 {
   return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
 }
+
+geometry_msgs::msg::TransformStamped identity_transform(
+  const std::string & parent_frame, const std::string & child_frame,
+  const builtin_interfaces::msg::Time & stamp)
+{
+  geometry_msgs::msg::TransformStamped transform;
+  transform.header.stamp = stamp;
+  transform.header.frame_id = parent_frame;
+  transform.child_frame_id = child_frame;
+  transform.transform.rotation.w = 1.0;
+  return transform;
+}
+
+struct TransformedFaceSample
+{
+  tracking::FaceSample sample;
+  msg::FaceTransformProvenance provenance;
+};
 
 std::string bool_string(const bool value)
 {
@@ -275,6 +296,8 @@ public:
       kPoseCommandTopic, rclcpp::QoS(1).reliable());
     tracking_target_publisher_ = create_publisher<msg::TrackingTarget>(
       "/servo_node/tracking_target_cmds", rclcpp::QoS(1).reliable());
+    face_transform_provenance_publisher_ = create_publisher<msg::FaceTransformProvenance>(
+      "/tracking/face_transform_provenance", rclcpp::QoS(16).reliable());
     diagnostics_publisher_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
       kDiagnosticsTopic, rclcpp::QoS(1).reliable());
     planning_scene_publisher_ = create_publisher<moveit_msgs::msg::PlanningScene>(
@@ -547,7 +570,7 @@ private:
       }
     }
 
-    const auto sample = transform_face(pending_face_->message);
+    auto sample = transform_face(pending_face_->message);
     if (!sample.has_value()) {
       last_adapter_status_ = "waiting_exact_tf";
       return;
@@ -555,25 +578,36 @@ private:
 
     const auto received_at = pending_face_->received_at;
     pending_face_.reset();
-    const tracking::IngestResult ingest_result = core_->ingest_face(*sample, now_ns);
+    const tracking::IngestResult ingest_result = core_->ingest_face(sample->sample, now_ns);
     if (!ingest_result.accepted()) {
       reject_face(reject_reason_name(ingest_result.reason));
       return;
     }
 
     ++accepted_face_count_;
-    last_accepted_face_stamp_ns_ = sample->measurement_stamp_ns;
+    sample->provenance.accepted_face_sequence = accepted_face_count_;
+    face_transform_provenance_publisher_->publish(sample->provenance);
+    last_accepted_face_stamp_ns_ = sample->sample.measurement_stamp_ns;
     last_accepted_face_target_ = *ingest_result.accepted_geometry;
     last_face_received_at_ = received_at;
     last_adapter_status_ = "face_accepted";
   }
 
-  std::optional<tracking::FaceSample> transform_face(
+  std::optional<TransformedFaceSample> transform_face(
     const geometry_msgs::msg::PointStamped & message)
   {
     try {
       const rclcpp::Time measurement_time(
         message.header.stamp, get_clock()->get_clock_type());
+      TransformedFaceSample result;
+      result.provenance.header = message.header;
+      result.provenance.source_face = message.point;
+      result.provenance.planning_from_face = identity_transform(
+        planning_frame_, message.header.frame_id, message.header.stamp);
+      result.provenance.planning_from_base = identity_transform(
+        planning_frame_, base_frame_, message.header.stamp);
+      result.provenance.planning_from_reach_center = identity_transform(
+        planning_frame_, reach_center_frame_, message.header.stamp);
       geometry_msgs::msg::PointStamped transformed_face;
       if (message.header.frame_id == planning_frame_) {
         transformed_face = message;
@@ -582,6 +616,8 @@ private:
           planning_frame_, message.header.frame_id, measurement_time,
           rclcpp::Duration::from_nanoseconds(0));
         tf2::doTransform(message, transformed_face, transform);
+        result.provenance.planning_from_face = transform;
+        result.provenance.face_transform_lookup_used = true;
       }
 
       Eigen::Vector3d base_position = Eigen::Vector3d::Zero();
@@ -589,6 +625,8 @@ private:
         const auto base_transform = tf_buffer_.lookupTransform(
           planning_frame_, base_frame_, measurement_time,
           rclcpp::Duration::from_nanoseconds(0));
+        result.provenance.planning_from_base = base_transform;
+        result.provenance.base_transform_lookup_used = true;
         base_position = {
           base_transform.transform.translation.x,
           base_transform.transform.translation.y,
@@ -600,20 +638,28 @@ private:
         const auto reach_center_transform = tf_buffer_.lookupTransform(
           planning_frame_, reach_center_frame_, measurement_time,
           rclcpp::Duration::from_nanoseconds(0));
+        result.provenance.planning_from_reach_center = reach_center_transform;
+        result.provenance.reach_center_transform_lookup_used = true;
         reach_center_position = {
           reach_center_transform.transform.translation.x,
           reach_center_transform.transform.translation.y,
           reach_center_transform.transform.translation.z};
       }
 
-      tracking::FaceSample sample;
-      sample.face_in_planning_frame = {
+      result.provenance.planning_face = transformed_face.point;
+      result.provenance.planning_base.x = base_position.x();
+      result.provenance.planning_base.y = base_position.y();
+      result.provenance.planning_base.z = base_position.z();
+      result.provenance.planning_reach_center.x = reach_center_position.x();
+      result.provenance.planning_reach_center.y = reach_center_position.y();
+      result.provenance.planning_reach_center.z = reach_center_position.z();
+      result.sample.face_in_planning_frame = {
         transformed_face.point.x, transformed_face.point.y, transformed_face.point.z};
-      sample.base_in_planning_frame = base_position;
-      sample.reach_center_in_planning_frame = reach_center_position;
-      sample.measurement_stamp_ns = measurement_time.nanoseconds();
-      sample.frame_id = planning_frame_;
-      return sample;
+      result.sample.base_in_planning_frame = base_position;
+      result.sample.reach_center_in_planning_frame = reach_center_position;
+      result.sample.measurement_stamp_ns = measurement_time.nanoseconds();
+      result.sample.frame_id = planning_frame_;
+      return result;
     } catch (const tf2::TransformException &) {
       return std::nullopt;
     }
@@ -1182,6 +1228,8 @@ private:
 
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_publisher_;
   rclcpp::Publisher<msg::TrackingTarget>::SharedPtr tracking_target_publisher_;
+  rclcpp::Publisher<msg::FaceTransformProvenance>::SharedPtr
+    face_transform_provenance_publisher_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
   rclcpp::Publisher<moveit_msgs::msg::PlanningScene>::SharedPtr planning_scene_publisher_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr face_subscription_;

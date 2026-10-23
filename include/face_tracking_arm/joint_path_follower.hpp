@@ -36,9 +36,12 @@ struct JointPathUpdate
 {
   JointPathStatus status{JointPathStatus::kInvalid};
   Eigen::VectorXd reference_position;
+  Eigen::VectorXd projected_position;
   double progress_rad{0.0};
+  double remaining_distance_rad{0.0};
   double total_length_rad{0.0};
   double distance_from_path_rad{0.0};
+  bool lookahead_crosses_corner{false};
 };
 
 /// Follow a geometric joint-space polyline; distances use the Euclidean norm.
@@ -64,6 +67,7 @@ public:
 
   void reset() noexcept;
   [[nodiscard]] bool active() const noexcept;
+  [[nodiscard]] double lookaheadDistanceRad() const noexcept;
 
 private:
   [[nodiscard]] Eigen::VectorXd positionAt(double distance_rad) const;

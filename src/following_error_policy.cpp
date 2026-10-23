@@ -16,7 +16,7 @@ FollowingErrorAction classifyFollowingError(
     std::isfinite(position_error_rad) && position_error_rad >= 0.0 &&
     std::isfinite(velocity_error_rad_s) && velocity_error_rad_s >= 0.0 &&
     std::isfinite(policy.position_tolerance_rad) &&
-    policy.position_tolerance_rad > 0.0 &&
+    policy.position_tolerance_rad >= 0.0 &&
     std::isfinite(policy.velocity_tolerance_rad_s) &&
     policy.velocity_tolerance_rad_s > 0.0;
   if (!valid) {

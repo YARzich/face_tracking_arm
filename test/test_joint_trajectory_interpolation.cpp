@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <limits>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <builtin_interfaces/msg/time.hpp>
@@ -17,6 +19,8 @@
 #include <rclcpp/time.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
+
+#include "face_tracking_arm/emergency_brake_tail.hpp"
 
 namespace face_tracking_arm
 {
@@ -89,6 +93,105 @@ TEST(JointTrajectoryInterpolation, PositionOnlySplinesDoNotSkipTheFirstPoint)
   EXPECT_NEAR(at_end.positions[0], 0.11, 1.0e-12);
 }
 
+TEST(JointTrajectoryInterpolation, MissedReplacementKeepsCheckedPrefixAndTailInBounds)
+{
+  constexpr double lower_bound = 0.0;
+  constexpr double upper_bound = 0.8;
+  constexpr std::int64_t sample_step_ns = 1'000'000;
+  constexpr double period_sec = 0.01;
+  constexpr double source_position = 0.7991;
+  constexpr double candidate_velocity = 0.002;
+
+  control::JointMotionLimits limits;
+  limits.lower_position = Eigen::VectorXd::Constant(1, lower_bound);
+  limits.upper_position = Eigen::VectorXd::Constant(1, upper_bound);
+  limits.position_margin = Eigen::VectorXd::Zero(1);
+  limits.max_velocity = Eigen::VectorXd::Constant(1, 1.0);
+  limits.max_acceleration = Eigen::VectorXd::Constant(1, 2.0);
+  limits.max_jerk = Eigen::VectorXd::Constant(1, 20.0);
+  limits.numerical_policy = control::NumericalPolicy{
+    control::Radians{1.0e-12}, control::RadiansPerSecond{1.0e-12},
+    control::RadiansPerSecondSquared{1.0e-12},
+    control::RadiansPerSecondCubed{1.0e-12}, control::SolverResidual{1.0e-6}};
+
+  control::JointMotionState candidate;
+  candidate.position = Eigen::VectorXd::Constant(
+    1, source_position + candidate_velocity * period_sec);
+  candidate.velocity = Eigen::VectorXd::Constant(1, candidate_velocity);
+  candidate.acceleration = Eigen::VectorXd::Constant(
+    1, (candidate_velocity - 0.0) / period_sec);
+  const control::EmergencyBrakeTail tail =
+    control::EmergencyBrakeTailGenerator().generate(candidate, limits);
+  ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
+  ASSERT_GE(tail.points.size(), 3U);
+
+  const auto make_message = [](const std::vector<double> & positions) {
+      auto message = std::make_shared<trajectory_msgs::msg::JointTrajectory>();
+      message->header.stamp.sec = 1;
+      message->joint_names = {"joint1"};
+      for (std::size_t index = 0; index < positions.size(); ++index) {
+        trajectory_msgs::msg::JointTrajectoryPoint point;
+        point.positions = {positions[index]};
+        point.time_from_start.nanosec = static_cast<std::uint32_t>(
+          static_cast<std::int64_t>(index) * kPeriodNs);
+        message->points.push_back(std::move(point));
+      }
+      return message;
+    };
+
+  // The old publication has a validated source prefix and its checked stationary suffix.
+  std::vector<double> old_positions{source_position, source_position};
+  std::vector<double> replacement_positions = old_positions;
+  for (const auto & point : tail.points) {
+    ASSERT_EQ(point.position.size(), 1);
+    EXPECT_GE(point.position[0], lower_bound);
+    EXPECT_LE(point.position[0], upper_bound);
+    old_positions.push_back(source_position);
+    replacement_positions.push_back(point.position[0]);
+  }
+  auto old_message = make_message(old_positions);
+  auto replacement_message = make_message(replacement_positions);
+  Trajectory old_publication(old_message);
+  Trajectory replacement(replacement_message);
+  trajectory_msgs::msg::JointTrajectoryPoint preceding_point;
+  preceding_point.positions = {source_position};
+  const rclcpp::Time preceding_time(kHeaderTimeNs - kPeriodNs, RCL_ROS_TIME);
+  old_publication.set_point_before_trajectory_msg(preceding_time, preceding_point);
+  replacement.set_point_before_trajectory_msg(preceding_time, preceding_point);
+
+  // The replacement preserves the queued prefix exactly. If it is missed, the controller
+  // keeps following the previously checked hold; if received, the actual generated braking
+  // suffix remains in bounds. Position-only JTC interpolation is linear between these points.
+  ASSERT_EQ(old_message->points.size(), replacement_message->points.size());
+  for (std::size_t index = 0; index < 2U; ++index) {
+    EXPECT_DOUBLE_EQ(
+      old_message->points[index].positions[0], replacement_message->points[index].positions[0]);
+  }
+  const auto trajectory_end_ns = static_cast<std::int64_t>(
+    old_message->points.size() - 1U) * kPeriodNs;
+  for (std::int64_t offset_ns = 0; offset_ns <= trajectory_end_ns;
+    offset_ns += sample_step_ns)
+  {
+    const auto old_sample = sample(
+      old_publication, kHeaderTimeNs + offset_ns,
+      InterpolationMethod::VARIABLE_DEGREE_SPLINE);
+    const auto replacement_sample = sample(
+      replacement, kHeaderTimeNs + offset_ns,
+      InterpolationMethod::VARIABLE_DEGREE_SPLINE);
+    ASSERT_EQ(old_sample.positions.size(), 1U);
+    ASSERT_EQ(replacement_sample.positions.size(), 1U);
+    EXPECT_GE(old_sample.positions[0], lower_bound);
+    EXPECT_LE(old_sample.positions[0], upper_bound);
+    EXPECT_GE(replacement_sample.positions[0], lower_bound);
+    EXPECT_LE(replacement_sample.positions[0], upper_bound);
+  }
+
+  const auto missed_replacement_sample = sample(
+    old_publication, kHeaderTimeNs + 15'000'000,
+    InterpolationMethod::VARIABLE_DEGREE_SPLINE);
+  EXPECT_DOUBLE_EQ(missed_replacement_sample.positions[0], source_position);
+}
+
 TEST(JointTrajectoryInterpolation, NoneModeWouldSkipToTheFollowingPoint)
 {
   Trajectory trajectory = make_trajectory();
@@ -97,6 +200,66 @@ TEST(JointTrajectoryInterpolation, NoneModeWouldSkipToTheFollowingPoint)
     trajectory, kHeaderTimeNs, InterpolationMethod::NONE);
   ASSERT_EQ(at_start.positions.size(), 1U);
   EXPECT_NEAR(at_start.positions[0], 0.11, 1.0e-12);
+}
+
+TEST(JointTrajectoryInterpolation, FloatSampleDifferencesStayInsideRoundoffEnvelope)
+{
+  Trajectory trajectory = make_trajectory();
+  constexpr std::int64_t kControllerSampleNs = 1'000'000;
+  constexpr double kControllerSampleSec =
+    static_cast<double>(kControllerSampleNs) * 1.0e-9;
+  std::vector<double> nominal;
+  std::vector<double> wire;
+  double maximum_half_ulp = 0.0;
+  for (std::int64_t offset_ns = 0; offset_ns <= kPeriodNs;
+    offset_ns += kControllerSampleNs)
+  {
+    const double value = sample(
+      trajectory, kHeaderTimeNs + offset_ns,
+      InterpolationMethod::VARIABLE_DEGREE_SPLINE).positions.at(0);
+    const float float_value = static_cast<float>(value);
+    const float lower = std::nextafter(float_value,
+      -std::numeric_limits<float>::infinity());
+    const float upper = std::nextafter(float_value,
+      std::numeric_limits<float>::infinity());
+    const double half_ulp = 0.5 * std::max(
+      static_cast<double>(float_value) - static_cast<double>(lower),
+      static_cast<double>(upper) - static_cast<double>(float_value));
+    maximum_half_ulp = std::max(maximum_half_ulp, half_ulp);
+    nominal.push_back(value);
+    wire.push_back(static_cast<double>(float_value));
+    EXPECT_LE(std::abs(wire.back() - nominal.back()), maximum_half_ulp);
+  }
+
+  std::vector<double> nominal_velocity, wire_velocity;
+  for (std::size_t index = 1; index < nominal.size(); ++index) {
+    nominal_velocity.push_back((nominal[index] - nominal[index - 1U]) /
+      kControllerSampleSec);
+    wire_velocity.push_back((wire[index] - wire[index - 1U]) /
+      kControllerSampleSec);
+    EXPECT_LE(std::abs(wire_velocity.back() - nominal_velocity.back()),
+      2.0 * maximum_half_ulp / kControllerSampleSec + 1.0e-12);
+  }
+
+  std::vector<double> nominal_acceleration, wire_acceleration;
+  for (std::size_t index = 1; index < nominal_velocity.size(); ++index) {
+    nominal_acceleration.push_back((nominal_velocity[index] - nominal_velocity[index - 1U]) /
+      kControllerSampleSec);
+    wire_acceleration.push_back((wire_velocity[index] - wire_velocity[index - 1U]) /
+      kControllerSampleSec);
+    EXPECT_LE(std::abs(wire_acceleration.back() - nominal_acceleration.back()),
+      4.0 * maximum_half_ulp / std::pow(kControllerSampleSec, 2) + 1.0e-9);
+  }
+  for (std::size_t index = 1; index < nominal_acceleration.size(); ++index) {
+    const double nominal_jerk =
+      (nominal_acceleration[index] - nominal_acceleration[index - 1U]) /
+      kControllerSampleSec;
+    const double wire_jerk =
+      (wire_acceleration[index] - wire_acceleration[index - 1U]) /
+      kControllerSampleSec;
+    EXPECT_LE(std::abs(wire_jerk - nominal_jerk),
+      8.0 * maximum_half_ulp / std::pow(kControllerSampleSec, 3) + 1.0e-6);
+  }
 }
 
 TEST(JointTrajectoryInterpolation, ZeroStampedStationaryResetSamplesMeasuredHoldAtTimeZero)

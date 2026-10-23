@@ -75,6 +75,7 @@ struct CommandSession
   void startRearmDeadline(const rclcpp::Time & current_time, const WallTime & wall_time);
   void ensureRearmDeadline(const rclcpp::Time & current_time, const WallTime & wall_time);
   void clearRearmDeadlines() noexcept;
+  bool claimRearmTimeoutReport() noexcept;
   bool rearmDeadlineExpired(
     const rclcpp::Time & current_time,
     const WallTime & wall_time) const noexcept;
@@ -109,6 +110,7 @@ struct CommandSession
   std::optional<rclcpp::Time> last_rearm_sample_time;
   std::optional<rclcpp::Time> rearm_deadline;
   std::optional<std::chrono::steady_clock::time_point> rearm_wall_deadline;
+  bool rearm_timeout_reported{false};
   std::size_t consecutive_automatic_rearms{0};
   std::size_t healthy_publications_since_rearm{0};
   std::uint64_t timeline_recovery_events{0};

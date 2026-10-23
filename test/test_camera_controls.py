@@ -168,6 +168,27 @@ def test_camera_launch_preserves_the_selected_io_method(method, tmp_path, monkey
     assert nodes[0]['parameters'][0]['io_method'] == (method or 'mmap')
 
 
+def test_realsense_launch_clears_inherited_config_file_argument(tmp_path, monkeypatch):
+    from face_tracking_bringup import hardware_launch
+
+    included = []
+    monkeypatch.setattr(hardware_launch, 'get_package_share_directory',
+                        lambda name: str(tmp_path))
+    monkeypatch.setattr(hardware_launch, 'IncludeLaunchDescription',
+                        lambda source, launch_arguments: included.append(
+                            dict(launch_arguments)))
+    config = {'rgbd': {'source': 'realsense', 'left': {
+        'image_topic': '/camera/color/image_raw',
+        'info_topic': '/camera/color/camera_info',
+        'depth_topic': '/camera/aligned_depth_to_color/image_raw'},
+        'camera_namespace': '', 'camera_name': 'camera', 'serial_no': '123',
+        'color_profile': '640x480x30', 'depth_profile': '640x480x30'}}
+
+    hardware_launch.camera_actions(config, 'rgbd', False)
+
+    assert included[0]['config_file'] == ''
+
+
 @pytest.mark.parametrize('controls', [
     {'preset': 'save'}, {'resolution': '640x480'}, {'systemd_cameractrlsd': 'enable'},
     {'logitech_brio_fov': '90,preset=save'}, {'zoom_absolute': 1.5},

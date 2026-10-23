@@ -26,7 +26,8 @@ SECTIONS = {
             'color_profile depth_profile',
 }
 ROOT_FIELDS = frozenset((
-    'mount_geometry_version', 'mount_setup', 'compact_maneuver', 'recovery'))
+    'mount_geometry_version', 'mount_setup', 'compact_maneuver', 'recovery',
+    'execution_error_budget'))
 COMPACT_MANEUVER_FIELDS = frozenset(('goal_joints_rad speed_scale').split())
 RECOVERY_FIELDS = frozenset(('mode',))
 MOUNT_SETUP_FIELDS = frozenset(('preferred_top_flange',

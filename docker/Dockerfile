@@ -60,6 +60,7 @@ COPY msg src/face_tracking_arm/msg
 COPY src src/face_tracking_arm/src
 COPY python src/face_tracking_arm/python
 COPY scripts src/face_tracking_arm/scripts
+COPY tools src/face_tracking_arm/tools
 COPY launch src/face_tracking_arm/launch
 COPY worlds src/face_tracking_arm/worlds
 RUN source /opt/ros/jazzy/setup.bash && \
@@ -96,7 +97,8 @@ COPY --from=build /opt/face_tracking_ws/src/xarm_ros2/xarm_sdk/cxx/LICENSE /usr/
 COPY docker/licenses /usr/share/doc/face_tracking_arm/third_party
 COPY docker/patches /usr/share/doc/face_tracking_arm/third_party/xarm-local-patches
 COPY docker/entrypoint.sh docker/runtime.py docker/fastdds.xml /opt/face_tracking_container/
-ENV HOME=/tmp/face_tracking_home \
+ENV FACE_TRACKING_SOURCE_SHA256=${FACE_TRACKING_SOURCE_SHA256} \
+    HOME=/tmp/face_tracking_home \
     PYTHONPATH=/opt/face_tracking_sdk \
     ROS_DOMAIN_ID=71 \
     RMW_IMPLEMENTATION=rmw_fastrtps_cpp \

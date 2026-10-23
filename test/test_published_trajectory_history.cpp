@@ -164,6 +164,41 @@ TEST(PublishedTrajectoryHistory, MatchesTheLatestPublication)
   EXPECT_TRUE(match.expected_output.terminal_hold);
 }
 
+TEST(PublishedTrajectoryHistory, HardwareReadUsesItsOwnInterpolatedTrajectoryTime)
+{
+  PublishedTrajectoryHistory history{4};
+  const auto id = history.append(
+    makeQueue(kSecondNs), rclcpp::Time(kSecondNs + 2 * kPeriodNs, RCL_ROS_TIME));
+  ASSERT_TRUE(id.has_value());
+  // Ownership is checked at JTC's own corrected reference/output times.
+  const auto jtc = makeControllerState(
+    2 * kSecondNs, 15'000'000, kSecondNs, 0.15, 0.2);
+  const auto match = history.match(
+    jtc, RCL_ROS_TIME, rclcpp::Duration::from_nanoseconds(kPeriodNs), 1.0e-9);
+  ASSERT_TRUE(match.matched());
+
+  // The coherent hardware sample was taken earlier. Its expected value is
+  // interpolated at its read timestamp, not copied from the newer JTC sample.
+  const auto actual_expected = history.expectedAt(
+    *id, rclcpp::Time(kSecondNs + 5'000'000, RCL_ROS_TIME));
+  ASSERT_TRUE(actual_expected.has_value());
+  EXPECT_NEAR(actual_expected->positions[0], 0.05, 1.0e-12);
+  EXPECT_NEAR(actual_expected->velocities[0], 10.0, 1.0e-12);
+  EXPECT_NE(match.expected_reference.positions[0], actual_expected->positions[0]);
+}
+
+TEST(PublishedTrajectoryHistory, NewJtcStampDoesNotValidateAnOldCommandPhase)
+{
+  PublishedTrajectoryHistory history{4};
+  ASSERT_TRUE(history.append(
+      makeQueue(kSecondNs), rclcpp::Time(kSecondNs + 2 * kPeriodNs, RCL_ROS_TIME)));
+  auto stale_phase = makeControllerState(
+    3 * kSecondNs, 15'000'000, kSecondNs, 0.15, 0.2);
+  const auto match = history.match(
+    stale_phase, RCL_ROS_TIME, rclcpp::Duration::from_nanoseconds(kPeriodNs), 1.0e-9);
+  EXPECT_FALSE(match.matched());
+}
+
 TEST(PublishedTrajectoryHistory, DelayedStateCanMatchAnOlderPublication)
 {
   PublishedTrajectoryHistory history{4};

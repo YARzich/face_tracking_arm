@@ -63,5 +63,16 @@ TEST(FollowingErrorPolicy, RepeatedRecordedLagHasNoAttemptBudget)
   }
 }
 
+TEST(FollowingErrorPolicy, AllowsImmediateReactionThreshold)
+{
+  const FollowingErrorPolicy immediate_policy{0.0, 0.25};
+  EXPECT_EQ(
+    classifyFollowingError(0.0, 0.0, immediate_policy),
+    FollowingErrorAction::kContinue);
+  EXPECT_EQ(
+    classifyFollowingError(1e-12, 0.0, immediate_policy),
+    FollowingErrorAction::kControlledRearm);
+}
+
 }  // namespace
 }  // namespace face_tracking_arm::control

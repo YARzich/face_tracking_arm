@@ -58,6 +58,10 @@ JointMotionLimits make_limits(const Eigen::Index joint_count)
   limits.max_velocity = Eigen::VectorXd::Constant(joint_count, 10.0);
   limits.max_acceleration = Eigen::VectorXd::Constant(joint_count, 1000.0);
   limits.max_jerk = Eigen::VectorXd::Constant(joint_count, 1.0e7);
+  limits.numerical_policy = NumericalPolicy{
+    Radians{1.0e-12}, RadiansPerSecond{1.0e-12},
+    RadiansPerSecondSquared{1.0e-12}, RadiansPerSecondCubed{1.0e-12},
+    SolverResidual{1.0e-6}};
   return limits;
 }
 
@@ -262,13 +266,17 @@ TEST(HierarchicalVelocityQp, JerkLimitedBaseHoldLetsOtherJointTrackOrientation)
   limits.max_velocity.setConstant(1.0);
   limits.max_acceleration.setConstant(2.0);
   limits.max_jerk.setConstant(20.0);
+  limits.numerical_policy = NumericalPolicy::fromDiscreteMotionLimits(
+    PositionInterval{-10.0, 10.0}, 1.0, 2.0, 20.0, config.period_sec,
+    SolverResidual{config.solution_feasibility_tolerance});
+  ASSERT_TRUE(limits.numerical_policy.has_value());
 
   Eigen::Matrix<double, 1, 2> roll_row;
   roll_row << 0.0, 1.0;
   Eigen::Matrix2d path_identity = Eigen::Matrix2d::Identity();
   detail::ScalarBrakingOptions braking_options;
   braking_options.period_sec = config.period_sec;
-  braking_options.comparison_tolerance = config.solution_feasibility_tolerance;
+  braking_options.numerical_policy = *limits.numerical_policy;
   braking_options.maximum_braking_steps = 1000;
 
   double roll_error = -0.05;
@@ -873,6 +881,59 @@ TEST(HierarchicalVelocityQp, ProductionToleranceNeverExpandsPhysicalJointLimits)
   }
 }
 
+TEST(HierarchicalVelocityQp, EndpointHoldAndInwardCommandsRemainTailFeasible)
+{
+  const HierarchicalVelocityQpConfig config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  const EmergencyBrakeTailGenerator tail_generator;
+  JointMotionLimits limits = make_limits(1);
+  limits.lower_position[0] = -1.0;
+  limits.upper_position[0] = 1.0;
+  limits.position_margin[0] = 0.0;
+
+  Eigen::Matrix<double, 1, 1> joint;
+  joint << 1.0;
+  const HierarchicalVelocityTask hold_task = make_task(
+    joint, Eigen::VectorXd::Zero(1), Eigen::MatrixXd{0, 1}, Eigen::VectorXd{0});
+
+  for (const double endpoint : std::array<double, 2>{-1.0, 1.0}) {
+    JointMotionState state = make_state(1);
+    state.position[0] = endpoint;
+
+    const QpResult hold = solver.solve(hold_task, state, limits);
+    ASSERT_TRUE(hold.command_available());
+    EXPECT_DOUBLE_EQ(hold.joint_velocity[0], 0.0);
+    JointMotionState held = state;
+    held.position[0] += hold.joint_velocity[0] * config.period_sec;
+    held.velocity[0] = hold.joint_velocity[0];
+    held.acceleration[0] =
+      (hold.joint_velocity[0] - state.velocity[0]) / config.period_sec;
+    const EmergencyBrakeTail held_tail = tail_generator.generate(held, limits);
+    ASSERT_TRUE(held_tail.command_available()) << held_tail.failure_reason;
+    ASSERT_FALSE(held_tail.points.empty());
+    EXPECT_DOUBLE_EQ(held_tail.points.front().position[0], endpoint);
+
+    const HierarchicalVelocityTask inward_task = make_task(
+      joint, Eigen::VectorXd::Constant(1, -endpoint * 0.1),
+      Eigen::MatrixXd{0, 1}, Eigen::VectorXd{0});
+    const QpResult inward = solver.solve(inward_task, state, limits);
+    ASSERT_TRUE(inward.command_available());
+    EXPECT_LT(endpoint * inward.joint_velocity[0], 0.0);
+    state.position[0] += inward.joint_velocity[0] * config.period_sec;
+    state.velocity[0] = inward.joint_velocity[0];
+    state.acceleration[0] = inward.joint_velocity[0] / config.period_sec;
+    const EmergencyBrakeTail inward_tail = tail_generator.generate(state, limits);
+    EXPECT_TRUE(inward_tail.command_available()) << inward_tail.failure_reason;
+
+    JointMotionState outside = make_state(1);
+    outside.position[0] = std::nextafter(
+      endpoint, endpoint < 0.0 ? -std::numeric_limits<double>::infinity() :
+      std::numeric_limits<double>::infinity());
+    const EmergencyBrakeTail outside_tail = tail_generator.generate(outside, limits);
+    EXPECT_FALSE(outside_tail.command_available());
+  }
+}
+
 TEST(HierarchicalVelocityQp, DiscreteVelocityEnvelopeRejectsContinuousCounterexampleAndMirror)
 {
   HierarchicalVelocityQpConfig config = make_config();
@@ -1003,7 +1064,6 @@ TEST(HierarchicalVelocityQp, AcceptedJoint5BoundaryCommandAlwaysHasAnExactBrakeT
   const HierarchicalVelocityQp solver{config};
   EmergencyBrakeTailConfig tail_config;
   tail_config.period_sec = config.period_sec;
-  tail_config.comparison_tolerance = 2.0 * config.solution_feasibility_tolerance;
   const EmergencyBrakeTailGenerator tail_generator{tail_config};
 
   JointMotionLimits limits = make_limits(1);
@@ -1160,7 +1220,6 @@ TEST(HierarchicalVelocityQp, SingularityPreferenceCanBeUnreachableWhilePhysicalB
 
   EmergencyBrakeTailConfig tail_config;
   tail_config.period_sec = config.period_sec;
-  tail_config.comparison_tolerance = 2.0 * config.solution_feasibility_tolerance;
   const EmergencyBrakeTail tail =
     EmergencyBrakeTailGenerator{tail_config}.generate(next, limits);
   EXPECT_TRUE(tail.command_available()) << tail.failure_reason;

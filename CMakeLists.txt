@@ -44,7 +44,11 @@ find_package(urdf REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/TrackingTarget.msg"
   "msg/PerceptionStatus.msg"
-  DEPENDENCIES builtin_interfaces geometry_msgs std_msgs
+  "msg/HardwareIoStatus.msg"
+  "msg/ServoExecutionContext.msg"
+  "msg/FaceTransformProvenance.msg"
+  "msg/ServoTrajectoryPublication.msg"
+  DEPENDENCIES builtin_interfaces geometry_msgs std_msgs trajectory_msgs
 )
 rosidl_get_typesupport_target(tracking_typesupport ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
@@ -79,11 +83,20 @@ ament_target_dependencies(
   rclcpp
 )
 
-add_tracking_library(hierarchical_velocity_qp src/hierarchical_velocity_qp.cpp)
+add_tracking_library(hierarchical_velocity_qp
+  src/hierarchical_velocity_qp.cpp
+  src/qp_failure_snapshot_io.cpp
+  src/qp_failure_snapshot_recorder.cpp)
 target_link_libraries(hierarchical_velocity_qp PUBLIC Eigen3::Eigen osqp::osqp)
+
+add_executable(qp_snapshot_replay tools/qp_snapshot_replay.cpp)
+target_link_libraries(qp_snapshot_replay PRIVATE hierarchical_velocity_qp)
 
 add_tracking_library(tracking_velocity_task src/tracking_velocity_task.cpp)
 target_link_libraries(tracking_velocity_task PUBLIC hierarchical_velocity_qp Eigen3::Eigen)
+
+add_tracking_library(hardware_io_status_policy src/hardware_io_status_policy.cpp)
+target_link_libraries(hardware_io_status_policy PUBLIC "${tracking_typesupport}")
 
 add_tracking_library(target_motion_estimator src/target_motion_estimator.cpp)
 target_link_libraries(target_motion_estimator PUBLIC Eigen3::Eigen)
@@ -103,6 +116,7 @@ ament_target_dependencies(background_path_planner
 
 add_tracking_library(emergency_brake_tail src/emergency_brake_tail.cpp)
 target_link_libraries(emergency_brake_tail PUBLIC Eigen3::Eigen)
+target_link_libraries(emergency_brake_tail PUBLIC hierarchical_velocity_qp)
 
 add_tracking_library(collision_constraints
   src/collision_constraints.cpp
@@ -132,6 +146,7 @@ target_link_libraries(
   control_time_grid
   emergency_brake_tail
   following_error_policy
+  hardware_io_status_policy
   hierarchical_velocity_qp
   tracking_velocity_task
   target_motion_estimator
@@ -308,6 +323,7 @@ install(DIRECTORY python/face_tracking_perception DESTINATION lib/${PROJECT_NAME
   PATTERN "__pycache__" EXCLUDE)
 install(DIRECTORY python/face_tracking_bringup DESTINATION lib/${PROJECT_NAME}
   PATTERN "__pycache__" EXCLUDE)
+install(PROGRAMS tools/record_face_runtime.py DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS
   scripts/face_detection_node.py
   scripts/face_position_node.py
@@ -338,6 +354,7 @@ install(
     published_trajectory_history
     hierarchical_velocity_qp
     tracking_velocity_task
+    hardware_io_status_policy
     target_motion_estimator
     joint_path_follower
     background_path_planner
@@ -345,6 +362,7 @@ install(
     collision_constraints
     collision_aware_servo_component
     face_tracking_component
+    qp_snapshot_replay
     test_face_target_publisher
     face_target_marker
     graceful_component_container
@@ -370,7 +388,23 @@ if(BUILD_TESTING)
   set(AMENT_LINT_AUTO_FILE_EXCLUDE
     .gitignore
     CONTRIBUTING.md
+    # Archived A/B experiment sources are immutable evidence, not package code.
+    log/
   )
+  file(GLOB_RECURSE _archived_experiment_cpp_sources CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/log/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/log/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/log/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/log/*.cxx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/log/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/log/*.hh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/log/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/log/*.hxx"
+  )
+  # The ament linters compare exact paths; a directory entry does not exclude its
+  # recursively discovered files, so pass the immutable archived sources explicitly.
+  set(ament_cmake_cpplint_ADDITIONAL_EXCLUDE ${_archived_experiment_cpp_sources})
+  set(ament_cmake_uncrustify_ADDITIONAL_EXCLUDE ${_archived_experiment_cpp_sources})
   ament_lint_auto_find_test_dependencies()
   ament_add_pytest_test(
     test_monitor_description
@@ -405,6 +439,8 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_kalman_point_filter test/test_kalman_point_filter.py TIMEOUT 30)
   ament_add_pytest_test(test_close_stress_motion test/test_close_stress_motion.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_config test/test_hardware_config.py TIMEOUT 30)
+  ament_add_pytest_test(test_execution_budget_profile
+    test/test_execution_budget_profile.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_zero_geometry test/test_hardware_zero_geometry.py TIMEOUT 30)
   ament_add_pytest_test(test_mount_collisions test/test_mount_collisions.py TIMEOUT 30)
   ament_add_pytest_test(test_container_tools test/test_container_tools.py TIMEOUT 30)
@@ -412,6 +448,8 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_robot_profile test/test_robot_profile.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_probe test/test_hardware_probe.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_monitor test/test_hardware_monitor.py TIMEOUT 30)
+  ament_add_pytest_test(test_hardware_monitor_node_flow
+    test/test_hardware_monitor_node_flow.py TIMEOUT 30)
   ament_add_pytest_test(test_processing_rate test/test_processing_rate.py TIMEOUT 30)
   ament_add_pytest_test(test_hardware_activation_guard
     test/test_hardware_activation_guard.py TIMEOUT 30)
@@ -449,6 +487,46 @@ if(BUILD_TESTING)
   target_include_directories(test_idle_search PRIVATE include)
   target_link_libraries(test_idle_search Eigen3::Eigen)
   target_link_libraries(test_joint_path_follower joint_path_follower)
+  ament_add_gtest(test_joint_boundary_policy test/test_joint_boundary_policy.cpp)
+  target_include_directories(test_joint_boundary_policy PRIVATE include)
+  ament_add_gtest(test_execution_error_budget test/test_execution_error_budget.cpp)
+  target_include_directories(test_execution_error_budget PRIVATE include)
+  ament_add_gtest(test_hardware_io_status test/test_hardware_io_status.cpp)
+  target_include_directories(test_hardware_io_status PRIVATE include)
+  target_link_libraries(test_hardware_io_status hardware_io_status_policy)
+  ament_add_gtest(test_qp_failure_snapshot test/test_qp_failure_snapshot.cpp)
+  target_include_directories(test_qp_failure_snapshot PRIVATE include)
+  target_link_libraries(test_qp_failure_snapshot hierarchical_velocity_qp Eigen3::Eigen osqp::osqp)
+  add_executable(
+    test_qp_failure_snapshot_recorder
+    test/test_qp_failure_snapshot_recorder.cpp)
+  target_include_directories(test_qp_failure_snapshot_recorder PRIVATE include)
+  target_link_libraries(
+    test_qp_failure_snapshot_recorder hierarchical_velocity_qp Eigen3::Eigen osqp::osqp)
+  add_test(
+    NAME test_qp_failure_snapshot_recorder
+    COMMAND test_qp_failure_snapshot_recorder $<TARGET_FILE:qp_snapshot_replay>)
+  ament_add_gtest(test_servo_execution_context_ring test/test_servo_execution_context_ring.cpp)
+  target_include_directories(test_servo_execution_context_ring PRIVATE include)
+  add_executable(
+    test_servo_trajectory_publication_ring
+    test/test_servo_trajectory_publication_ring.cpp)
+  target_include_directories(test_servo_trajectory_publication_ring PRIVATE include)
+  target_compile_features(test_servo_trajectory_publication_ring PRIVATE cxx_std_14)
+  add_test(
+    NAME test_servo_trajectory_publication_ring
+    COMMAND test_servo_trajectory_publication_ring)
+  add_executable(test_hardware_io_write_gate test/test_hardware_io_write_gate.cpp)
+  target_include_directories(test_hardware_io_write_gate PRIVATE docker/patches)
+  add_test(NAME test_hardware_io_write_gate COMMAND test_hardware_io_write_gate)
+  set_tests_properties(test_hardware_monitor_node_flow PROPERTIES
+    ENVIRONMENT "HARDWARE_IO_WRITE_GATE_TRACE_BIN=$<TARGET_FILE:test_hardware_io_write_gate>")
+  add_executable(
+    test_hardware_io_command_limits
+    test/test_hardware_io_command_limits.cpp)
+  target_include_directories(test_hardware_io_command_limits PRIVATE docker/patches)
+  target_compile_features(test_hardware_io_command_limits PRIVATE cxx_std_14)
+  add_test(NAME test_hardware_io_command_limits COMMAND test_hardware_io_command_limits)
   ament_add_gtest(test_background_path_planner test/test_background_path_planner.cpp)
   target_link_libraries(test_background_path_planner background_path_planner)
   ament_add_gtest(test_compact_upright test/test_compact_upright.cpp)
@@ -468,6 +546,7 @@ if(BUILD_TESTING)
     TEST_ROBOT_URDF_FILE="${CMAKE_CURRENT_BINARY_DIR}/test_robot.urdf"
     TEST_ROBOT_SRDF_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/moveit/xarm6.srdf")
   target_link_libraries(test_motion_reference collision_aware_servo_component)
+  target_include_directories(test_motion_reference PRIVATE src)
   set_tests_properties(test_motion_reference PROPERTIES
     FIXTURES_REQUIRED motion_reference_description)
   ament_add_gtest(test_compact_upright_path test/test_compact_upright_path.cpp)
@@ -500,9 +579,12 @@ if(BUILD_TESTING)
   )
   target_link_libraries(
     test_joint_trajectory_interpolation
+    collision_constraints
+    emergency_brake_tail
     joint_trajectory_controller::joint_trajectory_controller
     moveit_servo::moveit_servo_lib_cpp
   )
+  target_include_directories(test_joint_trajectory_interpolation PRIVATE include)
   ament_add_gtest(
     test_hierarchical_velocity_qp test/test_hierarchical_velocity_qp.cpp
   )
@@ -517,7 +599,12 @@ if(BUILD_TESTING)
   ament_add_gtest(
     test_collision_constraints test/test_collision_constraints.cpp
   )
-  target_link_libraries(test_collision_constraints collision_constraints Eigen3::Eigen)
+  target_link_libraries(
+    test_collision_constraints
+    collision_constraints
+    emergency_brake_tail
+    Eigen3::Eigen
+  )
   ament_target_dependencies(test_collision_constraints moveit_core)
 endif()
 

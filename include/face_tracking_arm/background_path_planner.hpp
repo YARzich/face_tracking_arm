@@ -32,6 +32,9 @@ struct BackgroundPathPlannerConfig
   double planning_time_s{0.25};
   /// Narrow compact-path feasibility regions need a longer OMPL sampling window.
   double compact_planning_time_s{3.0};
+  /// REST edge-constrained requests use their own worker budget and RRT range.
+  double rest_edge_planning_time_s{2.0};
+  double rest_edge_planner_range{0.30};
   double joint_tolerance_rad{0.01};
   double validation_joint_step_rad{0.03};
   std::size_t maximum_validation_samples{4096};
@@ -115,6 +118,15 @@ struct CompactGoal
   PathRequirements path_requirements;
 };
 
+/// Request-local geometric guard for REST paths. The sine cap is
+/// `sin(maximum_tilt_rad)` and is checked at every bounded worker interpolation
+/// sample; it carries no compact radius or pitch requirement.
+struct HorizontalEdgePathRequirement
+{
+  std::string screen_link_name;
+  double maximum_abs_edge_sine{0.0};
+};
+
 /// A geometric reference generator. It never publishes or executes motion.
 ///
 /// A single worker processes at most one active and one pending request. A newer
@@ -152,6 +164,14 @@ public:
   [[nodiscard]] std::uint64_t submit(
     const moveit::core::RobotState & start,
     const Eigen::VectorXd & goal_positions, std::uint64_t scene_revision);
+
+  /// Plans ordinary joint-space geometry with an additional sampled REST edge
+  /// guard. The same bounded worker validation budget applies as to other paths.
+  [[nodiscard]] std::uint64_t submit(
+    const moveit::core::RobotState & start,
+    const Eigen::VectorXd & goal_positions,
+    const HorizontalEdgePathRequirement & edge_requirement,
+    std::uint64_t scene_revision);
 
   /// Plans to an immutable bounded goal and validates every sampled state
   /// against the committed compact pitch, upright-roll and radius requirements.

@@ -38,13 +38,20 @@ struct FaceTrackingPolicyInput
 
 struct FaceTrackingErrorForecast
 {
-  /// Signed task-coordinate error which the proportional term corrects:
-  /// screen-normal left, screen-normal up, then upright roll, in radians.
+  /// Angle diagnostics: screen-normal left/up and horizontal-edge tilt, radians.
+  /// When horizontal_edge_axis is true, axis 2 is not used for prediction.
   Eigen::Vector3d signed_error_rad{Eigen::Vector3d::Zero()};
-  /// Target-only angular feed-forward in the same rows, excluding gain*error.
+  /// Target-only feed-forward for the first two angular rows, excluding gain*error.
   Eigen::Vector3d desired_feedforward_radps{Eigen::Vector3d::Zero()};
-  /// Existing QP achieved primary velocity in the same rows.
+  /// Achieved QP primary velocity. The third FACE row is edge-height rate, not rad/s.
   Eigen::Vector3d achieved_primary_radps{Eigen::Vector3d::Zero()};
+  /// When true, the explicit third-row forecast uses sin(tilt) (dimensionless)
+  /// and its time derivative (1/s); edge_guard is sin(angle guard).
+  bool horizontal_edge_axis{false};
+  double signed_edge_error{0.0};
+  double desired_edge_rate{0.0};
+  double achieved_edge_rate{0.0};
+  double edge_guard{0.0};
   double horizon_sec{0.0};
   double pointing_guard_rad{0.0};
   double roll_guard_rad{0.0};
@@ -66,6 +73,10 @@ struct FaceTrackingErrorForecast
   if (!forecast.signed_error_rad.allFinite() ||
     !forecast.desired_feedforward_radps.allFinite() ||
     !forecast.achieved_primary_radps.allFinite() ||
+    (forecast.horizontal_edge_axis && (!std::isfinite(forecast.signed_edge_error) ||
+    !std::isfinite(forecast.desired_edge_rate) ||
+    !std::isfinite(forecast.achieved_edge_rate) || !std::isfinite(forecast.edge_guard) ||
+    forecast.edge_guard <= 0.0)) ||
     !std::isfinite(forecast.horizon_sec) || forecast.horizon_sec <= 0.0 ||
     !std::isfinite(forecast.pointing_guard_rad) || forecast.pointing_guard_rad <= 0.0 ||
     !std::isfinite(forecast.roll_guard_rad) || forecast.roll_guard_rad <= 0.0)
@@ -93,11 +104,28 @@ struct FaceTrackingErrorForecast
 
   const double current_pointing_error = forecast.signed_error_rad.head<2>().norm();
   const double predicted_pointing_error = predicted_error.head<2>().norm();
-  const double current_roll_error = std::abs(forecast.signed_error_rad[2]);
-  const double predicted_roll_error = std::abs(predicted_error[2]);
   constexpr double kProgressEpsilonRad = 1.0e-9;
   const bool pointing_error_not_closing =
     predicted_pointing_error + kProgressEpsilonRad >= current_pointing_error;
+  if (forecast.horizontal_edge_axis) {
+    const double relative_edge_error_rate =
+      forecast.desired_edge_rate - forecast.achieved_edge_rate;
+    double predicted_edge_error = forecast.signed_edge_error +
+      forecast.horizon_sec * relative_edge_error_rate;
+    if (forecast.signed_edge_error * relative_edge_error_rate < 0.0 &&
+      forecast.signed_edge_error * predicted_edge_error <= 0.0)
+    {
+      predicted_edge_error = 0.0;
+    }
+    const bool edge_error_not_closing = std::abs(predicted_edge_error) + 1.0e-9 >=
+      std::abs(forecast.signed_edge_error);
+    return (predicted_pointing_error >= forecast.pointing_guard_rad &&
+           pointing_error_not_closing) ||
+           (std::abs(predicted_edge_error) >= forecast.edge_guard &&
+           edge_error_not_closing);
+  }
+  const double current_roll_error = std::abs(forecast.signed_error_rad[2]);
+  const double predicted_roll_error = std::abs(predicted_error[2]);
   const bool roll_error_not_closing =
     predicted_roll_error + kProgressEpsilonRad >= current_roll_error;
   return (predicted_pointing_error >= forecast.pointing_guard_rad &&
@@ -180,6 +208,36 @@ struct PairYawResourceAssessment
   PairYawJointResourceAssessment j1;
   PairYawJointResourceAssessment j4;
 };
+
+enum class PairYawResourceState
+{
+  kUnknown,
+  kAvailable,
+  kExhausted,
+};
+
+/// Classify only evidence that is sufficient to act on pair-resource state.
+/// A failed probe leaves the state unknown unless a solved actual probe already
+/// proves that useful yaw reserve remains.
+[[nodiscard]] inline PairYawResourceState pairYawResourceState(
+  const PairYawResourceAssessment & assessment) noexcept
+{
+  if (!assessment.valid) {
+    return PairYawResourceState::kUnknown;
+  }
+  if (!assessment.demand_present || !assessment.pair_bound_candidate) {
+    return PairYawResourceState::kAvailable;
+  }
+  if (assessment.probe_valid && assessment.actual_probe_solved &&
+    !assessment.actual_probe_infeasible &&
+    std::isfinite(assessment.actual_available_yaw_rad) &&
+    assessment.actual_available_yaw_rad >= 0.80 * kPairYawProbeDisplacementRad)
+  {
+    return PairYawResourceState::kAvailable;
+  }
+  return assessment.exhausted ? PairYawResourceState::kExhausted :
+         PairYawResourceState::kUnknown;
+}
 
 /// Compare the bounded reserve probes. The actual configuration must be unable
 /// to provide most of a small yaw increment, while relaxing only the required

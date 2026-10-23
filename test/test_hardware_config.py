@@ -164,6 +164,17 @@ def test_camera_only_needs_no_robot_or_motion_sections(config):
     validate_config(config, 'mono_cpu', camera_only=True)
 
 
+def test_camera_only_does_not_semantically_validate_unused_execution_profile(config):
+    for section in ('robot', 'table', 'monitor', 'camera_mount', 'tracking', 'motion',
+                    'limits', 'controller', 'stereo'):
+        config.pop(section, None)
+    config['execution_error_budget'] = {'execution_error_bound_rad': float('nan')}
+    validate_config(config, 'mono_cpu', camera_only=True)
+    config['execution_error_budget']['misspelled'] = True
+    with pytest.raises(ValueError, match='unknown settings'):
+        validate_config(config, 'mono_cpu', camera_only=True)
+
+
 def test_driver_only_needs_only_selected_camera_settings(config):
     for section in ('robot', 'table', 'monitor', 'camera_mount', 'tracking', 'motion',
                     'limits', 'controller', 'perception', 'point_filter', 'stereo'):

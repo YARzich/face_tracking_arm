@@ -1,0 +1,14 @@
+# Internal diagnostics for the accepted face sample and the transforms actually used.
+# Header stamp/frame identify the original face measurement.
+std_msgs/Header header
+uint64 accepted_face_sequence
+geometry_msgs/Point source_face
+geometry_msgs/Point planning_face
+geometry_msgs/TransformStamped planning_from_face
+geometry_msgs/TransformStamped planning_from_base
+geometry_msgs/TransformStamped planning_from_reach_center
+geometry_msgs/Point planning_base
+geometry_msgs/Point planning_reach_center
+bool face_transform_lookup_used
+bool base_transform_lookup_used
+bool reach_center_transform_lookup_used

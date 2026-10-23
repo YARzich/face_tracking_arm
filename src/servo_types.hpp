@@ -29,6 +29,7 @@ enum class CommandAttempt
 enum class CandidateRejectionKind
 {
   kOther,
+  kReferenceGuard,
   kCompactStopEnvelope,
 };
 

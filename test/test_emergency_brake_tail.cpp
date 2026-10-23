@@ -4,6 +4,7 @@
 #include <Eigen/Core>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -36,6 +37,10 @@ JointMotionLimits makeLimits(const Eigen::Index joint_count)
   limits.max_velocity = Eigen::VectorXd::Constant(joint_count, 1.0);
   limits.max_acceleration = Eigen::VectorXd::Constant(joint_count, 2.0);
   limits.max_jerk = Eigen::VectorXd::Constant(joint_count, 20.0);
+  limits.numerical_policy = NumericalPolicy{
+    Radians{1.0e-12}, RadiansPerSecond{1.0e-12},
+    RadiansPerSecondSquared{1.0e-12}, RadiansPerSecondCubed{1.0e-12},
+    SolverResidual{1.0e-6}};
   return limits;
 }
 
@@ -98,6 +103,57 @@ TEST(EmergencyBrakeTail, StationaryBranchPublishesAVisibleHoldSuffix)
   EXPECT_EQ(tail.first_stationary_point, 0U);
   EXPECT_EQ(
     tail.points.size(), generator.config().terminal_hold_points + 1U);
+}
+
+TEST(EmergencyBrakeTail, AcceptsInclusiveNominalPositionAndVelocityLimits)
+{
+  const EmergencyBrakeTailGenerator generator;
+  const JointMotionLimits limits = makeLimits(1);
+  for (const double endpoint : std::array<double, 2>{
+        limits.lower_position[0], limits.upper_position[0]})
+  {
+    JointMotionState state = makeState(1);
+    state.position[0] = endpoint;
+    const EmergencyBrakeTail tail = generator.generate(state, limits);
+    ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
+    EXPECT_DOUBLE_EQ(tail.points.front().position[0], endpoint);
+  }
+
+  JointMotionState velocity_boundary = makeState(1);
+  velocity_boundary.velocity[0] = limits.max_velocity[0];
+  const EmergencyBrakeTail tail = generator.generate(velocity_boundary, limits);
+  EXPECT_TRUE(tail.command_available()) << tail.failure_reason;
+}
+
+TEST(EmergencyBrakeTail, RejectsAnyNominalPositionOutsideEvenWithinArithmeticBudget)
+{
+  const EmergencyBrakeTailGenerator generator;
+  const JointMotionLimits limits = makeLimits(1);
+  JointMotionState state = makeState(1);
+  state.position[0] = limits.lower_position[0] - 0.5 *
+    limits.numerical_policy->position_error.value;
+
+  const EmergencyBrakeTail tail = generator.generate(state, limits);
+
+  EXPECT_EQ(tail.status, EmergencyBrakeTailStatus::kInvalidInput);
+  EXPECT_FALSE(tail.command_available());
+}
+
+TEST(EmergencyBrakeTail, AcceptsLocallySaturatedAccelerationAndJerk)
+{
+  const EmergencyBrakeTailGenerator generator;
+  JointMotionState state = makeState(1);
+  state.velocity[0] = 0.4;
+  state.acceleration[0] = 2.0;
+  const JointMotionLimits limits = makeLimits(1);
+
+  const EmergencyBrakeTail tail = generator.generate(state, limits);
+
+  ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
+  ASSERT_GT(tail.first_stationary_point, 0U);
+  const double jerk = (tail.points[1].acceleration[0] - state.acceleration[0]) /
+    generator.config().period_sec;
+  EXPECT_NEAR(jerk, -limits.max_jerk[0], 1.0e-8);
 }
 
 TEST(EmergencyBrakeTail, UsesExactBackwardEulerJerkLimitedBraking)

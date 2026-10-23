@@ -57,10 +57,13 @@ struct CollisionConstraintConfig
   std::string monitor_near_link_name{"link4"};
   std::string invariant_mount_neighbor_name{"link5"};
 
+  /// Protected-joint corridor used for state diagnostics and path certification.
   std::string protected_joint_name{"joint5"};
   double protected_joint_lower_rad{-1.60};
   double protected_joint_upper_rad{1.60};
   double residual_latency_sec{0.020};
+  /// Must match JointMotionLimits::numerical_policy for the same model/profile.
+  std::optional<NumericalPolicy> numerical_policy;
 
   /// Geometry-derived pair bounds; an empty second name denotes a world pair.
   std::map<std::pair<std::string, std::string>, double> distance_bounds;
@@ -152,12 +155,20 @@ struct CollisionActualStateValidationResult
   bool collision_detected{false};
   bool hard_clearance_violated{false};
   bool protected_joint_corridor_violated{false};
+  BoundaryClass protected_joint_boundary_class{BoundaryClass::kInvalid};
   double protected_joint_position_rad{std::numeric_limits<double>::quiet_NaN()};
   double minimum_self_distance_m{std::numeric_limits<double>::infinity()};
   double minimum_world_distance_m{std::numeric_limits<double>::infinity()};
   double minimum_distance_m{std::numeric_limits<double>::infinity()};
   std::string closest_pair;
   std::string failure_reason;
+};
+
+/// Encoding of measured q supplied to the actual-state validator.
+enum class ActualPositionEncoding
+{
+  kDouble,
+  kSdkFloatPromotedToDouble,
 };
 
 struct CollisionSegmentSampleDiagnostic
@@ -290,7 +301,8 @@ public:
   [[nodiscard]] CollisionActualStateValidationResult validateActualState(
     const planning_scene::PlanningScene & scene,
     const moveit::core::RobotState & robot_state,
-    const moveit::core::JointModelGroup & joint_model_group) const;
+    const moveit::core::JointModelGroup & joint_model_group,
+    ActualPositionEncoding position_encoding = ActualPositionEncoding::kDouble) const;
 
   /// Returns true only when a valid build result contains a controllable pair inside the
   /// requested activation distance. The activation distance must lie inside the configured

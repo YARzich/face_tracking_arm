@@ -68,6 +68,47 @@ TEST(JointPathFollower, LookaheadUsesPolylineArcAcrossACorner)
   EXPECT_NEAR(result.total_length_rad, 0.5, 1.0e-12);
 }
 
+TEST(JointPathFollower, ExposesProjectionRemainderAndIgnoresDenseCollinearVertices)
+{
+  JointPathFollower coarse_follower;
+  JointPathFollower dense_follower;
+  const std::vector<Eigen::VectorXd> coarse_path{point(0.0), point(0.2)};
+  const std::vector<Eigen::VectorXd> dense_path{
+    point(0.0), point(0.02), point(0.04), point(0.06), point(0.08),
+    point(0.10), point(0.12), point(0.14), point(0.16), point(0.18), point(0.20)};
+  ASSERT_TRUE(coarse_follower.setPath(coarse_path, point(0.0), 0.0));
+  ASSERT_TRUE(dense_follower.setPath(dense_path, point(0.0), 0.0));
+
+  const auto coarse = coarse_follower.update(point(0.0), 0.01);
+  const auto dense = dense_follower.update(point(0.0), 0.01);
+  ASSERT_EQ(coarse.status, JointPathStatus::kTracking);
+  ASSERT_EQ(dense.status, JointPathStatus::kTracking);
+  EXPECT_TRUE(coarse.projected_position.isApprox(point(0.0), 1.0e-12));
+  EXPECT_TRUE(dense.projected_position.isApprox(point(0.0), 1.0e-12));
+  EXPECT_NEAR(coarse.remaining_distance_rad, 0.2, 1.0e-12);
+  EXPECT_NEAR(dense.remaining_distance_rad, 0.2, 1.0e-12);
+  EXPECT_FALSE(coarse.lookahead_crosses_corner);
+  EXPECT_FALSE(dense.lookahead_crosses_corner);
+  EXPECT_TRUE(coarse.reference_position.isApprox(dense.reference_position, 1.0e-12));
+}
+
+TEST(JointPathFollower, DetectsDirectionChangeInsideLookaheadIncludingAttachmentBridge)
+{
+  JointPathFollower corner_follower;
+  ASSERT_TRUE(corner_follower.setPath(
+      {point(0.0), point(0.08), point(0.08, 0.2)}, point(0.0), 0.0));
+  const auto corner = corner_follower.update(point(0.0), 0.01);
+  ASSERT_EQ(corner.status, JointPathStatus::kTracking);
+  EXPECT_TRUE(corner.lookahead_crosses_corner);
+
+  JointPathFollower bridge_follower;
+  ASSERT_TRUE(bridge_follower.setPath(
+      {point(0.0), point(0.2)}, point(0.0, 0.02), 0.0));
+  const auto bridge = bridge_follower.update(point(0.0, 0.02), 0.01);
+  ASSERT_EQ(bridge.status, JointPathStatus::kTracking);
+  EXPECT_TRUE(bridge.lookahead_crosses_corner);
+}
+
 TEST(JointPathFollower, ProjectionWindowCoversLookaheadArcIndependentOfWaypointDensity)
 {
   std::vector<Eigen::VectorXd> coarse_path;

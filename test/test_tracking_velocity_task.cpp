@@ -11,8 +11,9 @@
 #include <optional>
 #include <tuple>
 
-#include "face_tracking_arm/tracking_velocity_task.hpp"
+#include "face_tracking_arm/horizontal_edge_upright.hpp"
 #include "face_tracking_arm/pointing_geometry.hpp"
+#include "face_tracking_arm/tracking_velocity_task.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -74,6 +75,49 @@ TEST(TrackingVelocityTask, AcceptedStaticPoseHasNoBackgroundMotionPreference)
   EXPECT_TRUE(result->has_face_primary_roll);
   EXPECT_TRUE(result->signed_face_primary_error_rad.isZero(kTolerance));
   EXPECT_TRUE(result->face_primary_feedforward_radps.isZero(kTolerance));
+}
+
+TEST(TrackingVelocityTask, FaceEdgeRecoveryKeepsOnlyPrimaryEdgeRowAndZeroSecondary)
+{
+  HierarchicalVelocityTask face_task;
+  face_task.primary_matrix.resize(3, 4);
+  face_task.primary_matrix <<
+    1.0, 2.0, 3.0, 4.0,
+    5.0, 6.0, 7.0, 8.0,
+    -0.5, 0.25, 1.5, -2.0;
+  face_task.primary_reference = Eigen::Vector3d(0.3, -0.4, 0.17);
+  face_task.primary_weights = Eigen::Vector3d(1.0, 1.0, 0.35);
+  face_task.secondary_matrix = Eigen::MatrixXd::Zero(3, 4);
+  face_task.secondary_reference = Eigen::Vector3d::Ones();
+  face_task.secondary_weights = Eigen::Vector3d::Ones();
+
+  const auto recovery = makeFaceEdgeOnlyRecoveryTask(face_task, true);
+  ASSERT_TRUE(recovery.has_value());
+  ASSERT_EQ(recovery->primary_matrix.rows(), 1);
+  ASSERT_EQ(recovery->primary_matrix.cols(), 4);
+  EXPECT_TRUE(recovery->primary_matrix.row(0).isApprox(face_task.primary_matrix.row(2), 0.0));
+  ASSERT_EQ(recovery->primary_reference.size(), 1);
+  EXPECT_DOUBLE_EQ(recovery->primary_reference[0], face_task.primary_reference[2]);
+  ASSERT_EQ(recovery->primary_weights.size(), 1);
+  EXPECT_DOUBLE_EQ(recovery->primary_weights[0], face_task.primary_weights[2]);
+  EXPECT_TRUE(recovery->secondary_matrix.isApprox(Eigen::Matrix4d::Identity(), 0.0));
+  EXPECT_TRUE(recovery->secondary_reference.isZero(0.0));
+  EXPECT_TRUE(recovery->secondary_weights.isOnes(0.0));
+}
+
+TEST(TrackingVelocityTask, FaceEdgeRecoveryRejectsNonFaceOrMalformedRows)
+{
+  HierarchicalVelocityTask face_task;
+  face_task.primary_matrix = Eigen::MatrixXd::Ones(3, 6);
+  face_task.primary_reference = Eigen::Vector3d::Zero();
+  face_task.primary_weights = Eigen::Vector3d::Ones();
+  EXPECT_FALSE(makeFaceEdgeOnlyRecoveryTask(face_task, false).has_value());
+
+  face_task.primary_matrix.resize(2, 6);
+  EXPECT_FALSE(makeFaceEdgeOnlyRecoveryTask(face_task, true).has_value());
+  face_task.primary_matrix = Eigen::MatrixXd::Ones(3, 6);
+  face_task.primary_weights[2] = 0.0;
+  EXPECT_FALSE(makeFaceEdgeOnlyRecoveryTask(face_task, true).has_value());
 }
 
 TEST(TrackingVelocityTask, SeparatesTargetFeedforwardFromGainCorrectedError)
@@ -142,12 +186,10 @@ TEST(TrackingVelocityTask, PointingAndUprightRollJacobiansMatchFiniteDifference)
     later.linear() = Eigen::AngleAxisd(
       delta * angular_velocity.norm(), angular_velocity.normalized()).toRotationMatrix() *
       current.linear();
-    const auto earlier_roll = measureUprightRollError(earlier);
-    const auto later_roll = measureUprightRollError(later);
-    ASSERT_TRUE(earlier_roll);
-    ASSERT_TRUE(later_roll);
-    const double roll_error_rate = (*later_roll - *earlier_roll) / (2.0 * delta);
-    EXPECT_NEAR(result->task.primary_matrix(2, column), -roll_error_rate, 2.0e-6);
+    const double earlier_edge_sine = earlier.linear()(2, 1);
+    const double later_edge_sine = later.linear()(2, 1);
+    const double edge_sine_rate = (later_edge_sine - earlier_edge_sine) / (2.0 * delta);
+    EXPECT_NEAR(result->task.primary_matrix(2, column), edge_sine_rate, 2.0e-6);
     EXPECT_TRUE(result->task.secondary_matrix.col(column).isApprox(
         jacobian.col(column).head<3>(), 2.0e-6));
   }
@@ -597,6 +639,10 @@ TEST(UprightRollPathTask, ExistingQpKeepsRollCorrectionAheadOfConflictingPathVel
   limits.max_velocity = Eigen::Vector2d::Ones();
   limits.max_acceleration = Eigen::Vector2d::Constant(2.0);
   limits.max_jerk = Eigen::Vector2d::Constant(20.0);
+  limits.numerical_policy = NumericalPolicy{
+    Radians{1.0e-12}, RadiansPerSecond{1.0e-12},
+    RadiansPerSecondSquared{1.0e-12}, RadiansPerSecondCubed{1.0e-12},
+    SolverResidual{1.0e-6}};
   HierarchicalVelocityQpConfig qp_config;
   qp_config.primary_preservation_tolerance = 2.0e-4;
   qp_config.solver_absolute_tolerance = 1.0e-5;
@@ -633,6 +679,10 @@ TEST(UprightRollPathTask, ExistingQpAllowsYawPathWhileActualScreenRemainsUpright
   limits.max_velocity = Eigen::VectorXd::Ones(1);
   limits.max_acceleration = Eigen::VectorXd::Constant(1, 2.0);
   limits.max_jerk = Eigen::VectorXd::Constant(1, 20.0);
+  limits.numerical_policy = NumericalPolicy{
+    Radians{1.0e-12}, RadiansPerSecond{1.0e-12},
+    RadiansPerSecondSquared{1.0e-12}, RadiansPerSecondCubed{1.0e-12},
+    SolverResidual{1.0e-6}};
   const HierarchicalVelocityQp solver{};
   constexpr double period = 0.01;
   double accumulated_yaw = 0.0;
@@ -687,6 +737,85 @@ TEST(UprightRollPathTask, RejectsUndefinedRollAndInvalidInputs)
   invalid_config.orientation_gain = std::numeric_limits<double>::quiet_NaN();
   EXPECT_FALSE(makeUprightRollPathTask(
     Eigen::Isometry3d::Identity(), jacobian, path_velocity, invalid_config));
+}
+
+TEST(HorizontalEdgePathTask, UsesSineRateRowAndKeepsHighPitchObservable)
+{
+  constexpr double theta = 0.05;
+  Eigen::Isometry3d screen_pose = Eigen::Isometry3d::Identity();
+  screen_pose.linear() = Eigen::AngleAxisd(theta, Eigen::Vector3d::UnitX()).toRotationMatrix();
+  Eigen::MatrixXd jacobian = Eigen::MatrixXd::Zero(6, 1);
+  jacobian(3, 0) = 1.0;
+  const Eigen::VectorXd path_reference = Eigen::VectorXd::Constant(1, 0.2);
+  TrackingVelocityTaskConfig config;
+  config.orientation_gain = 4.0;
+  config.roll_deadband_rad = std::asin(0.01);
+  config.maximum_angular_reference_radps = 0.70;
+
+  const auto task = makeHorizontalEdgePathTask(
+    screen_pose, jacobian, path_reference, config);
+
+  ASSERT_TRUE(task);
+  EXPECT_NEAR(task->signed_edge_sine, std::sin(theta), 1.0e-12);
+  EXPECT_NEAR(task->edge_tilt_error_rad, -theta, 1.0e-12);
+  EXPECT_NEAR(task->task.primary_matrix(0, 0), std::cos(theta), 1.0e-12);
+  EXPECT_NEAR(task->task.primary_reference[0],
+    -config.orientation_gain * (std::sin(theta) - std::sin(config.roll_deadband_rad)),
+    1.0e-12);
+  EXPECT_TRUE(task->task.secondary_reference.isApprox(path_reference));
+
+  constexpr double step = 1.0e-7;
+  Eigen::Isometry3d perturbed = screen_pose;
+  perturbed.linear() = Eigen::AngleAxisd(theta + step, Eigen::Vector3d::UnitX())
+    .toRotationMatrix();
+  const auto perturbed_task = makeHorizontalEdgePathTask(
+    perturbed, jacobian, path_reference, config);
+  ASSERT_TRUE(perturbed_task);
+  EXPECT_NEAR(
+    (perturbed_task->signed_edge_sine - task->signed_edge_sine) / step,
+    task->task.primary_matrix(0, 0), 1.0e-7);
+
+  Eigen::Isometry3d high_pitch_pose = Eigen::Isometry3d::Identity();
+  constexpr double kPi = 3.14159265358979323846;
+  high_pitch_pose.linear() = Eigen::AngleAxisd(
+    85.0 * kPi / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  const auto high_pitch_task = makeHorizontalEdgePathTask(
+    high_pitch_pose, jacobian, path_reference, config);
+  ASSERT_TRUE(high_pitch_task);
+  EXPECT_NEAR(high_pitch_task->edge_tilt_error_rad, 0.0, 1.0e-12);
+}
+
+TEST(HorizontalEdgeUpright, EnforcesCapAndRejectsInvalidGeometry)
+{
+  constexpr double kTilt = 5.1 * 3.14159265358979323846 / 180.0;
+  const Eigen::Matrix3d edge_rotation =
+    Eigen::AngleAxisd(kTilt, Eigen::Vector3d::UnitX()).toRotationMatrix();
+  const double exact_sine = edge_rotation(2, 1);
+
+  EXPECT_TRUE(evaluateHorizontalEdgeUprightWithSineCap(edge_rotation, exact_sine));
+  EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(
+      edge_rotation, std::nextafter(exact_sine, 0.0)));
+  EXPECT_TRUE(evaluateHorizontalEdgeUprightWithSineCap(
+      edge_rotation, std::nextafter(exact_sine, 1.0)));
+
+  const Eigen::Matrix3d flipped_up =
+    Eigen::AngleAxisd(3.14159265358979323846, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(flipped_up, 0.0));
+
+  Eigen::Matrix3d reflection = Eigen::Matrix3d::Identity();
+  reflection(2, 2) = -1.0;
+  EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(reflection, 1.0));
+  Eigen::Matrix3d non_orthogonal = Eigen::Matrix3d::Identity();
+  non_orthogonal(0, 1) = 0.01;
+  EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(non_orthogonal, 1.0));
+  Eigen::Matrix3d non_finite = Eigen::Matrix3d::Identity();
+  non_finite(1, 0) = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(non_finite, 1.0));
+
+  EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(edge_rotation, -0.01));
+  EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(edge_rotation, 1.01));
+  EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(
+      edge_rotation, std::numeric_limits<double>::infinity()));
 }
 
 TEST(FaceReturnPointingTask, AzimuthGapKeepsPitchPerturbationsRestoringWithRollPrimary)

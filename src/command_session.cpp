@@ -299,6 +299,7 @@ bool CommandSession::observeBootstrapSourceHold(
 void CommandSession::startRearmDeadline(
   const rclcpp::Time & current_time, const WallTime & wall_time)
 {
+  rearm_timeout_reported = false;
   rclcpp::Time settle_start = current_time;
   if (published_tail_rearm_pending) {
     const auto * published_record = activePublication();
@@ -327,6 +328,16 @@ void CommandSession::clearRearmDeadlines() noexcept
 {
   rearm_deadline.reset();
   rearm_wall_deadline.reset();
+  rearm_timeout_reported = false;
+}
+
+bool CommandSession::claimRearmTimeoutReport() noexcept
+{
+  if (rearm_timeout_reported) {
+    return false;
+  }
+  rearm_timeout_reported = true;
+  return true;
 }
 
 bool CommandSession::rearmDeadlineExpired(

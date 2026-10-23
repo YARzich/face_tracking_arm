@@ -1,41 +1,8 @@
---- a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
-+++ b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
-@@ -6,6 +6,7 @@
-            Vinman <vinman.cub@gmail.com>
-  ============================================================================*/
- 
-+#include "xarm_controller/hardware_activation_guard.hpp"
- #include "xarm_controller/hardware/uf_robot_system_hardware.h"
- 
- #define SERVICE_CALL_FAILED 999
-@@ -247,11 +248,11 @@
- 
-     CallbackReturn UFRobotSystemHardware::on_activate(const rclcpp_lifecycle::State& previous_state)
-     {
--        xarm_driver_.arm->clean_error();
--        xarm_driver_.arm->clean_warn();
--        xarm_driver_.arm->motion_enable(true);
--		xarm_driver_.arm->set_mode(velocity_control_ ? XARM_MODE::VELO_JOINT : XARM_MODE::SERVO);
--		xarm_driver_.arm->set_state(XARM_STATE::START);
-+        if (!face_tracking_arm::hardware::activateReadyArm(
-+                *xarm_driver_.arm, velocity_control_ ? XARM_MODE::VELO_JOINT : XARM_MODE::SERVO)) {
-+            RCLCPP_ERROR(LOGGER, "Robot activation refused: make the arm ready in UFACTORY Studio; no error reset is performed");
-+            return CallbackReturn::ERROR;
-+        }
- 
-         req_list_controller_ = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
-         res_list_controller_ = std::make_shared<controller_manager_msgs::srv::ListControllers::Response>();
-@@ -286,6 +287,7 @@
-     {
-         RCLCPP_INFO(LOGGER, "[%s] Stopping ...please wait...", robot_ip_.c_str());
- 
-+        xarm_driver_.arm->set_state(XARM_STATE::STOP);
-         xarm_driver_.arm->set_mode(XARM_MODE::POSE);
- 
-         RCLCPP_INFO(LOGGER, "[%s] System sucessfully stopped!", robot_ip_.c_str());
+diff --git a/xarm_api/src/xarm_driver.cpp b/xarm_api/src/xarm_driver.cpp
+index 7c7c758..d7cf43a 100644
 --- a/xarm_api/src/xarm_driver.cpp
 +++ b/xarm_api/src/xarm_driver.cpp
-@@ -40,6 +40,7 @@
+@@ -40,6 +40,7 @@ namespace xarm_api
  
      XArmDriver::~XArmDriver()
      {   
@@ -43,7 +10,7 @@
          arm->set_mode(XARM_MODE::POSE);
          arm->disconnect();
      }
-@@ -223,15 +224,9 @@
+@@ -223,15 +224,9 @@ namespace xarm_api
  
          for(int i=0; i<dof_; i++)
          {
@@ -60,4 +27,966 @@
 +                RCLCPP_WARN(node_->get_logger(), "Joint %d servo error 0x%x requires operator attention; not cleared", i+1, dbg_msg[i*2+1]);
              }
          }
+ 
+diff --git a/xarm_controller/CMakeLists.txt b/xarm_controller/CMakeLists.txt
+index 00126e2..cecd8d4 100644
+--- a/xarm_controller/CMakeLists.txt
++++ b/xarm_controller/CMakeLists.txt
+@@ -44,6 +44,8 @@ find_package(rclcpp_lifecycle REQUIRED)
+ find_package(sensor_msgs REQUIRED)
+ find_package(controller_manager_msgs REQUIRED)
+ find_package(xarm_msgs REQUIRED)
++find_package(face_tracking_arm REQUIRED)
++find_package(std_srvs REQUIRED)
+ find_package(xarm_api REQUIRED)
+ find_package(xarm_sdk REQUIRED)
+ 
+@@ -73,6 +75,8 @@ ament_target_dependencies(
+   sensor_msgs
+   controller_manager_msgs
+   xarm_msgs
++  face_tracking_arm
++  std_srvs
+ )
+ 
+ # message(STATUS "xarm_sdk_INCLUDE_DIRS: ${xarm_sdk_INCLUDE_DIRS}")
+diff --git a/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h b/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h
+index 0bc8a8a..4766b69 100644
+--- a/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h
++++ b/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h
+@@ -11,6 +11,11 @@
+ 
+ #include <vector>
+ #include <thread>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <limits>
+ #include <queue>
+ #include <rclcpp/rclcpp.hpp>
+ #include <std_msgs/msg/string.hpp>
+@@ -26,6 +31,10 @@
+ #include "controller_manager_msgs/srv/list_controllers.hpp"
+ #include "controller_manager_msgs/srv/switch_controller.hpp"
+ #include "xarm_api/xarm_driver.h"
++#include "face_tracking_arm/msg/hardware_io_status.hpp"
++#include "xarm_controller/hardware_io_write_gate.hpp"
++#include "xarm_msgs/msg/robot_msg.hpp"
++#include "std_srvs/srv/trigger.hpp"
+ 
+ 
+ namespace uf_robot_hardware
+@@ -67,10 +76,70 @@ namespace uf_robot_hardware
+ 		float cmds_float_[7];
+         std::vector<double> position_cmds_;
+         std::vector<double> velocity_cmds_;
++        std::array<double, 6> position_min_{};
++        std::array<double, 6> position_max_{};
++        std::array<bool, 6> position_limits_valid_{};
++        bool position_limits_available_ = false;
+         std::vector<double> position_states_;
+         std::vector<double> velocity_states_;
+ 
+         bool velocity_control_;
++        bool runtime_actions_enabled_ = false;
++        std::atomic<bool> hardware_active_{false};
++        std::atomic<bool> reset_epoch_latched_{false};
++        face_tracking_arm::hardware::HardwareIoWriteGate write_gate_;
++        std::atomic<uint64_t> inhibit_state_{0};
++        std::atomic<uint64_t> inhibit_epoch_{0};
++        std::atomic<uint64_t> hardware_epoch_{1};
++        std::atomic<uint8_t> first_fault_capture_state_{0};
++        std::atomic<uint64_t> first_fault_sequence_{0};
++        std::atomic<uint8_t> first_fault_kind_{0};
++        std::atomic<int32_t> first_fault_code_{0};
++        std::atomic<uint64_t> first_fault_read_attempt_sequence_{0};
++        std::atomic<int64_t> first_fault_stamp_ns_{0};
++        std::atomic<uint64_t> first_fault_epoch_{0};
++        std::atomic<uint64_t> read_attempt_sequence_{0};
++        std::atomic<uint64_t> read_sequence_{0};
++        std::atomic<uint64_t> read_epoch_{0};
++        std::atomic<uint64_t> write_sequence_{0};
++        std::atomic<uint64_t> driver_command_sequence_{0};
++        std::atomic<uint64_t> candidate_sequence_{0};
++        std::atomic<uint64_t> robot_msg_sequence_{0};
++        std::atomic<uint64_t> robot_status_version_{0};
++        std::atomic<bool> read_ok_{false};
++        std::atomic<int32_t> read_result_code_{0};
++        std::atomic<bool> write_attempted_{false};
++        std::atomic<bool> write_ok_{false};
++        std::atomic<bool> candidate_valid_{false};
++        std::atomic<uint8_t> candidate_failure_joint_index_{
++            face_tracking_arm::msg::HardwareIoStatus::CANDIDATE_FAILURE_JOINT_NONE};
++        std::atomic<bool> first_fault_candidate_valid_{false};
++        std::atomic<uint8_t> first_fault_candidate_joint_index_{
++            face_tracking_arm::msg::HardwareIoStatus::CANDIDATE_FAILURE_JOINT_NONE};
++        std::atomic<int32_t> write_result_code_{0};
++        std::atomic<int64_t> read_stamp_ns_{0};
++        std::atomic<int64_t> read_steady_ns_{0};
++        std::atomic<int64_t> write_stamp_ns_{0};
++        std::atomic<int64_t> last_status_ros_ns_{0};
++        std::atomic<int64_t> robot_msg_stamp_ns_{0};
++        std::atomic<int64_t> robot_msg_receipt_steady_ns_{0};
++        std::atomic<int64_t> robot_msg_source_age_ns_{0};
++        std::atomic<uint8_t> robot_state_{0};
++        std::atomic<uint8_t> robot_mode_{0};
++        std::atomic<uint8_t> robot_mt_able_{0};
++        std::atomic<uint8_t> robot_mt_brake_{0};
++        std::atomic<uint16_t> robot_error_code_{0};
++        std::atomic<uint16_t> robot_warn_code_{0};
++        std::atomic<uint64_t> read_status_version_{0};
++        std::atomic<uint64_t> write_status_version_{0};
++        std::array<std::atomic<double>, 6> status_q_{};
++        std::array<std::atomic<double>, 6> status_dq_{};
++        std::array<std::atomic<double>, 6> command_double_{};
++        std::array<std::atomic<float>, 6> command_float_{};
++        std::array<std::atomic<double>, 6> candidate_double_{};
++        std::array<std::atomic<float>, 6> candidate_float_{};
++        std::array<std::atomic<double>, 6> first_fault_candidate_double_{};
++        std::array<std::atomic<float>, 6> first_fault_candidate_float_{};
+         bool initialized_;
+         bool read_ready_;
+         bool reactivate_controller_later_;
+@@ -104,6 +173,10 @@ namespace uf_robot_hardware
+         rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr client_switch_controller_;
+ 
+         rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr update_goal_state_pub_;
++        rclcpp::Publisher<face_tracking_arm::msg::HardwareIoStatus>::SharedPtr hardware_io_status_pub_;
++        rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr inhibit_servoj_service_;
++        rclcpp::TimerBase::SharedPtr hardware_io_status_timer_;
++        rclcpp::Subscription<xarm_msgs::msg::RobotMsg>::SharedPtr robot_state_subscription_;
+         std_msgs::msg::Empty update_goal_state_msg_;
+ 
+         bool _check_cmds_is_change(float *prev, float *cur, double threshold = 0.0001);
+@@ -116,6 +189,16 @@ namespace uf_robot_hardware
+         void _activate_controller(void);
+ 
+         void _init_ufactory_driver(void);
++        bool latch_servoj_inhibit();
++        void capture_first_fault(uint8_t kind, int32_t code, uint64_t sequence,
++                                 uint64_t read_attempt_sequence, int64_t stamp_ns,
++                                 uint64_t epoch, const double * candidate_double = nullptr,
++                                 const float * candidate_float = nullptr,
++                                 bool candidate_valid = false,
++                                 uint8_t candidate_joint_index =
++                                 face_tracking_arm::msg::HardwareIoStatus::CANDIDATE_FAILURE_JOINT_NONE);
++        void publish_hardware_io_status();
++        void observe_robot_state(const xarm_msgs::msg::RobotMsg::SharedPtr message);
+ 
+         template<typename ServiceT, typename SharedRequest = typename ServiceT::Request::SharedPtr, typename SharedResponse = typename ServiceT::Response::SharedPtr>
+         int _call_request(std::shared_ptr<ServiceT> client, SharedRequest req, SharedResponse& res);
+@@ -127,4 +210,4 @@ namespace uf_robot_hardware
+ 
+ PLUGINLIB_EXPORT_CLASS(uf_robot_hardware::UFRobotSystemHardware, hardware_interface::SystemInterface)
+ 
+-#endif // __UF_ROBOT_SYSTEM_HARDWARE_INTERFACE_H__
+\ No newline at end of file
++#endif // __UF_ROBOT_SYSTEM_HARDWARE_INTERFACE_H__
+diff --git a/xarm_controller/include/xarm_controller/hardware_io_command_limits.hpp b/xarm_controller/include/xarm_controller/hardware_io_command_limits.hpp
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/xarm_controller/include/xarm_controller/hardware_io_command_limits.hpp
+@@ -0,0 +1,67 @@
++// Copyright 2026 YARzich
++// SPDX-License-Identifier: MIT
++
++#pragma once
++
++#include <cmath>
++#include <cstddef>
++
++namespace face_tracking_arm
++{
++namespace hardware
++{
++
++struct PositionCommandValidation
++{
++  bool valid = false;
++  std::size_t joint_index = 0;
++};
++
++inline PositionCommandValidation validate_finite_position_command(
++  const double * requested, const float * wire, std::size_t count) noexcept
++{
++  if (requested == nullptr || wire == nullptr || count != 6) {
++    return {false, 0};
++  }
++  for (std::size_t i = 0; i < count; ++i) {
++    if (!std::isfinite(requested[i]) || !std::isfinite(wire[i])) {
++      return {false, i};
++    }
++  }
++  return {true, count};
++}
++
++inline bool position_command_allowed(
++  bool runtime_actions_enabled, bool limits_available,
++  bool finite_candidate_valid, bool bounded_candidate_valid) noexcept
++{
++  return finite_candidate_valid &&
++         (!runtime_actions_enabled || (limits_available && bounded_candidate_valid));
++}
++
++inline PositionCommandValidation validate_position_command(
++  const double * requested, const float * wire,
++  const double * minimum, const double * maximum,
++  const bool * limit_valid, std::size_t count) noexcept
++{
++  if (requested == nullptr || wire == nullptr || minimum == nullptr ||
++    maximum == nullptr || limit_valid == nullptr || count != 6)
++  {
++    return {false, 0};
++  }
++  for (std::size_t i = 0; i < count; ++i) {
++    const double wire_value = static_cast<double>(wire[i]);
++    if (!limit_valid[i] || !std::isfinite(minimum[i]) || !std::isfinite(maximum[i]) ||
++      minimum[i] >= maximum[i] || !std::isfinite(requested[i]) ||
++      !std::isfinite(wire[i]) || requested[i] < minimum[i] ||
++      requested[i] > maximum[i] || wire_value<minimum[i] ||
++      wire_value> maximum[i])
++    {
++      return {false, i};
++    }
++  }
++  return {true, count};
++}
++
++}  // namespace hardware
++}  // namespace face_tracking_arm
+diff --git a/xarm_controller/include/xarm_controller/hardware_io_write_gate.hpp b/xarm_controller/include/xarm_controller/hardware_io_write_gate.hpp
+new file mode 100644
+index 0000000..07fa343
+--- /dev/null
++++ b/xarm_controller/include/xarm_controller/hardware_io_write_gate.hpp
+@@ -0,0 +1,75 @@
++// Copyright 2026 YARzich
++// SPDX-License-Identifier: MIT
++
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++namespace face_tracking_arm
++{
++namespace hardware
++{
++
++// With the runtime policy armed, STOP owns the transition before a controller
++// reset/deactivation can start another SDK-side action.
++inline bool defer_controller_deactivation_until_stop(
++  bool runtime_actions_enabled, bool hardware_active) noexcept
++{
++  return runtime_actions_enabled && hardware_active;
++}
++
++inline bool refuse_activation_after_latched_fault(
++  bool runtime_actions_enabled, bool inhibit_latched, bool fault_latched) noexcept
++{
++  return runtime_actions_enabled && (inhibit_latched || fault_latched);
++}
++
++// Keep the status publisher alive for an active gated disconnect so the
++// monitor can record the latched failure; legacy mode retains process exit.
++inline bool should_shutdown_on_disconnected_read(
++  bool runtime_actions_enabled, bool read_still_in_active_epoch) noexcept
++{
++  return !runtime_actions_enabled || !read_still_in_active_epoch;
++}
++
++// One-shot admission gate: close is atomic, and try_enter never retries.
++class HardwareIoWriteGate
++{
++public:
++  bool try_enter() noexcept
++  {
++    auto state = state_.load(std::memory_order_acquire);
++    if ((state & kClosed) != 0 || (state & kCountMask) != 0) {return false;}
++    return state_.compare_exchange_strong(
++            state, state + 1, std::memory_order_acq_rel, std::memory_order_acquire);
++  }
++
++  void leave() noexcept
++  {
++    state_.fetch_sub(1, std::memory_order_release);
++  }
++
++  void close() noexcept
++  {
++    state_.fetch_or(kClosed, std::memory_order_acq_rel);
++  }
++
++  std::uint32_t in_flight() const noexcept
++  {
++    return state_.load(std::memory_order_acquire) & kCountMask;
++  }
++
++  bool closed() const noexcept
++  {
++    return (state_.load(std::memory_order_acquire) & kClosed) != 0;
++  }
++
++private:
++  static constexpr std::uint32_t kClosed = std::uint32_t{1} << 31;
++  static constexpr std::uint32_t kCountMask = kClosed - 1;
++  std::atomic<std::uint32_t> state_{0};
++};
++
++}  // namespace hardware
++}  // namespace face_tracking_arm
+diff --git a/xarm_controller/package.xml b/xarm_controller/package.xml
+index 9cd0bf3..ce1b532 100644
+--- a/xarm_controller/package.xml
++++ b/xarm_controller/package.xml
+@@ -20,6 +20,8 @@
+   <depend>controller_manager_msgs</depend>
+   <depend>xarm_description</depend>
+   <depend>xarm_msgs</depend>
++  <depend>face_tracking_arm</depend>
++  <depend>std_srvs</depend>
+   <depend>xarm_api</depend>
+ 
+   <exec_depend>robot_state_publisher</exec_depend>
+diff --git a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
+index 54e7e8a..1bf9644 100644
+--- a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
++++ b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
+@@ -6,8 +6,14 @@
+            Vinman <vinman.cub@gmail.com>
+  ============================================================================*/
+ 
++#include "xarm_controller/hardware_activation_guard.hpp"
++#include "xarm_controller/hardware_io_command_limits.hpp"
+ #include "xarm_controller/hardware/uf_robot_system_hardware.h"
+ 
++#include <algorithm>
++#include <cmath>
++#include <string>
++
+ #define SERVICE_CALL_FAILED 999
+ #define SERVICE_IS_PERSISTENT_BUT_INVALID 998
+ #define ROBOT_IS_DISCONNECTED -1
+@@ -77,8 +83,42 @@ namespace uf_robot_hardware
+         if (it != info_.hardware_parameters.end()) {
+             hw_ns = it->second;
+         }
++        while (!hw_ns.empty() && hw_ns.front() == '/') hw_ns.erase(hw_ns.begin());
++        while (!hw_ns.empty() && hw_ns.back() == '/') hw_ns.pop_back();
+         node_->set_parameter(rclcpp::Parameter("hw_ns", hw_ns));
+ 
++        const std::string hardware_io_status_topic = "/" + hw_ns + "/hardware_io_status";
++        const std::string inhibit_service_name = "/" + hw_ns + "/_inhibit_servoj";
++        hardware_io_status_pub_ = node_->create_publisher<face_tracking_arm::msg::HardwareIoStatus>(
++            hardware_io_status_topic, rclcpp::QoS(1).reliable());
++        inhibit_servoj_service_ = node_->create_service<std_srvs::srv::Trigger>(
++            inhibit_service_name,
++            [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
++                   std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
++                if (!runtime_actions_enabled_) {
++                    response->success = false;
++                    response->message = "runtime hardware actions are disabled until stage 3";
++                    return;
++                }
++                const bool was_latched = latch_servoj_inhibit();
++                response->success = (inhibit_state_.load(std::memory_order_acquire) & 1U) != 0;
++                response->message = was_latched ? "ServoJ inhibit already latched" :
++                    "ServoJ inhibit latched";
++            });
++        robot_state_subscription_ = node_->create_subscription<xarm_msgs::msg::RobotMsg>(
++            "/" + hw_ns + "/robot_states", rclcpp::QoS(10).reliable(),
++            [this](xarm_msgs::msg::RobotMsg::SharedPtr message) {
++                observe_robot_state(message);
++            });
++        for (size_t i = 0; i < 6; ++i) {
++            status_q_[i].store(0.0, std::memory_order_relaxed);
++            status_dq_[i].store(0.0, std::memory_order_relaxed);
++            command_double_[i].store(0.0, std::memory_order_relaxed);
++            command_float_[i].store(0.0F, std::memory_order_relaxed);
++        }
++        hardware_io_status_timer_ = node_->create_wall_timer(
++            std::chrono::milliseconds(10), [this]() { publish_hardware_io_status(); });
++
+         std::string prefix = "";
+         it = info_.hardware_parameters.find("prefix");
+         if (it != info_.hardware_parameters.end()) {
+@@ -164,6 +204,65 @@ namespace uf_robot_hardware
+             return CallbackReturn::ERROR;
+         }
+         info_ = info;
++        if (info_.joints.size() != 6U) {
++            RCLCPP_ERROR(LOGGER, "Unsupported hardware DOF: this status contract supports exactly 6 joints");
++            return CallbackReturn::ERROR;
++        }
++        const auto dof_parameter = info_.hardware_parameters.find("dof");
++        if (dof_parameter != info_.hardware_parameters.end() && dof_parameter->second != "6") {
++            RCLCPP_ERROR(LOGGER, "Unsupported hardware dof='%s': this status contract supports dof=6",
++                dof_parameter->second.c_str());
++            return CallbackReturn::ERROR;
++        }
++        const auto gate_parameter = info_.hardware_parameters.find("runtime_actions_enabled");
++        if (gate_parameter != info_.hardware_parameters.end()) {
++            const auto & gate_value = gate_parameter->second;
++            if (gate_value == "true" || gate_value == "True" || gate_value == "1") {
++                runtime_actions_enabled_ = true;
++            } else if (gate_value == "false" || gate_value == "False" || gate_value == "0") {
++                runtime_actions_enabled_ = false;
++            } else {
++                RCLCPP_ERROR(LOGGER, "Invalid runtime_actions_enabled='%s' (expected true/false/1/0)",
++                    gate_value.c_str());
++                return CallbackReturn::ERROR;
++            }
++        } else {
++            runtime_actions_enabled_ = false;
++        }
++        position_limits_available_ = true;
++        for (size_t index = 0; index < 6; ++index) {
++            const auto & joint_name = info_.joints[index].name;
++            const auto limits = info_.limits.find(joint_name);
++            if (limits == info_.limits.end() || !limits->second.has_position_limits ||
++                !std::isfinite(limits->second.min_position) ||
++                !std::isfinite(limits->second.max_position) ||
++                limits->second.min_position >= limits->second.max_position) {
++                position_limits_available_ = false;
++                position_limits_valid_[index] = false;
++                continue;
++            }
++            position_min_[index] = limits->second.min_position;
++            position_max_[index] = limits->second.max_position;
++            position_limits_valid_[index] = true;
++        }
++        if (runtime_actions_enabled_ && !position_limits_available_) {
++            RCLCPP_ERROR(LOGGER, "runtime_actions_enabled requires finite position limits for all six joints");
++            return CallbackReturn::ERROR;
++        }
++        const auto hw_ns_parameter = info_.hardware_parameters.find("hw_ns");
++        if (hw_ns_parameter != info_.hardware_parameters.end()) {
++            std::string normalized_namespace = hw_ns_parameter->second;
++            while (!normalized_namespace.empty() && normalized_namespace.front() == '/') {
++                normalized_namespace.erase(normalized_namespace.begin());
++            }
++            while (!normalized_namespace.empty() && normalized_namespace.back() == '/') {
++                normalized_namespace.pop_back();
++            }
++            if (normalized_namespace.empty()) {
++                RCLCPP_ERROR(LOGGER, "Invalid empty hw_ns namespace");
++                return CallbackReturn::ERROR;
++            }
++        }
+         velocity_control_ = false;
+         read_code_ = 0;
+         write_code_ = 0;
+@@ -247,11 +346,18 @@ namespace uf_robot_hardware
+ 
+     CallbackReturn UFRobotSystemHardware::on_activate(const rclcpp_lifecycle::State& previous_state)
+     {
+-        xarm_driver_.arm->clean_error();
+-        xarm_driver_.arm->clean_warn();
+-        xarm_driver_.arm->motion_enable(true);
+-		xarm_driver_.arm->set_mode(velocity_control_ ? XARM_MODE::VELO_JOINT : XARM_MODE::SERVO);
+-		xarm_driver_.arm->set_state(XARM_STATE::START);
++        if (face_tracking_arm::hardware::refuse_activation_after_latched_fault(
++                runtime_actions_enabled_,
++                (inhibit_state_.load(std::memory_order_acquire) & 1U) != 0,
++                first_fault_capture_state_.load(std::memory_order_acquire) == 2)) {
++            RCLCPP_ERROR(LOGGER, "Activation refused after a latched hardware fault/inhibit; inspect robot readiness and restart the driver process after operator recovery");
++            return CallbackReturn::ERROR;
++        }
++        if (!face_tracking_arm::hardware::activateReadyArm(
++                *xarm_driver_.arm, velocity_control_ ? XARM_MODE::VELO_JOINT : XARM_MODE::SERVO)) {
++            RCLCPP_ERROR(LOGGER, "Robot activation refused: make the arm ready in UFACTORY Studio; no error reset is performed");
++            return CallbackReturn::ERROR;
++        }
+ 
+         req_list_controller_ = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
+         res_list_controller_ = std::make_shared<controller_manager_msgs::srv::ListControllers::Response>();
+@@ -278,14 +384,19 @@ namespace uf_robot_hardware
+             }
+         }
+         
++        hardware_epoch_.fetch_add(1, std::memory_order_acq_rel);
++        hardware_active_.store(true, std::memory_order_release);
+         RCLCPP_INFO(LOGGER, "[%s] System Sucessfully started!", robot_ip_.c_str());
+         return CallbackReturn::SUCCESS;
+     }
+ 
+     CallbackReturn UFRobotSystemHardware::on_deactivate(const rclcpp_lifecycle::State& previous_state)
+     {
++        hardware_active_.store(false, std::memory_order_release);
++        hardware_epoch_.fetch_add(1, std::memory_order_acq_rel);
+         RCLCPP_INFO(LOGGER, "[%s] Stopping ...please wait...", robot_ip_.c_str());
+ 
++        xarm_driver_.arm->set_state(XARM_STATE::STOP);
+         xarm_driver_.arm->set_mode(XARM_MODE::POSE);
+ 
+         RCLCPP_INFO(LOGGER, "[%s] System sucessfully stopped!", robot_ip_.c_str());
+@@ -294,9 +405,20 @@ namespace uf_robot_hardware
+ 
+     hardware_interface::return_type UFRobotSystemHardware::read(const rclcpp::Time & time, const rclcpp::Duration &period)
+     {
++        const bool read_started_active = hardware_active_.load(std::memory_order_acquire);
++        auto read_epoch = read_started_active ?
++            hardware_epoch_.load(std::memory_order_acquire) : 0U;
++        // Reject an operation straddling lifecycle transition; epoch zero is never accepted.
++        if (read_started_active && (!hardware_active_.load(std::memory_order_acquire) ||
++            hardware_epoch_.load(std::memory_order_acquire) != read_epoch)) {
++            read_epoch = 0U;
++        }
++        read_status_version_.fetch_add(1, std::memory_order_acq_rel);
++        // Pair with the reader acquire fence if a payload store is observed.
++        std::atomic_thread_fence(std::memory_order_release);
+         read_cnts_ += 1;
+         read_ready_ = _xarm_is_ready_read();
+-        rclcpp::Time start = node_->get_clock()->now();
++        read_attempt_sequence_.fetch_add(1, std::memory_order_relaxed);
+ 
+         read_code_ = xarm_driver_.update_joint_states(initialized_);
+         // double time_sec = joint_state_msg_->header.stamp.seconds() - start.seconds();
+@@ -307,10 +429,34 @@ namespace uf_robot_hardware
+         // if (read_cnts_ % 6000 == 0) {
+         //     RCLCPP_INFO(LOGGER, "[%s] [READ] cnt: %ld, max: %f, mean: %f, failed: %ld", robot_ip_.c_str(), read_cnts_, read_max_time_, read_total_time_ / read_cnts_, read_failed_cnts_);
+         // }
+-        if (read_code_ == 0 && read_ready_) {
++        const bool successful_read = read_code_ == 0 && read_ready_;
++        const bool read_still_in_active_epoch = read_started_active && read_epoch != 0U &&
++            hardware_active_.load(std::memory_order_acquire) &&
++            hardware_epoch_.load(std::memory_order_acquire) == read_epoch;
++        read_ok_.store(successful_read, std::memory_order_relaxed);
++        read_result_code_.store(read_code_, std::memory_order_relaxed);
++        if (!successful_read && read_still_in_active_epoch) {
++            const auto failed_read_stamp = node_->get_clock()->now().nanoseconds();
++            capture_first_fault(face_tracking_arm::msg::HardwareIoStatus::FAULT_READ,
++                read_code_, read_attempt_sequence_.load(std::memory_order_relaxed),
++                read_attempt_sequence_.load(std::memory_order_relaxed), failed_read_stamp,
++                read_epoch);
++        }
++        if (successful_read) {
++            const auto sample_time = node_->get_clock()->now();
++            read_stamp_ns_.store(sample_time.nanoseconds(), std::memory_order_relaxed);
++            read_steady_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
++            read_epoch_.store(read_epoch, std::memory_order_relaxed);
++            read_sequence_.store(
++                read_attempt_sequence_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+             for (int j = 0; j < info_.joints.size(); j++) {
+                 position_states_[j] = joint_state_msg_->position[j];
+                 velocity_states_[j] = joint_state_msg_->velocity[j];
++                if (j < 6) {
++                    status_q_[j].store(joint_state_msg_->position[j], std::memory_order_relaxed);
++                    status_dq_[j].store(joint_state_msg_->velocity[j], std::memory_order_relaxed);
++                }
+                 // effort_states_[j] = joint_state_msg_->effort[j];
+             }
+             if (!initialized_) {
+@@ -321,34 +467,68 @@ namespace uf_robot_hardware
+             }
+         }
+         else {
++            if (runtime_actions_enabled_ && read_still_in_active_epoch) {
++                latch_servoj_inhibit();
++            }
+             // initialized_ = read_ready_ && _xarm_is_ready_write();
+             if (read_code_) {
+                 read_failed_cnts_ += 1;
+                 RCLCPP_INFO(LOGGER, "[%s] Read() returns: %d", robot_ip_.c_str(), read_code_);
+-                if (read_code_ == ROBOT_IS_DISCONNECTED) {
++                if (read_code_ == ROBOT_IS_DISCONNECTED &&
++                    face_tracking_arm::hardware::should_shutdown_on_disconnected_read(
++                        runtime_actions_enabled_, read_still_in_active_epoch)) {
+                     RCLCPP_ERROR(LOGGER, "[%s] Robot is disconnected, ros shutdown", robot_ip_.c_str());
+                     rclcpp::shutdown();
+                     exit(1);
+-				}
++                }
+             }
+         }
+ 
++        read_status_version_.fetch_add(1, std::memory_order_release);
+         return hardware_interface::return_type::OK;
+     }
+ 
+     hardware_interface::return_type UFRobotSystemHardware::write(const rclcpp::Time & time, const rclcpp::Duration &period)
+     {
++        write_status_version_.fetch_add(1, std::memory_order_acq_rel);
++        // Pair with the reader acquire fence if a payload store is observed.
++        std::atomic_thread_fence(std::memory_order_release);
++        write_attempted_.store(false, std::memory_order_relaxed);
++        if (runtime_actions_enabled_ &&
++            (inhibit_state_.load(std::memory_order_acquire) & 1U)) {
++            write_status_version_.fetch_add(1, std::memory_order_release);
++            return hardware_interface::return_type::OK;
++        }
+         if (_need_reset()) {
+             initialized_ = false;
++            if (face_tracking_arm::hardware::defer_controller_deactivation_until_stop(
++                    runtime_actions_enabled_, hardware_active_.load(std::memory_order_acquire))) {
++                const auto stamp = node_->get_clock()->now().nanoseconds();
++                const auto sequence = read_attempt_sequence_.load(std::memory_order_relaxed);
++                capture_first_fault(face_tracking_arm::msg::HardwareIoStatus::FAULT_READ,
++                    read_code_ != 0 ? read_code_ : -1005, sequence, sequence, stamp,
++                    hardware_epoch_.load(std::memory_order_acquire));
++                latch_servoj_inhibit();
++                // The monitor owns STOP. Do not deactivate/restart the controller
++                // before it has observed the latched gate and drained any admitted write.
++                write_status_version_.fetch_add(1, std::memory_order_release);
++                return hardware_interface::return_type::OK;
++            }
+             _deactivate_controller();
++            write_status_version_.fetch_add(1, std::memory_order_release);
+             return hardware_interface::return_type::OK;
+         }
+         initialized_ = true;
++        if (inhibit_state_.load(std::memory_order_acquire) & 1U) {
++            write_status_version_.fetch_add(1, std::memory_order_release);
++            return hardware_interface::return_type::OK;
++        }
+         if(reactivate_controller_later_)
+         {
+             _activate_controller();
+             reactivate_controller_later_ = false;
+         }
++        candidate_sequence_.fetch_add(1, std::memory_order_relaxed);
+         // std::string pos_str = "[ ";
+         // std::string vel_str = "[ ";
+         // for (int i = 0; i < position_cmds_.size(); i++) { 
+@@ -363,23 +543,129 @@ namespace uf_robot_hardware
+ 
+         int cmd_ret = 0;
+         if (velocity_control_) {
+-            for (int i = 0; i < velocity_cmds_.size(); i++) { 
+-                cmds_float_[i] = (float)velocity_cmds_[i];
++            bool finite_velocity_command = true;
++            std::size_t invalid_velocity_index = velocity_cmds_.size();
++            for (int i = 0; i < velocity_cmds_.size(); i++) {
++                cmds_float_[i] = static_cast<float>(velocity_cmds_[i]);
++                candidate_double_[i].store(velocity_cmds_[i], std::memory_order_relaxed);
++                candidate_float_[i].store(cmds_float_[i], std::memory_order_relaxed);
++                if (finite_velocity_command &&
++                    (!std::isfinite(velocity_cmds_[i]) || !std::isfinite(cmds_float_[i]))) {
++                    invalid_velocity_index = static_cast<std::size_t>(i);
++                }
++                finite_velocity_command = finite_velocity_command &&
++                    std::isfinite(velocity_cmds_[i]) && std::isfinite(cmds_float_[i]);
++            }
++            candidate_valid_.store(finite_velocity_command, std::memory_order_relaxed);
++            candidate_failure_joint_index_.store(
++                finite_velocity_command ? face_tracking_arm::msg::HardwareIoStatus::CANDIDATE_FAILURE_JOINT_NONE :
++                static_cast<uint8_t>(invalid_velocity_index), std::memory_order_relaxed);
++            if (!finite_velocity_command) {
++                const auto stamp = node_->get_clock()->now().nanoseconds();
++                const auto sequence = candidate_sequence_.load(std::memory_order_relaxed);
++                capture_first_fault(face_tracking_arm::msg::HardwareIoStatus::FAULT_WRITE_BOUNDS,
++                    -1003, sequence, read_attempt_sequence_.load(std::memory_order_relaxed), stamp,
++                    hardware_epoch_.load(std::memory_order_relaxed), velocity_cmds_.data(),
++                    cmds_float_, false, static_cast<uint8_t>(invalid_velocity_index));
++                if (runtime_actions_enabled_) latch_servoj_inhibit();
++                write_status_version_.fetch_add(1, std::memory_order_release);
++                return hardware_interface::return_type::OK;
+             }
+             // RCLCPP_INFO(LOGGER, "[%s] velocity: %s", robot_ip_.c_str(), vel_str.c_str());
+-            cmd_ret = xarm_driver_.arm->vc_set_joint_velocity(cmds_float_, true, VELO_DURATION);
++            if (write_gate_.try_enter()) {
++                write_attempted_.store(true, std::memory_order_relaxed);
++                const uint64_t sequence = write_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
++                driver_command_sequence_.store(sequence, std::memory_order_relaxed);
++                for (size_t i = 0; i < 6; ++i) {
++                    command_double_[i].store(velocity_cmds_[i], std::memory_order_relaxed);
++                    command_float_[i].store(cmds_float_[i], std::memory_order_relaxed);
++                }
++                cmd_ret = xarm_driver_.arm->vc_set_joint_velocity(cmds_float_, true, VELO_DURATION);
++                write_stamp_ns_.store(node_->get_clock()->now().nanoseconds(), std::memory_order_relaxed);
++                write_result_code_.store(cmd_ret, std::memory_order_relaxed);
++                write_ok_.store(cmd_ret == 0, std::memory_order_relaxed);
++                if (cmd_ret != 0) {
++                    capture_first_fault(face_tracking_arm::msg::HardwareIoStatus::FAULT_WRITE,
++                        cmd_ret, sequence, read_attempt_sequence_.load(std::memory_order_relaxed),
++                        write_stamp_ns_.load(std::memory_order_relaxed),
++                        hardware_epoch_.load(std::memory_order_relaxed), velocity_cmds_.data(),
++                        cmds_float_, true,
++                        face_tracking_arm::msg::HardwareIoStatus::CANDIDATE_FAILURE_JOINT_NONE);
++                    if (runtime_actions_enabled_) latch_servoj_inhibit();
++                }
++                write_gate_.leave();
++            }
+             if (cmd_ret != 0) {
+                 RCLCPP_WARN(LOGGER, "[%s] vc_set_joint_velocity, ret=%d", robot_ip_.c_str(), cmd_ret);
+             }
+         }
+         else {
+-            for (int i = 0; i < position_cmds_.size(); i++) { 
+-                cmds_float_[i] = (float)position_cmds_[i];
++            for (int i = 0; i < position_cmds_.size(); i++) {
++                cmds_float_[i] = static_cast<float>(position_cmds_[i]);
++            }
++            const auto validation = face_tracking_arm::hardware::validate_position_command(
++                position_cmds_.data(), cmds_float_, position_min_.data(), position_max_.data(),
++                position_limits_valid_.data(), position_cmds_.size());
++            const auto finite_validation =
++                face_tracking_arm::hardware::validate_finite_position_command(
++                position_cmds_.data(), cmds_float_, position_cmds_.size());
++            const bool bounds_valid = position_limits_available_ && validation.valid;
++            const bool candidate_valid = face_tracking_arm::hardware::position_command_allowed(
++                runtime_actions_enabled_, position_limits_available_, finite_validation.valid,
++                bounds_valid);
++            const std::size_t failure_joint_index = !finite_validation.valid ?
++                finite_validation.joint_index : validation.joint_index;
++            for (size_t i = 0; i < 6; ++i) {
++                candidate_double_[i].store(position_cmds_[i], std::memory_order_relaxed);
++                candidate_float_[i].store(cmds_float_[i], std::memory_order_relaxed);
++            }
++            candidate_valid_.store(candidate_valid, std::memory_order_relaxed);
++            candidate_failure_joint_index_.store(
++                candidate_valid ? face_tracking_arm::msg::HardwareIoStatus::CANDIDATE_FAILURE_JOINT_NONE :
++                static_cast<uint8_t>(failure_joint_index), std::memory_order_relaxed);
++            if (!candidate_valid) {
++                const auto stamp = node_->get_clock()->now().nanoseconds();
++                const auto sequence = candidate_sequence_.load(std::memory_order_relaxed);
++                const bool limits_unavailable = runtime_actions_enabled_ &&
++                    !position_limits_available_;
++                const int32_t failure_code = limits_unavailable ? -1004 : -1003;
++                capture_first_fault(limits_unavailable ?
++                    face_tracking_arm::msg::HardwareIoStatus::FAULT_LIMITS_UNAVAILABLE :
++                    face_tracking_arm::msg::HardwareIoStatus::FAULT_WRITE_BOUNDS,
++                    failure_code, sequence,
++                    read_attempt_sequence_.load(std::memory_order_relaxed), stamp,
++                    hardware_epoch_.load(std::memory_order_relaxed), position_cmds_.data(),
++                    cmds_float_, false, static_cast<uint8_t>(failure_joint_index));
++                if (runtime_actions_enabled_) latch_servoj_inhibit();
++                write_status_version_.fetch_add(1, std::memory_order_release);
++                return hardware_interface::return_type::OK;
+             }
+             curr_write_time_ = node_->get_clock()->now();
+             if (curr_write_time_.seconds() - prev_write_time_.seconds() > 1 || _check_cmds_is_change(prev_cmds_float_, cmds_float_)) {
+                 // RCLCPP_INFO(LOGGER, "[%s] positon: %s", robot_ip_.c_str(), pos_str.c_str());
+-                cmd_ret = xarm_driver_.arm->set_servo_angle_j(cmds_float_, 0, 0, 0);
++                if (write_gate_.try_enter()) {
++                    write_attempted_.store(true, std::memory_order_relaxed);
++                    const uint64_t sequence = write_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
++                    driver_command_sequence_.store(sequence, std::memory_order_relaxed);
++                    for (size_t i = 0; i < 6; ++i) {
++                        command_double_[i].store(position_cmds_[i], std::memory_order_relaxed);
++                        command_float_[i].store(cmds_float_[i], std::memory_order_relaxed);
++                    }
++                    cmd_ret = xarm_driver_.arm->set_servo_angle_j(cmds_float_, 0, 0, 0);
++                    write_stamp_ns_.store(node_->get_clock()->now().nanoseconds(), std::memory_order_relaxed);
++                    write_result_code_.store(cmd_ret, std::memory_order_relaxed);
++                    write_ok_.store(cmd_ret == 0, std::memory_order_relaxed);
++                    if (cmd_ret != 0) {
++                        capture_first_fault(face_tracking_arm::msg::HardwareIoStatus::FAULT_WRITE,
++                            cmd_ret, sequence, read_attempt_sequence_.load(std::memory_order_relaxed),
++                            write_stamp_ns_.load(std::memory_order_relaxed),
++                            hardware_epoch_.load(std::memory_order_relaxed), position_cmds_.data(),
++                            cmds_float_, true,
++                            face_tracking_arm::msg::HardwareIoStatus::CANDIDATE_FAILURE_JOINT_NONE);
++                        if (runtime_actions_enabled_) latch_servoj_inhibit();
++                    }
++                    write_gate_.leave();
++                }
+                 if (cmd_ret != 0) {
+                     RCLCPP_WARN(LOGGER, "[%s] set_servo_angle_j, ret= %d", robot_ip_.c_str(), cmd_ret);
+                 }
+@@ -392,9 +678,183 @@ namespace uf_robot_hardware
+             }
+         }
+ 
++        write_status_version_.fetch_add(1, std::memory_order_release);
+         return hardware_interface::return_type::OK;
+     }
+ 
++    void UFRobotSystemHardware::capture_first_fault(
++        uint8_t kind, int32_t code, uint64_t sequence,
++        uint64_t read_attempt_sequence, int64_t stamp_ns, uint64_t epoch,
++        const double * candidate_double, const float * candidate_float,
++        bool candidate_valid, uint8_t candidate_joint_index)
++    {
++        uint8_t expected = 0;
++        if (!first_fault_capture_state_.compare_exchange_strong(
++                expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) return;
++        first_fault_sequence_.store(sequence, std::memory_order_relaxed);
++        first_fault_kind_.store(kind, std::memory_order_relaxed);
++        first_fault_code_.store(code, std::memory_order_relaxed);
++        first_fault_read_attempt_sequence_.store(read_attempt_sequence, std::memory_order_relaxed);
++        first_fault_stamp_ns_.store(stamp_ns, std::memory_order_relaxed);
++        first_fault_epoch_.store(epoch, std::memory_order_relaxed);
++        first_fault_candidate_valid_.store(candidate_valid, std::memory_order_relaxed);
++        first_fault_candidate_joint_index_.store(candidate_joint_index, std::memory_order_relaxed);
++        if (candidate_double != nullptr && candidate_float != nullptr) {
++            for (size_t i = 0; i < 6; ++i) {
++                first_fault_candidate_double_[i].store(candidate_double[i], std::memory_order_relaxed);
++                first_fault_candidate_float_[i].store(candidate_float[i], std::memory_order_relaxed);
++            }
++        }
++        first_fault_capture_state_.store(2, std::memory_order_release);
++    }
++
++    bool UFRobotSystemHardware::latch_servoj_inhibit()
++    {
++        write_gate_.close();
++        auto current = inhibit_state_.load(std::memory_order_acquire);
++        if (current & 1U) return true;
++        inhibit_epoch_.store(hardware_epoch_.load(std::memory_order_acquire),
++                             std::memory_order_relaxed);
++        const auto next = ((current >> 1) + 1) << 1 | 1U;
++        if (inhibit_state_.compare_exchange_strong(
++                current, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
++            return false;
++        }
++        return (current & 1U) != 0;
++    }
++
++    void UFRobotSystemHardware::publish_hardware_io_status()
++    {
++        const auto read_version_before = read_status_version_.load(std::memory_order_acquire);
++        const auto write_version_before = write_status_version_.load(std::memory_order_acquire);
++        if ((read_version_before & 1U) || (write_version_before & 1U)) return;
++        auto message = face_tracking_arm::msg::HardwareIoStatus();
++        const auto now = node_->get_clock()->now();
++        const auto now_ns = now.nanoseconds();
++        const auto previous_ns = last_status_ros_ns_.exchange(now_ns, std::memory_order_relaxed);
++        if (previous_ns > 0 && now_ns < previous_ns) {
++            const auto new_epoch = hardware_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
++            if (inhibit_state_.load(std::memory_order_acquire) & 1U) {
++                inhibit_epoch_.store(new_epoch, std::memory_order_release);
++            }
++        }
++        message.header.stamp = now;
++        message.source_kind = message.SOURCE_HARDWARE;
++        message.runtime_actions_enabled = runtime_actions_enabled_;
++        message.hardware_active = hardware_active_.load(std::memory_order_acquire);
++        message.epoch = hardware_epoch_.load(std::memory_order_acquire);
++        message.read_attempt_sequence = read_attempt_sequence_.load(std::memory_order_relaxed);
++        message.read_sequence = read_sequence_.load(std::memory_order_relaxed);
++        message.read_epoch = read_epoch_.load(std::memory_order_relaxed);
++        message.read_ok = read_ok_.load(std::memory_order_relaxed);
++        message.read_code = read_result_code_.load(std::memory_order_relaxed);
++        message.read_stamp = static_cast<builtin_interfaces::msg::Time>(
++            rclcpp::Time(read_stamp_ns_.load(std::memory_order_relaxed)));
++        const auto read_steady = read_steady_ns_.load(std::memory_order_relaxed);
++        const auto steady_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count();
++        const auto age_us = read_steady > 0 ? std::max<int64_t>(0, (steady_now - read_steady) / 1000) :
++            static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
++        message.read_age_us = static_cast<uint32_t>(std::min<int64_t>(
++            age_us, std::numeric_limits<uint32_t>::max()));
++        message.write_sequence = write_sequence_.load(std::memory_order_relaxed);
++        message.driver_command_sequence = driver_command_sequence_.load(std::memory_order_relaxed);
++        message.write_stamp = static_cast<builtin_interfaces::msg::Time>(
++            rclcpp::Time(write_stamp_ns_.load(std::memory_order_relaxed)));
++        message.write_attempted = write_attempted_.load(std::memory_order_relaxed);
++        message.write_ok = write_ok_.load(std::memory_order_relaxed);
++        message.write_code = write_result_code_.load(std::memory_order_relaxed);
++        message.candidate_sequence = candidate_sequence_.load(std::memory_order_relaxed);
++        message.candidate_valid = candidate_valid_.load(std::memory_order_relaxed);
++        message.candidate_failure_joint_index = candidate_failure_joint_index_.load(
++            std::memory_order_relaxed);
++        message.write_in_flight = write_gate_.in_flight();
++        const auto fault_state = first_fault_capture_state_.load(std::memory_order_acquire);
++        if (fault_state == 1) return;
++        message.fault_latched = fault_state == 2;
++        message.fault_sequence = first_fault_sequence_.load(std::memory_order_relaxed);
++        message.fault_kind = first_fault_kind_.load(std::memory_order_relaxed);
++        message.fault_code = first_fault_code_.load(std::memory_order_relaxed);
++        message.fault_read_attempt_sequence =
++            first_fault_read_attempt_sequence_.load(std::memory_order_relaxed);
++        message.fault_stamp = static_cast<builtin_interfaces::msg::Time>(rclcpp::Time(
++            first_fault_stamp_ns_.load(std::memory_order_relaxed)));
++        message.fault_epoch = first_fault_epoch_.load(std::memory_order_relaxed);
++        message.fault_candidate_valid = first_fault_candidate_valid_.load(std::memory_order_relaxed);
++        message.fault_candidate_joint_index = first_fault_candidate_joint_index_.load(
++            std::memory_order_relaxed);
++        for (size_t i = 0; i < 6; ++i) {
++            message.q[i] = status_q_[i].load(std::memory_order_relaxed);
++            message.dq[i] = status_dq_[i].load(std::memory_order_relaxed);
++            message.command_double[i] = command_double_[i].load(std::memory_order_relaxed);
++            message.command_float[i] = command_float_[i].load(std::memory_order_relaxed);
++            message.candidate_double[i] = candidate_double_[i].load(std::memory_order_relaxed);
++            message.candidate_float[i] = candidate_float_[i].load(std::memory_order_relaxed);
++            message.fault_candidate_double[i] =
++                first_fault_candidate_double_[i].load(std::memory_order_relaxed);
++            message.fault_candidate_float[i] =
++                first_fault_candidate_float_[i].load(std::memory_order_relaxed);
++        }
++        const auto robot_version_before = robot_status_version_.load(std::memory_order_acquire);
++        if (robot_version_before & 1U) return;
++        message.robot_msg_sequence = robot_msg_sequence_.load(std::memory_order_relaxed);
++        message.robot_msg_stamp = static_cast<builtin_interfaces::msg::Time>(rclcpp::Time(
++            robot_msg_stamp_ns_.load(std::memory_order_relaxed)));
++        const auto robot_age_ns = robot_msg_source_age_ns_.load(std::memory_order_relaxed) +
++            std::max<int64_t>(0, steady_now -
++                robot_msg_receipt_steady_ns_.load(std::memory_order_relaxed));
++        const auto robot_age_us = message.robot_msg_sequence > 0 && robot_age_ns >= 0 ?
++            robot_age_ns / 1000 : static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
++        message.robot_msg_age_us = static_cast<uint32_t>(std::min<int64_t>(
++            robot_age_us, std::numeric_limits<uint32_t>::max()));
++        message.robot_state = robot_state_.load(std::memory_order_relaxed);
++        message.robot_mode = robot_mode_.load(std::memory_order_relaxed);
++        message.robot_mt_able = robot_mt_able_.load(std::memory_order_relaxed);
++        message.robot_mt_brake = robot_mt_brake_.load(std::memory_order_relaxed);
++        message.robot_error_code = robot_error_code_.load(std::memory_order_relaxed);
++        message.robot_warn_code = robot_warn_code_.load(std::memory_order_relaxed);
++        const auto inhibit_state = inhibit_state_.load(std::memory_order_acquire);
++        message.inhibit_latched = (inhibit_state & 1U) != 0;
++        message.inhibit_epoch = message.inhibit_latched ?
++            inhibit_epoch_.load(std::memory_order_acquire) : 0;
++        message.inhibit_request_id = inhibit_state >> 1;
++        // Pair with each writer release fence and keep payload reads before
++        // version rechecks, so a mixed group is discarded.
++        std::atomic_thread_fence(std::memory_order_acquire);
++        const auto robot_version_after = robot_status_version_.load(std::memory_order_acquire);
++        const auto read_version_after = read_status_version_.load(std::memory_order_acquire);
++        const auto write_version_after = write_status_version_.load(std::memory_order_acquire);
++        if (read_version_after != read_version_before || (read_version_after & 1U) ||
++            write_version_after != write_version_before || (write_version_after & 1U) ||
++            robot_version_after != robot_version_before || (robot_version_after & 1U)) return;
++        hardware_io_status_pub_->publish(message);
++    }
++
++    void UFRobotSystemHardware::observe_robot_state(
++        const xarm_msgs::msg::RobotMsg::SharedPtr message)
++    {
++        const auto receipt = std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count();
++        const auto now_ros = node_->get_clock()->now().nanoseconds();
++        const auto stamp_ns = rclcpp::Time(message->header.stamp).nanoseconds();
++        const auto source_age_ns = stamp_ns > 0 && now_ros >= stamp_ns ? now_ros - stamp_ns :
++            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) * 1000;
++        robot_status_version_.fetch_add(1, std::memory_order_acq_rel);
++        // Pair with the reader acquire fence if a payload store is observed.
++        std::atomic_thread_fence(std::memory_order_release);
++        robot_msg_stamp_ns_.store(stamp_ns, std::memory_order_relaxed);
++        robot_msg_source_age_ns_.store(source_age_ns, std::memory_order_relaxed);
++        robot_msg_receipt_steady_ns_.store(receipt, std::memory_order_relaxed);
++        robot_state_.store(message->state, std::memory_order_relaxed);
++        robot_mode_.store(message->mode, std::memory_order_relaxed);
++        robot_mt_able_.store(message->mt_able, std::memory_order_relaxed);
++        robot_mt_brake_.store(message->mt_brake, std::memory_order_relaxed);
++        robot_error_code_.store(message->err, std::memory_order_relaxed);
++        robot_warn_code_.store(message->warn, std::memory_order_relaxed);
++        robot_msg_sequence_.fetch_add(1, std::memory_order_relaxed);
++        robot_status_version_.fetch_add(1, std::memory_order_release);
++    }
++
+     void UFRobotSystemHardware::_deactivate_controller(void) {
+         if(reactivate_controller_later_)
+             return;
+@@ -521,7 +981,17 @@ namespace uf_robot_hardware
+             }
+             write_code_ = 0;
+         }
+-        return is_not_ready || !write_succeed || read_code_ != 0 || !read_ready_;
++        const bool reset_required = is_not_ready || !write_succeed || read_code_ != 0 || !read_ready_;
++        if (reset_required && hardware_active_.load(std::memory_order_acquire) &&
++            !face_tracking_arm::hardware::defer_controller_deactivation_until_stop(
++                runtime_actions_enabled_, hardware_active_.load(std::memory_order_acquire))) {
++            if (!reset_epoch_latched_.exchange(true, std::memory_order_acq_rel)) {
++                hardware_epoch_.fetch_add(1, std::memory_order_acq_rel);
++            }
++        } else if (!reset_required) {
++            reset_epoch_latched_.store(false, std::memory_order_release);
++        }
++        return reset_required;
+     }
+ }
  

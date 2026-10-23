@@ -10,6 +10,8 @@
 #include <limits>
 #include <vector>
 
+#include "face_tracking_arm/joint_boundary_policy.hpp"
+
 namespace face_tracking_arm::control::detail
 {
 
@@ -30,7 +32,9 @@ struct ScalarBrakingLimits
 struct ScalarBrakingOptions
 {
   double period_sec{0.01};
-  double comparison_tolerance{1.0e-9};
+  NumericalPolicy numerical_policy{
+    Radians{0.0}, RadiansPerSecond{0.0}, RadiansPerSecondSquared{0.0},
+    RadiansPerSecondCubed{0.0}, SolverResidual{0.0}};
   std::size_t maximum_braking_steps{1000U};
   std::size_t adverse_ticks{0U};
 };
@@ -79,13 +83,14 @@ constexpr std::size_t kMaximumRecoverySteps = 10000U;
          limits.maximum_acceleration > 0.0 &&
          std::isfinite(limits.maximum_jerk) && limits.maximum_jerk > 0.0 &&
          std::isfinite(options.period_sec) && options.period_sec > 0.0 &&
-         std::isfinite(options.comparison_tolerance) &&
-         options.comparison_tolerance >= 0.0 &&
+         options.numerical_policy.valid() &&
          options.maximum_braking_steps > 0U &&
-         std::abs(state.velocity) <=
-         limits.maximum_velocity + options.comparison_tolerance &&
-         std::abs(state.acceleration) <=
-         limits.maximum_acceleration + options.comparison_tolerance;
+         classifyVelocity(RadiansPerSecond{state.velocity},
+           RadiansPerSecond{limits.maximum_velocity},
+           options.numerical_policy.velocity_error) != BoundaryClass::kOutside &&
+         classifyAcceleration(RadiansPerSecondSquared{state.acceleration},
+           RadiansPerSecondSquared{limits.maximum_acceleration},
+           options.numerical_policy.acceleration_error) != BoundaryClass::kOutside;
 }
 
 [[nodiscard]] inline double moveTowardZero(
@@ -134,21 +139,27 @@ struct ScalarBrakingStep
   constexpr int kBisectionIterations = 64;
   const double period = options.period_sec;
   const double acceleration_step = limits.maximum_jerk * period;
-  const double tolerance = options.comparison_tolerance;
-
   if (velocity == 0.0 && acceleration == 0.0) {
     return {true, 0.0, 0.0};
   }
 
   if (velocity != 0.0) {
     const double terminal_acceleration = -velocity / period;
-    if (std::abs(terminal_acceleration) <= limits.maximum_acceleration + tolerance &&
-      std::abs(terminal_acceleration - acceleration) <= acceleration_step + tolerance &&
-      std::abs(terminal_acceleration) <= acceleration_step + tolerance)
+    if (classifyAcceleration(RadiansPerSecondSquared{terminal_acceleration},
+        RadiansPerSecondSquared{limits.maximum_acceleration},
+        options.numerical_policy.acceleration_error) != BoundaryClass::kOutside &&
+      std::abs(terminal_acceleration - acceleration) <= acceleration_step +
+      options.numerical_policy.acceleration_error.value &&
+      std::abs(terminal_acceleration) <= acceleration_step +
+      options.numerical_policy.acceleration_error.value)
     {
       return {true, 0.0, terminal_acceleration};
     }
-  } else if (std::abs(acceleration) <= acceleration_step + tolerance) {
+  }
+
+  if (velocity == 0.0 && std::abs(acceleration) <= acceleration_step +
+    options.numerical_policy.acceleration_error.value)
+  {
     return {true, 0.0, 0.0};
   }
 
@@ -175,10 +186,13 @@ struct ScalarBrakingStep
   if (!std::isfinite(maximum_slack)) {
     return {};
   }
-  if (maximum_slack < -tolerance) {
+  if (maximum_slack < -options.numerical_policy.velocity_error.value) {
     const double next_acceleration = moveTowardZero(acceleration, acceleration_step);
     const double next_velocity = velocity + next_acceleration * period;
-    if (std::abs(next_velocity) > limits.maximum_velocity + tolerance) {
+    if (classifyVelocity(RadiansPerSecond{next_velocity},
+        RadiansPerSecond{limits.maximum_velocity},
+        options.numerical_policy.velocity_error) == BoundaryClass::kOutside)
+    {
       return {};
     }
     return {true, next_velocity, next_acceleration};
@@ -206,7 +220,9 @@ struct ScalarBrakingStep
   const double next_acceleration = direction * selected_acceleration;
   const double next_velocity = velocity + next_acceleration * period;
   if (!std::isfinite(next_velocity) || !std::isfinite(next_acceleration) ||
-    std::abs(next_velocity) > limits.maximum_velocity + tolerance)
+    classifyVelocity(RadiansPerSecond{next_velocity},
+    RadiansPerSecond{limits.maximum_velocity}, options.numerical_policy.velocity_error) ==
+    BoundaryClass::kOutside)
   {
     return {};
   }
@@ -251,13 +267,17 @@ struct ScalarBrakingStep
     };
   const auto dynamically_valid = [&](const ScalarBrakingState & previous,
     const ScalarBrakingState & next) {
-      const double tolerance = options.comparison_tolerance;
-      const double jerk_tolerance = tolerance / options.period_sec;
       const double jerk = (next.acceleration - previous.acceleration) / options.period_sec;
       return scalar_braking_policy::finiteState(next) &&
-             std::abs(next.velocity) <= limits.maximum_velocity + tolerance &&
-             std::abs(next.acceleration) <= limits.maximum_acceleration + tolerance &&
-             std::abs(jerk) <= limits.maximum_jerk + jerk_tolerance;
+             classifyVelocity(RadiansPerSecond{next.velocity},
+               RadiansPerSecond{limits.maximum_velocity},
+               options.numerical_policy.velocity_error) != BoundaryClass::kOutside &&
+             classifyAcceleration(RadiansPerSecondSquared{next.acceleration},
+               RadiansPerSecondSquared{limits.maximum_acceleration},
+               options.numerical_policy.acceleration_error) != BoundaryClass::kOutside &&
+             classifyJerk(RadiansPerSecondCubed{jerk},
+               RadiansPerSecondCubed{limits.maximum_jerk},
+               options.numerical_policy.jerk_error) != BoundaryClass::kOutside;
     };
 
   const double acceleration_step = limits.maximum_jerk * options.period_sec;

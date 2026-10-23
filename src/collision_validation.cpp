@@ -160,9 +160,12 @@ public:
     sample.interpolation_fraction = static_cast<double>(sample_index) /
       static_cast<double>(result_.requested_substeps);
     sample.protected_joint_position_rad = positions[protected_index_];
+    const BoundaryClass protected_position_class = classifyPosition(
+      positions[protected_index_],
+      PositionInterval{config_.protected_joint_lower_rad, config_.protected_joint_upper_rad},
+      config_.numerical_policy->position_error);
     sample.protected_joint_corridor_violated =
-      positions[protected_index_] < config_.protected_joint_lower_rad ||
-      positions[protected_index_] > config_.protected_joint_upper_rad;
+      protected_position_class != BoundaryClass::kInterior;
     if (!queryAndRecord(
         CollisionPairKind::kSelf, joint_uncertainty, sample, sample.minimum_self_distance_m) ||
       !queryAndRecord(
@@ -344,7 +347,8 @@ private:
 CollisionActualStateValidationResult CollisionConstraintBuilder::validateActualState(
   const planning_scene::PlanningScene & scene,
   const moveit::core::RobotState & robot_state,
-  const moveit::core::JointModelGroup & joint_model_group) const
+  const moveit::core::JointModelGroup & joint_model_group,
+  const ActualPositionEncoding position_encoding) const
 {
   CollisionActualStateValidationResult result;
   const auto fail = [&result](const std::string & reason) {
@@ -381,9 +385,21 @@ CollisionActualStateValidationResult CollisionConstraintBuilder::validateActualS
     return result;
   }
   result.protected_joint_position_rad = positions[protected_index];
-  result.protected_joint_corridor_violated =
-    positions[protected_index] < config_.protected_joint_lower_rad ||
-    positions[protected_index] > config_.protected_joint_upper_rad;
+  const PositionInterval protected_interval{
+    config_.protected_joint_lower_rad, config_.protected_joint_upper_rad};
+  if (position_encoding == ActualPositionEncoding::kSdkFloatPromotedToDouble) {
+    result.protected_joint_boundary_class = classifyMeasuredPosition(
+      positions[protected_index], protected_interval);
+    result.protected_joint_corridor_violated =
+      result.protected_joint_boundary_class != BoundaryClass::kInterior;
+  } else {
+    result.protected_joint_boundary_class = classifyPosition(
+      positions[protected_index], protected_interval,
+      kControllerPositionFeedbackTolerance);
+    result.protected_joint_corridor_violated =
+      result.protected_joint_boundary_class == BoundaryClass::kOutside ||
+      result.protected_joint_boundary_class == BoundaryClass::kInvalid;
+  }
 
   const auto & collision_environment = scene.getCollisionEnvUnpadded();
   if (!collision_environment) {
@@ -500,11 +516,15 @@ bool CollisionConstraintBuilder::canCertifySegment(
     return false;
   }
   const auto protected_index = static_cast<Eigen::Index>(diagnostics.protected_joint_index);
-  if (std::min(start_position[protected_index], end_position[protected_index]) <
-    config_.protected_joint_lower_rad ||
-    std::max(start_position[protected_index], end_position[protected_index]) >
-    config_.protected_joint_upper_rad)
-  {
+  const PositionInterval protected_interval{
+    config_.protected_joint_lower_rad, config_.protected_joint_upper_rad};
+  const BoundaryClass lower_class = classifyPosition(
+    std::min(start_position[protected_index], end_position[protected_index]),
+    protected_interval, config_.numerical_policy->position_error);
+  const BoundaryClass upper_class = classifyPosition(
+    std::max(start_position[protected_index], end_position[protected_index]),
+    protected_interval, config_.numerical_policy->position_error);
+  if (lower_class != BoundaryClass::kInterior || upper_class != BoundaryClass::kInterior) {
     return false;
   }
 
@@ -695,23 +715,15 @@ CollisionSegmentValidationResult CollisionConstraintBuilder::validateSegment(
   }
   result.input_valid = true;
   result.unsafe = false;
+  Eigen::VectorXd positions(variable_count);
   try {
     for (std::size_t sample_index = 0; sample_index <= substeps; ++sample_index) {
       const double fraction = static_cast<double>(sample_index) /
         static_cast<double>(substeps);
       const double start_weight = 1.0 - fraction;
-      const Eigen::VectorXd positions =
-        start_weight * current_motion_state.position +
+      positions.noalias() = start_weight * current_motion_state.position +
         fraction * candidate_motion_state.position;
-      const Eigen::VectorXd velocities =
-        start_weight * current_motion_state.velocity +
-        fraction * candidate_motion_state.velocity;
-      const Eigen::VectorXd accelerations =
-        start_weight * current_motion_state.acceleration +
-        fraction * candidate_motion_state.acceleration;
       sample_state.setJointGroupPositions(&joint_model_group, positions);
-      sample_state.setJointGroupVelocities(&joint_model_group, velocities);
-      sample_state.setJointGroupAccelerations(&joint_model_group, accelerations);
       sample_state.update(true);
 
       if (!query.evaluate(positions, inter_sample_joint_uncertainty, sample_index)) {
@@ -904,9 +916,13 @@ CollisionSegmentValidationResult CollisionConstraintBuilder::validatePath(
         waypoint_index <= last_waypoint; ++waypoint_index)
       {
         const double protected_position = waypoints[waypoint_index].position[protected_index_eigen];
+        const BoundaryClass protected_class = classifyPosition(
+          protected_position,
+          PositionInterval{config_.protected_joint_lower_rad,
+            config_.protected_joint_upper_rad},
+          config_.numerical_policy->position_error);
         protected_corridor_safe = protected_corridor_safe &&
-          protected_position >= config_.protected_joint_lower_rad &&
-          protected_position <= config_.protected_joint_upper_rad;
+          protected_class == BoundaryClass::kInterior;
       }
 
       bool block_certified = false;

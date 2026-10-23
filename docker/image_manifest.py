@@ -32,7 +32,7 @@ INPUT_FILES = (
     'docker/fastdds.xml', 'CMakeLists.txt', 'package.xml', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
 ) + PROGRAM_CONFIG_FILES
 INPUT_DIRECTORIES = (
-    'description', 'include', 'msg', 'src', 'python', 'scripts', 'launch', 'worlds',
+    'description', 'include', 'msg', 'src', 'python', 'scripts', 'launch', 'worlds', 'tools',
     'docker/patches', 'docker/licenses',
 )
 CACHE_DIRECTORIES = frozenset((

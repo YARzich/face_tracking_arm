@@ -10,16 +10,19 @@
 #include <optional>
 
 #include "face_tracking_arm/hierarchical_velocity_qp.hpp"
+#include "face_tracking_arm/horizontal_edge_upright.hpp"
 
 namespace face_tracking_arm::control
 {
 
 struct TrackingVelocityTaskConfig
 {
+  bool horizontal_edge_primary{true};
   double position_gain{1.5};
   double orientation_gain{4.0};
   double position_deadband_m{0.03};
   double pointing_deadband_rad{0.005};
+  /// Deadband for the horizontal screen-edge tilt objective.
   double roll_deadband_rad{0.01};
   double maximum_linear_reference_mps{0.18};
   double maximum_angular_reference_radps{0.70};
@@ -59,6 +62,13 @@ struct UprightRollPathTaskResult
   double roll_error_rad{0.0};
 };
 
+struct HorizontalEdgePathTaskResult
+{
+  HierarchicalVelocityTask task;
+  double signed_edge_sine{0.0};
+  double edge_tilt_error_rad{0.0};
+};
+
 struct FaceReturnPointingTask
 {
   Eigen::MatrixXd matrix;
@@ -69,7 +79,7 @@ struct FaceReturnPointingTask
 /// Build a pure velocity task in a common world/planning frame.
 ///
 /// The Jacobian maps qdot to [TCP linear velocity; world angular velocity].
-/// With a face, both pointing and upright roll account for the changing line of
+/// With a face, pointing and horizontal-edge height account for the changing line of
 /// sight caused by TCP translation. Without a face, target_rotation is fixed.
 /// Optional velocities are expressed in the same planning frame. Face velocity
 /// adds the desired look-at frame's angular motion; target-position velocity adds
@@ -93,6 +103,13 @@ struct FaceReturnPointingTask
   const Eigen::Vector3d & face_velocity = Eigen::Vector3d::Zero(),
   const Eigen::Vector3d & target_position_velocity = Eigen::Vector3d::Zero(),
   const std::optional<GazeKinematics> & gaze = std::nullopt);
+
+/// Preserve only the ordinary FACE screen-edge primary row for a guarded
+/// inward correction. The caller must prove this is a fresh FACE task and that
+/// row 2 is the upright screen-edge objective. Secondary identity/zero motion
+/// keeps joint speed small while the hard constraints remain owned by the QP.
+[[nodiscard]] std::optional<HierarchicalVelocityTask> makeFaceEdgeOnlyRecoveryTask(
+  const HierarchicalVelocityTask & face_task, bool has_face_primary_roll);
 
 /// Track face azimuth and elevation during compact RETURN_FACE reacquisition.
 /// The returned rows use analytic current-normal and moving-ray Jacobians;
@@ -127,6 +144,16 @@ struct FaceReturnPointingTask
   const Eigen::MatrixXd & screen_jacobian,
   const Eigen::VectorXd & path_velocity_reference,
   const TrackingVelocityTaskConfig & config = {});
+
+/// Keep the monitor's horizontal screen edge level without a screen-normal pole.
+[[nodiscard]] std::optional<HorizontalEdgePathTaskResult> makeHorizontalEdgePathTask(
+  const Eigen::Isometry3d & current_screen_pose,
+  const Eigen::MatrixXd & screen_jacobian,
+  const Eigen::VectorXd & path_velocity_reference,
+  const TrackingVelocityTaskConfig & config = {});
+
+[[nodiscard]] std::optional<double> measureHorizontalEdgeTiltError(
+  const Eigen::Isometry3d & current_screen_pose);
 
 /// Measure screen roll against the gravity-upright frame; returns nullopt near
 /// the vertical-normal singularity where upright roll is undefined.

@@ -22,8 +22,8 @@ struct EmergencyBrakeTailConfig
   /// Extra stationary points after the first exact v=a=0 state. Keep at least
   /// two because MoveIt Servo's trajectory composer withholds its final state.
   std::size_t terminal_hold_points{2};
-  /// Numerical tolerance for integrated position/velocity/acceleration. Jerk
-  /// is a finite difference, so its matching tolerance is divided by period.
+  /// Deprecated compatibility field; safety comparisons use the typed policy in
+  /// JointMotionLimits and this value is ignored.
   double comparison_tolerance{1.0e-9};
 };
 

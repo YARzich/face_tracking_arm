@@ -16,6 +16,16 @@ constexpr std::size_t kRequiredStableRearmSamples = 3;
 
 constexpr double kFeedbackLimitTolerance = 1.0e-6;
 
+builtin_interfaces::msg::Time to_builtin_time(const rclcpp::Time & time)
+{
+  constexpr std::int64_t nanoseconds_per_second = 1000000000LL;
+  const std::int64_t total = time.nanoseconds();
+  builtin_interfaces::msg::Time message;
+  message.sec = static_cast<std::int32_t>(total / nanoseconds_per_second);
+  message.nanosec = static_cast<std::uint32_t>(total % nanoseconds_per_second);
+  return message;
+}
+
 }  // namespace
 
 std::optional<control_msgs::msg::JointTrajectoryControllerState> CollisionAwareServoComponent::
@@ -69,8 +79,18 @@ ActualFeedbackSafety CollisionAwareServoComponent::validate_controller_feedback_
     return ActualFeedbackSafety::kWaiting;
   }
   measured_robot_state = std::make_shared<moveit::core::RobotState>(*measured_robot_state);
+  auto actual_positions = controller_state.feedback.positions;
+  if (require_hardware_io_status_) {
+    const auto hardware_status = current_hardware_io_status();
+    if (!hardware_status || !hardware_status->valid) {
+      reason = context + " is waiting for valid coherent hardware feedback";
+      return ActualFeedbackSafety::kWaiting;
+    }
+    actual_positions.assign(
+      hardware_status->sample.position.begin(), hardware_status->sample.position.end());
+  }
   measured_robot_state->setJointGroupPositions(
-    joint_model_group_, controller_state.feedback.positions);
+    joint_model_group_, actual_positions);
   measured_robot_state->update(true);
 
   planning_scene_monitor::LockedPlanningSceneRO locked_scene(planning_scene_monitor_);
@@ -81,7 +101,10 @@ ActualFeedbackSafety CollisionAwareServoComponent::validate_controller_feedback_
   }
   const control::CollisionActualStateValidationResult validation =
     collision_constraint_builder_->validateActualState(
-    *planning_scene, *measured_robot_state, *joint_model_group_);
+    *planning_scene, *measured_robot_state, *joint_model_group_,
+    require_hardware_io_status_ ?
+    control::ActualPositionEncoding::kSdkFloatPromotedToDouble :
+    control::ActualPositionEncoding::kDouble);
   ++telemetry_.actual_state_validation_count;
   telemetry_.last_actual_minimum_self_distance_m =
     std::isfinite(validation.minimum_self_distance_m) ?
@@ -136,7 +159,33 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
     reason = "Safe re-arm is waiting for fresh finite controller feedback";
     return RearmReadiness::kWaiting;
   }
-  const rclcpp::Time sample_time(state->header.stamp, current_time.get_clock_type());
+  auto actual_state = *state;
+  std::optional<hardware::HardwareIoStatusAssessment> hardware_status;
+  if (require_hardware_io_status_) {
+    hardware_status = current_hardware_io_status();
+    if (!hardware_status || !hardware_status->valid) {
+      commands_.stable_rearm_samples = 0;
+      reason = "Safe re-arm is waiting for valid coherent hardware feedback";
+      return RearmReadiness::kWaiting;
+    }
+    if (last_rearm_hardware_read_sequence_.has_value() &&
+      hardware_status->sample.read_sequence <= *last_rearm_hardware_read_sequence_)
+    {
+      reason = "Safe re-arm is waiting for the next successful hardware read";
+      return RearmReadiness::kWaiting;
+    }
+    last_rearm_hardware_read_sequence_ = hardware_status->sample.read_sequence;
+    actual_state.feedback.positions.assign(
+      hardware_status->sample.position.begin(), hardware_status->sample.position.end());
+    actual_state.feedback.velocities.assign(
+      hardware_status->sample.velocity.begin(), hardware_status->sample.velocity.end());
+  }
+  const rclcpp::Time sample_time = require_hardware_io_status_ ?
+    rclcpp::Time(hardware_status->sample.read_stamp_ns, current_time.get_clock_type()) :
+    rclcpp::Time(state->header.stamp, current_time.get_clock_type());
+  if (require_hardware_io_status_) {
+    actual_state.header.stamp = to_builtin_time(sample_time);
+  }
   if (commands_.last_rearm_sample_time.has_value() &&
     sample_time <= *commands_.last_rearm_sample_time)
   {
@@ -144,7 +193,7 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
     return RearmReadiness::kWaiting;
   }
   commands_.last_rearm_sample_time = sample_time;
-  observe_controller_feedback(*state, current_time.get_clock_type());
+  observe_controller_feedback(actual_state, current_time.get_clock_type());
 
   const auto maximum_absolute_difference = [](
     const std::vector<double> & first, const std::vector<double> & second) {
@@ -180,9 +229,9 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
   const double reference_output_error = maximum_absolute_difference(
     state->reference.positions, state->output.positions);
   const double following_position_error = maximum_absolute_difference(
-    state->reference.positions, state->feedback.positions);
+    state->reference.positions, actual_state.feedback.positions);
   const double reference_velocity = maximum_absolute(state->reference.velocities);
-  const double feedback_velocity = maximum_absolute(state->feedback.velocities);
+  const double feedback_velocity = maximum_absolute(actual_state.feedback.velocities);
 
   if (std::abs(state->speed_scaling_factor - 1.0) >
     kControllerSpeedScalingTolerance)
@@ -193,7 +242,11 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
   }
 
   std::string feedback_failure;
-  if (!feedback_motion_within_limits(*state, feedback_failure)) {
+  if (require_hardware_io_status_ ?
+    !hardware_feedback_motion_within_limits(
+      hardware_status->sample, feedback_failure) :
+    !feedback_motion_within_limits(*state, feedback_failure))
+  {
     ++telemetry_.feedback_motion_limit_failure_count;
     reason = "Safe re-arm measured unsafe motion: " + feedback_failure;
     return RearmReadiness::kUnsafe;
@@ -320,7 +373,7 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
 
   const bool stopped_and_settled = settled_rearm_state(
     reference_output_error, following_position_error, reference_velocity, feedback_velocity,
-    kControllerCommandAlignmentToleranceRad, parameters_.collision_tracking_error_bound_rad,
+    kControllerCommandAlignmentToleranceRad, execution_error_bound_rad(),
     true, true, stationary_hold_owned);
   if (!stopped_and_settled) {
     commands_.stable_rearm_samples = 0;
@@ -339,6 +392,28 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
       std::to_string(commands_.stable_rearm_samples) + "/" +
       std::to_string(kRequiredStableRearmSamples) + ")";
     return RearmReadiness::kWaiting;
+  }
+  if (require_hardware_io_status_ && stationary_hold_owned) {
+    // Preserve the command that was actually proven stationary. A fresh
+    // hardware read is the measured state, not a replacement command seed.
+    const Eigen::VectorXd hold = Eigen::Map<const Eigen::VectorXd>(
+      state->reference.positions.data(),
+      static_cast<Eigen::Index>(state->reference.positions.size()));
+    if (hold.size() != static_cast<Eigen::Index>(position_bound_sets_.size())) {
+      reason = "Safe re-arm cannot retain a stationary hold with the wrong joint count";
+      return RearmReadiness::kUnsafe;
+    }
+    for (std::size_t index = 0; index < position_bound_sets_.size(); ++index) {
+      if (!control::isWireCommand(
+          hold[static_cast<Eigen::Index>(index)], position_bound_sets_[index].wire))
+      {
+        reason = "Safe re-arm stationary command is outside the strict wire interval for " +
+          parameters_.joint_names[index];
+        return RearmReadiness::kUnsafe;
+      }
+    }
+    proven_q_hold_ = hold;
+    proven_q_hold_epoch_ = hardware_status->sample.epoch;
   }
   return RearmReadiness::kReady;
 }
@@ -382,19 +457,53 @@ predicted_or_measured_state(
   measured.joint_names = parameters_.joint_names;
   measured_robot_state->copyJointGroupPositions(joint_model_group_, measured.positions);
   measured_robot_state->copyJointGroupVelocities(joint_model_group_, measured.velocities);
+  std::optional<hardware::HardwareIoStatusAssessment> hardware_status;
+  auto actual_controller_state = current_controller_state();
+  if (!actual_controller_state.has_value()) {
+    failure_reason = "Fresh finite trajectory controller state is unavailable";
+    requires_latched_halt = require_hardware_io_status_ && commands_.epoch_has_published;
+    return std::nullopt;
+  }
+  if (require_hardware_io_status_) {
+    hardware_status = current_hardware_io_status();
+    if (!hardware_status || !hardware_status->valid) {
+      failure_reason = "Fresh coherent hardware read provenance is unavailable";
+      requires_latched_halt = true;
+      return std::nullopt;
+    }
+    measured.positions = Eigen::Map<const Eigen::VectorXd>(
+      hardware_status->sample.position.data(),
+      static_cast<Eigen::Index>(hardware_status->sample.position.size()));
+    measured.velocities = Eigen::Map<const Eigen::VectorXd>(
+      hardware_status->sample.velocity.data(),
+      static_cast<Eigen::Index>(hardware_status->sample.velocity.size()));
+    measured.time_stamp = rclcpp::Time(
+      hardware_status->sample.read_stamp_ns, current_time.get_clock_type());
+  }
   measured.accelerations.setZero();
   if (!finite_state(measured, parameters_.joint_names.size())) {
     return std::nullopt;
   }
-  measured.time_stamp = state_time;
-
-  const auto controller_state = current_controller_state();
-  if (!controller_state.has_value()) {
-    failure_reason = "Fresh finite trajectory controller state is unavailable";
-    return std::nullopt;
+  if (!require_hardware_io_status_) {
+    measured.time_stamp = state_time;
   }
-  observe_controller_feedback(*controller_state, current_time.get_clock_type());
-  if (!feedback_motion_within_limits(*controller_state, failure_reason)) {
+
+  const auto & controller_state = actual_controller_state;
+  auto hardware_observation_state = *controller_state;
+  if (require_hardware_io_status_) {
+    hardware_observation_state.header.stamp = to_builtin_time(measured.time_stamp);
+    hardware_observation_state.feedback.positions.assign(
+      hardware_status->sample.position.begin(), hardware_status->sample.position.end());
+    hardware_observation_state.feedback.velocities.assign(
+      hardware_status->sample.velocity.begin(), hardware_status->sample.velocity.end());
+    observe_controller_feedback(hardware_observation_state, current_time.get_clock_type());
+  } else {
+    observe_controller_feedback(*controller_state, current_time.get_clock_type());
+  }
+  if (require_hardware_io_status_ ?
+    !hardware_feedback_motion_within_limits(hardware_status->sample, failure_reason) :
+    !feedback_motion_within_limits(*controller_state, failure_reason))
+  {
     ++telemetry_.feedback_motion_limit_failure_count;
     requires_latched_halt = true;
     return std::nullopt;
@@ -413,22 +522,42 @@ predicted_or_measured_state(
 
   if (actual_feedback != nullptr) {
     control::JointMotionState feedback_motion_state;
-    feedback_motion_state.position = Eigen::Map<const Eigen::VectorXd>(
-      controller_state->feedback.positions.data(),
-      static_cast<Eigen::Index>(controller_state->feedback.positions.size()));
-    feedback_motion_state.velocity = Eigen::Map<const Eigen::VectorXd>(
-      controller_state->feedback.velocities.data(),
-      static_cast<Eigen::Index>(controller_state->feedback.velocities.size()));
-    // JTC state has no measured acceleration field.
+    rclcpp::Time feedback_stamp(
+      controller_state->header.stamp, current_time.get_clock_type());
+    if (require_hardware_io_status_) {
+      if (!hardware_status || !hardware_status->valid ||
+        hardware_status->sample.position.size() != parameters_.joint_names.size())
+      {
+        failure_reason = "Fresh coherent hardware read provenance is unavailable";
+        requires_latched_halt = true;
+        return std::nullopt;
+      }
+      feedback_motion_state.position = Eigen::Map<const Eigen::VectorXd>(
+        hardware_status->sample.position.data(),
+        static_cast<Eigen::Index>(hardware_status->sample.position.size()));
+      feedback_motion_state.velocity = Eigen::Map<const Eigen::VectorXd>(
+        hardware_status->sample.velocity.data(),
+        static_cast<Eigen::Index>(hardware_status->sample.velocity.size()));
+      feedback_stamp = rclcpp::Time(
+        hardware_status->sample.read_stamp_ns, current_time.get_clock_type());
+    } else {
+      feedback_motion_state.position = Eigen::Map<const Eigen::VectorXd>(
+        controller_state->feedback.positions.data(),
+        static_cast<Eigen::Index>(controller_state->feedback.positions.size()));
+      feedback_motion_state.velocity = Eigen::Map<const Eigen::VectorXd>(
+        controller_state->feedback.velocities.data(),
+        static_cast<Eigen::Index>(controller_state->feedback.velocities.size()));
+    }
+    // JTC state and hardware read snapshots both lack measured acceleration.
     feedback_motion_state.acceleration.setZero(feedback_motion_state.position.size());
     *actual_feedback = std::move(feedback_motion_state);
     if (actual_feedback_stamp != nullptr) {
-      *actual_feedback_stamp = rclcpp::Time(
-        controller_state->header.stamp, current_time.get_clock_type());
+      *actual_feedback_stamp = feedback_stamp;
     }
   }
 
   bool following_window_active = false;
+  std::optional<control::ExpectedPositionState> expected_hardware_sample;
   if (commands_.epoch_has_published) {
     const rclcpp::Duration controller_period = rclcpp::Duration::from_nanoseconds(
       seconds_to_nanoseconds(parameters_.trajectory_controller_period_sec));
@@ -447,6 +576,10 @@ predicted_or_measured_state(
       failure_reason =
         "Trajectory controller state has no valid checked publication phase";
       ++telemetry_.command_alignment_failure_count;
+      if (require_hardware_io_status_) {
+        requires_latched_halt = true;
+        return std::nullopt;
+      }
       std::string collision_failure;
       const ActualFeedbackSafety feedback_safety =
         validate_controller_feedback_collision_state(
@@ -500,18 +633,58 @@ predicted_or_measured_state(
         kControllerCommandAlignmentToleranceRad &&
         maximum_expected_difference(
           controller_state->feedback.positions, *commands_.bootstrap_seed_positions) <=
-        parameters_.collision_tracking_error_bound_rad &&
+        execution_error_bound_rad() &&
         maximum_absolute(controller_state->reference.velocities) <=
         kStoppedVelocityRadps &&
         maximum_absolute(controller_state->feedback.velocities) <=
         kStoppedVelocityRadps;
       if (preserving_validated_bootstrap_hold) {
+        if (require_hardware_io_status_) {
+          const rclcpp::Time read_time(
+            hardware_status->sample.read_stamp_ns, current_time.get_clock_type());
+          if (read_time >= *commands_.bootstrap_trajectory_origin ||
+            hardware_status->sample.position.size() != static_cast<std::size_t>(
+              commands_.bootstrap_seed_positions->size()))
+          {
+            failure_reason =
+              "Hardware read cannot be aligned to the verified pre-publication bootstrap hold";
+            ++telemetry_.command_alignment_failure_count;
+            requires_latched_halt = true;
+            return std::nullopt;
+          }
+          expected_hardware_sample = control::ExpectedPositionState{
+            *commands_.bootstrap_seed_positions,
+            Eigen::VectorXd::Zero(commands_.bootstrap_seed_positions->size()), true};
+          double bootstrap_error = 0.0;
+          double bootstrap_speed = 0.0;
+          for (std::size_t index = 0; index < hardware_status->sample.position.size(); ++index) {
+            const Eigen::Index axis = static_cast<Eigen::Index>(index);
+            bootstrap_error = std::max(bootstrap_error, std::abs(
+              hardware_status->sample.position[index] -
+              expected_hardware_sample->positions[axis]));
+            bootstrap_speed = std::max(
+              bootstrap_speed, std::abs(hardware_status->sample.velocity[index]));
+          }
+          if (bootstrap_error > reaction_threshold_rad() ||
+            bootstrap_speed > parameters_.following_velocity_tolerance_rad_s)
+          {
+            failure_reason =
+              "Hardware sample does not follow the verified stationary bootstrap hold";
+            ++telemetry_.following_error_count;
+            requires_latched_halt = true;
+            return std::nullopt;
+          }
+        }
         following_window_active = false;
       } else {
         failure_reason =
           "Trajectory controller reference/output do not match any retained checked "
           "publication";
         ++telemetry_.command_alignment_failure_count;
+        if (require_hardware_io_status_) {
+          requires_latched_halt = true;
+          return std::nullopt;
+        }
         std::string collision_failure;
         const ActualFeedbackSafety feedback_safety =
           validate_controller_feedback_collision_state(
@@ -542,6 +715,19 @@ predicted_or_measured_state(
         return std::nullopt;
       }
       commands_.active_publication_id = publication_match.publication_id;
+      if (require_hardware_io_status_) {
+        const rclcpp::Time read_time(
+          hardware_status->sample.read_stamp_ns, current_time.get_clock_type());
+        expected_hardware_sample = commands_.publications.expectedAt(
+          publication_match.publication_id, read_time);
+        if (!expected_hardware_sample.has_value()) {
+          failure_reason =
+            "Hardware read timestamp is outside the acknowledged checked trajectory";
+          ++telemetry_.command_alignment_failure_count;
+          requires_latched_halt = true;
+          return std::nullopt;
+        }
+      }
       if (commands_.bootstrap_ack_pending) {
         if (commands_.bootstrap_trajectory_origin.has_value() &&
           *commands_.bootstrap_trajectory_origin ==
@@ -570,10 +756,47 @@ predicted_or_measured_state(
         }
         return std::pair<double, std::size_t>{maximum, maximum_index};
       };
-    const auto [position_error, position_error_index] = maximum_absolute_difference(
-      controller_state->reference.positions, controller_state->feedback.positions);
-    const auto [velocity_error, velocity_error_index] = maximum_absolute_difference(
-      controller_state->reference.velocities, controller_state->feedback.velocities);
+    double position_error = 0.0;
+    std::size_t position_error_index = 0U;
+    double velocity_error = 0.0;
+    std::size_t velocity_error_index = 0U;
+    if (require_hardware_io_status_) {
+      if (!expected_hardware_sample.has_value() ||
+        expected_hardware_sample->positions.size() !=
+        static_cast<Eigen::Index>(hardware_status->sample.position.size()) ||
+        expected_hardware_sample->velocities.size() !=
+        static_cast<Eigen::Index>(hardware_status->sample.velocity.size()))
+      {
+        failure_reason = "No acknowledged trajectory sample covers the hardware read time";
+        ++telemetry_.command_alignment_failure_count;
+        requires_latched_halt = true;
+        return std::nullopt;
+      }
+      for (std::size_t index = 0; index < hardware_status->sample.position.size(); ++index) {
+        const Eigen::Index axis = static_cast<Eigen::Index>(index);
+        const double q_error = std::abs(
+          expected_hardware_sample->positions[axis] - hardware_status->sample.position[index]);
+        const double dq_error = std::abs(
+          expected_hardware_sample->velocities[axis] - hardware_status->sample.velocity[index]);
+        if (q_error > position_error) {
+          position_error = q_error;
+          position_error_index = index;
+        }
+        if (dq_error > velocity_error) {
+          velocity_error = dq_error;
+          velocity_error_index = index;
+        }
+      }
+    } else {
+      const auto errors = maximum_absolute_difference(
+        controller_state->reference.positions, controller_state->feedback.positions);
+      position_error = errors.first;
+      position_error_index = errors.second;
+      const auto velocity_errors = maximum_absolute_difference(
+        controller_state->reference.velocities, controller_state->feedback.velocities);
+      velocity_error = velocity_errors.first;
+      velocity_error_index = velocity_errors.second;
+    }
     telemetry_.last_following_position_error_rad = position_error;
     telemetry_.last_following_velocity_error_rad_s = velocity_error;
     telemetry_.last_following_position_error_joint = parameters_.joint_names[position_error_index];
@@ -589,18 +812,24 @@ predicted_or_measured_state(
         telemetry_.last_following_velocity_error_joint;
     }
     const control::FollowingErrorPolicy following_policy{
-      parameters_.following_position_tolerance_rad,
+      reaction_threshold_rad(),
       parameters_.following_velocity_tolerance_rad_s,
     };
     const control::FollowingErrorAction following_action =
       control::classifyFollowingError(position_error, velocity_error, following_policy);
     if (following_action != control::FollowingErrorAction::kContinue) {
       ++telemetry_.following_error_count;
+      const bool exceeded_profile_growth = hardware_execution_budget_.has_value() &&
+        control::executionResponseGrowthExceeded(
+        position_error, *hardware_execution_budget_);
       failure_reason =
         "Trajectory following error: position=" + std::to_string(position_error) +
         " rad (" + telemetry_.last_following_position_error_joint + "), velocity=" +
         std::to_string(velocity_error) + " rad/s (" +
         telemetry_.last_following_velocity_error_joint + ")";
+      if (exceeded_profile_growth) {
+        failure_reason += "; measured growth exceeded the validated T + R response bound";
+      }
       // Validate the exact JTC feedback sample that triggered recovery. The
       // independently updated PlanningSceneMonitor state can be one callback
       // behind and is not sufficient for this transition.
@@ -618,7 +847,7 @@ predicted_or_measured_state(
       // Following accuracy alone never creates a permanent halt: the
       // controlled re-arm path checks physical bounds and collision state on
       // every sample, then waits for a settled hold.
-      requires_latched_halt = false;
+      requires_latched_halt = exceeded_profile_growth;
       return std::nullopt;
     }
   }
@@ -638,9 +867,124 @@ predicted_or_measured_state(
     return std::nullopt;
   }
   commands_.queue.clear();
+  const auto retained_hold = applyProvenHardwareHold(
+    measured, controller_state, failure_reason, requires_latched_halt);
+  if (!retained_hold.has_value()) {
+    return std::nullopt;
+  }
+  const bool retained_stationary_hold_used = *retained_hold;
+  if (require_hardware_io_status_ && !retained_stationary_hold_used) {
+    for (std::size_t index = 0; index < position_bound_sets_.size(); ++index) {
+      if (!control::isWireCommand(
+          measured.positions[static_cast<Eigen::Index>(index)],
+          position_bound_sets_[index].wire))
+      {
+        failure_reason = "Hardware state is outside the wire interval without a proven "
+          "stationary command hold for " + parameters_.joint_names[index];
+        requires_latched_halt = true;
+        return std::nullopt;
+      }
+    }
+  }
   measured.time_stamp = current_time;
   initial_state_received_ = true;
   return measured;
+}
+
+std::optional<bool> CollisionAwareServoComponent::applyProvenHardwareHold(
+  moveit_servo::KinematicState & measured,
+  const std::optional<control_msgs::msg::JointTrajectoryControllerState> & controller_state,
+  std::string & failure_reason, bool & requires_latched_halt)
+{
+  bool retained_stationary_hold_used = false;
+  if (require_hardware_io_status_ && proven_q_hold_.has_value() &&
+    cycle_hardware_io_status_.has_value() &&
+    proven_q_hold_epoch_ == cycle_hardware_io_status_->sample.epoch &&
+    controller_state.has_value())
+  {
+    if (proven_q_hold_->size() != measured.positions.size()) {
+      failure_reason = "Retained stationary hardware command has the wrong joint count";
+      requires_latched_halt = true;
+      return std::nullopt;
+    }
+    const auto controller_matches_hold = [&](const std::vector<double> & values) {
+        if (values.size() != static_cast<std::size_t>(proven_q_hold_->size())) {
+          return false;
+        }
+        for (std::size_t index = 0; index < values.size(); ++index) {
+          if (std::abs(values[index] - (*proven_q_hold_)[static_cast<Eigen::Index>(index)]) >
+            kControllerCommandAlignmentToleranceRad)
+          {
+            return false;
+          }
+        }
+        return true;
+      };
+    const bool controller_hold_owned = controller_matches_hold(
+      controller_state->reference.positions) &&
+      controller_matches_hold(controller_state->output.positions) &&
+      std::all_of(
+      controller_state->reference.velocities.begin(),
+      controller_state->reference.velocities.end(), [](const double velocity) {
+        return std::abs(velocity) <= kStoppedVelocityRadps;
+      }) &&
+      std::all_of(
+      controller_state->output.velocities.begin(),
+      controller_state->output.velocities.end(), [](const double velocity) {
+        return std::abs(velocity) <= kStoppedVelocityRadps;
+      });
+    bool actual_within_execution_budget = controller_hold_owned &&
+      hardware_execution_error_rad_.size() == position_bound_sets_.size() &&
+      motion_limits_.numerical_policy.has_value();
+    if (actual_within_execution_budget) {
+      const double arithmetic_error =
+        motion_limits_.numerical_policy->position_error.value;
+      for (std::size_t index = 0; index < position_bound_sets_.size(); ++index) {
+        const Eigen::Index axis = static_cast<Eigen::Index>(index);
+        const double sample = measured.positions[axis];
+        const auto sample_uncertainty = control::floatMeasurementHalfUlp(sample);
+        const double execution_error = hardware_execution_error_rad_[index];
+        if (!sample_uncertainty || !std::isfinite(execution_error) || execution_error < 0.0 ||
+          std::abs(sample - (*proven_q_hold_)[axis]) >
+          execution_error + sample_uncertainty->value + arithmetic_error ||
+          std::abs(measured.velocities[axis]) > kStoppedVelocityRadps)
+        {
+          actual_within_execution_budget = false;
+          break;
+        }
+      }
+    }
+    if (actual_within_execution_budget) {
+      measured.positions = *proven_q_hold_;
+      measured.velocities.setZero();
+      measured.accelerations.setZero();
+      retained_stationary_hold_used = true;
+    } else {
+      proven_q_hold_.reset();
+      proven_q_hold_epoch_.reset();
+      for (std::size_t index = 0; index < position_bound_sets_.size(); ++index) {
+        if (!control::isWireCommand(
+            measured.positions[static_cast<Eigen::Index>(index)],
+            position_bound_sets_[index].wire))
+        {
+          failure_reason = "Hardware state is outside the wire interval without a matching "
+            "stationary command ownership and execution-error proof for " +
+            parameters_.joint_names[index];
+          requires_latched_halt = true;
+          return std::nullopt;
+        }
+      }
+    }
+  } else {
+    if (proven_q_hold_.has_value() &&
+      (!cycle_hardware_io_status_.has_value() ||
+      proven_q_hold_epoch_ != cycle_hardware_io_status_->sample.epoch))
+    {
+      proven_q_hold_.reset();
+      proven_q_hold_epoch_.reset();
+    }
+  }
+  return retained_stationary_hold_used;
 }
 
 void CollisionAwareServoComponent::observe_controller_feedback(
@@ -708,8 +1052,10 @@ bool CollisionAwareServoComponent::feedback_motion_within_limits(
   const Eigen::VectorXd & safe_lower = motion_limits_.lower_position;
   const Eigen::VectorXd & safe_upper = motion_limits_.upper_position;
 
-  if ((position.array() < safe_lower.array() - kFeedbackLimitTolerance).any() ||
-    (position.array() > safe_upper.array() + kFeedbackLimitTolerance).any())
+  if ((position.array() < safe_lower.array() -
+    control::kControllerPositionFeedbackTolerance.value).any() ||
+    (position.array() > safe_upper.array() +
+    control::kControllerPositionFeedbackTolerance.value).any())
   {
     failure_reason = "Measured joint position exceeds the robot joint limits";
     return false;
@@ -726,6 +1072,35 @@ bool CollisionAwareServoComponent::feedback_motion_within_limits(
   // too sensitive to sample jitter to serve as a hard stop. The published
   // command itself is still constrained by the exact acceleration/jerk
   // limits in every QP step and in the braking-tail generator.
+  return true;
+}
+
+bool CollisionAwareServoComponent::hardware_feedback_motion_within_limits(
+  const hardware::HardwareIoSample & sample, std::string & failure_reason) const
+{
+  if (sample.position.size() != parameters_.joint_names.size() ||
+    sample.velocity.size() != parameters_.joint_names.size() ||
+    physical_joint_velocity_limits_.size() !=
+    static_cast<Eigen::Index>(sample.velocity.size()))
+  {
+    failure_reason = "Coherent hardware feedback joint-count mismatch: positions=" +
+      std::to_string(sample.position.size()) + ", velocities=" +
+      std::to_string(sample.velocity.size()) + ", joints=" +
+      std::to_string(parameters_.joint_names.size()) + ", velocity_limits=" +
+      std::to_string(physical_joint_velocity_limits_.size());
+    return false;
+  }
+  for (std::size_t index = 0; index < sample.velocity.size(); ++index) {
+    if (!std::isfinite(sample.velocity[index]) ||
+      std::abs(sample.velocity[index]) >
+      physical_joint_velocity_limits_[static_cast<Eigen::Index>(index)] +
+      kFeedbackLimitTolerance)
+    {
+      failure_reason = "Measured hardware velocity exceeds physical URDF limit for " +
+        parameters_.joint_names[index];
+      return false;
+    }
+  }
   return true;
 }
 

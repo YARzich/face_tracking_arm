@@ -104,6 +104,62 @@ TEST(FaceTrackingPolicy, StationaryAlignedTargetDoesNotForecastGuardCrossing)
       Eigen::Vector3d::Zero(), 0.15, guard)));
 }
 
+TEST(FaceTrackingPolicy, HorizontalEdgeForecastUsesDimensionlessHeightRate)
+{
+  auto input = forecast(
+    Eigen::Vector3d(0.0, 0.0, 0.5), Eigen::Vector3d::Zero(),
+    Eigen::Vector3d(0.0, 0.0, 100.0), 0.2, 0.08);
+  input.horizontal_edge_axis = true;
+  input.signed_edge_error = 0.03;
+  input.desired_edge_rate = 0.0;
+  input.achieved_edge_rate = 0.0;
+  input.edge_guard = std::sin(5.1 * kPi / 180.0);
+  EXPECT_FALSE(trackingErrorWillCrossGuard(input));
+
+  input.signed_edge_error = 0.08;
+  input.achieved_edge_rate = -0.05;
+  EXPECT_TRUE(trackingErrorWillCrossGuard(input));
+}
+
+TEST(FaceTrackingPolicy, HorizontalEdgeClosingCorrectionDoesNotForecastPastZero)
+{
+  auto input = forecast(
+    Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+    0.30, 0.08);
+  input.horizontal_edge_axis = true;
+  input.signed_edge_error = -0.04;
+  input.desired_edge_rate = 0.0;
+  input.achieved_edge_rate = -0.50;
+  input.edge_guard = std::sin(5.1 * kPi / 180.0);
+
+  const double raw_prediction = input.signed_edge_error + input.horizon_sec *
+    (input.desired_edge_rate - input.achieved_edge_rate);
+  ASSERT_GT(raw_prediction, input.edge_guard);
+  EXPECT_FALSE(trackingErrorWillCrossGuard(input));
+}
+
+TEST(FaceTrackingPolicy, HorizontalEdgeOutwardAndUnclosingForecastsKeepTheirMeaning)
+{
+  auto input = forecast(
+    Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+    0.30, 0.08);
+  input.horizontal_edge_axis = true;
+  input.edge_guard = std::sin(5.1 * kPi / 180.0);
+  input.desired_edge_rate = 0.0;
+
+  input.signed_edge_error = 0.08;
+  input.achieved_edge_rate = -0.05;
+  EXPECT_TRUE(trackingErrorWillCrossGuard(input));
+
+  input.signed_edge_error = 0.08;
+  input.achieved_edge_rate = 0.0;
+  EXPECT_FALSE(trackingErrorWillCrossGuard(input));
+
+  input.signed_edge_error = -0.04;
+  input.achieved_edge_rate = -0.10;
+  EXPECT_FALSE(trackingErrorWillCrossGuard(input));
+}
+
 TEST(FaceTrackingPolicy, PredictsMovingTargetShortfallBeforeCurrentErrorCrossesGuard)
 {
   constexpr double horizon_sec = kFaceTrackingForecastHorizonSec;
@@ -477,6 +533,30 @@ TEST(PairYawResource, RequiresAUsefulCausalImprovement)
   assessment.pair_relaxed_available_yaw_rad =
     0.79 * kPairYawProbeDisplacementRad;
   EXPECT_FALSE(pairYawProbeShowsPairBoundCause(assessment));
+}
+
+TEST(PairYawResource, DistinguishesUnknownAvailableAndExhaustedEvidence)
+{
+  PairYawResourceAssessment assessment;
+  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kUnknown);
+
+  assessment.valid = true;
+  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kAvailable);
+
+  assessment.demand_present = true;
+  assessment.pair_bound_candidate = true;
+  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kUnknown);
+  assessment.probe_valid = true;
+  assessment.actual_probe_solved = true;
+  assessment.actual_available_yaw_rad = 0.80 * kPairYawProbeDisplacementRad;
+  EXPECT_FALSE(assessment.relaxed_probe_solved);
+  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kAvailable);
+
+  assessment.actual_available_yaw_rad = 0.79 * kPairYawProbeDisplacementRad;
+  assessment.relaxed_probe_solved = false;
+  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kUnknown);
+  assessment.exhausted = true;
+  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kExhausted);
 }
 
 TEST(BaseJointHandoffPolicy, LatchesTheJerkLimitedEndpointAtTheOutwardEdge)
