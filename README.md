@@ -50,6 +50,10 @@ Docker, камеру, конфигурацию и проверки перед д
 | Оценка 3D-точки лица | `face_depth_cpu.launch.py`, `face_depth_stereo.launch.py` | [Тест глубины](docs/face_depth_tests.md) |
 | Экспериментальная оценка глубины на GPU | `face_depth_gpu.launch.py` | [Тест глубины и ограничения](docs/face_depth_tests.md) |
 | Экспорт модели FaceV2 в ONNX | — | [Экспорт FaceV2](docs/facev2_export.md) |
+| Как контроллер направляет экран на лицо | — | [Траектория и наведение](docs/trajectory-guide.html) |
+| Как устроены QP-ограничения и матрицы | — | [Задача QP](docs/qp-guide.html) |
+
+Интерактивные HTML-руководства открывайте в браузере из локальной копии репозитория.
 
 Launch-файлы запускайте через `ros2 launch face_tracking_arm <имя-файла>`.
 Сначала соберите пакет по шагам из [CONTRIBUTING.md](CONTRIBUTING.md).

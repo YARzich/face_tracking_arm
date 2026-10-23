@@ -67,3 +67,5 @@ __pycache__/
 /docs/history/
 /docs/*_20??-*.md
 /docs/small_motion_comparison.png
+/docs/face_constraints_optimization.md
+/docs/qp_lifecycle_profile.md
