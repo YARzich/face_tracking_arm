@@ -10,7 +10,7 @@
 namespace face_tracking_arm::test_targets
 {
 
-enum class Scenario {kDisabled, kStationary, kCircle, kPeople, kWalkAround};
+enum class Scenario {kDisabled, kStationary, kCircle, kPeople, kWalkAround, kApproach};
 
 struct Point
 {
@@ -29,6 +29,7 @@ struct Sample
 // People: 24 s front sequence + eight sides for 6 s each + 48 s walk + 12 s loss/return.
 inline constexpr double kPeopleCycleDurationSec = 132.0;
 inline constexpr double kWalkDurationSec = 48.0;
+inline constexpr double kApproachCycleDurationSec = 24.0;
 
 Scenario parse_scenario(std::string_view name);
 Sample sample(Scenario scenario, double elapsed_sec);

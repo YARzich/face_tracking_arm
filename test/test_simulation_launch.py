@@ -39,6 +39,59 @@ def _config(**overrides):
     return load_simulation_config(ROOT, **{**settings, **overrides})
 
 
+def test_test_world_box_only_changes_moveit_table_fixture():
+    context = LaunchContext()
+    context.launch_configurations.update({
+        'robot_model': 'xarm6', 'start_pose': 'rest', 'initial_positions_file': '',
+        'camera_mode': 'disabled', 'camera_baseline': '0.08', 'camera_width': '1280',
+        'camera_height': '720', 'camera_rate': '30', 'camera_horizontal_fov': '1.433',
+        'servo_backend': 'collision_aware',
+        'smoothing_plugin': 'online_signal_smoothing::AccelerationLimitedPlugin',
+        'idle_behavior': 'rest', 'require_perception_status': 'false',
+        'collision_aware_servo_config_file': '',
+        'table_enabled': 'true',
+    })
+    ordinary = sim._configuration(context, ROOT)
+    assert ordinary.tracking.get('table_shape') != 'box'
+    context.launch_configurations['test_world_box'] = 'true'
+    test_scene = sim._configuration(context, ROOT)
+    assert test_scene.tracking['table_shape'] == 'box'
+    assert test_scene.tracking['table_dimensions_m'] == [0.10, 0.10, 0.10]
+    assert test_scene.tracking['table_center_m'] == [0.50, 0.0, 1.15]
+    assert ordinary.tracking.get('table_shape') != 'box'
+    context.launch_configurations['table_enabled'] = 'false'
+    with pytest.raises(ValueError, match='cannot be combined'):
+        sim._configuration(context, ROOT)
+
+
+def test_disabling_table_removes_only_scene_collision_and_preserves_robot_anchor():
+    config = _config(table_enabled=False)
+    assert config.controller['table_collision_enabled'] is False
+    assert config.tracking['table_dimensions_m'] == [0.0, 0.0]
+    robot = ET.fromstring(config.robot_parameters[0]['robot_description'])
+    anchor = robot.find("./joint[@name='world_joint']/origin")
+    assert anchor is not None and anchor.attrib['xyz'] == '0 0 0.75'
+    assert robot.findall('.//collision')
+    assert robot.find("./link[@name='link_base']") is not None
+
+
+def test_table_free_world_copy_removes_gazebo_table_but_keeps_floor(tmp_path):
+    source = ROOT / 'worlds/lite6_table.sdf'
+    rendered = sim._without_packaged_table(source, ROOT)
+    try:
+        world = ET.parse(rendered).getroot().find('world')
+        assert world is not None
+        models = {model.get('name'): model for model in world.findall('model')}
+        assert 'round_table' not in models
+        assert 'ground_plane' in models
+        assert 'face_target_marker' in models
+        assert source.is_file()
+    finally:
+        rendered.unlink(missing_ok=True)
+    with pytest.raises(ValueError, match='custom world contents are not modified'):
+        sim._without_packaged_table(tmp_path / 'custom.sdf', ROOT)
+
+
 def test_gazebo_physics_description_pads_only_top_level_revolute_bounds():
     source = """<robot name='test'>
       <link name="base"/><link name="arm"/><link name="tool"/>
@@ -138,6 +191,7 @@ def _assemble_with_stub_actions(monkeypatch, *, calibration):
         'calibration_mode': 'true' if calibration else 'false',
         'camera_mode': 'rgbd' if calibration else 'disabled',
         'world_file': str(ROOT / 'worlds/lite6_table.sdf'),
+        'table_enabled': 'true',
         'headless': 'true', 'robot_model': 'xarm6', 'start_pose': 'rest',
         'initial_positions_file': '', 'camera_baseline': '0.08',
         'camera_width': '1280', 'camera_height': '720', 'camera_rate': '30',

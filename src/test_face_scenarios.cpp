@@ -20,6 +20,10 @@ constexpr double kFrontSequenceEndSec = 24.0;
 constexpr double kSideDurationSec = 6.0;
 constexpr double kWalkStartSec = 72.0;
 constexpr double kWalkEndSec = kWalkStartSec + kWalkDurationSec;
+constexpr double kApproachStartX = 0.90;
+constexpr double kApproachMinimumX = 0.05;
+constexpr double kApproachMoveDurationSec = 8.0;
+constexpr double kApproachHoldDurationSec = 4.0;
 
 struct SidePerson
 {
@@ -103,6 +107,23 @@ Point walk_around_target(double elapsed)
   };
 }
 
+Point approach_target(double elapsed)
+{
+  const double t = std::fmod(elapsed, kApproachCycleDurationSec);
+  double x = kApproachStartX;
+  if (t < kApproachMoveDurationSec) {
+    x += (kApproachMinimumX - kApproachStartX) * smooth_step(
+      t / kApproachMoveDurationSec);
+  } else if (t < kApproachMoveDurationSec + kApproachHoldDurationSec) {
+    x = kApproachMinimumX;
+  } else if (t < 2.0 * kApproachMoveDurationSec + kApproachHoldDurationSec) {
+    const double retreat_time = t - kApproachMoveDurationSec - kApproachHoldDurationSec;
+    x = kApproachMinimumX + (kApproachStartX - kApproachMinimumX) * smooth_step(
+      retreat_time / kApproachMoveDurationSec);
+  }
+  return {x, 0.0, 1.68};
+}
+
 Sample people_sample(double elapsed)
 {
   const double t = std::fmod(elapsed, kPeopleCycleDurationSec);
@@ -160,8 +181,11 @@ Scenario parse_scenario(std::string_view name)
   if (name == "walk_around") {
     return Scenario::kWalkAround;
   }
+  if (name == "approach") {
+    return Scenario::kApproach;
+  }
   throw std::invalid_argument(
-      "scenario must be disabled, stationary, circle, people, or walk_around");
+      "scenario must be disabled, stationary, circle, people, walk_around, or approach");
 }
 
 Sample sample(Scenario scenario, double elapsed_sec)
@@ -180,6 +204,8 @@ Sample sample(Scenario scenario, double elapsed_sec)
       return people_sample(elapsed_sec);
     case Scenario::kWalkAround:
       return {walk_around_target(elapsed_sec), "Continuous walk around, height 1.80 m"};
+    case Scenario::kApproach:
+      return {approach_target(elapsed_sec), "Approach and retreat, height 1.68 m"};
   }
   throw std::invalid_argument("unknown scenario");
 }

@@ -191,7 +191,8 @@ def _controller_parameters(
 
 def load_simulation_config(share, *, robot_model, start_pose, initial_positions_file,
                            camera, servo_backend, smoothing_plugin, idle_behavior,
-                           require_perception_status=False, controller_config_file=None):
+                           require_perception_status=False, controller_config_file=None,
+                           table_enabled=True):
     """Build a consistent model and controller configuration for either backend."""
     share = Path(share)
     if idle_behavior != 'rest' and servo_backend != 'collision_aware':
@@ -210,6 +211,13 @@ def load_simulation_config(share, *, robot_model, start_pose, initial_positions_
     tracking = _load_yaml(share / 'config/tracking.yaml')
     tracking_parameters = tracking['face_tracking_controller']['ros__parameters']
     tracking_parameters['require_perception_status'] = bool(require_perception_status)
+    if not table_enabled:
+        # A zero-sized table is the existing REMOVE representation used by the
+        # tracking component; keep that and the servo's readiness gate aligned.
+        tracking_parameters['table_dimensions_m'] = [0.0, 0.0]
+        controller['table_collision_enabled'] = False
+    else:
+        controller['table_collision_enabled'] = True
     controller['face_target_freshness_timeout_sec'] = \
         tracking_parameters['face_target_freshness_timeout_sec']
     controller['face_prediction_timeout_sec'] = \

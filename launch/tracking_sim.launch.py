@@ -36,7 +36,7 @@ def generate_launch_description() -> LaunchDescription:
     test_face_scenario_argument = DeclareLaunchArgument(
         'test_face_scenario',
         default_value='people',
-        choices=['disabled', 'stationary', 'circle', 'people', 'walk_around'],
+        choices=['disabled', 'stationary', 'circle', 'people', 'walk_around', 'approach'],
         description='Deterministic test source published after tracking readiness.',
     )
     visualize_target_argument = DeclareLaunchArgument(
@@ -79,6 +79,13 @@ def generate_launch_description() -> LaunchDescription:
         'initial_positions_file',
         default_value='',
         description='Optional YAML with six angles in radians; overrides start_pose.')
+    test_world_box_argument = DeclareLaunchArgument(
+        'test_world_box', default_value='false', choices=['true', 'false'],
+        description=('Test-only: use a box instead of the round table in the initial MoveIt '
+                     'planning-scene update.'))
+    table_enabled_argument = DeclareLaunchArgument(
+        'table_enabled', default_value='true', choices=['true', 'false'],
+        description='Keep the tabletop in Gazebo and MoveIt planning scene.')
     robot_model_argument = DeclareLaunchArgument(
         'robot_model', default_value='xarm6', choices=['xarm6', 'lite6'],
         description='Simulated robot; lite6 reproduces the recorded incident pose.')
@@ -100,4 +107,5 @@ def generate_launch_description() -> LaunchDescription:
         visualize_target_argument, smoothing_plugin_argument, camera_mode_argument,
         camera_baseline_argument, *camera_arguments, idle_argument,
         perception_status_argument, world_argument, collision_aware_servo_config_argument,
-        initial_argument, robot_model_argument, start_pose_argument, setup])
+        initial_argument, test_world_box_argument, table_enabled_argument,
+        robot_model_argument, start_pose_argument, setup])

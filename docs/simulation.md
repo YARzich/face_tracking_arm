@@ -20,13 +20,24 @@ ros2 launch face_tracking_arm tracking_sim.launch.py
 
 | Аргумент | Значения | По умолчанию | Назначение |
 |---|---|---|---|
-| `test_face_scenario` | `disabled`, `stationary`, `circle`, `people`, `walk_around` | `people` | Источник искусственной точки |
+| `test_face_scenario` | `disabled`, `stationary`, `circle`, `people`, `walk_around`, `approach` | `people` | Источник искусственной точки |
 | `robot_model` | `xarm6`, `lite6` | `xarm6` | Модель руки |
 | `start_pose` | `rest`, `zero`, `folded`, `joint1_limit`, `incident` | `rest` | Начальная поза |
 | `initial_positions_file` | путь к YAML | пусто | Углы J1–J6; заменяют `start_pose` |
 | `servo_backend` | `collision_aware`, `standard` | `collision_aware` | Контроллер движения |
 | `headless` | `true`, `false` | `false` | Запустить Gazebo без окон |
 | `visualize_target` | `true`, `false` | `true` | Показать искусственную цель |
+| `test_world_box` | `true`, `false` | `false` | Подменить round table коробкой только в начальной сцене MoveIt |
+| `table_enabled` | `true`, `false` | `true` | Оставить или убрать штатный стол в Gazebo и сцене MoveIt |
+
+`test_world_box:=true` — тестовый режим измерения столкновений. Он заменяет
+объект `round_table` в сцене MoveIt коробкой 0.10 × 0.10 × 0.10 м с центром
+`(0.50, 0.00, 1.15)` в `world`; модель мира Gazebo и видимый стол не меняются.
+`table_enabled:=false` убирает штатный `round_table` из визуальной и физической
+сцены Gazebo и из planning scene MoveIt. Пол и высота закрепления основания
+робота сохраняются; ограничения суставов и самостолкновения остаются включены.
+Это поддержано для штатных миров пакета; содержимое пользовательского `world_file`
+автоматически не изменяется.
 
 Пример: нулевая поза и неподвижная цель:
 
@@ -81,6 +92,16 @@ ros2 launch face_tracking_arm tracking_sim.launch.py \
 `people` длится 132 с. `walk_around` имеет радиус около 0.85 м и высоту точки
 около 1.68 м. Сценарии используют искусственные координаты. Модель человека
 и камеры не нужны.
+
+`approach` повторяет плавный подход и отход по оси X перед роботом: точка идёт
+от 0.90 м до 0.05 м от вертикальной оси основания, задерживается и отходит.
+Высота точки — 1.68 м. Пять сантиметров — координата цели относительно оси
+основания, не расстояние до экрана; контроллер может не достичь такой цели.
+Обычный запуск без стола и с этим сценарием:
+
+```bash
+ros2 launch face_tracking_arm tracking_sim.launch.py table_enabled:=false test_face_scenario:=approach
+```
 
 `/face/center` публикует точку цели в метрах и frame `world`.
 `/tracking/diagnostics` и `/servo_node/diagnostics` показывают состояние управления. Проверяйте суставы

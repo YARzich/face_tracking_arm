@@ -24,9 +24,45 @@ TEST(FaceScenarios, ParsesEveryLaunchChoiceAndRejectsUnknownNames)
   EXPECT_EQ(parse_scenario("circle"), Scenario::kCircle);
   EXPECT_EQ(parse_scenario("people"), Scenario::kPeople);
   EXPECT_EQ(parse_scenario("walk_around"), Scenario::kWalkAround);
+  EXPECT_EQ(parse_scenario("approach"), Scenario::kApproach);
   EXPECT_THROW(parse_scenario(""), std::invalid_argument);
   EXPECT_THROW(parse_scenario("unknown"), std::invalid_argument);
   EXPECT_FALSE(sample(Scenario::kDisabled, 100.0).target.has_value());
+}
+
+TEST(FaceScenarios, ApproachGetsCloseThenRetreatsAndRepeatsWithSmoothEndpoints)
+{
+  const auto start = sample(Scenario::kApproach, 0.0).target.value();
+  const auto near = sample(Scenario::kApproach, 8.0).target.value();
+  const auto near_hold = sample(Scenario::kApproach, 10.0).target.value();
+  const auto retreat = sample(Scenario::kApproach, 20.0).target.value();
+  const auto repeat = sample(Scenario::kApproach, kApproachCycleDurationSec).target.value();
+  EXPECT_NEAR(start.x, 0.90, 1.0e-9);
+  EXPECT_NEAR(near.x, 0.05, 1.0e-9);
+  EXPECT_NEAR(near_hold.x, near.x, 1.0e-9);
+  EXPECT_NEAR(retreat.x, start.x, 1.0e-9);
+  EXPECT_NEAR(repeat.x, start.x, 1.0e-9);
+  EXPECT_DOUBLE_EQ(start.y, 0.0);
+  EXPECT_DOUBLE_EQ(start.z, 1.68);
+
+  for (double time = 0.0; time < 4.0 * kApproachCycleDurationSec; time += 0.05) {
+    const auto target = sample(Scenario::kApproach, time).target.value();
+    EXPECT_GE(target.x, 0.05 - 1.0e-9);
+    EXPECT_LE(target.x, 0.90 + 1.0e-9);
+    EXPECT_DOUBLE_EQ(target.y, 0.0);
+    EXPECT_DOUBLE_EQ(target.z, 1.68);
+  }
+  for (double boundary : {8.0, 12.0, 20.0, 24.0}) {
+    constexpr double dt = 0.001;
+    const double before_velocity =
+      (sample(Scenario::kApproach, boundary).target->x -
+      sample(Scenario::kApproach, boundary - dt).target->x) / dt;
+    const double after_velocity =
+      (sample(Scenario::kApproach, boundary + dt).target->x -
+      sample(Scenario::kApproach, boundary).target->x) / dt;
+    EXPECT_NEAR(before_velocity, 0.0, 0.002);
+    EXPECT_NEAR(after_velocity, 0.0, 0.002);
+  }
 }
 
 TEST(FaceScenarios, RejectsInvalidElapsedTime)
