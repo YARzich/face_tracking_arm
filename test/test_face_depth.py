@@ -231,7 +231,11 @@ def make_rgbd_frame_node(depth_message, detected_faces):
     image.header = header
     info = camera_info()
     info.header = header
+    transform = TransformStamped()
+    transform.header.frame_id = 'color_optical'
+    transform.transform.rotation.w = 1.
     perception_states = []
+    published_points, published_markers = [], []
     empty_pub = SimpleNamespace(publish=lambda _message: None)
     detector_calls = []
 
@@ -257,18 +261,22 @@ def make_rgbd_frame_node(depth_message, detected_faces):
         last_preview_at=-float('inf'), last_report=time.monotonic(),
         pending_world_point=None, world_point_drops=0,
         get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=10.05)),
+        tf_buffer=SimpleNamespace(lookup_transform=lambda *args: transform),
         get_logger=lambda: SimpleNamespace(info=lambda _message: None),
         publish_observation=None,
         publish_perception_state=lambda state, reason, stamp=None: perception_states.append(
             (state, reason, stamp)), publish_world_point=lambda: None,
         status_pub=empty_pub, perception_status_pub=empty_pub,
-        detection_pub=empty_pub, marker_pub=empty_pub, point_pub=empty_pub,
+        detection_pub=empty_pub, marker_pub=SimpleNamespace(publish=published_markers.append),
+        point_pub=SimpleNamespace(publish=published_points.append),
         image_pub=SimpleNamespace(get_subscription_count=lambda: 0),
         compressed_pub=SimpleNamespace(get_subscription_count=lambda: 0),
         depth_pub=SimpleNamespace(get_subscription_count=lambda: 0))
     node.publish_observation = lambda *args: FacePositionNode.publish_observation(node, *args)
     node.flush_observation = lambda: FacePositionNode.flush_observation(node)
     FacePositionNode.on_frame(node, image, info, depth_message)
+    node.published_points = published_points
+    node.published_markers = published_markers
     return node, perception_states, detector_calls
 
 
@@ -295,6 +303,20 @@ def test_rgbd_visible_face_with_all_invalid_depth_is_face_no_depth():
     assert detector_calls == [True]
     assert node.last_pair_receipt is not None
     assert states[-1][0:2] == (PerceptionStatus.FACE_NO_DEPTH, 'NO_VALID_FACE_DEPTH')
+
+
+def test_rgbd_confirming_face_is_wait_and_does_not_republish_old_3d_target():
+    header = Header(frame_id='color_optical', stamp=Time(seconds=10).to_msg())
+    depth_image = np.full((480, 640), 1.5, dtype=np.float32)
+    depth = CvBridge().cv2_to_imgmsg(depth_image, '32FC1')
+    depth.header = header
+    node, states, detector_calls = make_rgbd_frame_node(
+        depth, [Face(270, 180, 80, 90, .95)])
+
+    assert detector_calls == [True]
+    assert states[-1][0:2] == (PerceptionStatus.WAIT, 'CONFIRMING_FACE')
+    assert not node.published_points
+    assert node.published_markers[-1].action == node.published_markers[-1].DELETE
 
 
 @pytest.mark.parametrize(

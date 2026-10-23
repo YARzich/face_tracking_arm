@@ -562,7 +562,9 @@ class FacePositionNode(Node):
             state = PerceptionStatus.INVALID_INPUT
         elif reason == 'NO_VALID_FACE_DEPTH' and faces:
             state = PerceptionStatus.FACE_NO_DEPTH
-        elif not faces or reason == 'CONFIRMING_FACE':
+        elif reason == 'CONFIRMING_FACE':
+            state = PerceptionStatus.WAIT
+        elif not faces:
             state = PerceptionStatus.NO_FACE
         else:
             state = PerceptionStatus.INVALID_INPUT
