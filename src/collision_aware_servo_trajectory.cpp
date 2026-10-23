@@ -304,24 +304,32 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
     const Eigen::VectorXd * previous_guarded_position = &candidate_motion_state.position;
     for (std::size_t tail_index = 0U; tail_index < braking_tail.points.size(); ++tail_index) {
       const auto & point = braking_tail.points[tail_index];
-      std::string motion_reference_violation;
-      if (!motion_reference_->validateCommandTransition(
-          *robot_state, *previous_guarded_position, point.position,
-          &motion_reference_violation))
-      {
-        failure_reason = motion_reference_->compactManeuverActive() ?
-          "Compact emergency-braking suffix violates its committed " +
-          motion_reference_violation + " constraint" :
-          "FACE emergency-braking suffix violates its armed " +
-          motion_reference_violation + " guard";
-        if (motion_reference_->compactManeuverActive()) {
-          rejection_kind = CandidateRejectionKind::kCompactStopEnvelope;
-        } else {
-          rejection_kind = CandidateRejectionKind::kReferenceGuard;
+      const bool same_as_last_guarded =
+        point.position.size() == previous_guarded_position->size() &&
+        std::memcmp(
+        point.position.data(), previous_guarded_position->data(),
+        static_cast<std::size_t>(point.position.size()) * sizeof(double)) == 0;
+      if (!same_as_last_guarded) {
+        std::string motion_reference_violation;
+        if (!motion_reference_->validateCommandTransition(
+            *robot_state, *previous_guarded_position, point.position,
+            &motion_reference_violation))
+        {
+          failure_reason = motion_reference_->compactManeuverActive() ?
+            "Compact emergency-braking suffix violates its committed " +
+            motion_reference_violation + " constraint" :
+            "FACE emergency-braking suffix violates its armed " +
+            motion_reference_violation + " guard";
+          if (motion_reference_->compactManeuverActive()) {
+            rejection_kind = CandidateRejectionKind::kCompactStopEnvelope;
+          } else {
+            rejection_kind = CandidateRejectionKind::kReferenceGuard;
+          }
+          ++telemetry_.braking_tail_generation_failure_count;
+          return std::nullopt;
         }
-        ++telemetry_.braking_tail_generation_failure_count;
-        return std::nullopt;
       }
+      // Keep every tail sample; identical positions need only one geometric guard call.
       previous_guarded_position = &point.position;
     }
   }
@@ -330,14 +338,18 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
     collision_diagnostics, braking_tail.points);
   telemetry_.last_braking_tail_certified_segment_count = 0U;
   telemetry_.last_braking_tail_uncertified_segment_count = 0U;
-  for (std::size_t index = 0U; index + 1U < braking_tail.points.size(); ++index) {
-    if (collision_constraint_builder_->canCertifySegment(
-        collision_diagnostics, braking_tail.points[index].position,
-        braking_tail.points[index + 1U].position))
-    {
-      ++telemetry_.last_braking_tail_certified_segment_count;
-    } else {
-      ++telemetry_.last_braking_tail_uncertified_segment_count;
+  if (braking_tail_certified) {
+    telemetry_.last_braking_tail_certified_segment_count = braking_tail.points.size() - 1U;
+  } else {
+    for (std::size_t index = 0U; index + 1U < braking_tail.points.size(); ++index) {
+      if (collision_constraint_builder_->canCertifySegment(
+          collision_diagnostics, braking_tail.points[index].position,
+          braking_tail.points[index + 1U].position))
+      {
+        ++telemetry_.last_braking_tail_certified_segment_count;
+      } else {
+        ++telemetry_.last_braking_tail_uncertified_segment_count;
+      }
     }
   }
   if (!braking_tail_certified) {

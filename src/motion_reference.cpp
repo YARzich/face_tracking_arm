@@ -1552,8 +1552,11 @@ void MotionReference::updateBaseHandoff(
 
   double predicted_hold_position = 0.0;
   bool have_brake_endpoint = false;
+  const bool needs_new_handoff_endpoint =
+    !base_handoff_policy_.heldPositionRad().has_value() && !release_for_pair_yaw &&
+    edge_direction != BaseJointDirection::kNone && yaw_direction == edge_direction;
   const auto & brake_state = command_queue_state ? command_queue_state : actual_feedback;
-  if (brake_state &&
+  if (needs_new_handoff_endpoint && brake_state &&
     brake_state->position.size() == limits_.lower_position.size() &&
     brake_state->velocity.size() == limits_.lower_position.size() &&
     brake_state->acceleration.size() == limits_.lower_position.size())

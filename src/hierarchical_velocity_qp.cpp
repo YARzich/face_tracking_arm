@@ -149,23 +149,83 @@ bool discrete_stopping_envelope(
   return true;
 }
 
+// Scoped to one joint while building its bounds: limits, period, latency, and
+// numerical policy are immutable for that scope. Cache exact signed inputs only;
+// this reuses a previously computed rollout without approximating its key.
+class DiscreteStoppingEnvelopeCache
+{
+public:
+  DiscreteStoppingEnvelopeCache(
+    const double max_velocity, const double max_acceleration, const double max_jerk,
+    const NumericalPolicy & numerical_policy,
+    const HierarchicalVelocityQpConfig & config)
+  : max_velocity_(max_velocity), max_acceleration_(max_acceleration),
+    max_jerk_(max_jerk), numerical_policy_(numerical_policy), config_(config) {}
+
+  bool get(
+    const double signed_velocity, const double signed_acceleration,
+    DiscreteStoppingEnvelope & envelope)
+  {
+    for (const Entry & entry : entries_) {
+      if (entry.occupied && sameBits(entry.velocity, signed_velocity) &&
+        sameBits(entry.acceleration, signed_acceleration))
+      {
+        envelope = entry.envelope;
+        return entry.valid;
+      }
+    }
+    Entry & entry = entries_[next_entry_];
+    next_entry_ = (next_entry_ + 1U) % entries_.size();
+    entry.velocity = signed_velocity;
+    entry.acceleration = signed_acceleration;
+    entry.envelope = {};
+    entry.valid = discrete_stopping_envelope(
+      signed_velocity, signed_acceleration, max_velocity_, max_acceleration_, max_jerk_,
+      numerical_policy_, config_, entry.envelope);
+    entry.occupied = true;
+    envelope = entry.envelope;
+    return entry.valid;
+  }
+
+private:
+  static bool sameBits(const double lhs, const double rhs)
+  {
+    return lhs == rhs && std::signbit(lhs) == std::signbit(rhs);
+  }
+
+  struct Entry
+  {
+    double velocity{0.0};
+    double acceleration{0.0};
+    DiscreteStoppingEnvelope envelope{};
+    bool occupied{false};
+    bool valid{false};
+  };
+
+  double max_velocity_;
+  double max_acceleration_;
+  double max_jerk_;
+  const NumericalPolicy & numerical_policy_;
+  const HierarchicalVelocityQpConfig & config_;
+  std::array<Entry, 2> entries_{};
+  std::size_t next_entry_{0U};
+};
+
 bool safe_before_velocity_limit(
   const double candidate_velocity,
   const double current_velocity,
   const double signed_direction,
   const double max_velocity,
-  const double max_acceleration,
-  const double max_jerk,
   const NumericalPolicy & numerical_policy,
-  const HierarchicalVelocityQpConfig & config)
+  const HierarchicalVelocityQpConfig & config,
+  DiscreteStoppingEnvelopeCache & profile_cache)
 {
   const double candidate_acceleration =
     (candidate_velocity - current_velocity) / config.period_sec;
   DiscreteStoppingEnvelope envelope;
-  if (!discrete_stopping_envelope(
+  if (!profile_cache.get(
     signed_direction * candidate_velocity,
-    signed_direction * candidate_acceleration,
-    max_velocity, max_acceleration, max_jerk, numerical_policy, config, envelope))
+    signed_direction * candidate_acceleration, envelope))
   {
     return false;
   }
@@ -181,6 +241,7 @@ InputCheck enforce_velocity_braking_invariant(
   const JointMotionLimits & limits,
   const Eigen::Index index,
   const HierarchicalVelocityQpConfig & config,
+  DiscreteStoppingEnvelopeCache & profile_cache,
   double & lower_velocity,
   double & upper_velocity)
 {
@@ -189,8 +250,7 @@ InputCheck enforce_velocity_braking_invariant(
   const auto safe_upper = [&](const double candidate_velocity) {
       return safe_before_velocity_limit(
         candidate_velocity, state.velocity[index], 1.0,
-        limits.max_velocity[index], limits.max_acceleration[index], limits.max_jerk[index],
-        *limits.numerical_policy, config);
+        limits.max_velocity[index], *limits.numerical_policy, config, profile_cache);
     };
   if (!safe_upper(upper_velocity)) {
     if (!safe_upper(lower_velocity)) {
@@ -212,8 +272,7 @@ InputCheck enforce_velocity_braking_invariant(
   const auto safe_lower = [&](const double candidate_velocity) {
       return safe_before_velocity_limit(
         candidate_velocity, state.velocity[index], -1.0,
-        limits.max_velocity[index], limits.max_acceleration[index], limits.max_jerk[index],
-        *limits.numerical_policy, config);
+        limits.max_velocity[index], *limits.numerical_policy, config, profile_cache);
     };
   if (!safe_lower(lower_velocity)) {
     if (!safe_lower(upper_velocity)) {
@@ -241,11 +300,9 @@ bool safe_before_position_limit(
   const double current_velocity,
   const double signed_direction,
   const double safe_position_limit,
-  const double max_velocity,
-  const double max_acceleration,
-  const double max_jerk,
   const NumericalPolicy & numerical_policy,
-  const HierarchicalVelocityQpConfig & config)
+  const HierarchicalVelocityQpConfig & config,
+  DiscreteStoppingEnvelopeCache & profile_cache)
 {
   const double candidate_acceleration =
     (candidate_velocity - current_velocity) / config.period_sec;
@@ -253,10 +310,9 @@ bool safe_before_position_limit(
     (current_position + candidate_velocity * config.period_sec);
   const double signed_limit = signed_direction * safe_position_limit;
   DiscreteStoppingEnvelope envelope;
-  if (!discrete_stopping_envelope(
+  if (!profile_cache.get(
     signed_direction * candidate_velocity,
-    signed_direction * candidate_acceleration,
-    max_velocity, max_acceleration, max_jerk, numerical_policy, config, envelope))
+    signed_direction * candidate_acceleration, envelope))
   {
     return false;
   }
@@ -276,6 +332,7 @@ InputCheck enforce_braking_invariant(
   const JointMotionLimits & limits,
   const Eigen::Index index,
   const HierarchicalVelocityQpConfig & config,
+  DiscreteStoppingEnvelopeCache & profile_cache,
   double & lower_velocity,
   double & upper_velocity)
 {
@@ -291,8 +348,7 @@ InputCheck enforce_braking_invariant(
       return safe_before_position_limit(
         candidate_velocity, state.position[index], state.velocity[index],
         1.0, safe_upper_position,
-        limits.max_velocity[index], limits.max_acceleration[index], limits.max_jerk[index],
-        *limits.numerical_policy, config);
+        *limits.numerical_policy, config, profile_cache);
     };
   if (!safe_upper(upper_velocity)) {
     if (!safe_upper(lower_velocity)) {
@@ -315,8 +371,7 @@ InputCheck enforce_braking_invariant(
       return safe_before_position_limit(
         candidate_velocity, state.position[index], state.velocity[index],
         -1.0, safe_lower_position,
-        limits.max_velocity[index], limits.max_acceleration[index], limits.max_jerk[index],
-        *limits.numerical_policy, config);
+        *limits.numerical_policy, config, profile_cache);
     };
   if (!safe_lower(lower_velocity)) {
     if (!safe_lower(upper_velocity)) {
@@ -473,13 +528,16 @@ InputCheck build_constraint_matrix(
     if (lower_velocity > upper_velocity) {
       return InputCheck::kInfeasible;
     }
+    DiscreteStoppingEnvelopeCache profile_cache(
+      limits.max_velocity[index], limits.max_acceleration[index], limits.max_jerk[index],
+      *limits.numerical_policy, config);
     const InputCheck velocity_braking_check = enforce_velocity_braking_invariant(
-      state, limits, index, config, lower_velocity, upper_velocity);
+      state, limits, index, config, profile_cache, lower_velocity, upper_velocity);
     if (velocity_braking_check != InputCheck::kValid) {
       return velocity_braking_check;
     }
     const InputCheck braking_check = enforce_braking_invariant(
-      state, limits, index, config, lower_velocity, upper_velocity);
+      state, limits, index, config, profile_cache, lower_velocity, upper_velocity);
     if (braking_check != InputCheck::kValid) {
       return braking_check;
     }

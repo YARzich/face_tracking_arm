@@ -208,10 +208,24 @@ struct ScalarBrakingStep
     double safe = maximum_acceleration;
     for (int iteration = 0; iteration < kBisectionIterations; ++iteration) {
       const double candidate = 0.5 * (unsafe + safe);
-      if (viability_slack(candidate) >= 0.0) {
+      const double previous_unsafe = unsafe;
+      const double previous_safe = safe;
+      const double slack = viability_slack(candidate);
+      if (slack >= 0.0) {
         safe = candidate;
       } else {
         unsafe = candidate;
+      }
+      // Once rounding makes the midpoint identical to an endpoint, the
+      // deterministic predicate just evaluated cannot move that endpoint.
+      // Include the sign bit so +0 and -0 remain distinct states.
+      if ((candidate == previous_safe && std::signbit(candidate) ==
+        std::signbit(previous_safe)) ||
+        (candidate == previous_unsafe && std::signbit(candidate) ==
+        std::signbit(previous_unsafe)))
+      {
+        selected_acceleration = safe;
+        break;
       }
     }
     selected_acceleration = safe;
