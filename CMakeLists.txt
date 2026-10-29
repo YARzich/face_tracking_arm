@@ -456,6 +456,8 @@ if(BUILD_TESTING)
   )
   ament_add_pytest_test(test_face_detection test/test_face_detection.py TIMEOUT 30)
   ament_add_pytest_test(test_face_depth test/test_face_depth.py TIMEOUT 30)
+  ament_add_pytest_test(test_face_depth_tf_executor
+    test/test_face_depth_tf_executor.py TIMEOUT 30)
   ament_add_pytest_test(test_face_appearances test/test_face_appearances.py TIMEOUT 30)
   ament_add_pytest_test(test_stress_motion test/test_stress_motion.py TIMEOUT 30)
   ament_add_pytest_test(test_fast_stress_motion test/test_fast_stress_motion.py TIMEOUT 30)

@@ -3,6 +3,7 @@
 
 """Depth geometry and stereo checks without models, GPU or a running ROS graph."""
 
+import json
 from pathlib import Path
 import sys
 import time
@@ -319,6 +320,109 @@ def test_rgbd_confirming_face_is_wait_and_does_not_republish_old_3d_target():
     assert node.published_markers[-1].action == node.published_markers[-1].DELETE
 
 
+@pytest.mark.parametrize('replacement_sec', [.04, .05, .06])
+def test_replacing_pending_frame_starts_its_own_tf_wait(
+        monkeypatch, replacement_sec):
+    header = Header(frame_id='color_optical', stamp=Time(seconds=10).to_msg())
+    depth = CvBridge().cv2_to_imgmsg(
+        np.full((480, 640), 1.5, dtype=np.float32), '32FC1')
+    depth.header = header
+    node, _, _ = make_rgbd_frame_node(depth, [])
+    node.pending_observation = ('old-frame', None, [], [], None, 0., 'NO_FACE')
+    node.pending_since = 0.0
+    node.last_capture_sec = None
+    node.flush_observation = lambda: None
+    monkeypatch.setattr(
+        'face_tracking_perception.depth_node.time.monotonic',
+        lambda: replacement_sec)
+
+    def publish_old_timeout(*args):
+        node.pending_observation = None
+        node.pending_since = None
+
+    node.publish_observation = publish_old_timeout
+
+    image = CvBridge().cv2_to_imgmsg(
+        np.zeros((480, 640, 3), dtype=np.uint8), 'bgr8')
+    image.header = header
+    info = camera_info()
+    info.header = header
+    FacePositionNode.on_frame(node, image, info, depth)
+
+    assert node.pending_observation[0] is image
+    assert node.pending_since == pytest.approx(replacement_sec)
+
+
+@pytest.mark.parametrize('previous_face', [False, True])
+def test_continuous_tf_failure_is_bounded_across_replaced_frames(
+        monkeypatch, previous_face):
+    header = Header(frame_id='color_optical', stamp=Time(seconds=10).to_msg())
+    depth = CvBridge().cv2_to_imgmsg(
+        np.full((480, 640), 1.5, dtype=np.float32), '32FC1')
+    depth.header = header
+    node, _, _ = make_rgbd_frame_node(depth, [Face(270, 180, 80, 90, .95)])
+    node.options['source_timeout_sec'] = .25
+    if previous_face:
+        for stamp_sec in (9.7, 9.8, 9.9):
+            selected = node.selector.select([(0., 0., 1.)], stamp_sec)
+        assert selected == 0
+        node.last_selected_face_box = (270., 180., 80., 90.)
+        node.last_reliable_fixed_point = (0., 0., 1.)
+        node.last_reliable_depth_stamp = Time(seconds=9.9).to_msg()
+        node.last_target_id = node.selector.track_id
+    node.pending_observation = (
+        image := CvBridge().cv2_to_imgmsg(
+            np.zeros((480, 640, 3), dtype=np.uint8), 'bgr8'),
+        None, [Face(270, 180, 80, 90, .95)],
+        [(0, (0., 0., 1.))], None, 1., 'OK')
+    image.header = header
+    node.pending_since = 0.
+    node.tf_missing_since = None
+    node.tf_missing_reported = False
+    results = []
+    transform = node.tf_buffer.lookup_transform()
+
+    def unavailable(*args):
+        results.append(args)
+        node.pending_observation = None
+        node.pending_since = None
+
+    node.publish_observation = unavailable
+    node.tf_buffer.lookup_transform = lambda *args: (_ for _ in ()).throw(
+        TransformException('TF deliberately unavailable'))
+    now = [0.]
+    monkeypatch.setattr(
+        'face_tracking_perception.depth_node.time.monotonic', lambda: now[0])
+
+    for now[0] in (0., .04, .08, .12, .16, .20, .24):
+        node.pending_observation = (
+            image, None, [Face(270, 180, 80, 90, .95)],
+            [(0, (0., 0., 1.))], None, 1., 'OK')
+        node.pending_since = now[0]
+        FacePositionNode.flush_observation(node)
+        assert not results
+    now[0] = .26
+    node.pending_observation = (
+        image, None, [Face(270, 180, 80, 90, .95)],
+        [(0, (0., 0., 1.))], None, 1., 'OK')
+    node.pending_since = now[0]
+    FacePositionNode.flush_observation(node)
+
+    assert results == [(None, 'TF_UNAVAILABLE')]
+    node.tf_buffer.lookup_transform = lambda *args: transform
+    now[0] = .27
+    node.pending_observation = (
+        image, None, [Face(270, 180, 80, 90, .95)],
+        [(0, (0., 0., 1.))], None, 1., 'OK')
+    node.pending_since = now[0]
+    FacePositionNode.flush_observation(node)
+    expected_recovered_observation = (
+        (0, 'OK') if previous_face else (None, 'CONFIRMING_FACE'))
+    assert results[-1] == expected_recovered_observation
+    assert node.tf_missing_since is None
+    assert not node.tf_missing_reported
+
+
 @pytest.mark.parametrize(
     'encoding,data', [('bad_encoding', bytes(4)), ('32FC1', b'')])
 def test_rgbd_malformed_or_empty_depth_frame_is_invalid_input(encoding, data):
@@ -373,12 +477,174 @@ def test_aligned_rgbd_units_encodings_and_invalid_depth_are_explicit():
     assert np.isnan(converted[0, 0])
     assert converted[0, 1] == pytest.approx(.25)
     assert converted[0, 2] == pytest.approx(1.2)
-    assert np.isnan(converted[0, 3])
+    # RGB-D acceptance follows the source range; 9 m is no longer clipped here.
+    assert converted[0, 3] == pytest.approx(9.)
     float_depth = backend.convert(np.asarray([[1.0, np.inf]], dtype=np.float32), '32FC1')
     assert float_depth[0, 0] == pytest.approx(1.0)
     assert np.isnan(float_depth[0, 1])
     with pytest.raises(ValueError, match='encoding'):
         backend.convert(raw, 'mono16')
+
+
+@pytest.mark.parametrize('encoding,raw,expected', [
+    ('16UC1', 100, .1), ('16UC1', 200, .2), ('16UC1', 240, .24),
+    ('16UC1', 9000, 9.), ('32FC1', .1, .1), ('32FC1', .2, .2),
+    ('32FC1', .24, .24), ('32FC1', 9., 9.),
+])
+def test_rgbd_converter_preserves_all_finite_positive_depth_in_meters(encoding, raw, expected):
+    dtype = np.uint16 if encoding == '16UC1' else np.float32
+    converted = AlignedRGBDDepth().convert(np.asarray([[raw]], dtype=dtype), encoding)
+    assert converted[0, 0] == pytest.approx(expected, abs=1e-6)
+
+
+@pytest.mark.parametrize('z', [.1, .2, .24, 9.])
+def test_rgbd_sampler_accepts_finite_positive_face_depth_without_range_cutoff(z):
+    depth = np.full((480, 640), np.nan, dtype=np.float32)
+    face = Face(200, 100, 80, 100, .9)
+    depth[120:180, 220:260] = z
+    assert sample_face_depth(depth, face, 0.0, np.inf) == pytest.approx(z, abs=1e-6)
+
+
+def test_rgbd_sampler_uses_close_pixels_in_mixed_face_region_and_keeps_quality_checks():
+    face = Face(200, 100, 80, 100, .9)
+    depth = np.full((480, 640), np.nan, dtype=np.float32)
+    # The evaluated central patch is x=216..266: exactly 80% close and 20% far.
+    depth[120:180, 216:256] = .2
+    depth[120:180, 256:266] = .3
+    assert sample_face_depth(depth, face, 0.0, np.inf) == pytest.approx(.2)
+    depth[:] = np.nan
+    depth[120:180, 220:223] = .2
+    with pytest.raises(ValueError, match='Insufficient'):
+        sample_face_depth(depth, face, 0.0, np.inf)
+    depth[120:180, 220:260] = np.linspace(.1, 1.0, 60 * 40).reshape(60, 40)
+    with pytest.raises(ValueError, match='inconsistent'):
+        sample_face_depth(depth, face, 0.0, np.inf)
+
+
+def test_shared_depth_sampler_keeps_existing_non_rgbd_default_range():
+    face = Face(200, 100, 80, 100, .9)
+    close = np.full((480, 640), .2, dtype=np.float32)
+    far = np.full((480, 640), 9., dtype=np.float32)
+    with pytest.raises(ValueError, match='Insufficient'):
+        sample_face_depth(close, face)
+    with pytest.raises(ValueError, match='Insufficient'):
+        sample_face_depth(far, face)
+
+
+def test_rgbd_converter_rejects_nonpositive_and_nonfinite_data_and_bad_scale():
+    backend = AlignedRGBDDepth()
+    raw = np.asarray([[0., -1., np.nan, np.inf, -np.inf]], dtype=np.float32)
+    assert np.isnan(backend.convert(raw, '32FC1')).all()
+    with pytest.raises(ValueError, match='positive'):
+        AlignedRGBDDepth(float32_scale_m=0)
+
+
+def test_recorded_close_rgbd_frames_replay_without_the_old_cutoff():
+    fixture = np.load(Path(__file__).parent / 'fixtures/rgbd_close_cutoff_source_frames.npz')
+    backend = AlignedRGBDDepth()
+    replayed_stamps = []
+    for index in range(3):
+        metadata = json.loads(str(fixture[f'metadata_{index}']))
+        replayed_stamps.append(metadata['stamp_ns'])
+        face = Face(*metadata['bbox'], metadata['confidence'])
+        image = np.zeros(metadata['image_shape'], dtype=np.float32)
+        crop = fixture[f'depth_{index}']
+        x, y = metadata['crop_xy']
+        image[y:y + crop.shape[0], x:x + crop.shape[1]] = crop
+        converted = backend.convert(image, '32FC1')
+        z, _, _ = sample_face_measurement(converted, face, 0.0, np.inf)
+        raw_valid = crop[np.isfinite(crop) & (crop > 0)]
+        assert metadata['old_cutoff_valid_fraction'] < .25
+        assert np.median(raw_valid) == pytest.approx(
+            metadata['expected_positive_median_m'], abs=1e-7)
+        assert z == pytest.approx(metadata['expected_positive_median_m'], abs=.001)
+    assert replayed_stamps == [31_582_000_000, 31_615_000_000, 31_648_000_000]
+
+
+@pytest.mark.parametrize('z,encoding,raw', [(.1, '32FC1', .1), (.2, '32FC1', .2),
+                                            (.24, '16UC1', 240), (9., '16UC1', 9000)])
+def test_rgbd_node_keeps_valid_depth_candidate_before_publication(z, encoding, raw):
+    header = Header(frame_id='color_optical', stamp=Time(seconds=10).to_msg())
+    dtype = np.uint16 if encoding == '16UC1' else np.float32
+    depth = CvBridge().cv2_to_imgmsg(np.full((480, 640), raw, dtype=dtype), encoding)
+    depth.header = header
+    node, states, _ = make_rgbd_frame_node(depth, [Face(270, 180, 80, 90, .95)])
+    assert states[-1][0] == PerceptionStatus.WAIT
+    assert states[-1][1] == 'CONFIRMING_FACE'
+    assert not node.published_points
+    assert node.selector.confirmations == 1
+    assert node.selector.candidate[2] == pytest.approx(z, abs=1e-3)
+
+
+def test_rgbd_close_approach_and_return_keeps_published_point_and_track_id():
+    face = Face(270, 180, 80, 90, .95)
+    header = Header(frame_id='color_optical', stamp=Time(seconds=10).to_msg())
+    depth = CvBridge().cv2_to_imgmsg(np.full((480, 640), .3, dtype=np.float32), '32FC1')
+    depth.header = header
+    node, states, _ = make_rgbd_frame_node(depth, [face])
+    node.world_frame = 'world'
+    now = Time(nanoseconds=10_010_000_000)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: now)
+    measurements = ((.26, 10.04), (.25, 10.08), (.24, 10.12),
+                    (.20, 10.16), (.20, 10.20), (.20, 10.24), (.24, 10.28),
+                    (.25, 10.32), (.26, 10.36), (.30, 10.40), (.30, 10.44),
+                    (.30, 10.48))
+    for z, stamp in measurements:
+        now = Time(nanoseconds=round((stamp + .01) * 1e9))
+        header = Header(frame_id='color_optical',
+                        stamp=Time(nanoseconds=round(stamp * 1e9)).to_msg())
+        info = camera_info()
+        info.header = header
+        image = CvBridge().cv2_to_imgmsg(
+            np.zeros((480, 640, 3), dtype=np.uint8), 'bgr8')
+        image.header = header
+        depth = CvBridge().cv2_to_imgmsg(
+            np.full((480, 640), z, dtype=np.float32), '32FC1')
+        depth.header = header
+        FacePositionNode.on_frame(node, image, info, depth)
+    assert all(state != PerceptionStatus.FACE_NO_DEPTH for state, _, _ in states)
+    assert len(node.published_points) == len(measurements) - 1
+    assert {node.selector.track_id, node.last_target_id} == {1}
+    np.testing.assert_allclose(
+        [point.point.z for point in node.published_points],
+        [z for z, _ in measurements[1:]], atol=.001)
+
+
+def test_rgbd_reference_publishes_close_valid_depth_and_rejects_invalid_depth():
+    from face_tracking_perception.depth_reference import DepthReference
+
+    point = stamped_point(Header(frame_id='color_optical'), (0., 0., .2))
+    info = camera_info()
+    info.header = point.header
+    depth_image = np.full((480, 640), .2, dtype=np.float32)
+    depth_msg = CvBridge().cv2_to_imgmsg(depth_image, '32FC1')
+    depth_msg.header = point.header
+    published = []
+    node = SimpleNamespace(
+        bridge=CvBridge(), point_pub=SimpleNamespace(publish=published.append),
+        marker_pub=SimpleNamespace(publish=lambda _message: None),
+        error_pub=SimpleNamespace(publish=lambda _message: None))
+    DepthReference.compare(node, point, depth_msg, info)
+    assert len(published) == 1
+    assert published[0].point.z == pytest.approx(.2)
+    depth_msg.data = CvBridge().cv2_to_imgmsg(
+        np.full((480, 640), np.nan, dtype=np.float32), '32FC1').data
+    DepthReference.compare(node, point, depth_msg, info)
+    assert len(published) == 1
+
+
+def test_range_cutoff_controls_preserve_existing_non_rgbd_backend_contracts():
+    camera = Camera.from_info(camera_info())
+    assert size_depth(Face(200, 100, 80, 100, .9), camera, .16) == pytest.approx(1.)
+    left = Camera(640, 240, 500, 500, 320, 120)
+    right = Camera(640, 240, 500, 500, 320, 120, -40)
+    # A known 20 px disparity remains the calibrated 2 m stereo result.
+    rng = np.random.default_rng(42)
+    left_image = rng.integers(0, 256, (240, 640, 3), dtype=np.uint8)
+    right_image = np.zeros_like(left_image)
+    right_image[:, :-20] = left_image[:, 20:]
+    result = StereoDepth().compute(left_image, right_image, left, right)
+    assert np.nanmedian(result[40:200, 300:600]) == pytest.approx(2., abs=.02)
 
 
 def test_stereo_requires_calibrated_positive_baseline():

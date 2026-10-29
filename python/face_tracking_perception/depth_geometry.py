@@ -118,14 +118,16 @@ def sample_face_measurement(depth, face, minimum=0.25, maximum=8.0):
     x1, x2 = max(box_x1, round(u) - radius_x), min(box_x2, round(u) + radius_x + 1)
     y1, y2 = max(box_y1, round(v) - radius_y), min(box_y2, round(v) + radius_y + 1)
     patch = depth[y1:y2, x1:x2]
-    valid = patch[np.isfinite(patch) & (patch >= minimum) & (patch <= maximum)]
+    lower_valid = patch > 0 if minimum == 0 else patch >= minimum
+    valid_mask = np.isfinite(patch) & lower_valid & (patch <= maximum)
+    valid = patch[valid_mask]
     if valid.size < max(9, patch.size * patch_fraction):
         raise ValueError('Insufficient valid depth within the face')
     median = float(np.median(valid))
     mad = float(np.median(np.abs(valid - median)))
     if mad > max(0.10, median * 0.10):
         raise ValueError('Depth within face is inconsistent')
-    rows, columns = np.nonzero(np.isfinite(patch) & (patch >= minimum) & (patch <= maximum))
+    rows, columns = np.nonzero(valid_mask)
     # Use a robust center of actual face-supported depth pixels, not the center
     # of a box that may have been clipped by the image boundary.
     return median, float(x1 + np.median(columns)), float(y1 + np.median(rows))

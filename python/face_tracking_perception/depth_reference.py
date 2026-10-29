@@ -51,7 +51,7 @@ class DepthReference(Node):
         if depth.shape != (camera.height, camera.width):
             return
         patch = depth[max(0, v - 2):v + 3, max(0, u - 2):u + 3]
-        valid = patch[np.isfinite(patch) & (patch > 0.25) & (patch < 8)]
+        valid = patch[np.isfinite(patch) & (patch > 0)]
         if len(valid) < 9:
             return
         truth = stamped_point(point.header, camera.unproject(u, v, float(np.median(valid))))

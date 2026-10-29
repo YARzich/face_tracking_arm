@@ -4,6 +4,7 @@
 """Synchronized ROS adapter for the three interchangeable 3D face experiments."""
 
 from dataclasses import replace
+import threading
 import time
 
 import cv2
@@ -15,8 +16,11 @@ import message_filters
 import numpy as np
 import rclpy
 from rclpy.clock import Clock, ClockType
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.signals import SignalHandlerOptions
+from rclpy.subscription import RCLError
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import Header
@@ -100,8 +104,11 @@ class FacePositionNode(Node):
         self.last_reliable_depth_stamp = None
         self.last_depth_stamp = None
         self.last_capture_sec = None
+        self.last_ros_time_ns = None
         self.last_valid_input_receipt = None
         self.pending_since = None
+        self.tf_missing_since = None
+        self.tf_missing_reported = False
         self.last_perception_state = PerceptionStatus.WAIT
         self.last_perception_reason = 'waiting for a valid synchronized camera sample'
         self.last_preview_at = -float('inf')
@@ -142,8 +149,7 @@ class FacePositionNode(Node):
         self.pending_observation = None
         self.observation_drops = 0
         self.bridge = CvBridge()
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_buffer = Buffer(node=self)
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.point_pub = self.create_publisher(PointStamped, '/face_test/center_3d', qos)
         self.world_pub = self.create_publisher(PointStamped, '/face_test/center_world', qos)
@@ -181,15 +187,53 @@ class FacePositionNode(Node):
         self.sync.registerCallback(self.on_frame)
         self.get_logger().info(f'{self.mode}: ready; outputs are meters, original frame stamps')
         self.last_report = time.monotonic()
+        self.tf_listener_owner = TFListenerOwner(self.tf_buffer)
+
+    def destroy_node(self):
+        """Close the independent TF executor before destroying this node."""
+        owner = getattr(self, 'tf_listener_owner', None)
+        if owner is not None:
+            owner.close()
+        return super().destroy_node()
+
+    def _reset_for_clock_jump(self):
+        """Discard camera-epoch state after ROS time moves backward."""
+        self.last_capture_sec = None
+        self.last_source_stamp = None
+        self.pending_observation = None
+        self.pending_since = None
+        self.tf_missing_since = None
+        self.tf_missing_reported = False
+        self.last_selected_face_box = None
+        self.last_reliable_fixed_point = None
+        self.last_reliable_depth_stamp = None
+        self.last_depth_stamp = None
+        self.last_target_id = -1
+        self.pending_world_point = None
+        self.cadence.reset()
+        self.pair_cadence.reset()
+        self.processing_cadence.reset()
+        self.selector.reset()
+        self.point_filter.reset()
+        self.source_gap_limit = self.options['source_timeout_sec']
 
     def on_frame(self, image_msg, info, auxiliary_msg=None, right_info=None):
-        # A previously computed result may now have its exact TF. Give it a chance
-        # before the next inference blocks this executor or replaces the result.
-        self.flush_observation()
         mode = getattr(self, 'mode', 'mono_cpu')
         depth_msg = auxiliary_msg if mode == 'rgbd' else None
         right_msg = auxiliary_msg if mode == 'stereo' else None
         now = self.get_clock().now()
+        last_ros_time_ns = getattr(self, 'last_ros_time_ns', None)
+        clock_moved_backward = (
+            last_ros_time_ns is not None and now.nanoseconds < last_ros_time_ns)
+        self.last_ros_time_ns = now.nanoseconds
+        if clock_moved_backward:
+            # Pending observations belong to the old clock epoch and must not be
+            # flushed as stale while the camera state is being reset.
+            self._reset_for_clock_jump()
+        else:
+            # A previously computed result may now have its exact TF. Give it a
+            # chance before the next inference blocks this executor or replaces it.
+            self.flush_observation()
         inputs = (image_msg, info, depth_msg, right_msg, right_info)
         ages = [(now.nanoseconds - Time.from_msg(message.header.stamp).nanoseconds) / 1e9
                 for message in inputs if message is not None]
@@ -339,8 +383,10 @@ class FacePositionNode(Node):
                         z = size_depth(face, camera, self.options['face_width_m'])
                         u, v = face.center
                     else:
-                        z, u, v = sample_face_measurement(depth_map, face)
-                    if np.isfinite(z) and .25 <= z <= 8.0:
+                        limits = (0.0, np.inf) if mode == 'rgbd' else (.25, 8.0)
+                        z, u, v = sample_face_measurement(depth_map, face, *limits)
+                    in_range = (z > 0 if mode == 'rgbd' else .25 <= z <= 8.0)
+                    if np.isfinite(z) and in_range:
                         xyz = to_original @ camera.unproject(u, v, z)
                         candidates.append((index, tuple(float(v) for v in xyz)))
                 except ValueError:
@@ -359,8 +405,7 @@ class FacePositionNode(Node):
             image_msg, image, faces, candidates, depth_map, elapsed_ms, reason,
             partial_faces, camera if image is not None else None,
             to_original if image is not None else None)
-        if getattr(self, 'pending_since', None) is None:
-            self.pending_since = time.monotonic()
+        self.pending_since = time.monotonic()
         self.flush_observation()
 
     def flush_observation(self):
@@ -396,6 +441,8 @@ class FacePositionNode(Node):
                     and any(same_visible_face(getattr(self, 'last_selected_face_box', None), face)
                             for _, face in partial_faces))
                 if not candidates and not can_reuse_cpu_depth:
+                    self.tf_missing_since = None
+                    self.tf_missing_reported = False
                     self.selector.select([], stamp.nanoseconds / 1e9)
                     self.publish_observation(None, reason)
                     self.publish_world_point()
@@ -411,11 +458,26 @@ class FacePositionNode(Node):
                         inverse = self.tf_buffer.lookup_transform(
                             image_msg.header.frame_id, self.options['selection_frame'], stamp)
                 except TransformException:
+                    now = time.monotonic()
+                    tf_missing_since = getattr(self, 'tf_missing_since', None)
+                    if tf_missing_since is None:
+                        self.tf_missing_since = now
+                        tf_missing_since = now
                     pending_since = getattr(self, 'pending_since', None)
-                    if (pending_since is not None and time.monotonic() - pending_since
-                            >= self.options.get('tf_wait_timeout_sec', .05)):
+                    frame_timed_out = (
+                        pending_since is not None
+                        and now - pending_since >= self.options.get(
+                            'tf_wait_timeout_sec', .05))
+                    fault_timed_out = (
+                        now - tf_missing_since >= self.options.get(
+                            'source_timeout_sec', .25))
+                    if (frame_timed_out or fault_timed_out) and not getattr(
+                            self, 'tf_missing_reported', False):
+                        self.tf_missing_reported = True
                         self.publish_observation(None, 'TF_UNAVAILABLE')
                     return
+                self.tf_missing_since = None
+                self.tf_missing_reported = False
                 candidates = list(candidates)
                 partial_candidate_indices = set()
                 if (can_reuse_cpu_depth and self.mode == 'mono_cpu' and partial_faces
@@ -665,15 +727,65 @@ class FacePositionNode(Node):
         self.pending_world_point = None
 
 
+class TFListenerOwner:
+    """Own a private node and executor for TF callbacks into a shared buffer."""
+
+    def __init__(self, buffer):
+        """Create and spin an independent TF listener node."""
+        self.listener = TransformListener(buffer, None)
+        self.node = self.listener.node
+        self.executor = SingleThreadedExecutor()
+        self.executor.add_node(self.node)
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._spin, name='tf-listener-executor')
+        self._thread.start()
+
+    def _spin(self):
+        """Spin only the owned TF node until orderly shutdown."""
+        try:
+            self.executor.spin()
+        except ExternalShutdownException:
+            if rclpy.ok():
+                raise
+        except RCLError:
+            if rclpy.ok():
+                raise
+
+    def close(self):
+        """Stop the listener before destroying its node; context ownership stays outside."""
+        if self._closed:
+            return
+        self._closed = True
+        self.executor.shutdown()
+        self._thread.join()
+        self.executor.remove_node(self.node)
+        self.listener.unregister()
+        self.node.destroy_node()
+
+
+def create_face_position_executor():
+    """Run frame, selector, and watchdog callbacks with one sequential owner."""
+    return SingleThreadedExecutor()
+
+
 def main():
-    rclpy.init()
+    # Keep the context alive until both executors and nodes are explicitly closed.
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = None
+    executor = None
     try:
         node = FacePositionNode()
-        rclpy.spin(node)
+        executor = create_face_position_executor()
+        executor.add_node(node)
+        executor.spin()
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
+        if executor is not None:
+            executor.shutdown()
         if node is not None:
+            if executor is not None:
+                executor.remove_node(node)
             node.destroy_node()
         rclpy.try_shutdown()
