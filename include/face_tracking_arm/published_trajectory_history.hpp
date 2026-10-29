@@ -117,12 +117,22 @@ public:
     rcl_clock_type_t clock_type, const rclcpp::Duration & controller_period,
     double position_tolerance_rad) const;
 
+  /// Recognize an older terminal hold while its exact stationary replacement
+  /// has been published but has not yet started at the controller or measurement time.
+  [[nodiscard]] bool isPendingTerminalReplacement(
+    const PublicationMatch & match, const rclcpp::Time & measurement_time) const;
+
   /// Interpolate an actual measurement against one already acknowledged record.
   /// Terminal extrapolation is allowed only for this explicitly selected record.
   [[nodiscard]] std::optional<ExpectedPositionState> expectedAt(
     PublicationId id, const rclcpp::Time & sample_time) const;
 
 private:
+  [[nodiscard]] std::optional<ExpectedPositionState> expectedPrestartTerminalHold(
+    const PublishedTrajectoryRecord & latest_record,
+    const rclcpp::Time & measurement_time,
+    const rclcpp::Time & sample_time) const;
+
   [[nodiscard]] static std::optional<ExpectedPositionState> expectedStateAt(
     const PublishedTrajectoryRecord & record, const rclcpp::Time & sample_time,
     bool allow_terminal_extrapolation);

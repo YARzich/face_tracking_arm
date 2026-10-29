@@ -6,10 +6,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "collision_stopping.hpp"
+#include "face_tracking_arm/detail/scalar_braking_policy.hpp"
+#include "face_tracking_arm/emergency_brake_tail.hpp"
 
 namespace face_tracking_arm::control::collision_detail
 {
@@ -17,37 +22,87 @@ namespace face_tracking_arm::control::collision_detail
 namespace
 {
 
-/// Bound every joint's approach contribution under a common approach cap.
-/// Shared slack is intentionally reused per joint for a conservative stopping bound.
-[[nodiscard]] Eigen::VectorXd conservativeCandidateVelocityForApproachCap(
-  const double cap,
-  const Eigen::VectorXd & distance_gradient,
-  const ReachableVelocityInterval & velocity_interval,
-  const ReachableApproachInterval & approach_interval)
+constexpr std::size_t kMaximumSimulationTicks = 10000U;
+
+[[nodiscard]] detail::ScalarBrakingRollout rolloutJointTowardCollision(
+  const double position, const double velocity, const double acceleration,
+  const double direction, const double maximum_velocity,
+  const double maximum_acceleration, const double maximum_jerk,
+  const JointMotionLimits & motion_limits, const double period_sec,
+  const std::size_t adverse_ticks, const bool record_points)
 {
-  if (!std::isfinite(cap) ||
-    cap < approach_interval.minimum_mps - kComparisonTolerance ||
-    cap > approach_interval.maximum_mps + kComparisonTolerance)
+  if (!motion_limits.numerical_policy.has_value() ||
+    !motion_limits.numerical_policy->valid())
   {
-    throw std::invalid_argument("approach cap lies outside the reachable interval");
+    throw std::invalid_argument("joint numerical policy is missing or invalid");
   }
 
-  Eigen::VectorXd candidate_velocity(distance_gradient.size());
+  detail::ScalarBrakingOptions options;
+  options.period_sec = period_sec;
+  options.numerical_policy = *motion_limits.numerical_policy;
+  options.maximum_braking_steps = 1000U;
+  options.adverse_ticks = adverse_ticks;
+  return detail::rolloutScalarBraking(
+    detail::ScalarBrakingState{
+        direction * position, direction * velocity, direction * acceleration},
+    detail::ScalarBrakingLimits{
+        maximum_velocity, maximum_acceleration, maximum_jerk}, options, record_points);
+}
+
+[[nodiscard]] double collisionTailReserveForReachableBox(
+  const Eigen::VectorXd & distance_gradient,
+  const JointMotionState & motion_state,
+  const JointMotionLimits & motion_limits,
+  const ReachableVelocityInterval & velocity_interval,
+  const double period_sec, const double residual_latency_sec)
+{
+  const double residual_ticks_value = std::ceil(residual_latency_sec / period_sec);
+  if (!std::isfinite(residual_ticks_value) || residual_ticks_value < 0.0 ||
+    residual_ticks_value > static_cast<double>(kMaximumSimulationTicks))
+  {
+    throw std::invalid_argument("vector collision stopping horizon is invalid");
+  }
+  const std::size_t adverse_ticks = static_cast<std::size_t>(residual_ticks_value);
+
+  double total_reserve = 0.0;
   for (Eigen::Index index = 0; index < distance_gradient.size(); ++index) {
-    if (distance_gradient[index] == 0.0) {
-      candidate_velocity[index] = velocity_interval.lower[index];
+    const double gradient = distance_gradient[index];
+    if (gradient == 0.0) {
       continue;
     }
-    const double contribution_cap = std::clamp(
-      cap - (approach_interval.minimum_mps -
-      approach_interval.lower_contribution[index]),
-      approach_interval.lower_contribution[index],
-      approach_interval.upper_contribution[index]);
-    candidate_velocity[index] = std::clamp(
-      -contribution_cap / distance_gradient[index],
-      velocity_interval.lower[index], velocity_interval.upper[index]);
+
+    const double toward_direction = gradient > 0.0 ? -1.0 : 1.0;
+    const double endpoint_velocity = toward_direction > 0.0 ?
+      velocity_interval.upper[index] : velocity_interval.lower[index];
+    const double endpoint_acceleration =
+      (endpoint_velocity - motion_state.velocity[index]) / period_sec;
+    const double endpoint_position =
+      motion_state.position[index] + endpoint_velocity * period_sec;
+    const detail::ScalarBrakingRollout rollout = rolloutJointTowardCollision(
+      endpoint_position, endpoint_velocity, endpoint_acceleration,
+      toward_direction, motion_limits.max_velocity[index],
+      motion_limits.max_acceleration[index], motion_limits.max_jerk[index],
+      motion_limits, period_sec, adverse_ticks, false);
+    if (!rollout.commandAvailable()) {
+      // An infeasible extreme cannot contribute a finite reserve. The caller
+      // then falls back to the most-receding reachable cap and the final tail
+      // certificate remains the acceptance gate for every concrete command.
+      return std::numeric_limits<double>::infinity();
+    }
+    const double minimum_joint_position = toward_direction > 0.0 ?
+      rollout.minimum_position : -rollout.maximum_position;
+    const double maximum_joint_position = toward_direction > 0.0 ?
+      rollout.maximum_position : -rollout.minimum_position;
+    if (minimum_joint_position < motion_limits.lower_position[index] -
+      kComparisonTolerance || maximum_joint_position >
+      motion_limits.upper_position[index] + kComparisonTolerance)
+    {
+      return std::numeric_limits<double>::infinity();
+    }
+    total_reserve += std::abs(gradient) * std::max(
+      0.0, rollout.maximum_position - toward_direction * endpoint_position);
   }
-  return candidate_velocity;
+  return total_reserve;
 }
 
 }  // namespace
@@ -129,13 +184,15 @@ namespace
   const double period_sec,
   const double residual_latency_sec)
 {
-  const Eigen::VectorXd candidate_velocity =
-    conservativeCandidateVelocityForApproachCap(
-    cap, distance_gradient, velocity_interval, approach_interval);
-  const double stopping_distance = jerkLimitedCollisionStoppingDistance(
-    distance_gradient, motion_state, candidate_velocity, motion_limits,
+  if (!std::isfinite(cap) || cap < approach_interval.minimum_mps - kComparisonTolerance ||
+    cap > approach_interval.maximum_mps + kComparisonTolerance)
+  {
+    throw std::invalid_argument("approach cap lies outside the reachable interval");
+  }
+  const double tail_reserve = collisionTailReserveForReachableBox(
+    distance_gradient, motion_state, motion_limits, velocity_interval,
     period_sec, residual_latency_sec);
-  return std::max(0.0, cap * period_sec + stopping_distance);
+  return std::max(0.0, cap * period_sec + tail_reserve);
 }
 
 [[nodiscard]] bool validateMotionInput(
@@ -212,6 +269,9 @@ using collision_detail::requiredCollisionDistanceForApproachCap;
 using collision_detail::validateMotionInput;
 using collision_detail::isFinite;
 using collision_detail::kComparisonTolerance;
+using collision_detail::kMaximumSimulationTicks;
+using collision_detail::rolloutJointTowardCollision;
+using collision_detail::collisionTailReserveForReachableBox;
 
 double jerkLimitedStoppingDistance(
   const double toward_velocity,
@@ -345,7 +405,6 @@ double jerkLimitedCollisionStoppingDistance(
   const double period_sec,
   const double residual_latency_sec)
 {
-  constexpr std::size_t kMaximumSimulationTicks = 10000;
   const Eigen::Index joint_count = distance_gradient.size();
   std::string input_error;
   if (joint_count <= 0 || candidate_joint_velocity.size() != joint_count ||
@@ -380,70 +439,78 @@ double jerkLimitedCollisionStoppingDistance(
     throw std::invalid_argument("candidate joint velocity is not reachable in one period");
   }
 
+  if (distance_gradient.cwiseAbs().maxCoeff() <= 0.0) {
+    throw std::invalid_argument("distance gradient has no controllable projected limits");
+  }
+
   const double residual_ticks_value = std::ceil(residual_latency_sec / period_sec);
   if (!std::isfinite(residual_ticks_value) || residual_ticks_value < 0.0 ||
     residual_ticks_value > static_cast<double>(kMaximumSimulationTicks))
   {
     throw std::invalid_argument("vector collision stopping horizon is invalid");
   }
-  const auto residual_ticks = static_cast<std::size_t>(residual_ticks_value);
+  const std::size_t adverse_ticks = static_cast<std::size_t>(residual_ticks_value);
 
-  // Work in per-joint approach coordinates. This preserves every individual
-  // acceleration/jerk saturation while making both gradient signs symmetric.
-  Eigen::VectorXd velocity_contribution =
-    -distance_gradient.array() * candidate_joint_velocity.array();
-  Eigen::VectorXd acceleration_contribution =
-    -distance_gradient.array() * candidate_acceleration.array();
-  const Eigen::VectorXd maximum_acceleration_contribution =
-    distance_gradient.cwiseAbs().array() * motion_limits.max_acceleration.array();
-  const Eigen::VectorXd jerk_step =
-    distance_gradient.cwiseAbs().array() * motion_limits.max_jerk.array() * period_sec;
-  if (!isFinite(velocity_contribution) || !isFinite(acceleration_contribution) ||
-    !isFinite(maximum_acceleration_contribution) || !isFinite(jerk_step) ||
-    maximum_acceleration_contribution.maxCoeff() <= 0.0)
-  {
-    throw std::invalid_argument("distance gradient has no controllable projected limits");
+  std::vector<detail::ScalarBrakingRollout> joint_rollouts;
+  joint_rollouts.reserve(static_cast<std::size_t>(joint_count));
+  std::size_t maximum_points = 1U;
+  for (Eigen::Index index = 0; index < joint_count; ++index) {
+    const double gradient = distance_gradient[index];
+    if (gradient == 0.0) {
+      detail::ScalarBrakingRollout stationary;
+      stationary.status = detail::ScalarBrakingStatus::kSuccess;
+      stationary.points.push_back(detail::ScalarBrakingState{
+          candidate_position[index], candidate_joint_velocity[index],
+          candidate_acceleration[index]});
+      joint_rollouts.push_back(std::move(stationary));
+      continue;
+    }
+    const double toward_direction = gradient > 0.0 ? -1.0 : 1.0;
+    detail::ScalarBrakingRollout rollout = rolloutJointTowardCollision(
+      candidate_position[index], candidate_joint_velocity[index],
+      candidate_acceleration[index], toward_direction,
+      motion_limits.max_velocity[index], motion_limits.max_acceleration[index],
+      motion_limits.max_jerk[index], motion_limits, period_sec, adverse_ticks, true);
+    if (!rollout.commandAvailable()) {
+      throw std::invalid_argument(
+              "shared scalar collision braking rollout is infeasible at joint " +
+              std::to_string(index));
+    }
+    const double minimum_joint_position = toward_direction > 0.0 ?
+      rollout.minimum_position : -rollout.maximum_position;
+    const double maximum_joint_position = toward_direction > 0.0 ?
+      rollout.maximum_position : -rollout.minimum_position;
+    if (minimum_joint_position < motion_limits.lower_position[index] -
+      kComparisonTolerance || maximum_joint_position >
+      motion_limits.upper_position[index] + kComparisonTolerance)
+    {
+      throw std::invalid_argument(
+              "shared scalar collision braking rollout violates a joint position bound");
+    }
+    maximum_points = std::max(maximum_points, rollout.points.size());
+    joint_rollouts.push_back(std::move(rollout));
   }
 
-  double position = 0.0;
-  double maximum_position = 0.0;
-  std::size_t simulated_ticks = 0;
-  const auto integrate_tick = [&]() {
-      velocity_contribution += acceleration_contribution * period_sec;
-      const double approach_velocity = velocity_contribution.sum();
-      position += approach_velocity * period_sec;
-      if (!isFinite(velocity_contribution) || !isFinite(acceleration_contribution) ||
-        !std::isfinite(approach_velocity) || !std::isfinite(position))
-      {
-        throw std::invalid_argument("vector collision stopping trajectory is non-finite");
+  double maximum_projected_approach = 0.0;
+  for (std::size_t tick = 0; tick < maximum_points; ++tick) {
+    double projected_approach = 0.0;
+    for (Eigen::Index index = 0; index < joint_count; ++index) {
+      const double gradient = distance_gradient[index];
+      if (gradient == 0.0) {
+        continue;
       }
-      maximum_position = std::max(maximum_position, position);
-      ++simulated_ticks;
-    };
-
-  for (std::size_t tick = 0; tick < residual_ticks; ++tick) {
-    acceleration_contribution =
-      (acceleration_contribution + jerk_step).cwiseMin(
-      maximum_acceleration_contribution);
-    integrate_tick();
+      const auto & points = joint_rollouts[static_cast<std::size_t>(index)].points;
+      const detail::ScalarBrakingState & point = points[std::min(tick, points.size() - 1U)];
+      const detail::ScalarBrakingState & start = points.front();
+      projected_approach += std::abs(gradient) *
+        (point.position - start.position);
+    }
+    if (!std::isfinite(projected_approach)) {
+      throw std::invalid_argument("shared scalar collision rollout is non-finite");
+    }
+    maximum_projected_approach = std::max(maximum_projected_approach, projected_approach);
   }
-
-  auto approach_velocity = velocity_contribution.sum();
-  auto approach_acceleration = acceleration_contribution.sum();
-  while ((approach_velocity > 0.0 || approach_acceleration > 0.0) &&
-    simulated_ticks < kMaximumSimulationTicks)
-  {
-    acceleration_contribution =
-      (acceleration_contribution - jerk_step).cwiseMax(
-      -maximum_acceleration_contribution);
-    integrate_tick();
-    approach_velocity = velocity_contribution.sum();
-    approach_acceleration = acceleration_contribution.sum();
-  }
-  if (approach_velocity > 0.0 || approach_acceleration > 0.0) {
-    throw std::invalid_argument("vector collision stopping trajectory exceeds bounded horizon");
-  }
-  return std::max(0.0, maximum_position);
+  return maximum_projected_approach;
 }
 
 double maximumSafeCollisionApproachSpeed(
@@ -471,30 +538,40 @@ double maximumSafeCollisionApproachSpeed(
   }
   const ReachableApproachInterval reachable_approach =
     projectApproachInterval(distance_gradient, reachable_velocity);
-  const auto required_distance = [&](const double candidate_approach_speed) {
-      return requiredCollisionDistanceForApproachCap(
-        candidate_approach_speed, distance_gradient, motion_state, motion_limits,
-        reachable_velocity, reachable_approach, period_sec, residual_latency_sec);
-    };
-
-  if (required_distance(reachable_approach.minimum_mps) > remaining_distance) {
-    return reachable_approach.minimum_mps;
-  }
-  if (required_distance(reachable_approach.maximum_mps) <= remaining_distance) {
-    return reachable_approach.maximum_mps;
+  const double tail_reserve = collisionTailReserveForReachableBox(
+    distance_gradient, motion_state, motion_limits, reachable_velocity,
+    period_sec, residual_latency_sec);
+  double cap = reachable_approach.minimum_mps;
+  if (std::isfinite(tail_reserve)) {
+    cap = std::clamp(
+      (remaining_distance - tail_reserve) / period_sec,
+      reachable_approach.minimum_mps, reachable_approach.maximum_mps);
   }
 
-  double lower = reachable_approach.minimum_mps;
-  double upper = reachable_approach.maximum_mps;
-  for (int iteration = 0; iteration < 48; ++iteration) {
-    const double middle = 0.5 * (lower + upper);
-    if (required_distance(middle) <= remaining_distance) {
-      lower = middle;
-    } else {
-      upper = middle;
+  // A dynamically valid first command from the shared emergency-braking
+  // policy remains available even when the box reserve is larger than the
+  // clearance. This is only a QP row floor; segment and full-tail certificates
+  // still validate every concrete command before publication.
+  EmergencyBrakeTailConfig tail_config;
+  tail_config.period_sec = period_sec;
+  tail_config.terminal_hold_points = 2U;
+  const EmergencyBrakeTail brake_anchor = EmergencyBrakeTailGenerator(
+    tail_config).generate(motion_state, motion_limits);
+  if (brake_anchor.command_available() && brake_anchor.points.size() >= 2U) {
+    const Eigen::VectorXd anchor_velocity = brake_anchor.points[1].velocity;
+    bool anchor_reachable = anchor_velocity.size() == joint_count;
+    for (Eigen::Index index = 0; index < joint_count && anchor_reachable; ++index) {
+      anchor_reachable = anchor_velocity[index] >=
+        reachable_velocity.lower[index] - kComparisonTolerance &&
+        anchor_velocity[index] <=
+        reachable_velocity.upper[index] + kComparisonTolerance;
+    }
+    if (anchor_reachable) {
+      cap = std::max(cap, -distance_gradient.dot(anchor_velocity));
     }
   }
-  return lower;
+  return std::clamp(
+    cap, reachable_approach.minimum_mps, reachable_approach.maximum_mps);
 }
 
 }  // namespace face_tracking_arm::control

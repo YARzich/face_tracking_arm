@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -17,6 +18,7 @@
 #include <moveit/collision_detection/collision_matrix.hpp>
 #include <moveit/planning_scene/planning_scene.hpp>
 #include <moveit/robot_model/joint_model_group.hpp>
+#include <moveit/robot_model/link_model.hpp>
 #include <moveit/robot_state/robot_state.hpp>
 
 #include "collision_distance_query.hpp"
@@ -25,13 +27,36 @@
 namespace face_tracking_arm::control
 {
 
+CollisionValidationBudget::CollisionValidationBudget(
+  const TimePoint deadline, const std::size_t maximum_distance_queries,
+  const NowFunction now) noexcept
+: deadline_(deadline), remaining_distance_queries_(maximum_distance_queries), now_(now)
+{}
+
+bool CollisionValidationBudget::tryConsumeDistanceQuery() noexcept
+{
+  if (expired() || remaining_distance_queries_ == 0U) {
+    return false;
+  }
+  --remaining_distance_queries_;
+  return true;
+}
+
+bool CollisionValidationBudget::expired() const noexcept
+{
+  const TimePoint current = now_ == nullptr ? Clock::now() : now_();
+  return current >= deadline_;
+}
+
 using collision_detail::DistanceCandidate;
 using collision_detail::canonicalize;
 using collision_detail::candidateKey;
 using collision_detail::maximumRequiredClearance;
+using collision_detail::pairDistanceLipschitz;
 using collision_detail::readablePair;
 using collision_detail::requiredClearance;
-using collision_detail::pairInterSampleUncertainty;
+using collision_detail::requiredClearanceWithDistanceReserve;
+using collision_detail::pairInterSampleDistanceReserve;
 using collision_detail::validateCollisionModel;
 using collision_detail::validateSegmentMotionState;
 using collision_detail::isFinite;
@@ -44,6 +69,8 @@ namespace
 namespace BodyTypes = collision_detection::BodyTypes;
 
 enum class SampledMotionKind { kSegment, kPath };
+
+constexpr std::size_t kMaximumPathRefinements = 3U;
 
 const char * motionName(const SampledMotionKind kind)
 {
@@ -58,6 +85,15 @@ void failValidation(
   result.unsafe = true;
   if (kind == SampledMotionKind::kSegment || result.failure_reason.empty()) {
     result.failure_reason = reason;
+  }
+}
+
+void markBudgetExhausted(CollisionSegmentValidationResult & result)
+{
+  result.budget_exhausted = true;
+  result.unsafe = true;
+  if (result.failure_reason.empty()) {
+    result.failure_reason = "collision validation budget exhausted; path is uncertified";
   }
 }
 
@@ -135,10 +171,11 @@ public:
     const CollisionConstraintConfig & config, const planning_scene::PlanningScene & scene,
     const moveit::core::JointModelGroup & group, const moveit::core::RobotState & state,
     const Eigen::Index protected_index, const SampledMotionKind kind,
-    CollisionSegmentValidationResult & result)
+    CollisionSegmentValidationResult & result,
+    CollisionValidationBudget * const budget = nullptr)
   : config_(config), scene_(scene), group_(group), state_(state),
     environment_(*scene.getCollisionEnvUnpadded()), protected_index_(protected_index),
-    kind_(kind), result_(result), request_(signedDistanceRequest(scene, group))
+    kind_(kind), result_(result), budget_(budget), request_(signedDistanceRequest(scene, group))
   {
     request_.acm = &scene_.getAllowedCollisionMatrix();
   }
@@ -177,6 +214,11 @@ public:
     return true;
   }
 
+  [[nodiscard]] const std::string & physicalFailureReason() const
+  {
+    return physical_failure_reason_;
+  }
+
 private:
   void fail(const std::string & reason)
   {
@@ -187,6 +229,10 @@ private:
     const CollisionPairKind kind, const Eigen::VectorXd & joint_uncertainty,
     CollisionSegmentSampleDiagnostic & sample, double & minimum_distance)
   {
+    if (budget_ != nullptr && !budget_->tryConsumeDistanceQuery()) {
+      markBudgetExhausted(result_);
+      return false;
+    }
     distance_result_.clear();
     if (kind == CollisionPairKind::kSelf) {
       ++result_.distance_query_count;
@@ -291,11 +337,16 @@ private:
       sample.collision_detected = sample.collision_detected || candidate.distance_m <= 0.0;
       sample.hard_clearance_violated = sample.hard_clearance_violated ||
         candidate.distance_m < config_.hard_clearance_m;
-      const double required_clearance = requiredClearance(
-        candidate, config_,
-        pairInterSampleUncertainty(candidate, state_, group_, joint_uncertainty));
+      const double required_clearance = requiredClearanceWithDistanceReserve(
+        candidate, config_, pairInterSampleDistanceReserve(
+          candidate, state_, group_, joint_uncertainty, config_));
       sample.robust_clearance_violated = sample.robust_clearance_violated ||
         candidate.distance_m < required_clearance;
+      const double physical_clearance = requiredClearance(candidate, config_, 0.0);
+      const bool physical_failure = candidate.distance_m < physical_clearance;
+      result_.physical_clearance_violated = result_.physical_clearance_violated ||
+        physical_failure;
+      recordClearanceFailure(candidate, physical_clearance, physical_failure_reason_);
       recordClearanceFailure(candidate, required_clearance, result_.failure_reason);
     }
     if (distance_result_.collision != has_negative_distance) {
@@ -319,6 +370,8 @@ private:
     }
     result_.robust_clearance_violated = result_.robust_clearance_violated ||
       sample.robust_clearance_violated;
+    result_.protected_joint_corridor_violated =
+      result_.protected_joint_corridor_violated || sample.protected_joint_corridor_violated;
     const bool unsafe = sample.collision_detected || sample.robust_clearance_violated ||
       sample.protected_joint_corridor_violated;
     if (unsafe && !result_.unsafe) {
@@ -338,6 +391,8 @@ private:
   Eigen::Index protected_index_;
   SampledMotionKind kind_;
   CollisionSegmentValidationResult & result_;
+  CollisionValidationBudget * budget_;
+  std::string physical_failure_reason_;
   collision_detection::DistanceRequest request_;
   DistanceResult distance_result_;
 };
@@ -541,6 +596,8 @@ bool CollisionConstraintBuilder::canCertifySegment(
   }
   for (const auto & pair : diagnostics.pairs) {
     if (!std::isfinite(pair.distance_m) ||
+      !std::isfinite(pair.distance_lipschitz_m_per_rad) ||
+      pair.distance_lipschitz_m_per_rad < 0.0 ||
       pair.relative_motion_variables.size() != static_cast<std::size_t>(count))
     {
       return false;
@@ -551,11 +608,12 @@ bool CollisionConstraintBuilder::canCertifySegment(
         relative_excursion = std::max(relative_excursion, excursion[index]);
       }
     }
-    DistanceCandidate candidate;
-    candidate.kind = pair.kind;
-    candidate.body_names[0] = pair.first_body;
-    candidate.body_names[1] = pair.second_body;
-    if (pair.distance_m < requiredClearance(candidate, config_, relative_excursion)) {
+    const double effective_joint_position_uncertainty =
+      config_.tracking_position_error_bound_rad + relative_excursion;
+    const double required_clearance = config_.hard_clearance_m +
+      config_.numerical_distance_reserve_m +
+      pair.distance_lipschitz_m_per_rad * effective_joint_position_uncertainty;
+    if (!std::isfinite(required_clearance) || pair.distance_m < required_clearance) {
       return false;
     }
   }
@@ -736,12 +794,29 @@ CollisionSegmentValidationResult CollisionConstraintBuilder::validateSegment(
   return result;
 }
 
+CollisionSegmentValidationResult CollisionConstraintBuilder::validateSegmentWithRefinement(
+  const planning_scene::PlanningScene & scene,
+  const moveit::core::RobotState & current_robot_state,
+  const moveit::core::JointModelGroup & joint_model_group,
+  const JointMotionState & current_motion_state,
+  const JointMotionState & candidate_motion_state,
+  const std::size_t initial_substeps,
+  const std::size_t max_refinements,
+  CollisionValidationBudget * const budget) const
+{
+  const std::vector<JointMotionState> waypoints{current_motion_state, candidate_motion_state};
+  return validatePathWithRefinement(
+    scene, current_robot_state, joint_model_group, waypoints,
+    initial_substeps, max_refinements, budget);
+}
+
 CollisionSegmentValidationResult CollisionConstraintBuilder::validatePath(
   const planning_scene::PlanningScene & scene,
   const moveit::core::RobotState & start_robot_state,
   const moveit::core::JointModelGroup & joint_model_group,
   const std::vector<JointMotionState> & waypoints,
-  const std::size_t substeps_per_segment) const
+  const std::size_t substeps_per_segment,
+  CollisionValidationBudget * const budget) const
 {
   CollisionSegmentValidationResult result;
   const Eigen::Index variable_count = static_cast<Eigen::Index>(
@@ -825,6 +900,18 @@ CollisionSegmentValidationResult CollisionConstraintBuilder::validatePath(
     CollisionSegmentValidationResult & query_result) {
       result.distance_query_count += query_result.distance_query_count;
       result.evaluated_samples += query_result.evaluated_samples;
+      result.physical_clearance_violated = result.physical_clearance_violated ||
+        query_result.physical_clearance_violated;
+      result.protected_joint_corridor_violated =
+        result.protected_joint_corridor_violated ||
+        query_result.protected_joint_corridor_violated;
+      if (query_result.budget_exhausted) {
+        result.budget_exhausted = true;
+        result.unsafe = true;
+        if (result.failure_reason.empty()) {
+          result.failure_reason = query_result.failure_reason;
+        }
+      }
       for (auto & sample : query_result.samples) {
         result.minimum_self_distance_m = std::min(
           result.minimum_self_distance_m, sample.minimum_self_distance_m);
@@ -841,10 +928,10 @@ CollisionSegmentValidationResult CollisionConstraintBuilder::validatePath(
   const auto validate_dense_segment = [
     this, &result, &scene, &sample_state, &joint_model_group, protected_index,
     &waypoints, segment_count, substeps_per_segment, &inter_sample_joint_uncertainties,
-    &proven_dense_samples](const std::size_t segment_index) {
+    &proven_dense_samples, budget](const std::size_t segment_index) {
       SampledCollisionQuery query(
         config_, scene, joint_model_group, sample_state, protected_index,
-        SampledMotionKind::kPath, result);
+        SampledMotionKind::kPath, result, budget);
       const JointMotionState & start = waypoints[segment_index];
       const JointMotionState & end = waypoints[segment_index + 1U];
       for (std::size_t local_index = 0U; local_index <= substeps_per_segment; ++local_index) {
@@ -882,7 +969,7 @@ CollisionSegmentValidationResult CollisionConstraintBuilder::validatePath(
     this, &result, &scene, &sample_state, &joint_model_group, protected_index,
     variable_count, &fail,
     &waypoints, segment_count, substeps_per_segment, &inter_sample_joint_uncertainties,
-    &proven_dense_samples, &merge_observed_query, &validate_dense_segment](
+    &proven_dense_samples, &merge_observed_query, &validate_dense_segment, budget](
     auto && self, const std::size_t first_waypoint, const std::size_t last_waypoint) -> bool {
       const std::size_t middle_waypoint = first_waypoint +
         (last_waypoint - first_waypoint) / 2U;
@@ -933,7 +1020,7 @@ CollisionSegmentValidationResult CollisionConstraintBuilder::validatePath(
         attempt_result.unsafe = false;
         SampledCollisionQuery query(
           config_, scene, joint_model_group, sample_state, protected_index,
-          SampledMotionKind::kPath, attempt_result);
+          SampledMotionKind::kPath, attempt_result, budget);
         sample_state.setJointGroupPositions(&joint_model_group, anchor_position);
         sample_state.updateCollisionBodyTransforms();
         (void)query.evaluate(anchor_position, block_uncertainty, anchor_sample_index);
@@ -945,9 +1032,28 @@ CollisionSegmentValidationResult CollisionConstraintBuilder::validatePath(
           sample.path_block_end_sample_index = block_end_sample_index;
         }
         merge_observed_query(attempt_result);
+        if (attempt_result.budget_exhausted) {
+          return false;
+        }
         if (!attempt_result.input_valid) {
           fail(attempt_result.failure_reason.empty() ?
             "path block collision query failed" : attempt_result.failure_reason);
+          return false;
+        }
+        if (attempt_result.physical_clearance_violated) {
+          // This FCL query is at an actual path waypoint, so it proves a static
+          // physical-floor breach. No dense-grid search is needed to reject the
+          // path. Keep the earliest dense sample unavailable: this anchor witness
+          // is not necessarily the first unsafe point in time.
+          result.unsafe = true;
+          result.robust_clearance_violated = true;
+          result.failure_reason =
+            "path static-floor breach proven at waypoint anchor sample " +
+            std::to_string(anchor_sample_index) +
+            "; earliest dense-grid unsafe sample was not searched";
+          if (!query.physicalFailureReason().empty()) {
+            result.failure_reason += ": " + query.physicalFailureReason();
+          }
           return false;
         }
         if (block_certified) {
@@ -977,12 +1083,77 @@ CollisionSegmentValidationResult CollisionConstraintBuilder::validatePath(
 
   try {
     if (!certify_or_split(certify_or_split, 0U, segment_count)) {
+      if (result.input_valid && budget != nullptr && budget->expired()) {
+        markBudgetExhausted(result);
+      }
       return result;
     }
   } catch (const std::exception & exception) {
     fail(std::string("collision path query failed: ") + exception.what());
   }
+  if (result.input_valid && budget != nullptr && budget->expired()) {
+    markBudgetExhausted(result);
+  }
   return result;
+}
+
+CollisionSegmentValidationResult CollisionConstraintBuilder::validatePathWithRefinement(
+  const planning_scene::PlanningScene & scene,
+  const moveit::core::RobotState & start_robot_state,
+  const moveit::core::JointModelGroup & joint_model_group,
+  const std::vector<JointMotionState> & waypoints,
+  const std::size_t initial_substeps,
+  const std::size_t max_refinements,
+  CollisionValidationBudget * const budget) const
+{
+  const std::size_t refinement_limit = std::min(max_refinements, kMaximumPathRefinements);
+  std::size_t substeps = initial_substeps;
+  std::size_t total_query_count = 0U;
+  std::size_t total_evaluated_samples = 0U;
+  std::size_t total_certified_blocks = 0U;
+  std::size_t total_inconclusive_blocks = 0U;
+  double minimum_self_distance = std::numeric_limits<double>::infinity();
+  double minimum_world_distance = std::numeric_limits<double>::infinity();
+  double minimum_distance = std::numeric_limits<double>::infinity();
+  std::string closest_pair;
+
+  for (std::size_t refinement = 0U;; ++refinement) {
+    CollisionSegmentValidationResult result = validatePath(
+      scene, start_robot_state, joint_model_group, waypoints, substeps, budget);
+    result.refinement_attempts = refinement;
+
+    total_query_count += result.distance_query_count;
+    total_evaluated_samples += result.evaluated_samples;
+    total_certified_blocks += result.certified_path_block_count;
+    total_inconclusive_blocks += result.inconclusive_path_block_count;
+    minimum_self_distance = std::min(minimum_self_distance, result.minimum_self_distance_m);
+    minimum_world_distance = std::min(minimum_world_distance, result.minimum_world_distance_m);
+    if (result.minimum_distance_m < minimum_distance) {
+      minimum_distance = result.minimum_distance_m;
+      closest_pair = result.closest_pair;
+    }
+
+    const bool can_refine = result.input_valid && result.unsafe &&
+      !result.budget_exhausted &&
+      !result.physical_clearance_violated &&
+      !result.protected_joint_corridor_violated &&
+      refinement < refinement_limit;
+    if (!can_refine || substeps > std::numeric_limits<std::size_t>::max() / 2U) {
+      if (can_refine) {
+        result.failure_reason = "path refinement grid would overflow size_t";
+      }
+      result.distance_query_count = total_query_count;
+      result.evaluated_samples = total_evaluated_samples;
+      result.certified_path_block_count = total_certified_blocks;
+      result.inconclusive_path_block_count = total_inconclusive_blocks;
+      result.minimum_self_distance_m = minimum_self_distance;
+      result.minimum_world_distance_m = minimum_world_distance;
+      result.minimum_distance_m = minimum_distance;
+      result.closest_pair = std::move(closest_pair);
+      return result;
+    }
+    substeps *= 2U;
+  }
 }
 
 }  // namespace face_tracking_arm::control

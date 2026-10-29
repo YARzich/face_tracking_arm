@@ -63,7 +63,10 @@ struct JointCenteringGuidance
 /// Task-space velocity objectives, already expressed in a common command frame.
 ///
 /// The primary rows normally represent task-critical motion. Ordinary FACE tracking
-/// uses both screen-normal axes and upright roll as primary, with translation secondary;
+/// uses both screen-normal axes and upright roll as primary. Face-distance and
+/// posture preferences occupy explicit lower ranks; GOOD comfort rows are preferred
+/// hard rows for primary and lower ranks, with an unguarded primary fallback only when
+/// the preferred rows conflict with physical constraints or the guarded solve fails.
 /// compact PATH tracks the checked joint-space path as primary and enforces upright roll,
 /// pitch, and radius through hard velocity constraints. RETURN_FACE retains the roll-primary
 /// reacquisition task. Optional gaze and fixed-orientation tasks retain their own two-axis
@@ -77,6 +80,24 @@ struct HierarchicalVelocityTask
   Eigen::MatrixXd secondary_matrix;
   Eigen::VectorXd secondary_reference;
   Eigen::VectorXd secondary_weights;
+  /// Optional GOOD-mode rows preferred by primary and retained by lower ranks on
+  /// success. If this constrained primary fails, the solver retries against physical
+  /// constraints alone and returns primary-only; these rows never relax physical bounds.
+  std::vector<LinearVelocityConstraint> preferred_primary_constraints;
+  /// Hard interval constraints owned by the secondary level. They do not constrain
+  /// the primary solve; if incompatible with its achieved command, the solver keeps
+  /// the primary-only command instead of letting a secondary objective violate them.
+  std::vector<LinearVelocityConstraint> secondary_constraints;
+  /// Optional lower-priority preference, normally elbow-side and joint-margin
+  /// objectives. It is solved after secondary and preserved by distance.
+  Eigen::MatrixXd tertiary_matrix;
+  Eigen::VectorXd tertiary_reference;
+  Eigen::VectorXd tertiary_weights;
+  /// Optional final best-effort objective. Unreachable references remain a valid
+  /// least-squares request and must not become hard constraints.
+  Eigen::MatrixXd distance_matrix;
+  Eigen::VectorXd distance_reference;
+  Eigen::VectorXd distance_weights;
 };
 
 struct HierarchicalVelocityQpConfig
@@ -111,6 +132,8 @@ enum class QpSolveStage
   kPrimary,
   kSecondary,
   kBrake,
+  kTertiary,
+  kDistance,
 };
 
 enum class QpFailureSnapshotDisposition
@@ -121,12 +144,10 @@ enum class QpFailureSnapshotDisposition
 };
 
 inline constexpr std::size_t kQpFailureSnapshotMaximumJoints = 6U;
-// Worst controller assembly is bounded by 64 collision rows plus their one
-// protected-joint row, 64 compact-radius supports, at most 6 upright/pitch
-// rows, 2 face rows, 1 J1 handoff row, 6 joint rows and at most 6 primary
-// preservation rows (150 total). Round the snapshot cap to 160; this does not
-// change solver admission. Generic oversized tasks retain an explicit
-// shape-limit disposition.
+// The validated compact-path worst case is bounded by 64 radius supports plus
+// its upright/physical rows; FACE has at most 64 collision rows plus its
+// protected-joint row, tracking guards, and preservation rows for each rank.
+// Keep the established 160-row cap; it affects diagnostics only, never admission.
 inline constexpr std::size_t kQpFailureSnapshotMaximumRows = 160U;
 inline constexpr std::size_t kQpFailureSnapshotMaximumANonzeros =
   kQpFailureSnapshotMaximumRows * kQpFailureSnapshotMaximumJoints;
@@ -219,37 +240,68 @@ enum class QpStatus
   kMaxIterations,
   kTimeLimit,
   kSolverError,
+  /// A valid command is available, but a later optional objective stage failed.
+  kPartial,
 };
 
 struct QpResult
 {
   QpStatus status{QpStatus::kInvalidInput};
   QpStageStatus primary_status{QpStageStatus::kNotRun};
+  /// Status of the guarded primary attempt; kNotRun when no preferred rows exist.
+  QpStageStatus preferred_primary_status{QpStageStatus::kNotRun};
+  bool preferred_primary_fallback_used{false};
   QpStageStatus secondary_status{QpStageStatus::kNotRun};
+  QpStageStatus tertiary_status{QpStageStatus::kNotRun};
+  QpStageStatus distance_status{QpStageStatus::kNotRun};
+  /// True when the final distance command used a checked feasible segment approximation.
+  bool distance_feasible_approximation_used{false};
+  /// Selected segment fraction; meaningful only when the approximation flag is true.
+  double distance_feasible_approximation_alpha{0.0};
   Eigen::VectorXd joint_velocity;
   Eigen::VectorXd achieved_primary_velocity;
   int primary_iterations{0};
   int secondary_iterations{0};
+  int tertiary_iterations{0};
+  int distance_iterations{0};
+  /// Number of bounded post-solver recovery methods used by each stage.
+  int primary_retry_count{0};
+  int secondary_retry_count{0};
+  int tertiary_retry_count{0};
+  int distance_retry_count{0};
+  double primary_solve_time_sec{0.0};
+  double secondary_solve_time_sec{0.0};
+  double tertiary_solve_time_sec{0.0};
+  double distance_solve_time_sec{0.0};
+  std::optional<double> requested_distance_rate;
+  std::optional<double> achieved_distance_rate;
   std::optional<QpFailureSnapshot> primary_failure_snapshot;
   std::optional<QpFailureSnapshot> secondary_failure_snapshot;
+  std::optional<QpFailureSnapshot> tertiary_failure_snapshot;
+  std::optional<QpFailureSnapshot> distance_failure_snapshot;
   QpFailureSnapshotDisposition primary_snapshot_disposition{
     QpFailureSnapshotDisposition::kNotNeeded};
   QpFailureSnapshotDisposition secondary_snapshot_disposition{
+    QpFailureSnapshotDisposition::kNotNeeded};
+  QpFailureSnapshotDisposition tertiary_snapshot_disposition{
+    QpFailureSnapshotDisposition::kNotNeeded};
+  QpFailureSnapshotDisposition distance_snapshot_disposition{
     QpFailureSnapshotDisposition::kNotNeeded};
 
   /// True when joint_velocity is a checked command satisfying every hard constraint.
   [[nodiscard]] bool command_available() const noexcept;
 
-  /// True only when both lexicographic stages completed.
+  /// True only when every requested lexicographic stage completed.
   [[nodiscard]] bool fully_solved() const noexcept;
 };
 
-/// Two-stage lexicographic joint-velocity optimizer.
+/// Lexicographic optimizer with optional secondary, tertiary and final distance ranks.
 ///
-/// Stage one tracks the primary task under all safety limits. Stage two tracks the
-/// secondary task while constraining the primary task-space velocity to remain within
-/// primary_preservation_tolerance of stage one's result. OSQP workspaces are local to
-/// each call, so this object contains no hidden state and can be tested deterministically.
+/// Each solved objective rank is preserved by lower ranks within
+/// primary_preservation_tolerance. Secondary-level interval constraints apply after
+/// the primary rank. Failed later stages retain the last valid command. Distance is a
+/// soft final objective. OSQP workspaces are local to each call, so this object
+/// contains no hidden state and can be tested deterministically.
 /// Joint velocity and position bounds include jerk-limited braking invariants using
 /// the queue's discrete backward-Euler update. Residual latency is conservatively
 /// rounded up to whole controller ticks rather than integrated continuously.

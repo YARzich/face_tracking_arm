@@ -50,6 +50,133 @@ TEST(ServoTelemetry, CountsModeTransitionsSeparatelyFromTicks)
   EXPECT_EQ(telemetry.emergency_event_count, 1U);
 }
 
+TEST(ServoTelemetry, CountsAvailablePartialRankCommandWithoutCallingItSolverFailure)
+{
+  ServoTelemetry telemetry;
+  control::QpResult result;
+  result.status = control::QpStatus::kPartial;
+  result.joint_velocity = Eigen::VectorXd::Zero(1);
+
+  telemetry.recordQpResult(std::chrono::steady_clock::now(), result);
+
+  EXPECT_TRUE(result.command_available());
+  EXPECT_EQ(telemetry.solver_failure_count, 0U);
+  EXPECT_EQ(telemetry.primary_only_count, 0U);
+  EXPECT_EQ(telemetry.lower_rank_partial_count, 1U);
+}
+
+TEST(ServoTelemetry, CountsRecoveredQpRetriesWithoutCountingSolverFailure)
+{
+  ServoTelemetry telemetry;
+  control::QpResult recovered;
+  recovered.status = control::QpStatus::kSolved;
+  recovered.primary_status = control::QpStageStatus::kSolved;
+  recovered.primary_retry_count = 1;
+  recovered.joint_velocity = Eigen::VectorXd::Zero(1);
+
+  telemetry.recordQpResult(std::chrono::steady_clock::now(), recovered);
+  EXPECT_EQ(telemetry.qp_retry_count, 1U);
+  EXPECT_EQ(telemetry.solver_failure_count, 0U);
+
+  control::QpResult next_default_result;
+  next_default_result.status = control::QpStatus::kSolved;
+  next_default_result.primary_status = control::QpStageStatus::kSolved;
+  next_default_result.joint_velocity = Eigen::VectorXd::Zero(1);
+  telemetry.recordQpResult(std::chrono::steady_clock::now(), next_default_result);
+
+  EXPECT_EQ(telemetry.qp_retry_count, 1U);
+  EXPECT_EQ(telemetry.solver_failure_count, 0U);
+}
+
+TEST(ServoTelemetry, RecordsLastRankOutcomesAndDistanceRateOnlyForScalarTask)
+{
+  ServoTelemetry telemetry;
+  control::QpResult result;
+  result.status = control::QpStatus::kSolved;
+  result.primary_status = control::QpStageStatus::kSolved;
+  result.secondary_status = control::QpStageStatus::kNotRun;
+  result.tertiary_status = control::QpStageStatus::kSolvedInaccurate;
+  result.distance_status = control::QpStageStatus::kSolved;
+  result.primary_iterations = 12;
+  result.tertiary_iterations = 7;
+  result.distance_iterations = 4;
+  result.primary_solve_time_sec = 0.0004;
+  result.tertiary_solve_time_sec = 0.0003;
+  result.distance_solve_time_sec = 0.0002;
+  result.requested_distance_rate = -0.18;
+  result.achieved_distance_rate = -0.06;
+
+  telemetry.recordQpResult(std::chrono::steady_clock::now(), result);
+
+  EXPECT_EQ(telemetry.last_qp_rank_count, 3U);
+  EXPECT_EQ(telemetry.last_qp_primary_status, control::QpStageStatus::kSolved);
+  EXPECT_EQ(telemetry.last_qp_secondary_status, control::QpStageStatus::kNotRun);
+  EXPECT_EQ(telemetry.last_qp_tertiary_status, control::QpStageStatus::kSolvedInaccurate);
+  EXPECT_EQ(telemetry.last_qp_distance_status, control::QpStageStatus::kSolved);
+  EXPECT_EQ(telemetry.last_qp_primary_iterations, 12);
+  EXPECT_EQ(telemetry.last_qp_tertiary_iterations, 7);
+  EXPECT_EQ(telemetry.last_qp_distance_iterations, 4);
+  EXPECT_DOUBLE_EQ(telemetry.last_qp_primary_solve_time_sec, 0.0004);
+  EXPECT_DOUBLE_EQ(telemetry.last_qp_tertiary_solve_time_sec, 0.0003);
+  EXPECT_DOUBLE_EQ(telemetry.last_qp_distance_solve_time_sec, 0.0002);
+  ASSERT_TRUE(telemetry.last_requested_distance_rate.has_value());
+  ASSERT_TRUE(telemetry.last_achieved_distance_rate.has_value());
+  EXPECT_DOUBLE_EQ(*telemetry.last_requested_distance_rate, -0.18);
+  EXPECT_DOUBLE_EQ(*telemetry.last_achieved_distance_rate, -0.06);
+
+  // A future distance objective may include tangential rows. Keep the scalar
+  // rate diagnostic unavailable for that shape instead of reporting row 0 as
+  // the achieved radial rate.
+  result.requested_distance_rate.reset();
+  result.achieved_distance_rate.reset();
+  telemetry.recordQpResult(std::chrono::steady_clock::now(), result);
+  EXPECT_FALSE(telemetry.last_requested_distance_rate.has_value());
+  EXPECT_FALSE(telemetry.last_achieved_distance_rate.has_value());
+}
+
+TEST(ServoTelemetry, CountsGuardedPrimaryFallbackAndBothPrimaryAttempts)
+{
+  ServoTelemetry telemetry;
+  control::QpResult result;
+  result.status = control::QpStatus::kPrimaryOnly;
+  result.preferred_primary_status = control::QpStageStatus::kMaxIterations;
+  result.preferred_primary_fallback_used = true;
+  result.primary_status = control::QpStageStatus::kSolved;
+  result.primary_iterations = 237;
+  result.primary_solve_time_sec = 0.0008;
+
+  telemetry.recordQpResult(std::chrono::steady_clock::now(), result);
+  telemetry.recordQpResult(std::chrono::steady_clock::now(), result);
+
+  EXPECT_EQ(telemetry.preferred_primary_fallback_count, 2U);
+  EXPECT_TRUE(telemetry.last_qp_preferred_primary_fallback_used);
+  EXPECT_EQ(telemetry.last_qp_preferred_primary_status, control::QpStageStatus::kMaxIterations);
+  EXPECT_EQ(telemetry.last_qp_primary_iterations, 237);
+  EXPECT_DOUBLE_EQ(telemetry.last_qp_primary_solve_time_sec, 0.0008);
+  EXPECT_EQ(telemetry.last_qp_rank_count, 2U);
+}
+
+TEST(ServoTelemetry, CountsDistanceFeasibleApproximationWithoutHidingRawFailure)
+{
+  ServoTelemetry telemetry;
+  control::QpResult result;
+  result.status = control::QpStatus::kPartial;
+  result.distance_status = control::QpStageStatus::kMaxIterations;
+  result.distance_feasible_approximation_used = true;
+  result.distance_feasible_approximation_alpha = 0.131740381606;
+  result.joint_velocity = Eigen::VectorXd::Zero(1);
+
+  telemetry.recordQpResult(std::chrono::steady_clock::now(), result);
+  telemetry.recordQpResult(std::chrono::steady_clock::now(), result);
+
+  EXPECT_EQ(telemetry.last_qp_distance_status, control::QpStageStatus::kMaxIterations);
+  EXPECT_TRUE(telemetry.last_qp_distance_feasible_approximation_used);
+  EXPECT_DOUBLE_EQ(telemetry.last_qp_distance_feasible_approximation_alpha, 0.131740381606);
+  EXPECT_EQ(telemetry.distance_feasible_approximation_count, 2U);
+  EXPECT_EQ(telemetry.lower_rank_partial_count, 2U);
+  EXPECT_EQ(telemetry.solver_failure_count, 0U);
+}
+
 TEST(ServoTelemetry, RejectionDoesNotKeepDistancesFromPreviousAttempt)
 {
   ServoTelemetry telemetry;

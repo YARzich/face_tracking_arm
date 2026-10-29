@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -34,10 +35,12 @@ using collision_detail::collisionBodyLink;
 using collision_detail::isInvariantPair;
 using collision_detail::maximumRequiredClearance;
 using collision_detail::pairDistanceLipschitz;
+using collision_detail::pairInterSampleDistanceReserve;
 using collision_detail::pairInterSampleUncertainty;
 using collision_detail::readablePair;
 using collision_detail::relativeMotionVariables;
 using collision_detail::requiredClearance;
+using collision_detail::requiredClearanceWithDistanceReserve;
 using collision_detail::validateCollisionModel;
 using collision_detail::ReachableVelocityInterval;
 using collision_detail::ReachableApproachInterval;
@@ -372,10 +375,10 @@ CollisionConstraintResult CollisionConstraintBuilder::build(
     pair_diagnostic.distance_m = candidate.distance_m;
     pair_diagnostic.invariant_pair = isInvariantPair(candidate, config_);
     pair_diagnostic.distance_lipschitz_m_per_rad = pairDistanceLipschitz(candidate, config_);
-    const double next_segment_pair_uncertainty = pairInterSampleUncertainty(
-      candidate, state, joint_model_group, next_segment_joint_uncertainty);
-    pair_diagnostic.required_clearance_m = requiredClearance(
-      candidate, config_, next_segment_pair_uncertainty);
+    const double next_segment_pair_reserve_m = pairInterSampleDistanceReserve(
+      candidate, state, joint_model_group, next_segment_joint_uncertainty, config_);
+    pair_diagnostic.required_clearance_m = requiredClearanceWithDistanceReserve(
+      candidate, config_, next_segment_pair_reserve_m);
     pair_diagnostic.relative_motion_variables = relativeMotionVariables(
       candidate, state, joint_model_group);
 
@@ -452,7 +455,9 @@ CollisionConstraintResult CollisionConstraintBuilder::build(
       continue;
     }
 
-    if (!isFinite(gradient) || pair_diagnostic.gradient_norm < config_.minimum_gradient_norm) {
+    if (!isFinite(gradient) ||
+      pair_diagnostic.gradient_norm < config_.minimum_gradient_norm)
+    {
       ++diagnostics.uncontrollable_contacts;
       if (pair_diagnostic.robust_clearance_violated) {
         setFailure(
@@ -463,8 +468,9 @@ CollisionConstraintResult CollisionConstraintBuilder::build(
       diagnostics.pairs.push_back(std::move(pair_diagnostic));
       continue;
     }
-
-    if (config_.separation_buffer_m > 0.0) {
+    if (config_.separation_buffer_m > 0.0 &&
+      pair_diagnostic.gradient_norm >= config_.minimum_gradient_norm)
+    {
       const double approach_speed = std::max(0.0, -gradient.dot(motion_state.velocity));
       const double predicted_headroom = candidate.distance_m -
         pair_diagnostic.required_clearance_m - approach_speed * config_.separation_lookahead_sec;
@@ -490,17 +496,16 @@ CollisionConstraintResult CollisionConstraintBuilder::build(
       reachable_approach.minimum_mps;
     pair_diagnostic.maximum_reachable_approach_speed_mps =
       reachable_approach.maximum_mps;
+
     try {
       pair_diagnostic.jerk_aware_safe_approach_speed_mps =
         maximumSafeCollisionApproachSpeed(
         candidate.distance_m - pair_diagnostic.required_clearance_m, gradient, motion_state,
         motion_limits, period_sec, config_.residual_latency_sec);
-      const double minimum_required_distance =
-        requiredCollisionDistanceForApproachCap(
+      const double minimum_required_distance = requiredCollisionDistanceForApproachCap(
         reachable_approach.minimum_mps, gradient, motion_state, motion_limits,
         reachable_velocity, reachable_approach, period_sec, config_.residual_latency_sec);
-      pair_diagnostic.outside_viability =
-        minimum_required_distance >
+      pair_diagnostic.outside_viability = minimum_required_distance >
         candidate.distance_m - pair_diagnostic.required_clearance_m + kComparisonTolerance;
     } catch (const std::invalid_argument & exception) {
       setFailure(
@@ -516,25 +521,24 @@ CollisionConstraintResult CollisionConstraintBuilder::build(
       ++diagnostics.outside_viability_contacts;
     }
 
-    if (pair_diagnostic.applied_approach_speed_cap_mps + kComparisonTolerance >=
+    if (pair_diagnostic.applied_approach_speed_cap_mps + kComparisonTolerance <
       reachable_approach.maximum_mps)
     {
-      diagnostics.pairs.push_back(std::move(pair_diagnostic));
-      continue;
+      if (result.constraints.size() >= config_.maximum_constraint_rows) {
+        ++diagnostics.truncated_constraints;
+        setFailure(
+          diagnostics,
+          "collision row budget exhausted before all query-distance contacts were constrained");
+        diagnostics.pairs.push_back(std::move(pair_diagnostic));
+        continue;
+      }
+      LinearVelocityConstraint constraint;
+      constraint.coefficients = gradient;
+      constraint.lower_bound = -pair_diagnostic.applied_approach_speed_cap_mps;
+      result.constraints.push_back(std::move(constraint));
+      ++diagnostics.active_distance_constraints;
+      pair_diagnostic.constraint_added = true;
     }
-
-    if (result.constraints.size() >= config_.maximum_constraint_rows) {
-      ++diagnostics.truncated_constraints;
-      diagnostics.pairs.push_back(std::move(pair_diagnostic));
-      continue;
-    }
-
-    LinearVelocityConstraint constraint;
-    constraint.coefficients = gradient;
-    constraint.lower_bound = -pair_diagnostic.applied_approach_speed_cap_mps;
-    result.constraints.push_back(std::move(constraint));
-    pair_diagnostic.constraint_added = true;
-    ++diagnostics.active_distance_constraints;
     diagnostics.pairs.push_back(std::move(pair_diagnostic));
   }
 

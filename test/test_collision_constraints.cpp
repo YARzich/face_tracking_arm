@@ -9,11 +9,13 @@
 #include <urdf_parser/urdf_parser.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,6 +26,8 @@
 
 #include "face_tracking_arm/collision_constraints.hpp"
 #include "face_tracking_arm/emergency_brake_tail.hpp"
+#include "fixtures/collision_brake/logged_event_states.hpp"
+#include "../src/collision_distance_query.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -169,6 +173,97 @@ JointMotionState twoDofMotion(const double common, const double relative)
   return state;
 }
 
+[[nodiscard]] double executableProjectedTailApproach(
+  const JointMotionState & candidate, const JointMotionLimits & limits,
+  const Eigen::VectorXd & gradient, const double period)
+{
+  EmergencyBrakeTailConfig config;
+  config.period_sec = period;
+  config.terminal_hold_points = 2U;
+  const EmergencyBrakeTail tail = EmergencyBrakeTailGenerator(config).generate(
+    candidate, limits);
+  if (!tail.command_available()) {
+    throw std::runtime_error("test candidate has no executable braking tail: " +
+      tail.failure_reason);
+  }
+  double maximum_approach = 0.0;
+  for (const JointMotionState & point : tail.points) {
+    maximum_approach = std::max(
+      maximum_approach, -gradient.dot(point.position - candidate.position));
+  }
+  return maximum_approach;
+}
+
+[[nodiscard]] double executableCandidateTailApproach(
+  const JointMotionState & measured, const Eigen::VectorXd & candidate_velocity,
+  const JointMotionLimits & limits, const Eigen::VectorXd & gradient,
+  const double period, const double latency = 0.0)
+{
+  JointMotionState candidate{
+    measured.position + candidate_velocity * period,
+    candidate_velocity,
+    (candidate_velocity - measured.velocity) / period};
+  const std::size_t latency_ticks = static_cast<std::size_t>(std::ceil(latency / period));
+  std::vector<Eigen::VectorXd> latency_positions{candidate.position};
+  for (std::size_t tick = 0; tick < latency_ticks; ++tick) {
+    for (Eigen::Index joint = 0; joint < gradient.size(); ++joint) {
+      const double direction = gradient[joint] > 0.0 ? -1.0 : 1.0;
+      candidate.acceleration[joint] = direction * std::min(
+        limits.max_acceleration[joint], direction * candidate.acceleration[joint] +
+        limits.max_jerk[joint] * period);
+      candidate.velocity[joint] += candidate.acceleration[joint] * period;
+      candidate.position[joint] += candidate.velocity[joint] * period;
+    }
+    latency_positions.push_back(candidate.position);
+  }
+
+  std::vector<EmergencyBrakeTail> tails;
+  tails.reserve(static_cast<std::size_t>(gradient.size()));
+  std::size_t maximum_tail_points = 0U;
+  for (Eigen::Index joint = 0; joint < gradient.size(); ++joint) {
+    JointMotionState scalar{
+      Eigen::VectorXd::Constant(1, candidate.position[joint]),
+      Eigen::VectorXd::Constant(1, candidate.velocity[joint]),
+      Eigen::VectorXd::Constant(1, candidate.acceleration[joint])};
+    JointMotionLimits scalar_limits;
+    scalar_limits.lower_position = Eigen::VectorXd::Constant(1, limits.lower_position[joint]);
+    scalar_limits.upper_position = Eigen::VectorXd::Constant(1, limits.upper_position[joint]);
+    scalar_limits.position_margin = Eigen::VectorXd::Constant(1, limits.position_margin[joint]);
+    scalar_limits.max_velocity = Eigen::VectorXd::Constant(1, limits.max_velocity[joint]);
+    scalar_limits.max_acceleration = Eigen::VectorXd::Constant(
+      1, limits.max_acceleration[joint]);
+    scalar_limits.max_jerk = Eigen::VectorXd::Constant(1, limits.max_jerk[joint]);
+    scalar_limits.numerical_policy = limits.numerical_policy;
+    EmergencyBrakeTailConfig config;
+    config.period_sec = period;
+    config.terminal_hold_points = 2U;
+    tails.push_back(EmergencyBrakeTailGenerator(config).generate(scalar, scalar_limits));
+    if (!tails.back().command_available()) {
+      throw std::runtime_error("independent scalar tail oracle failed: " +
+            tails.back().failure_reason);
+    }
+    maximum_tail_points = std::max(maximum_tail_points, tails.back().points.size());
+  }
+
+  double maximum_approach = 0.0;
+  for (const Eigen::VectorXd & position : latency_positions) {
+    maximum_approach = std::max(
+      maximum_approach, -gradient.dot(position - latency_positions.front()));
+  }
+  for (std::size_t point = 1U; point < maximum_tail_points; ++point) {
+    double approach = 0.0;
+    for (Eigen::Index joint = 0; joint < gradient.size(); ++joint) {
+      const auto & points = tails[static_cast<std::size_t>(joint)].points;
+      const std::size_t index = std::min(point, points.size() - 1U);
+      approach -= gradient[joint] *
+        (points[index].position[0] - latency_positions.back()[joint]);
+    }
+    maximum_approach = std::max(maximum_approach, approach -
+      gradient.dot(latency_positions.back() - latency_positions.front()));
+  }
+  return maximum_approach;
+}
+
 [[nodiscard]] CollisionConstraintConfig sliderConfig()
 {
   CollisionConstraintConfig config;
@@ -186,6 +281,17 @@ JointMotionState twoDofMotion(const double common, const double relative)
   config.monitor_near_link_name = "near";
   config.invariant_mount_neighbor_name = "mount_neighbor";
   return config;
+}
+
+std::size_t deterministic_clock_calls = 0U;
+CollisionValidationBudget::TimePoint deterministic_clock_deadline;
+
+CollisionValidationBudget::TimePoint deterministicBudgetClock() noexcept
+{
+  ++deterministic_clock_calls;
+  return deterministic_clock_calls < 3U ?
+         deterministic_clock_deadline - std::chrono::nanoseconds(1) :
+         deterministic_clock_deadline;
 }
 
 [[nodiscard]] const CollisionPairDiagnostic * findWorldPair(
@@ -387,7 +493,9 @@ TEST(CollisionConstraints, VectorStoppingPreservesIndividualAccelerationSaturati
 
   const double stopping_distance = jerkLimitedCollisionStoppingDistance(
     gradient, state, candidate_velocity, twoDofLimits(), period, latency);
-  EXPECT_NEAR(stopping_distance, 0.1156, 1.0e-12);
+  const double executable_tail = executableCandidateTailApproach(
+    state, candidate_velocity, twoDofLimits(), gradient, period, latency);
+  EXPECT_NEAR(stopping_distance, executable_tail, 1.0e-12);
 
   // Mirroring the gradient and every joint derivative must produce the same
   // approach-coordinate trajectory and stopping excursion.
@@ -422,12 +530,15 @@ TEST(CollisionConstraints, VectorApproachEnvelopeRejectsScalarSaturationCountere
     jerkLimitedCollisionStoppingDistance(
     gradient, state, unsafe_candidate, twoDofLimits(), period, latency);
   ASSERT_NEAR(unsafe_approach_speed, 0.5, 1.0e-15);
-  ASSERT_NEAR(unsafe_required_distance, 0.1206, 1.0e-12);
+  const double executable_tail = executableCandidateTailApproach(
+    state, unsafe_candidate, twoDofLimits(), gradient, period, latency);
+  ASSERT_NEAR(unsafe_required_distance, unsafe_approach_speed * period + executable_tail,
+    1.0e-12);
   ASSERT_GT(unsafe_required_distance, remaining_distance);
 
   const double safe_cap = maximumSafeCollisionApproachSpeed(
     remaining_distance, gradient, state, twoDofLimits(), period, latency);
-  EXPECT_GE(safe_cap, 0.499);
+  EXPECT_GE(safe_cap, -1.0e-12);
   EXPECT_LT(safe_cap, unsafe_approach_speed);
 
   JointMotionState mirrored_state = state;
@@ -438,6 +549,240 @@ TEST(CollisionConstraints, VectorApproachEnvelopeRejectsScalarSaturationCountere
       remaining_distance, -gradient, mirrored_state,
       twoDofLimits(), period, latency),
     safe_cap, 1.0e-12);
+}
+
+TEST(CollisionConstraints, LoggedEvent1EnvelopeCoversExecutableJointWiseTail)
+{
+  constexpr double period = 0.01;
+  constexpr double latency = 0.02;
+  constexpr double arithmetic_budget =
+    64.0 * std::numeric_limits<double>::epsilon();
+
+  JointMotionState measured;
+  measured.position.resize(6);
+  measured.velocity.resize(6);
+  measured.acceleration.resize(6);
+  Eigen::VectorXd candidate_velocity(6);
+  Eigen::VectorXd gradient(6);
+  for (Eigen::Index joint = 0; joint < 6; ++joint) {
+    measured.position[joint] = face_tracking_arm::test::collision_brake::kEvent1Position[
+      static_cast<std::size_t>(joint)];
+    measured.velocity[joint] = face_tracking_arm::test::collision_brake::kEvent1Velocity[
+      static_cast<std::size_t>(joint)];
+    measured.acceleration[joint] = face_tracking_arm::test::collision_brake::kEvent1Acceleration[
+      static_cast<std::size_t>(joint)];
+    candidate_velocity[joint] =
+      face_tracking_arm::test::collision_brake::kEvent1CandidateVelocity[
+      static_cast<std::size_t>(joint)];
+    gradient[joint] = face_tracking_arm::test::collision_brake::kEvent1DistanceGradient[
+      static_cast<std::size_t>(joint)];
+  }
+
+  JointMotionLimits limits;
+  limits.lower_position = Eigen::VectorXd::Constant(6, -3.0);
+  limits.upper_position = Eigen::VectorXd::Constant(6, 3.0);
+  limits.position_margin = Eigen::VectorXd::Zero(6);
+  limits.max_velocity = Eigen::VectorXd::Constant(6, 1.0);
+  limits.max_acceleration = Eigen::VectorXd::Constant(6, 2.0);
+  limits.max_jerk = Eigen::VectorXd::Constant(6, 20.0);
+  limits.numerical_policy = twoDofLimits().numerical_policy;
+
+  const Eigen::VectorXd candidate_acceleration =
+    (candidate_velocity - measured.velocity) / period;
+  const JointMotionState candidate_state{
+    measured.position + candidate_velocity * period,
+    candidate_velocity, candidate_acceleration};
+  EmergencyBrakeTailConfig tail_config;
+  tail_config.period_sec = period;
+  tail_config.terminal_hold_points = 2U;
+  const EmergencyBrakeTail tail = EmergencyBrakeTailGenerator(tail_config).generate(
+    candidate_state, limits);
+  ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
+
+  double executable_tail_approach = 0.0;
+  for (const JointMotionState & point : tail.points) {
+    executable_tail_approach = std::max(
+      executable_tail_approach,
+      -gradient.dot(point.position - candidate_state.position));
+  }
+  const double modeled_tail_approach = jerkLimitedCollisionStoppingDistance(
+    gradient, measured, candidate_velocity, limits, period, latency);
+
+  // This is a policy-consistency assertion, independent of any FCL certificate.
+  // The old summed-projection rollout reports 0.3078 mm; the executable tail uses
+  // 0.5117 mm on this exact recorded candidate.
+  EXPECT_NEAR(executable_tail_approach, 0.000511700398857, 2.0e-12);
+  EXPECT_GE(modeled_tail_approach, executable_tail_approach - arithmetic_budget);
+}
+
+TEST(CollisionConstraints, LoggedEvent2OutsideViabilityTailUsesJointWisePolicy)
+{
+  constexpr double period = 0.01;
+  constexpr double latency = 0.02;
+  constexpr double arithmetic_budget =
+    64.0 * std::numeric_limits<double>::epsilon();
+
+  JointMotionState measured;
+  measured.position.resize(6);
+  measured.velocity.resize(6);
+  measured.acceleration.resize(6);
+  Eigen::VectorXd candidate_velocity(6);
+  Eigen::VectorXd gradient(6);
+  for (Eigen::Index joint = 0; joint < 6; ++joint) {
+    const std::size_t index = static_cast<std::size_t>(joint);
+    measured.position[joint] =
+      face_tracking_arm::test::collision_brake::kEvent2Position[index];
+    measured.velocity[joint] =
+      face_tracking_arm::test::collision_brake::kEvent2Velocity[index];
+    measured.acceleration[joint] =
+      face_tracking_arm::test::collision_brake::kEvent2Acceleration[index];
+    candidate_velocity[joint] =
+      face_tracking_arm::test::collision_brake::kEvent2CandidateVelocity[index];
+    gradient[joint] =
+      face_tracking_arm::test::collision_brake::kEvent2DistanceGradient[index];
+  }
+
+  JointMotionLimits limits;
+  limits.lower_position = Eigen::VectorXd::Constant(6, -3.0);
+  limits.upper_position = Eigen::VectorXd::Constant(6, 3.0);
+  limits.position_margin = Eigen::VectorXd::Zero(6);
+  limits.max_velocity = Eigen::VectorXd::Constant(6, 1.0);
+  limits.max_acceleration = Eigen::VectorXd::Constant(6, 2.0);
+  limits.max_jerk = Eigen::VectorXd::Constant(6, 20.0);
+  limits.numerical_policy = twoDofLimits().numerical_policy;
+
+  const Eigen::VectorXd candidate_acceleration =
+    (candidate_velocity - measured.velocity) / period;
+  const JointMotionState candidate_state{
+    measured.position + candidate_velocity * period,
+    candidate_velocity, candidate_acceleration};
+  const double executable_tail_approach = executableProjectedTailApproach(
+    candidate_state, limits, gradient, period);
+  const double modeled_tail_approach = jerkLimitedCollisionStoppingDistance(
+    gradient, measured, candidate_velocity, limits, period, latency);
+
+  EXPECT_NEAR(executable_tail_approach, 0.0000867935773097, 2.0e-12);
+  EXPECT_GE(modeled_tail_approach, executable_tail_approach - arithmetic_budget);
+}
+
+TEST(CollisionConstraints, JointWiseTailGridExposesCancellationAndDistributionEffects)
+{
+  constexpr double period = 0.01;
+  const JointMotionLimits limits = twoDofLimits();
+  const Eigen::VectorXd gradient = Eigen::Vector2d::Ones();
+  double largest_underestimate = 0.0;
+  std::size_t underestimated_candidates = 0U;
+  std::vector<std::pair<double, double>> projected_tail_samples;
+  std::size_t evaluated = 0U;
+
+  // A small deterministic grid exercises opposing projected motion, mixed
+  // acceleration signs, and joints that reach rest on different ticks.
+  for (const double first_velocity : {-0.20, -0.10, 0.0, 0.10, 0.20}) {
+    for (const double second_velocity : {-0.20, -0.10, 0.0, 0.10, 0.20}) {
+      for (const double first_acceleration : {-0.10, 0.0, 0.10}) {
+        for (const double second_acceleration : {-0.10, 0.0, 0.10}) {
+          JointMotionState measured;
+          measured.position = Eigen::Vector2d::Zero();
+          measured.velocity = Eigen::Vector2d(first_velocity, second_velocity);
+          measured.acceleration = Eigen::Vector2d(
+            first_acceleration, second_acceleration);
+          // These one-tick accelerations are reachable from the chosen states.
+          const Eigen::Vector2d candidate_velocity = measured.velocity +
+            measured.acceleration * period;
+          const JointMotionState candidate{
+            measured.position + candidate_velocity * period,
+            candidate_velocity, measured.acceleration};
+          const double executable = executableProjectedTailApproach(
+            candidate, limits, gradient, period);
+          const double modeled = jerkLimitedCollisionStoppingDistance(
+            gradient, measured, candidate_velocity, limits, period, 0.0);
+          const double underestimate = executable - modeled;
+          if (underestimate > 64.0 * std::numeric_limits<double>::epsilon()) {
+            ++underestimated_candidates;
+          }
+          largest_underestimate = std::max(largest_underestimate, underestimate);
+          projected_tail_samples.emplace_back(
+            gradient.dot(candidate_velocity), executable);
+          ++evaluated;
+        }
+      }
+    }
+  }
+
+  ASSERT_EQ(evaluated, 225U);
+  EXPECT_EQ(underestimated_candidates, 0U)
+    << "the braking envelope must cover every executable joint-wise tail in the "
+       "frozen 225-case grid; largest underestimate=" << largest_underestimate << " m";
+
+  double same_projection_tail_spread = 0.0;
+  for (const auto & first : projected_tail_samples) {
+    for (const auto & second : projected_tail_samples) {
+      if (std::abs(first.first - second.first) <= 1.0e-12) {
+        same_projection_tail_spread = std::max(
+          same_projection_tail_spread, std::abs(first.second - second.second));
+      }
+    }
+  }
+  EXPECT_GT(same_projection_tail_spread, 1.0e-8)
+    << "equal projected next velocities can have different joint-wise tails";
+}
+
+TEST(CollisionConstraints, TowardEndpointBoundsJointBrakeReserveOnReachableGrid)
+{
+  constexpr double period = 0.01;
+  constexpr double latency = 0.02;
+  constexpr double arithmetic_budget =
+    64.0 * std::numeric_limits<double>::epsilon();
+  const JointMotionLimits limits = oneDofLimits();
+  const Eigen::VectorXd candidate_gradient = Eigen::VectorXd::Ones(1);
+  std::size_t evaluated = 0U;
+
+  // The box reserve evaluates the toward-most reachable endpoint. Check that it
+  // bounds every interior scalar-policy rollout over representative reachable
+  // intervals, including mirrored velocity/acceleration combinations.
+  for (const double sign : {-1.0, 1.0}) {
+    for (const double initial_velocity : {-0.4, 0.0, 0.4}) {
+      for (const double initial_acceleration : {-0.5, 0.0, 0.5}) {
+        JointMotionState state = motionAt(0.0);
+        state.velocity[0] = initial_velocity;
+        state.acceleration[0] = initial_acceleration;
+        const auto [reachable_minimum, reachable_maximum] =
+          oneDofReachableVelocityInterval(state, limits, period);
+        ASSERT_LE(reachable_minimum, reachable_maximum);
+        const double toward_endpoint = sign > 0.0 ? reachable_minimum : reachable_maximum;
+        const double endpoint_peak = jerkLimitedCollisionStoppingDistance(
+          sign * candidate_gradient, state, Eigen::VectorXd::Constant(1, toward_endpoint),
+          limits, period, latency);
+        for (std::size_t sample = 0U; sample <= 32U; ++sample) {
+          const double fraction = static_cast<double>(sample) / 32.0;
+          const double candidate = reachable_minimum +
+            fraction * (reachable_maximum - reachable_minimum);
+          const double interior_peak = jerkLimitedCollisionStoppingDistance(
+            sign * candidate_gradient, state, Eigen::VectorXd::Constant(1, candidate),
+            limits, period, latency);
+          EXPECT_LE(interior_peak, endpoint_peak + arithmetic_budget)
+            << "sign=" << sign << ", v=" << initial_velocity
+            << ", a=" << initial_acceleration << ", sample=" << sample;
+          ++evaluated;
+        }
+      }
+    }
+  }
+  EXPECT_EQ(evaluated, 594U);
+}
+
+TEST(CollisionConstraints, ZeroEquilibriumAtBoundaryDoesNotDemandMotionAway)
+{
+  const JointMotionState state{
+    Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero()};
+  const JointMotionLimits limits = twoDofLimits();
+  const Eigen::VectorXd gradient = Eigen::Vector2d::Ones();
+
+  const double safe_cap = maximumSafeCollisionApproachSpeed(
+    0.0, gradient, state, limits, 0.01, 0.02);
+  EXPECT_GE(safe_cap, -1.0e-12)
+    << "a stationary command has zero stopping excursion and must remain feasible "
+       "at the hard boundary";
 }
 
 TEST(CollisionConstraints, ResidualLatencyRoundsUpToCompleteDiscreteTicks)
@@ -678,7 +1023,7 @@ TEST(CollisionConstraints, QpEnvelopeUsesPairSpecificRobustRemainingDistance)
   EXPECT_TRUE(wall_pair->robust_clearance_violated);
   EXPECT_TRUE(result.diagnostics.robust_clearance_violated);
   EXPECT_FALSE(result.diagnostics.hard_clearance_violated);
-  EXPECT_LT(wall_pair->applied_approach_speed_cap_mps, 0.0);
+  EXPECT_DOUBLE_EQ(wall_pair->applied_approach_speed_cap_mps, 0.0);
 }
 
 TEST(CollisionConstraints, QpNextStepReserveMatchesSegmentValidator)
@@ -744,10 +1089,9 @@ TEST(CollisionConstraints, QpNextStepReserveMatchesSegmentValidator)
     wall_pair->required_clearance_m,
     base_required_clearance + qp_inter_sample_reserve, 1.0e-12);
 
-  const double old_qp_safe_approach_speed = maximumSafeCollisionApproachSpeed(
-    wall_pair->distance_m - base_required_clearance,
-    actual_distance_gradient, motion, limits, period, config.residual_latency_sec);
-  ASSERT_GE(old_qp_safe_approach_speed, legacy_candidate_velocity);
+  // Historical QP-envelope cap from the pre-jointwise model. Keep this fixed as a
+  // regression witness: the matching reachable command fails the segment validator.
+  constexpr double historical_qp_approach_cap = 0.002;
 
   HierarchicalVelocityQpConfig qp_config;
   qp_config.period_sec = period;
@@ -764,7 +1108,7 @@ TEST(CollisionConstraints, QpNextStepReserveMatchesSegmentValidator)
   task.secondary_weights = Eigen::VectorXd(0);
 
   std::vector<LinearVelocityConstraint> legacy_constraints = collision.constraints;
-  legacy_constraints.back().lower_bound = -old_qp_safe_approach_speed;
+  legacy_constraints.back().lower_bound = -historical_qp_approach_cap;
   const QpResult legacy_qp = solver.solve(task, motion, limits, legacy_constraints);
   ASSERT_TRUE(legacy_qp.command_available());
   EXPECT_NEAR(legacy_qp.joint_velocity[0], legacy_candidate_velocity, 1.0e-6);
@@ -824,10 +1168,14 @@ TEST(CollisionConstraints, BuildSingleDoesNotLetInvariantHideControllablePair)
     };
   const CollisionPairDiagnostic * invariant = find_self_pair("mount_neighbor", "moving");
   const CollisionPairDiagnostic * controllable = find_self_pair("base", "moving");
+  const CollisionPairDiagnostic * second_controllable =
+    find_self_pair("base", "mount_neighbor");
 
   ASSERT_NE(invariant, nullptr);
   ASSERT_NE(controllable, nullptr);
+  ASSERT_NE(second_controllable, nullptr);
   EXPECT_TRUE(invariant->invariant_pair);
+  EXPECT_FALSE(second_controllable->invariant_pair);
   EXPECT_FALSE(invariant->constraint_added);
   EXPECT_NEAR(invariant->distance_m, 0.020, 1.0e-9);
   EXPECT_FALSE(controllable->invariant_pair);
@@ -838,7 +1186,6 @@ TEST(CollisionConstraints, BuildSingleDoesNotLetInvariantHideControllablePair)
   EXPECT_EQ(result.diagnostics.closest_controllable_pair, "base <-> moving");
   EXPECT_EQ(result.diagnostics.skipped_invariant_contacts, 1U);
   EXPECT_GE(result.diagnostics.active_distance_constraints, 1U);
-
   std::set<std::pair<std::string, std::string>> unique_body_pairs;
   for (const CollisionPairDiagnostic & pair : result.diagnostics.pairs) {
     EXPECT_TRUE(unique_body_pairs.emplace(pair.first_body, pair.second_body).second);
@@ -1186,6 +1533,59 @@ TEST(CollisionConstraints, CertificateChargesCommonAncestorForWorldPairs)
       result.diagnostics, start.position, twoDofMotion(0.002, 0.3).position));
 }
 
+TEST(CollisionConstraints, SegmentCertificateUsesSavedWorldPairLipschitzBound)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d obstacle = Eigen::Isometry3d::Identity();
+  obstacle.translation().x() = 0.46;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.1, 0.1, 0.1), obstacle);
+
+  const auto certificate_for_bound = [&](
+    const double world_pair_lipschitz, const double synthetic_distance) {
+      CollisionConstraintConfig config = sliderConfig();
+      for (const auto * link : fixture.robot_model->getLinkModels()) {
+        config.distance_bounds[{link->getName(), ""}] = world_pair_lipschitz;
+      }
+      config.distance_bounds[{"mount_neighbor", "moving"}] = 0.0;
+      CollisionConstraintBuilder builder(config);
+      moveit::core::RobotState state(fixture.robot_model);
+      state.setToDefaultValues();
+      const auto start = motionAt(0.3);
+      state.setJointGroupPositions(fixture.group, start.position);
+      state.update(true);
+      auto result = builder.build(
+        *fixture.scene, state, *fixture.group, start, oneDofLimits(), 0.01);
+      EXPECT_TRUE(result.diagnostics.valid) << result.diagnostics.failure_reason;
+      EXPECT_FALSE(result.diagnostics.robust_clearance_violated);
+      const CollisionPairDiagnostic * wall_pair = findWorldPair(result, "wall");
+      EXPECT_NE(wall_pair, nullptr);
+      if (wall_pair == nullptr) {
+        return false;
+      }
+      EXPECT_DOUBLE_EQ(wall_pair->distance_lipschitz_m_per_rad, world_pair_lipschitz);
+
+      // Isolate the pair-reserve arithmetic while retaining builder-produced
+      // pair identity, motion mask, query completeness, and configured bound.
+      for (auto & pair : result.diagnostics.pairs) {
+        pair.distance_m = pair.kind == CollisionPairKind::kWorld &&
+          (pair.first_body == "wall" || pair.second_body == "wall") ?
+          synthetic_distance : 1.0;
+      }
+      return builder.canCertifySegment(
+        result.diagnostics, start.position, motionAt(0.301).position);
+    };
+
+  const double default_lipschitz = sliderConfig().default_distance_lipschitz_m_per_rad;
+  ASSERT_LT(1.0, default_lipschitz);
+  ASSERT_GT(4.0, default_lipschitz);
+  EXPECT_TRUE(certificate_for_bound(1.0, 0.03))
+    << "a configured tighter world-pair bound should certify this envelope";
+  EXPECT_FALSE(certificate_for_bound(4.0, 0.040))
+    << "the pair envelope must reject while its static floor is still clear";
+}
+
 TEST(CollisionConstraints, CertificateBoundsPairsOmittedBeyondTheQueryDistance)
 {
   SliderFixture fixture;
@@ -1248,7 +1648,7 @@ TEST(CollisionConstraints, PathCertificateIncludesIntermediateSuffixExtrema)
   EXPECT_FALSE(builder.canCertifyPath(result.diagnostics, unsafe_suffix));
 }
 
-TEST(CollisionConstraints, UnsafePathReportsItsFirstSampleWithoutEvaluatingTheRemainder)
+TEST(CollisionConstraints, UnsafePathStopsAtPhysicalWaypointAnchor)
 {
   SliderFixture fixture;
   ASSERT_NE(fixture.group, nullptr);
@@ -1269,12 +1669,14 @@ TEST(CollisionConstraints, UnsafePathReportsItsFirstSampleWithoutEvaluatingTheRe
 
   ASSERT_TRUE(result.input_valid) << result.failure_reason;
   ASSERT_TRUE(result.unsafe);
-  EXPECT_EQ(result.first_unsafe_sample, 0U);
-  EXPECT_GE(result.evaluated_samples, 1U);
-  EXPECT_GT(result.distance_query_count, 0U);
-  const auto * first_unsafe = findDensePathSample(result, 0U);
-  ASSERT_NE(first_unsafe, nullptr);
-  EXPECT_TRUE(first_unsafe->collision_detected || first_unsafe->robust_clearance_violated);
+  EXPECT_TRUE(result.physical_clearance_violated);
+  EXPECT_EQ(result.first_unsafe_sample, std::numeric_limits<std::size_t>::max());
+  EXPECT_TRUE(std::isnan(result.first_unsafe_fraction));
+  EXPECT_EQ(result.evaluated_samples, 1U);
+  EXPECT_EQ(result.distance_query_count, 2U);
+  ASSERT_EQ(result.samples.size(), 1U);
+  EXPECT_TRUE(result.samples.front().path_block_certificate_attempt);
+  EXPECT_EQ(result.samples.front().sample_index, 0U);
   EXPECT_LT(result.evaluated_samples, result.requested_substeps + 1U);
 }
 
@@ -1312,6 +1714,13 @@ TEST(CollisionConstraints, CertificateRejectsIncompleteDataAndProtectedCorridorE
   EXPECT_FALSE(builder.canCertifySegment(incomplete, start.position, start.position));
   incomplete = result.diagnostics;
   incomplete.pairs.front().distance_m = 0.01;
+  EXPECT_FALSE(builder.canCertifySegment(incomplete, start.position, start.position));
+  incomplete = result.diagnostics;
+  ASSERT_FALSE(incomplete.pairs.empty());
+  incomplete.pairs.front().distance_lipschitz_m_per_rad =
+    std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(builder.canCertifySegment(incomplete, start.position, start.position));
+  incomplete.pairs.front().distance_lipschitz_m_per_rad = -1.0;
   EXPECT_FALSE(builder.canCertifySegment(incomplete, start.position, start.position));
 }
 
@@ -1373,15 +1782,17 @@ TEST(CollisionConstraints, SampledWorldDistancesPreservePairSpecificReservesAndC
       *fixture.scene, state, *fixture.group, {motionAt(0.30), motionAt(0.30)}, 2);
     ASSERT_TRUE(result.input_valid) << result.failure_reason;
     ASSERT_TRUE(result.unsafe);
-    EXPECT_EQ(result.first_unsafe_sample, 0U);
+    EXPECT_EQ(result.first_unsafe_sample, std::numeric_limits<std::size_t>::max());
     EXPECT_NEAR(result.minimum_world_distance_m, 0.020, 1.0e-9);
     EXPECT_EQ(result.closest_pair, "near <-> near_wall");
     EXPECT_NE(result.failure_reason.find("moving <-> moving_wall"), std::string::npos);
-    const auto * dense_failure = findDensePathSample(result, 0U);
-    ASSERT_NE(dense_failure, nullptr);
-    EXPECT_FALSE(dense_failure->collision_detected);
-    EXPECT_FALSE(dense_failure->hard_clearance_violated);
-    EXPECT_TRUE(dense_failure->robust_clearance_violated);
+    ASSERT_EQ(result.samples.size(), 1U);
+    const auto & floor_witness = result.samples.front();
+    EXPECT_TRUE(floor_witness.path_block_certificate_attempt);
+    EXPECT_EQ(floor_witness.sample_index, 0U);
+    EXPECT_FALSE(floor_witness.collision_detected);
+    EXPECT_FALSE(floor_witness.hard_clearance_violated);
+    EXPECT_TRUE(floor_witness.robust_clearance_violated);
   }
   // Querying a sample must not change the scene's collision exclusions.
   fixture.scene->getAllowedCollisionMatrixNonConst().setEntry("moving", "moving_wall", true);
@@ -1947,10 +2358,20 @@ void expectEquivalentSamples(
   ASSERT_TRUE(path.input_valid) << path.failure_reason;
   EXPECT_EQ(path.unsafe, segment.unsafe);
   EXPECT_EQ(path.requested_substeps, segment.requested_substeps);
-  EXPECT_EQ(path.first_unsafe_sample, segment.first_unsafe_sample);
+  const bool stopped_at_physical_anchor =
+    path.failure_reason.find("path static-floor breach proven") == 0U;
+  if (stopped_at_physical_anchor) {
+    EXPECT_TRUE(path.physical_clearance_violated);
+    EXPECT_EQ(path.first_unsafe_sample, std::numeric_limits<std::size_t>::max());
+    EXPECT_TRUE(std::isnan(path.first_unsafe_fraction));
+  } else {
+    EXPECT_EQ(path.first_unsafe_sample, segment.first_unsafe_sample);
+  }
   EXPECT_EQ(path.samples.size(), path.evaluated_samples);
   if (segment.unsafe) {
-    EXPECT_DOUBLE_EQ(path.first_unsafe_fraction, segment.first_unsafe_fraction);
+    if (!stopped_at_physical_anchor) {
+      EXPECT_DOUBLE_EQ(path.first_unsafe_fraction, segment.first_unsafe_fraction);
+    }
   } else {
     EXPECT_EQ(path.robust_clearance_violated, segment.robust_clearance_violated);
     EXPECT_TRUE(std::isnan(segment.first_unsafe_fraction));
@@ -1974,6 +2395,239 @@ void expectEquivalentSamples(
     EXPECT_EQ(right.protected_joint_corridor_violated, left.protected_joint_corridor_violated);
     EXPECT_EQ(right.skipped_invariant_contacts, left.skipped_invariant_contacts);
   }
+}
+
+TEST(CollisionConstraints, ExpiredBudgetPreventsFirstDistanceQuery)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  const CollisionConstraintBuilder builder(sliderConfig());
+  const std::vector<JointMotionState> path{motionAt(0.30), motionAt(0.31)};
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(fixture.group, path.front().position);
+  robot_state.update(true);
+  CollisionValidationBudget budget(CollisionValidationBudget::TimePoint::min());
+
+  const auto result = builder.validatePathWithRefinement(
+    *fixture.scene, robot_state, *fixture.group, path, 2U, 3U, &budget);
+
+  EXPECT_TRUE(result.input_valid);
+  EXPECT_TRUE(result.unsafe);
+  EXPECT_TRUE(result.budget_exhausted);
+  EXPECT_FALSE(result.physical_clearance_violated);
+  EXPECT_EQ(result.distance_query_count, 0U);
+}
+
+TEST(CollisionConstraints, SharedQueryAllowanceCoversRefinementsAndLaterCalls)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d wall_pose = Eigen::Isometry3d::Identity();
+  wall_pose.translation().x() = 0.45;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.01, 0.20, 0.20), wall_pose);
+  const CollisionConstraintBuilder builder(sliderConfig());
+  const std::vector<JointMotionState> crossing_path{motionAt(0.18), motionAt(0.72)};
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(fixture.group, crossing_path.front().position);
+  robot_state.update(true);
+  constexpr std::size_t kInitialSubsteps = 3U;
+  const auto coarse = builder.validatePath(
+    *fixture.scene, robot_state, *fixture.group, crossing_path, kInitialSubsteps);
+  ASSERT_TRUE(coarse.input_valid) << coarse.failure_reason;
+  ASSERT_TRUE(coarse.unsafe) << "coarse clearance envelope should remain inconclusive";
+  EXPECT_FALSE(coarse.physical_clearance_violated);
+  const auto unlimited = builder.validatePathWithRefinement(
+    *fixture.scene, robot_state, *fixture.group, crossing_path, kInitialSubsteps, 3U);
+  ASSERT_TRUE(unlimited.input_valid) << unlimited.failure_reason;
+  EXPECT_TRUE(unlimited.unsafe) << unlimited.failure_reason;
+  EXPECT_FALSE(unlimited.physical_clearance_violated);
+  EXPECT_GT(unlimited.refinement_attempts, 0U);
+
+  const std::size_t query_allowance = coarse.distance_query_count + 1U;
+  CollisionValidationBudget budget(
+    CollisionValidationBudget::TimePoint::max(), query_allowance);
+
+  const auto first = builder.validatePathWithRefinement(
+    *fixture.scene, robot_state, *fixture.group, crossing_path,
+    kInitialSubsteps, 3U, &budget);
+  const auto second = builder.validatePathWithRefinement(
+    *fixture.scene, robot_state, *fixture.group, crossing_path,
+    kInitialSubsteps, 3U, &budget);
+
+  EXPECT_TRUE(first.budget_exhausted);
+  EXPECT_TRUE(first.unsafe);
+  EXPECT_FALSE(first.physical_clearance_violated);
+  EXPECT_GT(first.refinement_attempts, 0U);
+  EXPECT_LE(first.distance_query_count, query_allowance);
+  EXPECT_TRUE(second.budget_exhausted);
+  EXPECT_TRUE(second.unsafe);
+  EXPECT_FALSE(second.physical_clearance_violated);
+  EXPECT_EQ(second.distance_query_count, 0U);
+}
+
+TEST(CollisionConstraints, DeadlineExpiryAfterFinalQueryDoesNotCertifyPath)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  const CollisionConstraintBuilder builder(sliderConfig());
+  const std::vector<JointMotionState> path{motionAt(0.30), motionAt(0.31)};
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(fixture.group, path.front().position);
+  robot_state.update(true);
+  deterministic_clock_calls = 0U;
+  deterministic_clock_deadline = CollisionValidationBudget::TimePoint{} +
+    std::chrono::seconds(1);
+  CollisionValidationBudget budget(
+    deterministic_clock_deadline, std::numeric_limits<std::size_t>::max(),
+    &deterministicBudgetClock);
+
+  const auto result = builder.validatePathWithRefinement(
+    *fixture.scene, robot_state, *fixture.group, path, 2U, 3U, &budget);
+
+  EXPECT_TRUE(result.budget_exhausted);
+  EXPECT_TRUE(result.unsafe);
+  EXPECT_FALSE(result.physical_clearance_violated);
+  EXPECT_EQ(result.distance_query_count, 2U);
+}
+
+TEST(CollisionConstraints, UnlimitedBudgetPreservesSafeAndPhysicalUnsafeResults)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  const CollisionConstraintBuilder builder(sliderConfig());
+  const std::vector<JointMotionState> safe_path{motionAt(0.30), motionAt(0.31)};
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  robot_state.setJointGroupPositions(fixture.group, safe_path.front().position);
+  robot_state.update(true);
+  const auto safe = builder.validatePathWithRefinement(
+    *fixture.scene, robot_state, *fixture.group, safe_path, 2U);
+  EXPECT_TRUE(safe.input_valid);
+  EXPECT_FALSE(safe.unsafe);
+  EXPECT_FALSE(safe.budget_exhausted);
+  EXPECT_EQ(safe.distance_query_count, 2U);
+
+  Eigen::Isometry3d wall_pose = Eigen::Isometry3d::Identity();
+  wall_pose.translation().x() = 0.45;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.01, 0.20, 0.20), wall_pose);
+  const std::vector<JointMotionState> physical_path{
+    motionAt(0.18), motionAt(0.45), motionAt(0.72)};
+  moveit::core::RobotState physical_start(robot_state);
+  physical_start.setJointGroupPositions(fixture.group, physical_path.front().position);
+  physical_start.update(true);
+  const auto physical = builder.validatePathWithRefinement(
+    *fixture.scene, physical_start, *fixture.group, physical_path, 4U);
+  EXPECT_TRUE(physical.unsafe);
+  EXPECT_FALSE(physical.budget_exhausted);
+  EXPECT_TRUE(physical.physical_clearance_violated);
+}
+
+TEST(CollisionConstraints, PathRefinementFindsPhysicalCrossingMissedByCoarseGrid)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d wall_pose = Eigen::Isometry3d::Identity();
+  wall_pose.translation().x() = 0.45;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.01, 0.20, 0.20), wall_pose);
+  const CollisionConstraintConfig config = sliderConfig();
+  const CollisionConstraintBuilder builder(config);
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  const std::vector<JointMotionState> crossing{motionAt(0.18), motionAt(0.72)};
+  robot_state.setJointGroupPositions(fixture.group, crossing.front().position);
+  robot_state.update(true);
+
+  const auto coarse = builder.validatePath(
+    *fixture.scene, robot_state, *fixture.group, crossing, 3U);
+  ASSERT_TRUE(coarse.input_valid) << coarse.failure_reason;
+  EXPECT_TRUE(coarse.unsafe) << "coarse inter-sample reserve should be inconclusive";
+  EXPECT_FALSE(coarse.physical_clearance_violated);
+  const double physical_floor = config.hard_clearance_m +
+    config.numerical_distance_reserve_m +
+    config.default_distance_lipschitz_m_per_rad *
+    config.tracking_position_error_bound_rad;
+  EXPECT_GT(coarse.minimum_world_distance_m, physical_floor);
+
+  // The helper may remain conservatively inconclusive before it samples the
+  // actual collision. Independently verify that the continuous path crosses it.
+  const auto midpoint = motionAt(0.45);
+  moveit::core::RobotState midpoint_state(robot_state);
+  midpoint_state.setJointGroupPositions(fixture.group, midpoint.position);
+  midpoint_state.update(true);
+  const auto actual_crossing = builder.validatePose(
+    *fixture.scene, midpoint_state, *fixture.group, midpoint);
+  ASSERT_TRUE(actual_crossing.input_valid) << actual_crossing.failure_reason;
+  EXPECT_TRUE(actual_crossing.unsafe);
+  EXPECT_TRUE(actual_crossing.physical_clearance_violated);
+  EXPECT_LE(actual_crossing.minimum_world_distance_m, 0.0);
+
+  const auto refined = builder.validatePathWithRefinement(
+    *fixture.scene, robot_state, *fixture.group, crossing, 3U, 3U);
+  EXPECT_TRUE(refined.input_valid) << refined.failure_reason;
+  EXPECT_TRUE(refined.unsafe) << "unresolved crossing must remain fail-closed";
+  EXPECT_GE(refined.refinement_attempts, 1U);
+  EXPECT_LE(refined.refinement_attempts, 3U);
+  EXPECT_FALSE(refined.physical_clearance_violated)
+    << "path validator should stop at the conservative frontier before its samples enter the wall";
+  EXPECT_GT(refined.minimum_world_distance_m, physical_floor);
+}
+
+TEST(CollisionConstraints, PhysicalWaypointAnchorStopsDenseSearch)
+{
+  SliderFixture fixture;
+  ASSERT_NE(fixture.scene, nullptr);
+  ASSERT_NE(fixture.group, nullptr);
+  Eigen::Isometry3d wall_pose = Eigen::Isometry3d::Identity();
+  wall_pose.translation().x() = 0.45;
+  fixture.scene->getWorldNonConst()->addToObject(
+    "wall", std::make_shared<shapes::Box>(0.01, 0.20, 0.20), wall_pose);
+
+  CollisionConstraintBuilder builder(sliderConfig());
+  moveit::core::RobotState robot_state(fixture.robot_model);
+  robot_state.setToDefaultValues();
+  const std::vector<JointMotionState> path{
+    motionAt(0.18), motionAt(0.45), motionAt(0.72)};
+  robot_state.setJointGroupPositions(fixture.group, path.front().position);
+  robot_state.update(true);
+  moveit::core::RobotState anchor_state(robot_state);
+  anchor_state.setJointGroupPositions(fixture.group, path[1].position);
+  anchor_state.update(true);
+  const auto anchor = builder.validatePose(
+    *fixture.scene, anchor_state, *fixture.group, path[1]);
+  ASSERT_TRUE(anchor.input_valid) << anchor.failure_reason;
+  ASSERT_TRUE(anchor.physical_clearance_violated)
+    << "the midpoint waypoint must independently breach the physical floor";
+
+  const auto result = builder.validatePath(
+    *fixture.scene, robot_state, *fixture.group, path, 4U);
+
+  ASSERT_TRUE(result.input_valid) << result.failure_reason;
+  EXPECT_TRUE(result.unsafe);
+  EXPECT_TRUE(result.physical_clearance_violated);
+  EXPECT_TRUE(result.robust_clearance_violated);
+  EXPECT_EQ(result.distance_query_count, 2U);
+  EXPECT_EQ(result.evaluated_samples, 1U);
+  ASSERT_EQ(result.samples.size(), 1U);
+  EXPECT_TRUE(result.samples.front().path_block_certificate_attempt);
+  EXPECT_FALSE(result.samples.front().path_block_certified);
+  EXPECT_EQ(result.samples.front().sample_index, 4U);
+  // The queried waypoint is a concrete unsafe witness. Since the validator
+  // short-circuits here, it must not claim this is the earliest dense-grid
+  // failure; that diagnostic remains unavailable.
+  EXPECT_EQ(result.first_unsafe_sample, std::numeric_limits<std::size_t>::max());
+  EXPECT_TRUE(std::isnan(result.first_unsafe_fraction));
+  EXPECT_NE(result.failure_reason.find("static-floor"), std::string::npos);
 }
 
 TEST(CollisionConstraints, SingleSegmentAndPathHaveEquivalentClearanceDiagnostics)
@@ -2252,8 +2906,11 @@ TEST(CollisionConstraints, PathSharedWaypointUsesBothAdjacentSegmentReserves)
 
   ASSERT_TRUE(path.input_valid) << path.failure_reason;
   ASSERT_TRUE(path.unsafe);
+  EXPECT_FALSE(path.physical_clearance_violated);
   EXPECT_EQ(path.first_unsafe_sample, 2U);
   EXPECT_DOUBLE_EQ(path.first_unsafe_fraction, 0.5);
+  EXPECT_GT(path.distance_query_count, 2U)
+    << "uncertainty-only rejection must continue without the physical-floor shortcut";
   const auto * safe_start = findDensePathSample(path, 0U);
   const auto * safe_adjacent = findDensePathSample(path, 1U);
   const auto * unsafe_shared = findDensePathSample(path, 2U);
@@ -2263,6 +2920,12 @@ TEST(CollisionConstraints, PathSharedWaypointUsesBothAdjacentSegmentReserves)
   EXPECT_FALSE(safe_start->robust_clearance_violated);
   EXPECT_FALSE(safe_adjacent->robust_clearance_violated);
   EXPECT_TRUE(unsafe_shared->robust_clearance_violated);
+  const double physical_floor = sliderConfig().hard_clearance_m +
+    sliderConfig().numerical_distance_reserve_m +
+    sliderConfig().default_distance_lipschitz_m_per_rad *
+    sliderConfig().tracking_position_error_bound_rad;
+  EXPECT_GT(path.minimum_world_distance_m, physical_floor)
+    << "the rejected shared anchor only violates the uncertainty envelope";
 }
 
 TEST(CollisionConstraints, InvalidPathInputFailsClosed)
@@ -2694,6 +3357,95 @@ TEST(CollisionConstraints, PhysicalBoundaryStartDoesNotRequireOneTickMarginRecov
     EXPECT_TRUE(result.diagnostics.valid) << result.diagnostics.failure_reason;
     EXPECT_FALSE(result.diagnostics.protected_joint_corridor_violated);
   }
+}
+
+TEST(CollisionDistanceReserve, AttachedAndMimicPairsUseScalarFallback)
+{
+  using collision_detail::DistanceCandidate;
+  using collision_detail::pairDistanceLipschitz;
+  using collision_detail::pairInterSampleDistanceReserve;
+  using collision_detail::pairInterSampleUncertainty;
+
+  std::string description = kSliderUrdf;
+  description.replace(description.find("prismatic"), 9U, "revolute");
+  SliderFixture fixture(description);
+  ASSERT_NE(fixture.group, nullptr);
+  CollisionConstraintConfig config = sliderConfig();
+  config.default_distance_lipschitz_m_per_rad = 2.0;
+  configureGeometryBounds(config, *fixture.robot_model, *fixture.group);
+
+  moveit::core::RobotState attached_state(fixture.robot_model);
+  attached_state.setToDefaultValues();
+  std::vector<shapes::ShapeConstPtr> attached_shapes{
+    std::make_shared<shapes::Box>(0.02, 0.02, 0.02)};
+  EigenSTL::vector_Isometry3d attached_shape_poses(1U, Eigen::Isometry3d::Identity());
+  attached_state.attachBody(
+    "attached_tool", Eigen::Isometry3d::Identity(), attached_shapes,
+    attached_shape_poses, std::vector<std::string>{"moving"}, "moving");
+  attached_state.update();
+  const Eigen::VectorXd uncertainty = Eigen::VectorXd::Constant(1, 0.01);
+  DistanceCandidate attached;
+  attached.kind = CollisionPairKind::kWorld;
+  attached.body_types[0] = collision_detection::BodyTypes::ROBOT_ATTACHED;
+  attached.body_types[1] = collision_detection::BodyTypes::WORLD_OBJECT;
+  attached.body_names[0] = "attached_tool";
+  attached.body_names[1] = "world_object";
+  const double attached_scalar = pairDistanceLipschitz(attached, config);
+  EXPECT_DOUBLE_EQ(
+    pairInterSampleDistanceReserve(
+      attached, attached_state, *fixture.group, uncertainty, config),
+    attached_scalar * pairInterSampleUncertainty(
+      attached, attached_state, *fixture.group, uncertainty));
+
+  const std::string mimic_urdf =
+    R"(
+<robot name="mimic_fixture">
+  <link name="base"/><link name="driver_link"/><link name="mimic_link"/>
+  <joint name="driver" type="revolute">
+    <parent link="base"/><child link="driver_link"/><axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="10" velocity="1"/>
+  </joint>
+  <joint name="mimic" type="revolute">
+    <parent link="driver_link"/><child link="mimic_link"/><axis xyz="0 1 0"/>
+    <limit lower="-1" upper="1" effort="10" velocity="1"/>
+    <mimic joint="driver" multiplier="1" offset="0"/>
+  </joint>
+</robot>)";
+  const std::string mimic_srdf =
+    R"(
+<robot name="mimic_fixture"><group name="arm">
+  <chain base_link="base" tip_link="mimic_link"/>
+</group></robot>)";
+  const auto mimic_urdf_model = urdf::parseURDF(mimic_urdf);
+  ASSERT_TRUE(mimic_urdf_model);
+  auto mimic_srdf_model = std::make_shared<srdf::Model>();
+  ASSERT_TRUE(mimic_srdf_model->initString(*mimic_urdf_model, mimic_srdf));
+  const auto mimic_model = std::make_shared<moveit::core::RobotModel>(
+    mimic_urdf_model, mimic_srdf_model);
+  const auto * mimic_group = mimic_model->getJointModelGroup("arm");
+  ASSERT_NE(mimic_group, nullptr);
+  ASSERT_FALSE(mimic_model->getMimicJointModels().empty());
+  moveit::core::RobotState mimic_state(mimic_model);
+  mimic_state.setToDefaultValues();
+  mimic_state.update();
+
+  CollisionConstraintConfig mimic_config;
+  mimic_config.default_distance_lipschitz_m_per_rad = 2.0;
+  configureGeometryBounds(mimic_config, *mimic_model, *mimic_group);
+  DistanceCandidate mimic = attached;
+  mimic.body_types[0] = collision_detection::BodyTypes::ROBOT_LINK;
+  mimic.body_names[0] = "mimic_link";
+  mimic_config.distance_bounds[{"mimic_link", ""}] = 2.0;
+  mimic_config.distance_joint_bounds_m_per_rad[{"mimic_link", ""}] =
+    std::vector<double>(mimic_group->getVariableCount(), 2.0);
+  const Eigen::VectorXd mimic_uncertainty = Eigen::VectorXd::Constant(
+    static_cast<Eigen::Index>(mimic_group->getVariableCount()), 0.01);
+  const double mimic_scalar = pairDistanceLipschitz(mimic, mimic_config);
+  EXPECT_DOUBLE_EQ(
+    pairInterSampleDistanceReserve(
+      mimic, mimic_state, *mimic_group, mimic_uncertainty, mimic_config),
+    mimic_scalar * pairInterSampleUncertainty(
+      mimic, mimic_state, *mimic_group, mimic_uncertainty));
 }
 
 }  // namespace

@@ -94,6 +94,8 @@ bool writeQpFailureSnapshot(std::ostream & output, const QpFailureSnapshot & sna
 {
   if (snapshot.variable_count <= 0 || snapshot.variable_count > static_cast<int>(kMaxJoints) ||
     snapshot.constraint_count <= 0 || snapshot.constraint_count > static_cast<int>(kMaxRows) ||
+    static_cast<int>(snapshot.stage) < 0 ||
+    static_cast<int>(snapshot.stage) > static_cast<int>(QpSolveStage::kDistance) ||
     snapshot.p_values.size() > kMaxPNonzeros || snapshot.a_values.size() > kMaxANonzeros)
   {
     return false;
@@ -152,7 +154,8 @@ bool readQpFailureSnapshot(std::istream & input, QpFailureSnapshot & snapshot)
     !readLabel(input, "dimensions") || !readValue(input, variable_count) ||
     !readValue(input, constraint_count) || variable_count <= 0 ||
     variable_count > static_cast<int>(kMaxJoints) || constraint_count <= 0 ||
-    constraint_count > static_cast<int>(kMaxRows) || stage < 0 || stage > 2 ||
+    constraint_count > static_cast<int>(kMaxRows) || stage < 0 ||
+    stage > static_cast<int>(QpSolveStage::kDistance) ||
     classified < 0 || classified > static_cast<int>(QpStageStatus::kSolverError) ||
     !readLabel(input, "build") || !(input >> osqp_version) ||
     !readValue(input, snapshot.c_int_size) || !readValue(input, snapshot.c_float_size) ||

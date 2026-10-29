@@ -3,6 +3,8 @@
 std_msgs/Header header
 uint64 tick_sequence
 uint64 cycle_duration_ns
+# True only for a normal non-due control-time-grid observation; no target was consumed.
+bool control_time_wait
 uint8 CONTROLLER_TRACKING=0
 uint8 CONTROLLER_BRAKING=1
 uint8 CONTROLLER_WAITING=2

@@ -18,6 +18,8 @@ struct QpFailureSnapshotEventWriteResult
   bool index_ok{false};
   std::string primary_path;
   std::string secondary_path;
+  std::string tertiary_path;
+  std::string distance_path;
 };
 
 /// Persist one bounded failure event off the real-time path: one snapshot per

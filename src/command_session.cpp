@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <utility>
 
 namespace face_tracking_arm
@@ -20,6 +21,52 @@ const noexcept
 {
   return active_publication_id.has_value() ?
          publications.find(*active_publication_id) : nullptr;
+}
+
+bool CommandSession::hasVerifiedTerminalHold(const std::size_t joint_count) const noexcept
+{
+  if (joint_count == 0U || !epoch_active || !epoch_has_published || rearm_pending ||
+    published_tail_rearm_pending || bootstrap_ack_pending || bootstrap_reset_ack_pending ||
+    command_deadline_retry_pending || queue.size() != 1U || !time_grid ||
+    !active_publication_id.has_value() || !verified_terminal_hold_publication_id.has_value() ||
+    *verified_terminal_hold_publication_id != *active_publication_id ||
+    max_queue_points < 2U)
+  {
+    return false;
+  }
+
+  const auto * record = activePublication();
+  const std::int64_t period_ns = time_grid->periodNs();
+  if (record == nullptr || record->id != *active_publication_id || period_ns <= 0 ||
+    record->execution_queue.size() < 3U)
+  {
+    return false;
+  }
+
+  const auto transmitted_end = std::prev(record->execution_queue.end(), 2);
+  const auto & anchor = queue.front();
+  const std::int64_t anchor_ns = anchor.time_stamp.nanoseconds();
+  const std::int64_t terminal_ns = transmitted_end->time_stamp.nanoseconds();
+  if (transmitted_end->joint_names.size() != joint_count ||
+    anchor.joint_names != transmitted_end->joint_names || !finite_state(anchor, joint_count) ||
+    anchor.time_stamp.get_clock_type() != transmitted_end->time_stamp.get_clock_type() ||
+    anchor_ns <= terminal_ns || anchor_ns % period_ns != terminal_ns % period_ns ||
+    !(anchor.positions.array() == transmitted_end->positions.array()).all() ||
+    !anchor.velocities.isZero(0.0) || !anchor.accelerations.isZero(0.0))
+  {
+    return false;
+  }
+
+  try {
+    if (anchor_ns > std::numeric_limits<std::int64_t>::max() - period_ns) {
+      return false;
+    }
+    auto checked_grid = *time_grid;
+    const auto next_stamp = checked_grid.commandStamp(anchor_ns, 0, 0);
+    return next_stamp.has_value() && *next_stamp == anchor_ns + period_ns;
+  } catch (...) {
+    return false;
+  }
 }
 
 bool CommandSession::deferCommandDeadlineRetry() noexcept
@@ -39,25 +86,39 @@ std::optional<std::uint64_t> CommandSession::timelineRecoveryPeriods(
   const std::uint64_t observed_skipped_periods, const std::int64_t current_time_ns,
   const std::int64_t target_command_lead_ns) const
 {
-  if (!command_deadline_retry_pending) {
-    return observed_skipped_periods;
-  }
   if (!time_grid) {
-    return std::nullopt;
+    return command_deadline_retry_pending ?
+           std::nullopt : std::optional<std::uint64_t>{observed_skipped_periods};
   }
+  // Timer skips describe callback cadence, not the current command-grid lead.
+  // A published-brake continuation may already have advanced that grid, so
+  // using the observed count here would recover the same intervals twice.
   const auto required_periods = time_grid->periodsUntilCommandLead(
     current_time_ns, target_command_lead_ns);
   if (!required_periods.has_value()) {
-    return std::nullopt;
+    // An inactive startup/reset epoch has no command anchor yet; retain its
+    // callback-based behavior. An active epoch must have a usable anchor.
+    return command_deadline_retry_pending || epoch_active ?
+           std::nullopt : std::optional<std::uint64_t>{observed_skipped_periods};
   }
-  // Both counts are relative to the current command-grid branch. Taking the
-  // maximum avoids counting the same delayed periods twice.
-  return std::max(observed_skipped_periods, *required_periods);
+  return required_periods;
 }
 
 void CommandSession::completeDeferredCommandDeadlineRetry() noexcept
 {
   command_deadline_retry_pending = false;
+}
+
+void CommandSession::pruneExpiredHistory(
+  const rclcpp::Time & current_time, const double retained_history_sec)
+{
+  const rclcpp::Duration retained_history = rclcpp::Duration::from_seconds(
+    retained_history_sec);
+  while (queue.size() > 1U &&
+    queue.front().time_stamp < current_time - retained_history)
+  {
+    queue.pop_front();
+  }
 }
 
 TimelineRecoveryStatus CommandSession::recoverTimeline(
@@ -78,11 +139,7 @@ TimelineRecoveryStatus CommandSession::recoverTimeline(
 
   const rclcpp::Duration retained_history = rclcpp::Duration::from_seconds(
     retained_history_sec);
-  while (queue.size() > 1U &&
-    queue.front().time_stamp < current_time - retained_history)
-  {
-    queue.pop_front();
-  }
+  const auto retention_cutoff = current_time - retained_history;
 
   // The final execution-queue entry is intentionally withheld by MoveIt
   // Servo's trajectory composer, so it must never become a recovery anchor.
@@ -93,6 +150,24 @@ TimelineRecoveryStatus CommandSession::recoverTimeline(
     [this](const moveit_servo::KinematicState & state) {
       return state.time_stamp == queue.back().time_stamp;
     });
+  if (current_branch == transmitted_end &&
+    verified_terminal_hold_publication_id == active_publication_id &&
+    current_time >= published_record->stationary_time)
+  {
+    const auto terminal = std::prev(published_queue.end(), 2);
+    const std::int64_t extension_ns =
+      queue.back().time_stamp.nanoseconds() - terminal->time_stamp.nanoseconds();
+    if (finite_state(queue.back(), joint_count) &&
+      queue.back().time_stamp.get_clock_type() == current_time.get_clock_type() &&
+      extension_ns > 0 && extension_ns % time_grid->periodNs() == 0 &&
+      queue.back().positions.isApprox(terminal->positions, kFiniteEpsilon) &&
+      queue.back().velocities.isZero(kFiniteEpsilon) &&
+      queue.back().accelerations.isZero(kFiniteEpsilon))
+    {
+      failure_reason = "verified terminal hold needs a fresh settled check before extension";
+      return TimelineRecoveryStatus::kExhaustedPublishedSuffix;
+    }
+  }
   if (current_branch == transmitted_end ||
     !current_branch->positions.isApprox(queue.back().positions, kFiniteEpsilon) ||
     !current_branch->velocities.isApprox(queue.back().velocities, kFiniteEpsilon) ||
@@ -112,20 +187,6 @@ TimelineRecoveryStatus CommandSession::recoverTimeline(
   const auto recovery_anchor = std::next(
     current_branch, static_cast<std::ptrdiff_t>(skipped_periods));
 
-  const std::size_t recovered_periods = static_cast<std::size_t>(skipped_periods);
-  // Retained past points are useful for matching a replacement, but they are
-  // not part of the future safety horizon. Drop only the oldest history when
-  // a delayed callback needs room for already-published future samples.
-  while (queue.size() > 1U &&
-    queue.size() + recovered_periods > max_queue_points)
-  {
-    queue.pop_front();
-  }
-  if (queue.size() + recovered_periods > max_queue_points) {
-    failure_reason = "published recovery span exceeds the command queue hard bound";
-    return TimelineRecoveryStatus::kExhaustedPublishedSuffix;
-  }
-
   auto previous_stamp = current_branch->time_stamp;
   for (auto point = std::next(current_branch); point != std::next(recovery_anchor); ++point) {
     if (!finite_state(*point, joint_count) ||
@@ -137,18 +198,227 @@ TimelineRecoveryStatus CommandSession::recoverTimeline(
     }
     previous_stamp = point->time_stamp;
   }
+
+  // Validate the full transmitted prefix above, including expired samples,
+  // but retain only entries still inside the history window. Work on a bounded
+  // candidate so a failed capacity check cannot mutate the live command queue.
+  const auto recovery_end = std::next(recovery_anchor);
+  auto first_retained = std::next(current_branch);
+  while (first_retained != recovery_end && first_retained->time_stamp < retention_cutoff) {
+    ++first_retained;
+  }
+  // The adopted command-grid stamp must always be represented by the queue,
+  // even when the entire crossed prefix is older than the retention window.
+  if (first_retained == recovery_end) {
+    first_retained = recovery_anchor;
+  }
+  std::size_t retained_recovery_points = static_cast<std::size_t>(
+    std::distance(first_retained, recovery_end));
+
+  auto recovered_queue = queue;
+  while (recovered_queue.size() > 1U &&
+    recovered_queue.front().time_stamp < retention_cutoff)
+  {
+    recovered_queue.pop_front();
+  }
+  // If the only surviving old queue entry is expired, the retained transmitted
+  // prefix (which always includes its anchor) supersedes it completely.
+  if (recovered_queue.size() == 1U &&
+    recovered_queue.front().time_stamp < retention_cutoff &&
+    retained_recovery_points > 0U)
+  {
+    recovered_queue.clear();
+  }
+  while (!recovered_queue.empty() &&
+    recovered_queue.size() + retained_recovery_points > max_queue_points &&
+    recovered_queue.front().time_stamp < current_time)
+  {
+    recovered_queue.pop_front();
+  }
+  while (recovered_queue.size() + retained_recovery_points > max_queue_points &&
+    first_retained != recovery_anchor && first_retained->time_stamp < current_time)
+  {
+    ++first_retained;
+    --retained_recovery_points;
+  }
+  if (recovered_queue.size() + retained_recovery_points > max_queue_points) {
+    failure_reason = "published recovery span exceeds the command queue hard bound";
+    return TimelineRecoveryStatus::kExhaustedPublishedSuffix;
+  }
   if (!time_grid->adoptPublishedStamp(recovery_anchor->time_stamp.nanoseconds())) {
     failure_reason = "recovery anchor was not on the active command grid";
     return TimelineRecoveryStatus::kInvariantFailure;
   }
-  queue.insert(
-    queue.end(), std::next(current_branch), std::next(recovery_anchor));
+  for (auto point = first_retained; point != recovery_end; ++point) {
+    recovered_queue.push_back(*point);
+  }
+  queue.swap(recovered_queue);
+  const std::size_t recovered_periods = static_cast<std::size_t>(skipped_periods);
   if (purpose == TimelineRecoveryPurpose::kDeadline) {
     ++timeline_recovery_events;
     timeline_recovered_periods += recovered_periods;
   } else {
     ++published_brake_continuation_count;
   }
+  return TimelineRecoveryStatus::kSuccess;
+}
+
+TimelineRecoveryStatus CommandSession::resumeVerifiedTerminalHold(
+  const control::PublicationId expected_publication_id,
+  const rclcpp::Time & current_time, const std::int64_t target_command_lead_ns,
+  const std::size_t joint_count, const bool settled_proof, std::string & failure_reason)
+{
+  if (!settled_proof || !epoch_active || !epoch_has_published || rearm_pending ||
+    published_tail_rearm_pending || bootstrap_ack_pending || queue.empty() || !time_grid ||
+    !active_publication_id.has_value() || *active_publication_id != expected_publication_id)
+  {
+    failure_reason = "verified terminal hold no longer owns the active command epoch";
+    return TimelineRecoveryStatus::kExhaustedPublishedSuffix;
+  }
+  if (target_command_lead_ns < 0 || joint_count == 0U) {
+    failure_reason = "terminal hold resume has invalid scheduling bounds";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+
+  const auto * record = publications.find(expected_publication_id);
+  if (record == nullptr || record != activePublication() ||
+    record->execution_queue.size() < 3U ||
+    record->stationary_time.get_clock_type() != current_time.get_clock_type() ||
+    current_time < record->stationary_time)
+  {
+    failure_reason = "verified terminal hold publication is missing or not yet stationary";
+    return TimelineRecoveryStatus::kExhaustedPublishedSuffix;
+  }
+
+  const auto & published_queue = record->execution_queue;
+  const auto transmitted_end = std::prev(published_queue.end(), 2);
+  const auto stationary = std::find_if(
+    published_queue.begin(), std::next(transmitted_end), [record](const auto & state) {
+      return state.time_stamp == record->stationary_time;
+    });
+  if (stationary == std::next(transmitted_end) ||
+    !finite_state(*transmitted_end, joint_count) ||
+    transmitted_end->joint_names.size() != joint_count ||
+    transmitted_end->time_stamp.get_clock_type() != current_time.get_clock_type())
+  {
+    failure_reason = "published terminal hold is not a transmitted, finite command";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+
+  const Eigen::VectorXd & terminal_position = transmitted_end->positions;
+  for (auto point = stationary; point != published_queue.end(); ++point) {
+    if (!finite_state(*point, joint_count) || point->joint_names != queue.front().joint_names ||
+      point->time_stamp.get_clock_type() != current_time.get_clock_type() ||
+      !point->positions.isApprox(terminal_position, kFiniteEpsilon) ||
+      !point->velocities.isZero(kFiniteEpsilon) ||
+      !point->accelerations.isZero(kFiniteEpsilon))
+    {
+      failure_reason = "published terminal suffix does not hold one exact stopped command";
+      return TimelineRecoveryStatus::kInvariantFailure;
+    }
+    if (point != stationary && point->time_stamp - std::prev(point)->time_stamp !=
+      rclcpp::Duration::from_nanoseconds(time_grid->periodNs()))
+    {
+      failure_reason = "published terminal hold left the active fixed command grid";
+      return TimelineRecoveryStatus::kInvariantFailure;
+    }
+  }
+
+  const auto current_branch = std::find_if(
+    published_queue.begin(), std::next(transmitted_end), [this](const auto & state) {
+      return state.time_stamp == queue.back().time_stamp;
+    });
+  const bool exact_published_branch = current_branch != std::next(transmitted_end) &&
+    current_branch->positions.isApprox(queue.back().positions, kFiniteEpsilon) &&
+    current_branch->velocities.isApprox(queue.back().velocities, kFiniteEpsilon) &&
+    current_branch->accelerations.isApprox(queue.back().accelerations, kFiniteEpsilon);
+  const bool verified_virtual_hold =
+    verified_terminal_hold_publication_id == expected_publication_id &&
+    finite_state(queue.back(), joint_count) &&
+    queue.back().time_stamp.get_clock_type() == current_time.get_clock_type() &&
+    queue.back().time_stamp > transmitted_end->time_stamp &&
+    (queue.back().time_stamp.nanoseconds() -
+    transmitted_end->time_stamp.nanoseconds()) % time_grid->periodNs() == 0 &&
+    queue.back().positions.isApprox(terminal_position, kFiniteEpsilon) &&
+    queue.back().velocities.isZero(kFiniteEpsilon) &&
+    queue.back().accelerations.isZero(kFiniteEpsilon);
+  if (!exact_published_branch && !verified_virtual_hold) {
+    failure_reason = "current command branch is not an exact published or verified hold prefix";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+
+  const std::int64_t period_ns = time_grid->periodNs();
+  if (period_ns <= 0 || max_queue_points < 2U) {
+    failure_reason = "terminal hold resume has no usable command-grid capacity";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+  auto resumed_grid = *time_grid;
+  const rclcpp::Time base_anchor = verified_virtual_hold ?
+    queue.back().time_stamp : transmitted_end->time_stamp;
+  if (!verified_virtual_hold && queue.back().time_stamp < base_anchor &&
+    !resumed_grid.adoptPublishedStamp(base_anchor.nanoseconds()))
+  {
+    failure_reason = "published terminal command is not later on the active command grid";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+  if (!verified_virtual_hold && queue.back().time_stamp > base_anchor) {
+    failure_reason = "current command branch advanced beyond the published terminal command";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+  const auto required_periods = resumed_grid.periodsUntilCommandLead(
+    current_time.nanoseconds(), target_command_lead_ns);
+  if (!required_periods.has_value()) {
+    failure_reason = "terminal hold resume lost its command-grid anchor";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+  if (*required_periods > static_cast<std::uint64_t>(
+      (std::numeric_limits<std::int64_t>::max() - base_anchor.nanoseconds()) / period_ns))
+  {
+    failure_reason = "verified terminal hold timestamp exceeds the representable command grid";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+  std::uint64_t anchor_periods = *required_periods;
+  std::int64_t final_anchor_ns = base_anchor.nanoseconds() +
+    static_cast<std::int64_t>(anchor_periods) * period_ns;
+  while (final_anchor_ns <= current_time.nanoseconds()) {
+    if (anchor_periods == std::numeric_limits<std::uint64_t>::max() ||
+      anchor_periods >= static_cast<std::uint64_t>(
+        (std::numeric_limits<std::int64_t>::max() - base_anchor.nanoseconds()) / period_ns))
+    {
+      failure_reason = "verified terminal hold timestamp exceeds the representable command grid";
+      return TimelineRecoveryStatus::kInvariantFailure;
+    }
+    ++anchor_periods;
+    final_anchor_ns = base_anchor.nanoseconds() +
+      static_cast<std::int64_t>(anchor_periods) * period_ns;
+  }
+  const rclcpp::Time final_anchor(final_anchor_ns, current_time.get_clock_type());
+  if (anchor_periods > 0U &&
+    !resumed_grid.adoptPublishedStamp(final_anchor.nanoseconds()))
+  {
+    failure_reason = "terminal hold resume could not adopt its phase-aligned command anchor";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+
+  if (final_anchor < record->stationary_time) {
+    failure_reason = "phase-aligned terminal hold anchor precedes the published stationary point";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+  moveit_servo::KinematicState hold(static_cast<int>(joint_count));
+  hold.joint_names = transmitted_end->joint_names;
+  hold.positions = terminal_position;
+  hold.velocities.setZero();
+  hold.accelerations.setZero();
+  hold.time_stamp = final_anchor;
+  if (!finite_state(hold, joint_count)) {
+    failure_reason = "terminal hold extension produced a non-finite command sample";
+    return TimelineRecoveryStatus::kInvariantFailure;
+  }
+
+  queue.clear();
+  queue.push_back(std::move(hold));
+  *time_grid = std::move(resumed_grid);
+  verified_terminal_hold_publication_id = expected_publication_id;
   return TimelineRecoveryStatus::kSuccess;
 }
 
@@ -165,12 +435,39 @@ PublishedBrakeContinuationStatus CommandSession::continuePublishedBrake(
   }
   const auto required_periods = time_grid->periodsUntilCommandLead(
     decision_time.nanoseconds(), required_next_command_lead_ns);
-  if (!required_periods.has_value() || *required_periods > 1U) {
+  if (!required_periods.has_value()) {
     return PublishedBrakeContinuationStatus::kNotEligible;
   }
 
+  const auto * published_record = activePublication();
+  if (published_record != nullptr && active_publication_id.has_value() &&
+    verified_terminal_hold_publication_id == active_publication_id &&
+    decision_time >= published_record->stationary_time &&
+    published_record->execution_queue.size() >= 3U)
+  {
+    const auto transmitted_end = std::prev(published_record->execution_queue.end(), 2);
+    const auto expected_hold = publications.expectedAt(
+      published_record->id, queue.back().time_stamp);
+    const std::int64_t extension_ns =
+      queue.back().time_stamp.nanoseconds() - transmitted_end->time_stamp.nanoseconds();
+    if (finite_state(queue.back(), joint_count) &&
+      queue.back().time_stamp.get_clock_type() == decision_time.get_clock_type() &&
+      time_grid->periodNs() > 0 && extension_ns > 0 &&
+      extension_ns % time_grid->periodNs() == 0 &&
+      expected_hold.has_value() && expected_hold->terminal_hold &&
+      expected_hold->positions.isApprox(queue.back().positions, kFiniteEpsilon) &&
+      expected_hold->velocities.isZero(kFiniteEpsilon) &&
+      queue.back().velocities.isZero(kFiniteEpsilon) &&
+      queue.back().accelerations.isZero(kFiniteEpsilon))
+    {
+      ++published_brake_continuation_count;
+      return PublishedBrakeContinuationStatus::kContinued;
+    }
+  }
+
   const TimelineRecoveryStatus recovery_status = recoverTimeline(
-    1U, decision_time, failure_reason, retained_history_sec, joint_count,
+    std::max<std::uint64_t>(1U, *required_periods), decision_time,
+    failure_reason, retained_history_sec, joint_count,
     TimelineRecoveryPurpose::kPublishedBrakeContinuation);
   switch (recovery_status) {
     case TimelineRecoveryStatus::kSuccess:
@@ -382,6 +679,7 @@ void CommandSession::discardBranch(const bool preserveBootstrapReset)
   epoch_has_published = false;
   command_deadline_retry_pending = false;
   command_deadline_retry_used = false;
+  verified_terminal_hold_publication_id.reset();
   clearBootstrap();
   if (reset_ack_pending && reset_positions.has_value()) {
     bootstrap_reset_ack_pending = true;
@@ -394,6 +692,7 @@ void CommandSession::forgetPublished()
 {
   publications.clear();
   active_publication_id.reset();
+  verified_terminal_hold_publication_id.reset();
 }
 
 bool CommandSession::hasRetainedPublication() const noexcept

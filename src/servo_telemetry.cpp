@@ -115,11 +115,52 @@ void ServoTelemetry::recordQpResult(
   const double duration_ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - start).count();
   (void)qp_statistics.add(duration_ms);
+  last_qp_status = result.status;
+  last_qp_primary_status = result.primary_status;
+  last_qp_preferred_primary_status = result.preferred_primary_status;
+  last_qp_preferred_primary_fallback_used = result.preferred_primary_fallback_used;
+  if (result.preferred_primary_fallback_used) {
+    ++preferred_primary_fallback_count;
+  }
+  last_qp_secondary_status = result.secondary_status;
+  last_qp_tertiary_status = result.tertiary_status;
+  last_qp_distance_status = result.distance_status;
+  last_qp_distance_feasible_approximation_used =
+    result.distance_feasible_approximation_used;
+  last_qp_distance_feasible_approximation_alpha =
+    result.distance_feasible_approximation_alpha;
+  if (result.distance_feasible_approximation_used) {
+    ++distance_feasible_approximation_count;
+  }
+  last_qp_primary_iterations = result.primary_iterations;
+  last_qp_secondary_iterations = result.secondary_iterations;
+  last_qp_tertiary_iterations = result.tertiary_iterations;
+  last_qp_distance_iterations = result.distance_iterations;
+  last_qp_primary_solve_time_sec = result.primary_solve_time_sec;
+  last_qp_secondary_solve_time_sec = result.secondary_solve_time_sec;
+  last_qp_tertiary_solve_time_sec = result.tertiary_solve_time_sec;
+  last_qp_distance_solve_time_sec = result.distance_solve_time_sec;
+  qp_retry_count += static_cast<std::uint64_t>(std::max(0,
+      result.primary_retry_count)) +
+    static_cast<std::uint64_t>(std::max(0, result.secondary_retry_count)) +
+    static_cast<std::uint64_t>(std::max(0, result.tertiary_retry_count)) +
+    static_cast<std::uint64_t>(std::max(0, result.distance_retry_count));
+  last_qp_rank_count = static_cast<std::size_t>(
+    result.primary_status != control::QpStageStatus::kNotRun) +
+    static_cast<std::size_t>(
+    result.preferred_primary_status != control::QpStageStatus::kNotRun) +
+    static_cast<std::size_t>(result.secondary_status != control::QpStageStatus::kNotRun) +
+    static_cast<std::size_t>(result.tertiary_status != control::QpStageStatus::kNotRun) +
+    static_cast<std::size_t>(result.distance_status != control::QpStageStatus::kNotRun);
+  last_requested_distance_rate = result.requested_distance_rate;
+  last_achieved_distance_rate = result.achieved_distance_rate;
   if (!result.command_available()) {
     ++solver_failure_count;
   }
   if (result.status == control::QpStatus::kPrimaryOnly) {
     ++primary_only_count;
+  } else if (result.status == control::QpStatus::kPartial) {
+    ++lower_rank_partial_count;
   }
 }
 

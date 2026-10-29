@@ -4,6 +4,8 @@
 #include "collision_distance_query.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <tuple>
 #include <utility>
 
@@ -278,7 +280,7 @@ void appendDistanceCandidates(
   const moveit::core::JointModelGroup & group,
   const Eigen::VectorXd & joint_uncertainty)
 {
-  const double fallback = joint_uncertainty.maxCoeff();
+  const double fallback = joint_uncertainty.size() == 0 ? 0.0 : joint_uncertainty.maxCoeff();
   if (fallback == 0.0) {
     return 0.0;
   }
@@ -289,6 +291,9 @@ void appendDistanceCandidates(
   }
   double uncertainty = 0.0;
   const auto & names = group.getVariableNames();
+  if (joint_uncertainty.size() != static_cast<Eigen::Index>(names.size())) {
+    return fallback;
+  }
   for (Eigen::Index index = 0; index < joint_uncertainty.size(); ++index) {
     if (joint_uncertainty[index] == 0.0) {
       continue;
@@ -297,13 +302,98 @@ void appendDistanceCandidates(
     if (joint == nullptr) {
       return fallback;
     }
-    // Common ancestors transform both self bodies rigidly together. For world
-    // pairs the world side has no ancestors, retaining all robot-side motion.
+    // Common ancestors move both self bodies rigidly together. A world body has no
+    // robot ancestors, so all joints affecting the robot link remain relevant.
     if (jointAffectsLink(joint, first) != jointAffectsLink(joint, second)) {
       uncertainty = std::max(uncertainty, joint_uncertainty[index]);
     }
   }
   return uncertainty;
+}
+
+[[nodiscard]] double pairInterSampleDistanceReserve(
+  const DistanceCandidate & candidate,
+  const moveit::core::RobotState & state,
+  const moveit::core::JointModelGroup & group,
+  const Eigen::VectorXd & joint_uncertainty,
+  const CollisionConstraintConfig & config)
+{
+  if (joint_uncertainty.size() == 0 || !joint_uncertainty.array().isFinite().all() ||
+    (joint_uncertainty.array() < 0.0).any())
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+  const double max_uncertainty = joint_uncertainty.maxCoeff();
+  const double scalar_lipschitz = pairDistanceLipschitz(candidate, config);
+  const double fallback = scalar_lipschitz * pairInterSampleUncertainty(
+    candidate, state, group, joint_uncertainty);
+  if (max_uncertainty == 0.0 || !std::isfinite(fallback) || fallback < 0.0 ||
+    candidate.body_types[0] == BodyTypes::ROBOT_ATTACHED ||
+    candidate.body_types[1] == BodyTypes::ROBOT_ATTACHED ||
+    !state.getRobotModel()->getMimicJointModels().empty() ||
+    config.geometry_bounds_model_identity != state.getRobotModel().get() ||
+    config.geometry_bounds_group_identity != &group ||
+    config.geometry_bounds_variable_names != group.getVariableNames() ||
+    joint_uncertainty.size() != static_cast<Eigen::Index>(group.getVariableCount()) ||
+    config.distance_bounds.empty())
+  {
+    return fallback;
+  }
+
+  std::pair<std::string, std::string> key;
+  if (candidate.kind == CollisionPairKind::kSelf) {
+    if (candidate.body_types[0] != BodyTypes::ROBOT_LINK ||
+      candidate.body_types[1] != BodyTypes::ROBOT_LINK)
+    {
+      return fallback;
+    }
+    key = std::minmax(candidate.body_names[0], candidate.body_names[1]);
+  } else {
+    const bool first_world = candidate.body_types[0] == BodyTypes::WORLD_OBJECT;
+    const bool second_world = candidate.body_types[1] == BodyTypes::WORLD_OBJECT;
+    if (first_world == second_world ||
+      (first_world ? candidate.body_types[1] : candidate.body_types[0]) != BodyTypes::ROBOT_LINK)
+    {
+      return fallback;
+    }
+    key.first = first_world ? candidate.body_names[1] : candidate.body_names[0];
+  }
+  const auto coefficients = config.distance_joint_bounds_m_per_rad.find(key);
+  const auto configured_bound = config.distance_bounds.find(key);
+  if (coefficients == config.distance_joint_bounds_m_per_rad.end() ||
+    configured_bound == config.distance_bounds.end() ||
+    coefficients->second.size() != static_cast<std::size_t>(joint_uncertainty.size()))
+  {
+    return fallback;
+  }
+  double coefficient_sum = 0.0;
+  double weighted_reserve = 0.0;
+  for (Eigen::Index index = 0; index < joint_uncertainty.size(); ++index) {
+    const double coefficient = coefficients->second[static_cast<std::size_t>(index)];
+    if (!std::isfinite(coefficient) || coefficient < 0.0) {
+      return fallback;
+    }
+    coefficient_sum += coefficient;
+    weighted_reserve += coefficient * joint_uncertainty[index];
+  }
+  const double sum_tolerance = 64.0 * std::numeric_limits<double>::epsilon() *
+    std::max(1.0, scalar_lipschitz);
+  if (!std::isfinite(weighted_reserve) ||
+    !std::isfinite(configured_bound->second) ||
+    std::abs(coefficient_sum - scalar_lipschitz) > sum_tolerance ||
+    std::abs(configured_bound->second - scalar_lipschitz) > sum_tolerance)
+  {
+    return fallback;
+  }
+  return weighted_reserve;
+}
+
+[[nodiscard]] double requiredClearanceWithDistanceReserve(
+  const DistanceCandidate & candidate,
+  const CollisionConstraintConfig & config,
+  const double additional_distance_reserve_m)
+{
+  return requiredClearance(candidate, config) + additional_distance_reserve_m;
 }
 
 [[nodiscard]] bool validateCollisionModel(

@@ -25,8 +25,12 @@ struct QpFailureSnapshotEvent
   std::uint64_t latest_publication_id{0U};
   QpFailureSnapshotDisposition primary_disposition{QpFailureSnapshotDisposition::kNotNeeded};
   QpFailureSnapshotDisposition secondary_disposition{QpFailureSnapshotDisposition::kNotNeeded};
+  QpFailureSnapshotDisposition tertiary_disposition{QpFailureSnapshotDisposition::kNotNeeded};
+  QpFailureSnapshotDisposition distance_disposition{QpFailureSnapshotDisposition::kNotNeeded};
   std::optional<QpFailureSnapshot> primary;
   std::optional<QpFailureSnapshot> secondary;
+  std::optional<QpFailureSnapshot> tertiary;
+  std::optional<QpFailureSnapshot> distance;
 };
 
 struct QpFailureSnapshotContext
@@ -49,7 +53,9 @@ public:
     const QpFailureSnapshotContext & context = {}) noexcept
   {
     if (result.primary_snapshot_disposition == QpFailureSnapshotDisposition::kNotNeeded &&
-      result.secondary_snapshot_disposition == QpFailureSnapshotDisposition::kNotNeeded)
+      result.secondary_snapshot_disposition == QpFailureSnapshotDisposition::kNotNeeded &&
+      result.tertiary_snapshot_disposition == QpFailureSnapshotDisposition::kNotNeeded &&
+      result.distance_snapshot_disposition == QpFailureSnapshotDisposition::kNotNeeded)
     {
       return false;
     }
@@ -69,8 +75,12 @@ public:
     pending_.latest_publication_id = context.latest_publication_id;
     pending_.primary_disposition = result.primary_snapshot_disposition;
     pending_.secondary_disposition = result.secondary_snapshot_disposition;
+    pending_.tertiary_disposition = result.tertiary_snapshot_disposition;
+    pending_.distance_disposition = result.distance_snapshot_disposition;
     pending_.primary = std::move(result.primary_failure_snapshot);
     pending_.secondary = std::move(result.secondary_failure_snapshot);
+    pending_.tertiary = std::move(result.tertiary_failure_snapshot);
+    pending_.distance = std::move(result.distance_failure_snapshot);
     state_.store(2U, std::memory_order_release);
     return true;
   }

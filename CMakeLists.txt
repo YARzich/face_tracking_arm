@@ -125,7 +125,7 @@ add_tracking_library(collision_constraints
   src/collision_stopping.cpp
   src/collision_validation.cpp
   src/robot_geometry_bounds.cpp)
-target_link_libraries(collision_constraints hierarchical_velocity_qp Eigen3::Eigen)
+target_link_libraries(collision_constraints hierarchical_velocity_qp emergency_brake_tail Eigen3::Eigen)
 ament_target_dependencies(collision_constraints moveit_core)
 
 add_tracking_library(collision_aware_servo_component

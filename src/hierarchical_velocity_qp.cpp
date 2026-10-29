@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "face_tracking_arm/detail/scalar_braking_policy.hpp"
+#include "face_tracking_arm/detail/feasible_distance_approximation.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -46,8 +48,12 @@ struct SparseArrays
 struct StageResult
 {
   QpStageStatus status{QpStageStatus::kSolverError};
+  QpStageStatus raw_solver_status{QpStageStatus::kSolverError};
   Eigen::VectorXd velocity;
+  Eigen::VectorXd raw_velocity;
   int iterations{0};
+  double solve_time_sec{0.0};
+  int retry_attempts{0};
   std::optional<QpFailureSnapshot> failure_snapshot;
   QpFailureSnapshotDisposition snapshot_disposition{
     QpFailureSnapshotDisposition::kNotNeeded};
@@ -657,13 +663,245 @@ bool satisfies_constraints(
   return true;
 }
 
-StageResult solve_stage(
+bool exact_box_single_row_minimizer(
+  const Eigen::MatrixXd & hessian,
+  const Eigen::VectorXd & gradient,
+  const ConstraintMatrix & constraints,
+  const double feasibility_tolerance,
+  const std::chrono::steady_clock::time_point deadline,
+  Eigen::VectorXd & solution)
+{
+  const Eigen::Index count = gradient.size();
+  if (count <= 0 || hessian.rows() != count || hessian.cols() != count ||
+    constraints.matrix.rows() != count + 1 || constraints.matrix.cols() != count ||
+    constraints.lower.size() != count + 1 || constraints.upper.size() != count + 1 ||
+    !is_finite(hessian) || !is_finite(gradient) || !is_finite(constraints.matrix))
+  {
+    return false;
+  }
+
+  Eigen::VectorXd lower(count);
+  Eigen::VectorXd upper(count);
+  Eigen::VectorXd diagonal(count);
+  Eigen::VectorXd unconstrained(count);
+  const double machine_epsilon = std::numeric_limits<double>::epsilon();
+  for (Eigen::Index i = 0; i < count; ++i) {
+    if (!std::isfinite(constraints.lower[i]) || !std::isfinite(constraints.upper[i]) ||
+      constraints.lower[i] > constraints.upper[i] ||
+      !std::isfinite(hessian(i, i)) || hessian(i, i) <= 0.0)
+    {
+      return false;
+    }
+    for (Eigen::Index j = 0; j < count; ++j) {
+      if (i != j && (hessian(i, j) != 0.0 || hessian(j, i) != 0.0)) {
+        return false;
+      }
+      if (constraints.matrix(i, j) != (i == j ? 1.0 : 0.0)) {
+        return false;
+      }
+    }
+    diagonal[i] = hessian(i, i);
+    lower[i] = constraints.lower[i];
+    upper[i] = constraints.upper[i];
+    unconstrained[i] = -gradient[i] / diagonal[i];
+    if (!std::isfinite(unconstrained[i])) {
+      return false;
+    }
+  }
+
+  const Eigen::VectorXd row = constraints.matrix.row(count).transpose();
+  const double row_lower = constraints.lower[count];
+  const double row_upper = constraints.upper[count];
+  if (!is_finite(row) || std::isnan(row_lower) || std::isnan(row_upper) ||
+    row_lower > row_upper)
+  {
+    return false;
+  }
+  Eigen::VectorXd candidate = unconstrained.cwiseMax(lower).cwiseMin(upper);
+  double lambda = 0.0;
+  double direction = 0.0;
+  double target = 0.0;
+  double row_at_candidate = row.dot(candidate);
+  if (!std::isfinite(row_at_candidate)) {
+    return false;
+  }
+  if (row_at_candidate < row_lower) {
+    direction = 1.0;
+    target = row_lower;
+  } else if (row_at_candidate > row_upper) {
+    direction = -1.0;
+    target = -row_upper;
+  } else {
+    solution = std::move(candidate);
+    return satisfies_constraints(solution, constraints, feasibility_tolerance);
+  }
+  if (!std::isfinite(target)) {
+    return false;
+  }
+
+  Eigen::VectorXd signed_row = direction * row;
+  const long double n_eps = static_cast<long double>(2 * count + 1) *
+    static_cast<long double>(machine_epsilon);
+  const long double gamma = n_eps / (1.0L - n_eps);
+  long double max_row_value = 0.0L;
+  long double row_abs_sum = 0.0L;
+  for (Eigen::Index i = 0; i < count; ++i) {
+    const double extremal = signed_row[i] >= 0.0 ? upper[i] : lower[i];
+    const long double term = static_cast<long double>(signed_row[i]) *
+      static_cast<long double>(extremal);
+    max_row_value += term;
+    row_abs_sum += std::abs(term);
+  }
+  const long double arithmetic_roundoff = gamma * row_abs_sum;
+  if (static_cast<long double>(target) - max_row_value > arithmetic_roundoff) {
+    return false;
+  }
+
+  std::vector<double> saturation_breakpoints;
+  saturation_breakpoints.reserve(static_cast<std::size_t>(count));
+  for (Eigen::Index i = 0; i < count; ++i) {
+    const double c = signed_row[i];
+    if (c > 0.0 && unconstrained[i] < upper[i]) {
+      const double breakpoint = (upper[i] - unconstrained[i]) * diagonal[i] / c;
+      if (std::isfinite(breakpoint)) {
+        saturation_breakpoints.push_back(breakpoint);
+      }
+    } else if (c < 0.0 && unconstrained[i] > lower[i]) {
+      const double breakpoint = (lower[i] - unconstrained[i]) * diagonal[i] / c;
+      if (std::isfinite(breakpoint)) {
+        saturation_breakpoints.push_back(breakpoint);
+      }
+    }
+  }
+  if (saturation_breakpoints.empty()) {
+    return false;
+  }
+  std::sort(saturation_breakpoints.begin(), saturation_breakpoints.end());
+
+  const auto at_multiplier = [&](const double multiplier) {
+      return (unconstrained + multiplier * signed_row.cwiseQuotient(diagonal))
+             .cwiseMax(lower).cwiseMin(upper);
+    };
+  double low = 0.0;
+  double high = 0.0;
+  bool bracket_found = false;
+  for (const double breakpoint : saturation_breakpoints) {
+    const Eigen::VectorXd at_breakpoint = at_multiplier(breakpoint);
+    const double value = signed_row.dot(at_breakpoint);
+    if (!std::isfinite(value)) {
+      return false;
+    }
+    if (value >= target) {
+      high = breakpoint;
+      bracket_found = true;
+      break;
+    }
+    low = breakpoint;
+  }
+  if (!bracket_found) {
+    // The row bound can exceed the exact box extremum only by the bounded
+    // floating-point dot-product error checked above. Use that exact box corner.
+    lambda = saturation_breakpoints.back();
+    candidate.resize(count);
+    for (Eigen::Index i = 0; i < count; ++i) {
+      candidate[i] = signed_row[i] >= 0.0 ? upper[i] : lower[i];
+    }
+    const double achieved_at_corner = signed_row.dot(candidate);
+    if (!std::isfinite(achieved_at_corner) ||
+      static_cast<long double>(target) - static_cast<long double>(achieved_at_corner) >
+      arithmetic_roundoff)
+    {
+      return false;
+    }
+  } else {
+    for (int iteration = 0; iteration < 64; ++iteration) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      const double middle = low + 0.5 * (high - low);
+      if (middle == low || middle == high) {
+        break;
+      }
+      const Eigen::VectorXd at_middle = at_multiplier(middle);
+      const double value = signed_row.dot(at_middle);
+      if (!std::isfinite(value)) {
+        return false;
+      }
+      if (value >= target) {
+        high = middle;
+      } else {
+        low = middle;
+      }
+    }
+    lambda = high;
+    candidate = at_multiplier(lambda);
+  }
+  const double achieved = signed_row.dot(candidate);
+  if (!is_finite(candidate) || !std::isfinite(achieved) ||
+    static_cast<long double>(target) - static_cast<long double>(achieved) >
+    arithmetic_roundoff)
+  {
+    return false;
+  }
+
+  // Verify the diagonal-QP KKT conditions, including the box normal cone.
+  const Eigen::VectorXd stationarity = diagonal.cwiseProduct(candidate) +
+    gradient - lambda * signed_row;
+  for (Eigen::Index i = 0; i < count; ++i) {
+    if (lower[i] == upper[i]) {
+      continue;
+    }
+    const double scale = std::max({1.0, std::abs(gradient[i]),
+          std::abs(diagonal[i] * candidate[i]), std::abs(lambda * signed_row[i])});
+    const double kkt_tolerance = 64.0 * machine_epsilon * scale;
+    if (candidate[i] == lower[i]) {
+      if (stationarity[i] < -kkt_tolerance) {
+        return false;
+      }
+    } else if (candidate[i] == upper[i]) {
+      if (stationarity[i] > kkt_tolerance) {
+        return false;
+      }
+    } else if (std::abs(stationarity[i]) > kkt_tolerance) {
+      return false;
+    }
+  }
+  const long double objective = [&]() {
+      long double value = 0.0L;
+      for (Eigen::Index i = 0; i < count; ++i) {
+        const long double x = static_cast<long double>(candidate[i]);
+        value += 0.5L * static_cast<long double>(diagonal[i]) * x * x +
+          static_cast<long double>(gradient[i]) * x;
+      }
+      return value;
+    }();
+  long double box_objective = 0.0L;
+  for (Eigen::Index i = 0; i < count; ++i) {
+    const long double x = static_cast<long double>(std::clamp(
+        unconstrained[i], lower[i], upper[i]));
+    box_objective += 0.5L * static_cast<long double>(diagonal[i]) * x * x +
+      static_cast<long double>(gradient[i]) * x;
+  }
+  const long double objective_roundoff = 64.0L * machine_epsilon *
+    std::max(1.0L, std::abs(objective));
+  if (!std::isfinite(objective) || objective + objective_roundoff < box_objective ||
+    !satisfies_constraints(candidate, constraints, feasibility_tolerance))
+  {
+    return false;
+  }
+  solution = std::move(candidate);
+  return true;
+}
+
+StageResult solve_stage_once(
   const Eigen::MatrixXd & hessian,
   const Eigen::VectorXd & gradient,
   const ConstraintMatrix & constraints,
   const Eigen::VectorXd & warm_start,
   const HierarchicalVelocityQpConfig & config,
-  const QpSolveStage solve_stage_kind)
+  const QpSolveStage solve_stage_kind,
+  const std::chrono::steady_clock::time_point deadline,
+  const bool primary_rho_retry = false)
 {
   StageResult result;
   const Eigen::Index variable_count = gradient.size();
@@ -765,10 +1003,24 @@ StageResult solve_stage(
   settings.scaled_termination = 1;
   settings.check_termination = 1;
   settings.max_iter = static_cast<c_int>(config.solver_max_iterations);
+  if (primary_rho_retry && solve_stage_kind == QpSolveStage::kPrimary) {
+    // This bounded primary retry resolves the captured collision-bound corner
+    // without changing tolerances, iterations, or the shared solver deadline.
+    settings.rho = 100.0;
+    settings.adaptive_rho = 0;
+  }
+  if (solve_stage_kind == QpSolveStage::kDistance) {
+    // Captured production distance QPs converge more reliably with a less
+    // aggressive penalty update interval. The iteration limit remains the
+    // configured limit and the wall-clock budget stays unchanged.
+    settings.rho = 2.0;
+    settings.adaptive_rho_interval = 50;
+  }
   settings.eps_prim_inf = static_cast<c_float>(kSolverPrimalInfeasibilityTolerance);
   settings.eps_abs = static_cast<c_float>(config.solver_absolute_tolerance);
   settings.eps_rel = static_cast<c_float>(config.solver_relative_tolerance);
-  settings.time_limit = static_cast<c_float>(config.solver_time_limit_sec);
+  settings.time_limit = static_cast<c_float>(std::max(0.0,
+      std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count()));
 
   std::vector<c_float> initial_velocity(static_cast<std::size_t>(variable_count));
   for (Eigen::Index index = 0; index < variable_count; ++index) {
@@ -863,11 +1115,28 @@ StageResult solve_stage(
   }
   if (workspace->settings != nullptr) {
     settings = *workspace->settings;
+    const double remaining_time_sec = std::max(0.0,
+      std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count());
+    workspace->settings->time_limit = static_cast<c_float>(remaining_time_sec);
+    settings = *workspace->settings;
   }
 
   if (osqp_warm_start_x(workspace.get(), initial_velocity.data()) != 0) {
     capture_failure(0, -1, OSQP_UNSOLVED, 0.0);
     return result;
+  }
+
+  const double remaining_time_sec = std::chrono::duration<double>(
+    deadline - std::chrono::steady_clock::now()).count();
+  if (remaining_time_sec <= 0.0) {
+    result.status = QpStageStatus::kTimeLimit;
+    result.raw_solver_status = QpStageStatus::kTimeLimit;
+    capture_failure(0, 0, OSQP_UNSOLVED, 0.0);
+    return result;
+  }
+  if (workspace->settings != nullptr) {
+    workspace->settings->time_limit = static_cast<c_float>(remaining_time_sec);
+    settings = *workspace->settings;
   }
 
   const c_int solve_result = osqp_solve(workspace.get());
@@ -876,16 +1145,26 @@ StageResult solve_stage(
     return result;
   }
   result.status = classify_stage_status(workspace->info->status_val);
+  result.raw_solver_status = result.status;
   result.iterations = static_cast<int>(workspace->info->iter);
+  result.solve_time_sec = static_cast<double>(workspace->info->solve_time);
+  const bool has_raw_solution = workspace->solution != nullptr &&
+    workspace->solution->x != nullptr;
   if (result.status != QpStageStatus::kSolved &&
     result.status != QpStageStatus::kSolvedInaccurate)
   {
+    if (solve_stage_kind == QpSolveStage::kDistance && has_raw_solution) {
+      result.raw_velocity.resize(variable_count);
+      for (Eigen::Index index = 0; index < variable_count; ++index) {
+        result.raw_velocity[index] = workspace->solution->x[index] + variable_shift[index];
+      }
+    }
     capture_failure(0, static_cast<int>(solve_result),
       static_cast<int>(workspace->info->status_val),
       static_cast<double>(workspace->info->solve_time));
     return result;
   }
-  if (workspace->solution == nullptr || workspace->solution->x == nullptr) {
+  if (!has_raw_solution) {
     result.status = QpStageStatus::kSolverError;
     capture_failure(0, static_cast<int>(solve_result),
       static_cast<int>(workspace->info->status_val),
@@ -907,6 +1186,12 @@ StageResult solve_stage(
   if (!satisfies_constraints(
       result.velocity, constraints, config.solution_feasibility_tolerance))
   {
+    if (solve_stage_kind == QpSolveStage::kDistance) {
+      result.raw_velocity.resize(variable_count);
+      for (Eigen::Index index = 0; index < variable_count; ++index) {
+        result.raw_velocity[index] = workspace->solution->x[index] + variable_shift[index];
+      }
+    }
     result.velocity.resize(0);
     result.status = QpStageStatus::kSolverError;
     capture_failure(0, static_cast<int>(solve_result),
@@ -914,6 +1199,87 @@ StageResult solve_stage(
       static_cast<double>(workspace->info->solve_time));
   }
   return result;
+}
+
+StageResult solve_stage_until(
+  const Eigen::MatrixXd & hessian,
+  const Eigen::VectorXd & gradient,
+  const ConstraintMatrix & constraints,
+  const Eigen::VectorXd & warm_start,
+  const HierarchicalVelocityQpConfig & config,
+  const QpSolveStage solve_stage_kind,
+  const std::chrono::steady_clock::time_point deadline)
+{
+  StageResult first = solve_stage_once(
+    hessian, gradient, constraints, warm_start, config, solve_stage_kind, deadline);
+
+  const bool postcheck_failure =
+    first.status == QpStageStatus::kSolverError &&
+    (first.raw_solver_status == QpStageStatus::kSolved ||
+    first.raw_solver_status == QpStageStatus::kSolvedInaccurate);
+  const bool eligible_failure = first.status == QpStageStatus::kInfeasible ||
+    first.status == QpStageStatus::kMaxIterations ||
+    first.status == QpStageStatus::kTimeLimit || postcheck_failure;
+  if (!eligible_failure || std::chrono::steady_clock::now() >= deadline) {
+    return first;
+  }
+
+  Eigen::VectorXd exact_solution;
+  const bool exact_solution_available = exact_box_single_row_minimizer(
+    hessian, gradient, constraints, config.solution_feasibility_tolerance,
+    deadline, exact_solution);
+  if (std::chrono::steady_clock::now() >= deadline) {
+    return first;
+  }
+  if (exact_solution_available && exact_solution.size() == warm_start.size()) {
+    for (Eigen::Index index = 0; index < exact_solution.size(); ++index) {
+      exact_solution[index] = std::clamp(
+        exact_solution[index], constraints.lower[index], constraints.upper[index]);
+    }
+    if (satisfies_constraints(
+        exact_solution, constraints, config.solution_feasibility_tolerance))
+    {
+      first.status = QpStageStatus::kSolved;
+      // Keep raw_solver_status and the first-attempt snapshot as diagnostics. The
+      // accepted command came from the exact diagonal box+row minimizer above.
+      first.velocity = std::move(exact_solution);
+      first.retry_attempts = 1;
+      return first;
+    }
+  }
+
+  if (solve_stage_kind != QpSolveStage::kPrimary ||
+    first.status != QpStageStatus::kMaxIterations ||
+    std::chrono::steady_clock::now() >= deadline)
+  {
+    return first;
+  }
+
+  StageResult retry = solve_stage_once(
+    hessian, gradient, constraints, warm_start, config, solve_stage_kind,
+    deadline, true);
+  retry.iterations += first.iterations;
+  retry.solve_time_sec += first.solve_time_sec;
+  retry.retry_attempts += first.retry_attempts + 1;
+  // Report the original failure even when the alternate settings recover.
+  retry.failure_snapshot = std::move(first.failure_snapshot);
+  retry.snapshot_disposition = first.snapshot_disposition;
+  return retry;
+}
+
+StageResult solve_stage(
+  const Eigen::MatrixXd & hessian,
+  const Eigen::VectorXd & gradient,
+  const ConstraintMatrix & constraints,
+  const Eigen::VectorXd & warm_start,
+  const HierarchicalVelocityQpConfig & config,
+  const QpSolveStage solve_stage_kind)
+{
+  const auto deadline = std::chrono::steady_clock::now() +
+    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+    std::chrono::duration<double>(config.solver_time_limit_sec));
+  return solve_stage_until(
+    hessian, gradient, constraints, warm_start, config, solve_stage_kind, deadline);
 }
 
 std::pair<Eigen::MatrixXd, Eigen::VectorXd> make_tracking_objective(
@@ -962,6 +1328,110 @@ QpStatus top_level_status(const QpStageStatus status)
 }
 
 }  // namespace
+
+std::optional<detail::FeasibleDistanceApproximation>
+detail::minimizeFeasibleDistanceSegment(
+  const QpStageStatus stage_status, const QpStageStatus raw_solver_status,
+  const Eigen::MatrixXd & hessian, const Eigen::VectorXd & gradient,
+  const Eigen::MatrixXd & constraints, const Eigen::VectorXd & lower,
+  const Eigen::VectorXd & upper, const Eigen::VectorXd & warm,
+  const Eigen::VectorXd & raw, const double feasibility_tolerance)
+{
+  const bool retryable_failure = stage_status == QpStageStatus::kMaxIterations ||
+    stage_status == QpStageStatus::kTimeLimit;
+  const bool postcheck_rejected = stage_status == QpStageStatus::kSolverError &&
+    (raw_solver_status == QpStageStatus::kSolved ||
+    raw_solver_status == QpStageStatus::kSolvedInaccurate);
+  const Eigen::Index joint_count = warm.size();
+  if ((!retryable_failure && !postcheck_rejected) || joint_count <= 0 ||
+    raw.size() != joint_count || hessian.rows() != joint_count ||
+    hessian.cols() != joint_count || gradient.size() != joint_count ||
+    constraints.cols() != joint_count || constraints.rows() < joint_count ||
+    lower.size() != constraints.rows() || upper.size() != constraints.rows() ||
+    !std::isfinite(feasibility_tolerance) || feasibility_tolerance < 0.0 ||
+    !is_finite(hessian) || !is_finite(gradient) || !is_finite(constraints) ||
+    !is_finite(warm) || !is_finite(raw))
+  {
+    return std::nullopt;
+  }
+  for (Eigen::Index row = 0; row < lower.size(); ++row) {
+    if (std::isnan(lower[row]) || std::isnan(upper[row]) || lower[row] > upper[row]) {
+      return std::nullopt;
+    }
+  }
+
+  const Eigen::VectorXd warm_rows = constraints * warm;
+  if (!is_finite(warm_rows)) {
+    return std::nullopt;
+  }
+  double alpha_upper = 1.0;
+  const Eigen::VectorXd direction = raw - warm;
+  const Eigen::VectorXd row_direction = constraints * direction;
+  for (Eigen::Index row = 0; row < constraints.rows(); ++row) {
+    const double tolerance = row < joint_count ? 0.0 : feasibility_tolerance;
+    const double row_lower = lower[row] - tolerance;
+    const double row_upper = upper[row] + tolerance;
+    const double start = warm_rows[row];
+    const double delta = row_direction[row];
+    if ((std::isfinite(row_lower) && start < row_lower) ||
+      (std::isfinite(row_upper) && start > row_upper))
+    {
+      return std::nullopt;
+    }
+    if (delta > 0.0 && std::isfinite(row_upper)) {
+      alpha_upper = std::min(alpha_upper, (row_upper - start) / delta);
+    } else if (delta < 0.0 && std::isfinite(row_lower)) {
+      alpha_upper = std::min(alpha_upper, (row_lower - start) / delta);
+    }
+  }
+  alpha_upper = std::clamp(alpha_upper, 0.0, 1.0);
+  if (alpha_upper > 0.0 && alpha_upper < 1.0) {
+    alpha_upper = std::nextafter(alpha_upper, 0.0);
+  }
+
+  const Eigen::MatrixXd symmetric_hessian = 0.5 * (hessian + hessian.transpose());
+  const double quadratic = direction.dot(symmetric_hessian * direction);
+  const double linear = direction.dot(symmetric_hessian * warm + gradient);
+  const double warm_cost = 0.5 * warm.dot(symmetric_hessian * warm) + gradient.dot(warm);
+  if (!std::isfinite(quadratic) || !std::isfinite(linear) || !std::isfinite(warm_cost)) {
+    return std::nullopt;
+  }
+  double alpha = 0.0;
+  if (quadratic > 0.0) {
+    alpha = std::clamp(-linear / quadratic, 0.0, alpha_upper);
+  } else if (linear < 0.0) {
+    alpha = alpha_upper;
+  }
+
+  detail::FeasibleDistanceApproximation approximation;
+  approximation.alpha = alpha;
+  approximation.velocity = warm + alpha * direction;
+  for (Eigen::Index joint = 0; joint < joint_count; ++joint) {
+    approximation.velocity[joint] = std::clamp(
+      approximation.velocity[joint], lower[joint], upper[joint]);
+  }
+  const Eigen::VectorXd candidate_rows = constraints * approximation.velocity;
+  if (!is_finite(candidate_rows)) {
+    return std::nullopt;
+  }
+  for (Eigen::Index row = 0; row < constraints.rows(); ++row) {
+    if ((std::isfinite(lower[row]) &&
+      candidate_rows[row] < lower[row] - feasibility_tolerance) ||
+      (std::isfinite(upper[row]) &&
+      candidate_rows[row] > upper[row] + feasibility_tolerance))
+    {
+      return std::nullopt;
+    }
+  }
+  const double candidate_cost =
+    0.5 * approximation.velocity.dot(symmetric_hessian * approximation.velocity) +
+    gradient.dot(approximation.velocity);
+  if (!std::isfinite(candidate_cost) || candidate_cost > warm_cost) {
+    approximation.velocity = warm;
+    approximation.alpha = 0.0;
+  }
+  return approximation;
+}
 
 QpReplayResult replayQpFailureSnapshot(const QpFailureSnapshot & snapshot)
 {
@@ -1140,7 +1610,7 @@ QpStageStatus classifyQpSolverStatus(const int raw_status_value) noexcept
 bool QpResult::command_available() const noexcept
 {
   return status == QpStatus::kSolved || status == QpStatus::kSolvedInaccurate ||
-         status == QpStatus::kPrimaryOnly;
+         status == QpStatus::kPrimaryOnly || status == QpStatus::kPartial;
 }
 
 JointCenteringGuidance jointCenteringGuidance(
@@ -1193,16 +1663,44 @@ QpResult HierarchicalVelocityQp::solve(
   }
 
   const Eigen::Index joint_count = state.position.size();
+  const auto optional_objective_valid = [&](
+    const Eigen::MatrixXd & matrix, const Eigen::VectorXd & reference,
+    const Eigen::VectorXd & weights) {
+      return matrix.rows() == 0 ?
+             (matrix.cols() == 0 || matrix.cols() == joint_count) &&
+             reference.size() == 0 && weights.size() == 0 :
+             valid_objective(matrix, reference, weights, joint_count, true);
+    };
   if (!valid_objective(
       task.primary_matrix, task.primary_reference, task.primary_weights,
       joint_count, false) ||
     !valid_objective(
       task.secondary_matrix, task.secondary_reference, task.secondary_weights,
-      joint_count, true))
+      joint_count, true) ||
+    !optional_objective_valid(
+      task.tertiary_matrix, task.tertiary_reference, task.tertiary_weights) ||
+    !optional_objective_valid(
+      task.distance_matrix, task.distance_reference, task.distance_weights))
   {
     return result;
   }
 
+  const auto valid_constraint = [joint_count](const LinearVelocityConstraint & constraint) {
+      return constraint.coefficients.size() == joint_count &&
+             is_finite(constraint.coefficients) && !std::isnan(constraint.lower_bound) &&
+             !std::isnan(constraint.upper_bound) &&
+             constraint.lower_bound <= constraint.upper_bound;
+    };
+  for (const LinearVelocityConstraint & constraint : task.preferred_primary_constraints) {
+    if (!valid_constraint(constraint)) {
+      return result;
+    }
+  }
+  for (const LinearVelocityConstraint & constraint : task.secondary_constraints) {
+    if (!valid_constraint(constraint)) {
+      return result;
+    }
+  }
   ConstraintMatrix base_constraints;
   const InputCheck bounds_check = build_constraint_matrix(
     state, limits, constraints, config_, base_constraints);
@@ -1213,70 +1711,267 @@ QpResult HierarchicalVelocityQp::solve(
     result.status = QpStatus::kInfeasible;
     return result;
   }
-
-  const auto primary_objective = make_tracking_objective(
-    task.primary_matrix, task.primary_reference, task.primary_weights,
-    state.velocity, config_);
-  StageResult primary = solve_stage(
-    primary_objective.first, primary_objective.second, base_constraints,
-    state.velocity, config_, QpSolveStage::kPrimary);
-  result.primary_status = primary.status;
-  result.primary_iterations = primary.iterations;
-  result.primary_failure_snapshot = std::move(primary.failure_snapshot);
-  result.primary_snapshot_disposition = primary.snapshot_disposition;
-  if (primary.status != QpStageStatus::kSolved &&
-    primary.status != QpStageStatus::kSolvedInaccurate)
+  if (task.distance_matrix.rows() == 1 && task.distance_reference.size() == 1 &&
+    std::isfinite(task.distance_reference[0]))
   {
+    result.requested_distance_rate = task.distance_reference[0];
+  }
+  const auto record_achieved_distance_rate = [&]() {
+      if (result.command_available() && task.distance_matrix.rows() == 1 &&
+        result.joint_velocity.size() == joint_count)
+      {
+        const double rate = task.distance_matrix.row(0).dot(result.joint_velocity);
+        if (std::isfinite(rate)) {
+          result.achieved_distance_rate = rate;
+        }
+      }
+    };
+
+  // Carry preferred GOOD rows and lower-rank constraints through every lower solve.
+  // Empty objectives are skipped, so an empty objective never preserves damping.
+  ConstraintMatrix lower_constraints = base_constraints;
+  const auto append_task_constraints = [&](
+    ConstraintMatrix & output, const auto & task_constraints) {
+      if (task_constraints.empty()) {
+        return;
+      }
+      const Eigen::Index old_rows = output.matrix.rows();
+      const Eigen::Index extra_rows =
+        static_cast<Eigen::Index>(task_constraints.size());
+      output.matrix.conservativeResize(old_rows + extra_rows, joint_count);
+      output.lower.conservativeResize(old_rows + extra_rows);
+      output.upper.conservativeResize(old_rows + extra_rows);
+      for (Eigen::Index row = 0; row < extra_rows; ++row) {
+        const auto & constraint = task_constraints[static_cast<std::size_t>(row)];
+        output.matrix.row(old_rows + row) = constraint.coefficients.transpose();
+        output.lower[old_rows + row] = constraint.lower_bound;
+        output.upper[old_rows + row] = constraint.upper_bound;
+      }
+    };
+  append_task_constraints(lower_constraints, task.preferred_primary_constraints);
+  append_task_constraints(lower_constraints, task.secondary_constraints);
+
+  const auto with_preservation = [&](
+    const std::vector<std::pair<Eigen::MatrixXd, Eigen::VectorXd>> & preserved) {
+      ConstraintMatrix output;
+      Eigen::Index preserved_rows = 0;
+      for (const auto & entry : preserved) {
+        preserved_rows += entry.first.rows();
+      }
+      const Eigen::Index base_rows = lower_constraints.matrix.rows();
+      output.matrix.resize(base_rows + preserved_rows, joint_count);
+      output.lower.resize(base_rows + preserved_rows);
+      output.upper.resize(base_rows + preserved_rows);
+      output.matrix.topRows(base_rows) = lower_constraints.matrix;
+      output.lower.head(base_rows) = lower_constraints.lower;
+      output.upper.head(base_rows) = lower_constraints.upper;
+      Eigen::Index row = base_rows;
+      for (const auto & entry : preserved) {
+        const Eigen::Index count = entry.first.rows();
+        output.matrix.middleRows(row, count) = entry.first;
+        output.lower.segment(row, count) = entry.second.array() -
+          config_.primary_preservation_tolerance;
+        output.upper.segment(row, count) = entry.second.array() +
+          config_.primary_preservation_tolerance;
+        row += count;
+      }
+      return output;
+    };
+
+  const auto succeeded = [](const QpStageStatus status) {
+      return status == QpStageStatus::kSolved ||
+             status == QpStageStatus::kSolvedInaccurate;
+    };
+  std::vector<std::pair<Eigen::MatrixXd, Eigen::VectorXd>> preserved;
+  const auto run_rank = [&](
+    const Eigen::MatrixXd & matrix, const Eigen::VectorXd & reference,
+    const Eigen::VectorXd & weights, const QpSolveStage stage,
+    const Eigen::VectorXd & warm_start) {
+      const auto objective = make_tracking_objective(
+        matrix, reference, weights, state.velocity, config_);
+      return solve_stage(
+        objective.first, objective.second, with_preservation(preserved),
+        warm_start, config_, stage);
+    };
+
+  StageResult primary;
+  const bool has_preferred_primary_constraints =
+    !task.preferred_primary_constraints.empty();
+  {
+    const auto objective = make_tracking_objective(
+      task.primary_matrix, task.primary_reference, task.primary_weights,
+      state.velocity, config_);
+    ConstraintMatrix guarded_constraints = base_constraints;
+    if (has_preferred_primary_constraints) {
+      append_task_constraints(guarded_constraints, task.preferred_primary_constraints);
+    }
+    primary = solve_stage(
+      objective.first, objective.second, guarded_constraints, state.velocity,
+      config_, QpSolveStage::kPrimary);
+    if (has_preferred_primary_constraints) {
+      result.preferred_primary_status = primary.status;
+      result.primary_iterations = primary.iterations;
+      result.primary_retry_count = primary.retry_attempts;
+      result.primary_solve_time_sec = primary.solve_time_sec;
+      result.primary_failure_snapshot = std::move(primary.failure_snapshot);
+      result.primary_snapshot_disposition = primary.snapshot_disposition;
+      if (!succeeded(primary.status)) {
+        result.preferred_primary_fallback_used = true;
+        StageResult unguarded = solve_stage(
+          objective.first, objective.second, base_constraints, state.velocity,
+          config_, QpSolveStage::kPrimary);
+        result.primary_iterations += unguarded.iterations;
+        result.primary_retry_count += unguarded.retry_attempts;
+        result.primary_solve_time_sec += unguarded.solve_time_sec;
+        if (!result.primary_failure_snapshot.has_value()) {
+          result.primary_failure_snapshot = std::move(unguarded.failure_snapshot);
+          result.primary_snapshot_disposition = unguarded.snapshot_disposition;
+        }
+        primary = std::move(unguarded);
+      }
+    }
+  }
+  result.primary_status = primary.status;
+  if (!has_preferred_primary_constraints) {
+    result.primary_iterations = primary.iterations;
+    result.primary_retry_count = primary.retry_attempts;
+    result.primary_solve_time_sec = primary.solve_time_sec;
+    result.primary_failure_snapshot = std::move(primary.failure_snapshot);
+    result.primary_snapshot_disposition = primary.snapshot_disposition;
+  }
+  if (!succeeded(primary.status)) {
     result.status = top_level_status(primary.status);
     return result;
   }
-
   result.joint_velocity = primary.velocity;
   result.achieved_primary_velocity = task.primary_matrix * primary.velocity;
-
-  if (task.secondary_matrix.rows() == 0) {
-    result.status = top_level_status(primary.status);
+  bool any_rank_inaccurate = primary.status == QpStageStatus::kSolvedInaccurate;
+  preserved.emplace_back(task.primary_matrix, result.achieved_primary_velocity);
+  if (result.preferred_primary_fallback_used) {
+    result.status = QpStatus::kPrimaryOnly;
+    record_achieved_distance_rate();
     return result;
   }
 
-  ConstraintMatrix secondary_constraints;
-  const Eigen::Index base_rows = base_constraints.matrix.rows();
-  const Eigen::Index primary_rows = task.primary_matrix.rows();
-  secondary_constraints.matrix.resize(base_rows + primary_rows, joint_count);
-  secondary_constraints.matrix.topRows(base_rows) = base_constraints.matrix;
-  secondary_constraints.matrix.bottomRows(primary_rows) = task.primary_matrix;
-  secondary_constraints.lower.resize(base_rows + primary_rows);
-  secondary_constraints.upper.resize(base_rows + primary_rows);
-  secondary_constraints.lower.head(base_rows) = base_constraints.lower;
-  secondary_constraints.upper.head(base_rows) = base_constraints.upper;
-  secondary_constraints.lower.tail(primary_rows) =
-    result.achieved_primary_velocity.array() - config_.primary_preservation_tolerance;
-  secondary_constraints.upper.tail(primary_rows) =
-    result.achieved_primary_velocity.array() + config_.primary_preservation_tolerance;
+  const bool has_later_objective = task.secondary_matrix.rows() > 0 ||
+    task.tertiary_matrix.rows() > 0 || task.distance_matrix.rows() > 0;
+  const bool needs_constraints_only_secondary =
+    task.secondary_matrix.rows() == 0 &&
+    (!task.preferred_primary_constraints.empty() || !task.secondary_constraints.empty()) &&
+    !has_later_objective;
+  Eigen::VectorXd last_velocity = primary.velocity;
 
-  const auto secondary_objective = make_tracking_objective(
-    task.secondary_matrix, task.secondary_reference, task.secondary_weights,
-    state.velocity, config_);
-  StageResult secondary = solve_stage(
-    secondary_objective.first, secondary_objective.second,
-    secondary_constraints, primary.velocity, config_, QpSolveStage::kSecondary);
-  result.secondary_status = secondary.status;
-  result.secondary_iterations = secondary.iterations;
-  result.secondary_failure_snapshot = std::move(secondary.failure_snapshot);
-  result.secondary_snapshot_disposition = secondary.snapshot_disposition;
-  if (secondary.status != QpStageStatus::kSolved &&
-    secondary.status != QpStageStatus::kSolvedInaccurate)
+  const auto run_lower_rank = [&](
+    const Eigen::MatrixXd & matrix, const Eigen::VectorXd & reference,
+    const Eigen::VectorXd & weights, const QpSolveStage stage,
+    QpStageStatus & stage_status, int & iterations, double & solve_time_sec,
+    int & retry_count,
+    std::optional<QpFailureSnapshot> & failure_snapshot,
+    QpFailureSnapshotDisposition & snapshot_disposition,
+    const bool constraints_only = false) {
+      if (matrix.rows() == 0 && !constraints_only) {
+        return true;
+      }
+      const bool idle_constraints_only_rank = constraints_only &&
+        task.primary_reference.size() > 0 && task.primary_reference.isZero(0.0);
+      StageResult stage_result;
+      if (idle_constraints_only_rank) {
+        const Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(
+          joint_count, joint_count);
+        const Eigen::VectorXd zero = Eigen::VectorXd::Zero(joint_count);
+        const Eigen::VectorXd unit_weights = Eigen::VectorXd::Ones(joint_count);
+        stage_result = run_rank(identity, zero, unit_weights, stage, last_velocity);
+      } else {
+        stage_result = run_rank(matrix, reference, weights, stage, last_velocity);
+      }
+      stage_status = stage_result.status;
+      iterations = stage_result.iterations;
+      solve_time_sec = stage_result.solve_time_sec;
+      retry_count = stage_result.retry_attempts;
+      failure_snapshot = std::move(stage_result.failure_snapshot);
+      snapshot_disposition = stage_result.snapshot_disposition;
+      if (!succeeded(stage_status)) {
+        return false;
+      }
+      last_velocity = std::move(stage_result.velocity);
+      result.joint_velocity = last_velocity;
+      result.achieved_primary_velocity = task.primary_matrix * last_velocity;
+      any_rank_inaccurate = any_rank_inaccurate ||
+        stage_status == QpStageStatus::kSolvedInaccurate;
+      if (matrix.rows() > 0) {
+        preserved.emplace_back(matrix, matrix * last_velocity);
+      }
+      return true;
+    };
+
+  if (!run_lower_rank(
+      task.secondary_matrix, task.secondary_reference, task.secondary_weights,
+      QpSolveStage::kSecondary, result.secondary_status, result.secondary_iterations,
+      result.secondary_solve_time_sec,
+      result.secondary_retry_count,
+      result.secondary_failure_snapshot, result.secondary_snapshot_disposition,
+      needs_constraints_only_secondary))
   {
     result.status = QpStatus::kPrimaryOnly;
+    record_achieved_distance_rate();
     return result;
   }
+  if (!run_lower_rank(
+      task.tertiary_matrix, task.tertiary_reference, task.tertiary_weights,
+      QpSolveStage::kTertiary, result.tertiary_status, result.tertiary_iterations,
+      result.tertiary_solve_time_sec,
+      result.tertiary_retry_count,
+      result.tertiary_failure_snapshot, result.tertiary_snapshot_disposition))
+  {
+    result.status = QpStatus::kPartial;
+    record_achieved_distance_rate();
+    return result;
+  }
+  if (task.distance_matrix.rows() > 0) {
+    const auto distance_objective = make_tracking_objective(
+      task.distance_matrix, task.distance_reference, task.distance_weights,
+      state.velocity, config_);
+    const ConstraintMatrix distance_constraints = with_preservation(preserved);
+    StageResult distance = solve_stage(
+      distance_objective.first, distance_objective.second, distance_constraints,
+      last_velocity, config_, QpSolveStage::kDistance);
+    result.distance_status = distance.status;
+    result.distance_iterations += distance.iterations;
+    result.distance_retry_count += distance.retry_attempts;
+    result.distance_solve_time_sec += distance.solve_time_sec;
+    result.distance_failure_snapshot = std::move(distance.failure_snapshot);
+    result.distance_snapshot_disposition = distance.snapshot_disposition;
+    if (succeeded(distance.status)) {
+      last_velocity = std::move(distance.velocity);
+      result.joint_velocity = last_velocity;
+      result.achieved_primary_velocity = task.primary_matrix * last_velocity;
+      any_rank_inaccurate = any_rank_inaccurate ||
+        distance.status == QpStageStatus::kSolvedInaccurate;
+    } else {
+      const auto approximation = detail::minimizeFeasibleDistanceSegment(
+        distance.status, distance.raw_solver_status,
+        distance_objective.first, distance_objective.second,
+        distance_constraints.matrix, distance_constraints.lower,
+        distance_constraints.upper, last_velocity, distance.raw_velocity,
+        config_.solution_feasibility_tolerance);
+      if (approximation.has_value() && satisfies_constraints(
+          approximation->velocity, distance_constraints,
+          config_.solution_feasibility_tolerance))
+      {
+        result.joint_velocity = approximation->velocity;
+        result.achieved_primary_velocity = task.primary_matrix * result.joint_velocity;
+        result.distance_feasible_approximation_used = true;
+        result.distance_feasible_approximation_alpha = approximation->alpha;
+      }
+      result.status = QpStatus::kPartial;
+      record_achieved_distance_rate();
+      return result;
+    }
+  }
 
-  result.joint_velocity = secondary.velocity;
-  result.achieved_primary_velocity = task.primary_matrix * secondary.velocity;
-  result.status =
-    primary.status == QpStageStatus::kSolvedInaccurate ||
-    secondary.status == QpStageStatus::kSolvedInaccurate ?
-    QpStatus::kSolvedInaccurate : QpStatus::kSolved;
+  result.achieved_primary_velocity = task.primary_matrix * result.joint_velocity;
+  result.status = any_rank_inaccurate ? QpStatus::kSolvedInaccurate : QpStatus::kSolved;
+  record_achieved_distance_rate();
   return result;
 }
 
@@ -1315,6 +2010,7 @@ QpResult HierarchicalVelocityQp::brake(
     hessian, gradient, hard_constraints, state.velocity, config_, QpSolveStage::kBrake);
   result.primary_status = braking.status;
   result.primary_iterations = braking.iterations;
+  result.primary_retry_count = braking.retry_attempts;
   result.primary_failure_snapshot = std::move(braking.failure_snapshot);
   result.primary_snapshot_disposition = braking.snapshot_disposition;
   result.status = top_level_status(braking.status);

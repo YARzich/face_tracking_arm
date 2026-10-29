@@ -2,21 +2,29 @@
 // SPDX-License-Identifier: MIT
 
 #include <Eigen/Core>
+#include <Eigen/Eigenvalues>
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 #include "face_tracking_arm/emergency_brake_tail.hpp"
 #include "face_tracking_arm/detail/scalar_braking_policy.hpp"
+#include "face_tracking_arm/detail/feasible_distance_approximation.hpp"
 #include "face_tracking_arm/hierarchical_velocity_qp.hpp"
+#include "face_tracking_arm/qp_failure_snapshot_io.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -65,6 +73,211 @@ JointMotionLimits make_limits(const Eigen::Index joint_count)
   return limits;
 }
 
+HierarchicalVelocityQpConfig make_production_tolerance_config()
+{
+  HierarchicalVelocityQpConfig config;
+  config.velocity_regularization = 1.0e-4;
+  config.continuity_weight = 1.0e-3;
+  config.primary_preservation_tolerance = 2.0e-4;
+  config.solution_feasibility_tolerance = 2.0e-5;
+  config.solver_absolute_tolerance = 1.0e-5;
+  config.solver_relative_tolerance = 1.0e-5;
+  config.solver_time_limit_sec = 0.1;
+  config.solver_max_iterations = 2000;
+  return config;
+}
+
+void set_idle_physical_limits(JointMotionLimits & limits, const double period_sec)
+{
+  limits.max_velocity.setConstant(1.0);
+  limits.max_acceleration.setConstant(2.0);
+  limits.max_jerk.setConstant(20.0);
+  const auto numerical_policy = NumericalPolicy::fromDiscreteMotionLimits(
+    PositionInterval{-10.0, 10.0}, 1.0, 2.0, 20.0, period_sec,
+    SolverResidual{1.0e-6});
+  if (numerical_policy.has_value()) {
+    limits.numerical_policy = *numerical_policy;
+  }
+}
+
+void set_feasible_regression_limits(JointMotionLimits & limits);
+HierarchicalVelocityTask make_task(
+  const Eigen::MatrixXd & primary_matrix,
+  const Eigen::VectorXd & primary_reference,
+  const Eigen::MatrixXd & secondary_matrix,
+  const Eigen::VectorXd & secondary_reference);
+
+TEST(HierarchicalVelocityQp, ProductionToleranceNullspaceDecaysWithinTwoSeconds)
+{
+  auto config = make_production_tolerance_config();
+  config.period_sec = 0.01;
+  config.residual_command_latency_sec = 0.02;
+  const HierarchicalVelocityQp solver{config};
+  auto state = make_state(2);
+  auto limits = make_limits(2);
+  set_idle_physical_limits(limits, config.period_sec);
+  state.velocity[1] = 0.05;
+
+  Eigen::Matrix<double, 1, 2> primary;
+  primary << 1.0, 0.0;
+  Eigen::Matrix<double, 0, 2> no_secondary_objective;
+  auto task = make_task(
+    primary, Eigen::VectorXd::Zero(1), no_secondary_objective,
+    Eigen::VectorXd::Zero(0));
+  LinearVelocityConstraint zero_primary_axis;
+  zero_primary_axis.coefficients = Eigen::Vector2d(1.0, 0.0);
+  zero_primary_axis.lower_bound = 0.0;
+  zero_primary_axis.upper_bound = 0.0;
+  task.secondary_constraints.push_back(zero_primary_axis);
+
+  EmergencyBrakeTailConfig brake_config;
+  brake_config.period_sec = config.period_sec;
+  const EmergencyBrakeTail shared_brake = EmergencyBrakeTailGenerator{
+    brake_config}.generate(state, limits);
+  ASSERT_TRUE(shared_brake.command_available()) << shared_brake.failure_reason;
+
+  constexpr int kTicks = 200;
+  double integrated_joint_path = 0.0;
+  int secondary_one_iteration_ticks = 0;
+  int secondary_solved_ticks = 0;
+  for (int tick = 0; tick < kTicks; ++tick) {
+    const QpResult result = solver.solve(task, state, limits);
+    ASSERT_TRUE(result.command_available()) << "tick=" << tick;
+    ASSERT_TRUE(result.fully_solved()) << "tick=" << tick;
+    EXPECT_EQ(result.secondary_status, QpStageStatus::kSolved);
+    ASSERT_EQ(result.achieved_primary_velocity.size(), 1);
+    EXPECT_NEAR(result.achieved_primary_velocity[0], 0.0,
+      config.primary_preservation_tolerance);
+    secondary_one_iteration_ticks += result.secondary_iterations == 1 ? 1 : 0;
+    secondary_solved_ticks += result.secondary_iterations > 0 ? 1 : 0;
+
+    const double next_velocity = result.joint_velocity[1];
+    const double next_acceleration =
+      (next_velocity - state.velocity[1]) / config.period_sec;
+    const double next_jerk =
+      (next_acceleration - state.acceleration[1]) / config.period_sec;
+    integrated_joint_path += std::abs(next_velocity) * config.period_sec;
+    state.position[1] += next_velocity * config.period_sec;
+    state.acceleration[1] = next_acceleration;
+    state.velocity[1] = next_velocity;
+    EXPECT_LE(std::abs(next_acceleration), limits.max_acceleration[1] + 2.0e-5);
+    EXPECT_LE(std::abs(next_jerk), limits.max_jerk[1] + 2.0e-5);
+  }
+
+  std::cout << "ProductionToleranceNullspaceDecayDiagnostic"
+            << " initial_speed=0.05 final_speed=" << state.velocity[1]
+            << " path_rad=" << integrated_joint_path
+            << " brake_horizon_sec="
+            << (shared_brake.first_stationary_point * config.period_sec)
+            << " ticks=" << kTicks
+            << " secondary_solved_ticks=" << secondary_solved_ticks
+            << " secondary_one_iteration_ticks=" << secondary_one_iteration_ticks
+            << "\n";
+  EXPECT_EQ(secondary_solved_ticks, kTicks);
+  EXPECT_NEAR(state.position[0], 0.0, 1.0e-8);
+  EXPECT_LE(std::abs(state.acceleration[1]), limits.max_acceleration[1]);
+  // With no task requesting motion on joint 2, the exact least-squares
+  // minimizer contracts its velocity by lambda_c / (lambda_v + lambda_c)
+  // each tick. Two seconds are twenty time constants at these weights.
+  EXPECT_LT(std::abs(state.velocity[1]), 1.0e-4);
+  EXPECT_LT(integrated_joint_path, 0.01);
+}
+
+TEST(HierarchicalVelocityQp, ExplicitZeroVelocityRankSettlesWithPhysicalLimits)
+{
+  auto config = make_production_tolerance_config();
+  config.period_sec = 0.01;
+  config.residual_command_latency_sec = 0.02;
+  const HierarchicalVelocityQp solver{config};
+  auto state = make_state(2);
+  auto limits = make_limits(2);
+  set_idle_physical_limits(limits, config.period_sec);
+  state.velocity[1] = 0.05;
+
+  Eigen::Matrix<double, 1, 2> primary;
+  primary << 1.0, 0.0;
+  auto task = make_task(
+    primary, Eigen::VectorXd::Zero(1), Eigen::Matrix2d::Identity(),
+    Eigen::VectorXd::Zero(2));
+  LinearVelocityConstraint zero_primary_axis;
+  zero_primary_axis.coefficients = Eigen::Vector2d(1.0, 0.0);
+  zero_primary_axis.lower_bound = 0.0;
+  zero_primary_axis.upper_bound = 0.0;
+  task.secondary_constraints.push_back(zero_primary_axis);
+
+  auto raw_task = make_task(
+    primary, Eigen::VectorXd::Constant(1, 1.0e-3), Eigen::MatrixXd::Zero(0, 2),
+    Eigen::VectorXd::Zero(0));
+  LinearVelocityConstraint preserve_moving_primary;
+  preserve_moving_primary.coefficients = Eigen::Vector2d(1.0, 0.0);
+  preserve_moving_primary.lower_bound = 1.0e-3;
+  preserve_moving_primary.upper_bound = 1.0e-3;
+  raw_task.secondary_constraints.push_back(preserve_moving_primary);
+  const QpResult raw_result = solver.solve(raw_task, state, limits);
+  ASSERT_TRUE(raw_result.command_available());
+  ASSERT_TRUE(raw_result.fully_solved());
+  EXPECT_NEAR(raw_result.achieved_primary_velocity[0], 1.0e-3,
+    config.primary_preservation_tolerance);
+  EXPECT_GT(std::abs(raw_result.joint_velocity[1]), 0.01);
+
+  EmergencyBrakeTailConfig brake_config;
+  brake_config.period_sec = config.period_sec;
+  const EmergencyBrakeTail shared_brake = EmergencyBrakeTailGenerator{
+    brake_config}.generate(state, limits);
+  ASSERT_TRUE(shared_brake.command_available()) << shared_brake.failure_reason;
+
+  constexpr int kTicks = 1000;
+  double integrated_joint_path = 0.0;
+  int secondary_one_iteration_ticks = 0;
+  for (int tick = 0; tick < kTicks; ++tick) {
+    const QpResult result = solver.solve(task, state, limits);
+    ASSERT_TRUE(result.command_available()) << "tick=" << tick;
+    ASSERT_TRUE(result.fully_solved()) << "tick=" << tick;
+    EXPECT_EQ(result.secondary_status, QpStageStatus::kSolved);
+    ASSERT_EQ(result.achieved_primary_velocity.size(), 1);
+    EXPECT_NEAR(result.achieved_primary_velocity[0], 0.0,
+      config.primary_preservation_tolerance);
+    secondary_one_iteration_ticks += result.secondary_iterations == 1 ? 1 : 0;
+
+    const double next_velocity = result.joint_velocity[1];
+    const double next_acceleration =
+      (next_velocity - state.velocity[1]) / config.period_sec;
+    const double next_jerk =
+      (next_acceleration - state.acceleration[1]) / config.period_sec;
+    EXPECT_LE(std::abs(next_velocity), limits.max_velocity[1] + 2.0e-5);
+    EXPECT_LE(std::abs(next_acceleration), limits.max_acceleration[1] + 2.0e-5);
+    EXPECT_LE(std::abs(next_jerk), limits.max_jerk[1] + 2.0e-5);
+    integrated_joint_path += std::abs(next_velocity) * config.period_sec;
+    state.position[1] += next_velocity * config.period_sec;
+    state.acceleration[1] = next_acceleration;
+    state.velocity[1] = next_velocity;
+  }
+
+  std::cout << "ExplicitZeroVelocityRankSettlesWithPhysicalLimits"
+            << " raw_empty_rank_first_speed=" << raw_result.joint_velocity[1]
+            << " initial_speed=0.05 final_speed=" << state.velocity[1]
+            << " path_rad=" << integrated_joint_path
+            << " brake_horizon_sec="
+            << (shared_brake.first_stationary_point * config.period_sec)
+            << " ticks=" << kTicks
+            << " secondary_one_iteration_ticks=" << secondary_one_iteration_ticks
+            << "\n";
+  EXPECT_LT(std::abs(state.velocity[1]), 1.0e-3);
+  EXPECT_LT(integrated_joint_path, 0.01);
+}
+
+void set_feasible_regression_limits(JointMotionLimits & limits)
+{
+  limits.max_velocity.setConstant(2.0);
+  limits.max_acceleration.setConstant(10.0);
+  limits.max_jerk.setConstant(1000.0);
+  const auto numerical_policy = NumericalPolicy::fromDiscreteMotionLimits(
+    PositionInterval{-10.0, 10.0}, 2.0, 10.0, 1000.0, 0.01, SolverResidual{1.0e-6});
+  if (numerical_policy.has_value()) {
+    limits.numerical_policy = *numerical_policy;
+  }
+}
+
 HierarchicalVelocityTask make_task(
   const Eigen::MatrixXd & primary_matrix,
   const Eigen::VectorXd & primary_reference,
@@ -78,6 +291,12 @@ HierarchicalVelocityTask make_task(
   task.secondary_matrix = secondary_matrix;
   task.secondary_reference = secondary_reference;
   task.secondary_weights = Eigen::VectorXd::Ones(secondary_matrix.rows());
+  task.tertiary_matrix = Eigen::MatrixXd(0, primary_matrix.cols());
+  task.tertiary_reference = Eigen::VectorXd(0);
+  task.tertiary_weights = Eigen::VectorXd(0);
+  task.distance_matrix = Eigen::MatrixXd(0, primary_matrix.cols());
+  task.distance_reference = Eigen::VectorXd(0);
+  task.distance_weights = Eigen::VectorXd(0);
   return task;
 }
 
@@ -204,6 +423,1254 @@ TEST(HierarchicalVelocityQp, PreservesPrimaryTaskWhileUsingItsNullSpace)
     config.primary_preservation_tolerance + kTolerance);
 }
 
+TEST(HierarchicalVelocityQp, PreservesAllHigherRanksBeforeBestEffortDistance)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 3> gaze;
+  gaze << 1.0, 0.0, 0.0;
+  Eigen::Matrix<double, 1, 3> bend;
+  bend << 0.0, 1.0, 0.0;
+  Eigen::Matrix<double, 1, 3> extras;
+  extras << 0.0, 0.0, 1.0;
+  auto task = make_task(
+    gaze, Eigen::VectorXd::Constant(1, 0.4),
+    bend, Eigen::VectorXd::Constant(1, -0.2));
+  task.tertiary_matrix = extras;
+  task.tertiary_reference = Eigen::VectorXd::Constant(1, 0.3);
+  task.tertiary_weights = Eigen::VectorXd::Ones(1);
+  task.distance_matrix = extras;
+  task.distance_reference = Eigen::VectorXd::Constant(1, -0.7);
+  task.distance_weights = Eigen::VectorXd::Ones(1);
+
+  const QpResult result = solver.solve(task, make_state(3), make_limits(3));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_TRUE(result.fully_solved());
+  EXPECT_NEAR(result.joint_velocity[0], 0.4, config.primary_preservation_tolerance + kTolerance);
+  EXPECT_NEAR(result.joint_velocity[1], -0.2, config.primary_preservation_tolerance + kTolerance);
+  EXPECT_NEAR(result.joint_velocity[2], 0.3, config.primary_preservation_tolerance + kTolerance);
+  EXPECT_EQ(result.tertiary_status, QpStageStatus::kSolved);
+  EXPECT_EQ(result.distance_status, QpStageStatus::kSolved);
+}
+
+TEST(HierarchicalVelocityQp, BadPostureCanRecoverWithoutAComfortHardCorridor)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> gaze;
+  gaze << 1.0, 0.0;
+  Eigen::Matrix<double, 1, 2> normal_bend;
+  normal_bend << 0.0, 1.0;
+  auto task = make_task(
+    gaze, Eigen::VectorXd::Constant(1, 0.2),
+    normal_bend, Eigen::VectorXd::Constant(1, -0.3));
+  task.distance_matrix = normal_bend;
+  task.distance_reference = Eigen::VectorXd::Constant(1, 0.7);
+  task.distance_weights = Eigen::VectorXd::Ones(1);
+  JointMotionState state = make_state(2);
+  state.position[1] = 9.0;
+
+  const QpResult result = solver.solve(task, state, make_limits(2));
+
+  ASSERT_TRUE(result.command_available());
+  ASSERT_TRUE(result.fully_solved());
+  EXPECT_LT(result.joint_velocity[1], 0.0);
+  EXPECT_NEAR(result.joint_velocity[1], -0.3, config.primary_preservation_tolerance + kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, EmptyBendRankDoesNotPreserveZeroVelocityAgainstDistance)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> gaze;
+  gaze << 1.0, 0.0;
+  const Eigen::MatrixXd no_secondary(0, 2);
+  auto task = make_task(
+    gaze, Eigen::VectorXd::Zero(1), no_secondary, Eigen::VectorXd(0));
+  Eigen::Matrix<double, 1, 2> distance;
+  distance << 0.0, 1.0;
+  task.distance_matrix = distance;
+  task.distance_reference = Eigen::VectorXd::Constant(1, 0.5);
+  task.distance_weights = Eigen::VectorXd::Ones(1);
+
+  const QpResult result = solver.solve(task, make_state(2), make_limits(2));
+
+  ASSERT_TRUE(result.command_available());
+  ASSERT_TRUE(result.fully_solved());
+  EXPECT_NEAR(result.joint_velocity[1], 0.5, kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, UnreachableDistanceReferenceRemainsAValidSoftObjective)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  const Eigen::MatrixXd no_primary(0, 1);
+  const Eigen::MatrixXd no_secondary(0, 1);
+  auto task = make_task(no_primary, Eigen::VectorXd(0), no_secondary, Eigen::VectorXd(0));
+  task.primary_matrix = Eigen::MatrixXd::Zero(1, 1);
+  task.primary_reference = Eigen::VectorXd::Zero(1);
+  task.primary_weights = Eigen::VectorXd::Ones(1);
+  task.distance_matrix = Eigen::MatrixXd::Ones(1, 1);
+  task.distance_reference = Eigen::VectorXd::Constant(1, 5.0);
+  task.distance_weights = Eigen::VectorXd::Ones(1);
+  JointMotionLimits limits = make_limits(1);
+  limits.max_velocity[0] = 0.1;
+
+  const QpResult result = solver.solve(task, make_state(1), limits);
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_TRUE(result.fully_solved());
+  EXPECT_EQ(result.distance_status, QpStageStatus::kSolved);
+  EXPECT_LE(std::abs(result.joint_velocity[0]), 0.1 + config.solution_feasibility_tolerance);
+
+  // At either hard position endpoint, an outward distance request has no
+  // admissible correction even though an independent primary task remains active.
+  for (const double outward_sign : {-1.0, 1.0}) {
+    auto bounded_task = make_task(
+      (Eigen::Matrix<double, 1, 2>() << 0.0, 1.0).finished(),
+      Eigen::VectorXd::Constant(1, 0.05), Eigen::MatrixXd(0, 2), Eigen::VectorXd(0));
+    bounded_task.distance_matrix = (Eigen::Matrix<double, 1, 2>() << 1.0, 0.0).finished();
+    bounded_task.distance_reference = Eigen::VectorXd::Constant(1, outward_sign * 0.5);
+    bounded_task.distance_weights = Eigen::VectorXd::Ones(1);
+
+    JointMotionLimits bounded_limits = make_limits(2);
+    bounded_limits.lower_position[0] = -1.0;
+    bounded_limits.upper_position[0] = 1.0;
+    bounded_limits.position_margin[0] = 0.1;
+    JointMotionState bounded_state = make_state(2);
+    bounded_state.position[0] = outward_sign > 0.0 ?
+      bounded_limits.upper_position[0] : bounded_limits.lower_position[0];
+
+    const QpResult bounded_result = solver.solve(
+      bounded_task, bounded_state, bounded_limits);
+
+    ASSERT_TRUE(bounded_result.command_available()) << "outward_sign=" << outward_sign;
+    ASSERT_TRUE(bounded_result.fully_solved()) << "outward_sign=" << outward_sign;
+    EXPECT_EQ(bounded_result.distance_status, QpStageStatus::kSolved);
+    ASSERT_TRUE(bounded_result.requested_distance_rate.has_value());
+    ASSERT_TRUE(bounded_result.achieved_distance_rate.has_value());
+    EXPECT_GT(outward_sign * *bounded_result.requested_distance_rate, 0.0);
+    EXPECT_NEAR(bounded_result.joint_velocity[0], 0.0, kTolerance);
+    EXPECT_NEAR(*bounded_result.achieved_distance_rate, 0.0, kTolerance);
+    EXPECT_NEAR(bounded_result.joint_velocity[1], 0.05, kTolerance);
+    EXPECT_NEAR(
+      bounded_state.position[0] + config.period_sec * bounded_result.joint_velocity[0],
+      bounded_state.position[0], kTolerance);
+  }
+}
+
+TEST(HierarchicalVelocityQp, VectorDistanceObjectiveDoesNotReportScalarRadialRate)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  const Eigen::MatrixXd no_primary(0, 2);
+  const Eigen::MatrixXd no_secondary(0, 2);
+  auto task = make_task(
+    no_primary, Eigen::VectorXd(0), no_secondary, Eigen::VectorXd(0));
+  task.primary_matrix = Eigen::MatrixXd::Zero(1, 2);
+  task.primary_reference = Eigen::VectorXd::Zero(1);
+  task.primary_weights = Eigen::VectorXd::Ones(1);
+  task.distance_matrix.resize(3, 2);
+  task.distance_matrix << 0.0, 1.0, 1.0, 0.0, 1.0, 1.0;
+  task.distance_reference = Eigen::Vector3d(0.4, 0.0, 0.0);
+  task.distance_weights = Eigen::Vector3d::Ones();
+
+  const QpResult result = solver.solve(task, make_state(2), make_limits(2));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_TRUE(result.fully_solved());
+  EXPECT_FALSE(result.requested_distance_rate.has_value());
+  EXPECT_FALSE(result.achieved_distance_rate.has_value());
+}
+
+TEST(HierarchicalVelocityQp, DistanceObjectiveRespectsActualAccelerationAndJerkLimits)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  auto task = make_task(
+    Eigen::MatrixXd::Zero(1, 1), Eigen::VectorXd::Zero(1),
+    Eigen::MatrixXd(0, 1), Eigen::VectorXd(0));
+  task.distance_matrix = Eigen::MatrixXd::Ones(1, 1);
+  task.distance_reference = Eigen::VectorXd::Constant(1, 2.0);
+  task.distance_weights = Eigen::VectorXd::Ones(1);
+  auto state = make_state(1);
+  state.velocity[0] = 0.1;
+  JointMotionLimits limits = make_limits(1);
+  limits.max_velocity[0] = 1.0;
+  limits.max_acceleration[0] = 0.5;
+  limits.max_jerk[0] = 10.0;
+
+  const QpResult result = solver.solve(task, state, limits);
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_TRUE(result.fully_solved());
+  const double command_acceleration =
+    (result.joint_velocity[0] - state.velocity[0]) / config.period_sec;
+  EXPECT_LE(std::abs(command_acceleration), limits.max_acceleration[0] + kTolerance);
+  EXPECT_LE(std::abs(command_acceleration - state.acceleration[0]) / config.period_sec,
+    limits.max_jerk[0] + kTolerance);
+  EXPECT_LE(result.joint_velocity[0], 0.101 + kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, EmptySecondaryRankCarriesItsConstraintsIntoTertiary)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> gaze;
+  gaze << 1.0, 0.0;
+  const Eigen::MatrixXd no_secondary(0, 2);
+  auto task = make_task(
+    gaze, Eigen::VectorXd::Zero(1), no_secondary, Eigen::VectorXd(0));
+  LinearVelocityConstraint comfort;
+  comfort.coefficients = Eigen::Vector2d(0.0, 1.0);
+  comfort.lower_bound = 0.2;
+  comfort.upper_bound = 0.3;
+  task.secondary_constraints.push_back(comfort);
+  Eigen::Matrix<double, 1, 2> extras;
+  extras << 0.0, 1.0;
+  task.tertiary_matrix = extras;
+  task.tertiary_reference = Eigen::VectorXd::Constant(1, 0.25);
+  task.tertiary_weights = Eigen::VectorXd::Ones(1);
+
+  const QpResult result = solver.solve(task, make_state(2), make_limits(2));
+
+  ASSERT_TRUE(result.command_available());
+  ASSERT_TRUE(result.fully_solved());
+  EXPECT_EQ(result.secondary_status, QpStageStatus::kNotRun);
+  EXPECT_EQ(result.tertiary_status, QpStageStatus::kSolved);
+  EXPECT_NEAR(result.joint_velocity[1], 0.25, kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, SecondaryFailureKeepsPrimaryAndSkipsLowerRanks)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 1> gaze;
+  gaze << 1.0;
+  auto task = make_task(
+    gaze, Eigen::VectorXd::Constant(1, 0.2),
+    gaze, Eigen::VectorXd::Constant(1, -0.2));
+  LinearVelocityConstraint impossible_comfort;
+  impossible_comfort.coefficients = Eigen::VectorXd::Ones(1);
+  impossible_comfort.lower_bound = 0.8;
+  impossible_comfort.upper_bound = 1.0;
+  task.secondary_constraints.push_back(impossible_comfort);
+  task.distance_matrix = gaze;
+  task.distance_reference = Eigen::VectorXd::Constant(1, 5.0);
+  task.distance_weights = Eigen::VectorXd::Ones(1);
+
+  const QpResult result = solver.solve(task, make_state(1), make_limits(1));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_FALSE(result.fully_solved());
+  EXPECT_EQ(result.status, QpStatus::kPrimaryOnly);
+  EXPECT_EQ(result.secondary_status, QpStageStatus::kInfeasible);
+  EXPECT_EQ(result.distance_status, QpStageStatus::kNotRun);
+  EXPECT_NEAR(result.joint_velocity[0], 0.2, config.solution_feasibility_tolerance + kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, PreferredPrimaryGuardAllowsSmallPrimaryTradeoff)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 1> axis;
+  axis << 1.0;
+  auto task = make_task(
+    axis, Eigen::VectorXd::Constant(1, 0.104), axis,
+    Eigen::VectorXd::Constant(1, 0.1));
+  LinearVelocityConstraint guard;
+  guard.coefficients = Eigen::VectorXd::Ones(1);
+  guard.lower_bound = -10.0;
+  guard.upper_bound = 0.1;
+  task.preferred_primary_constraints.push_back(guard);
+
+  const auto limits = make_limits(1);
+  const QpResult result = solver.solve(task, make_state(1), limits);
+  auto unguarded_task = task;
+  unguarded_task.preferred_primary_constraints.clear();
+  const QpResult unguarded = solver.solve(unguarded_task, make_state(1), limits);
+
+  ASSERT_TRUE(result.command_available());
+  ASSERT_TRUE(unguarded.command_available());
+  EXPECT_TRUE(result.fully_solved());
+  EXPECT_FALSE(result.preferred_primary_fallback_used);
+  EXPECT_EQ(result.preferred_primary_status, QpStageStatus::kSolved);
+  EXPECT_LE(result.joint_velocity[0], 0.1 + config.solution_feasibility_tolerance);
+  EXPECT_NEAR(result.joint_velocity[0], 0.1, 1.0e-4);
+  EXPECT_GT(unguarded.joint_velocity[0], 0.1035);
+  EXPECT_GT(unguarded.joint_velocity[0], result.joint_velocity[0] + 0.003);
+}
+
+TEST(HierarchicalVelocityQp, PreferredGuardKeepsConstraintsOnlySecondaryDamping)
+{
+  auto config = make_config();
+  config.velocity_regularization = 1.0e-4;
+  config.continuity_weight = 0.0;
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> primary;
+  primary << 1.0e4, 0.0;
+  const Eigen::MatrixXd no_secondary(0, 2);
+  auto task = make_task(
+    primary, Eigen::VectorXd::Zero(1), no_secondary, Eigen::VectorXd(0));
+  LinearVelocityConstraint guard;
+  guard.coefficients = Eigen::Vector2d(1.0, 0.0);
+  guard.lower_bound = -0.01;
+  guard.upper_bound = 0.01;
+  task.preferred_primary_constraints.push_back(guard);
+  auto state = make_state(2);
+  state.velocity[1] = 0.1;
+
+  const QpResult result = solver.solve(task, state, make_limits(2));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_TRUE(result.fully_solved());
+  EXPECT_EQ(result.secondary_status, QpStageStatus::kSolved);
+  EXPECT_LE(std::abs(result.joint_velocity[1]), 0.01);
+}
+
+TEST(HierarchicalVelocityQp, PhysicalConflictFallsBackToUnguardedPrimary)
+{
+  const HierarchicalVelocityQp solver{make_config()};
+  Eigen::Matrix<double, 1, 1> axis;
+  axis << 1.0;
+  auto task = make_task(
+    axis, Eigen::VectorXd::Constant(1, 0.04), axis,
+    Eigen::VectorXd::Constant(1, 0.04));
+  LinearVelocityConstraint guard;
+  guard.coefficients = axis.transpose();
+  guard.lower_bound = 0.2;
+  guard.upper_bound = 0.3;
+  task.preferred_primary_constraints.push_back(guard);
+
+  auto limits = make_limits(1);
+  limits.max_velocity[0] = 0.1;
+  const QpResult result = solver.solve(task, make_state(1), limits);
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_EQ(result.status, QpStatus::kPrimaryOnly);
+  EXPECT_TRUE(result.preferred_primary_fallback_used);
+  EXPECT_EQ(result.preferred_primary_status, QpStageStatus::kInfeasible);
+  EXPECT_EQ(result.primary_status, QpStageStatus::kSolved);
+  EXPECT_EQ(result.secondary_status, QpStageStatus::kNotRun);
+  EXPECT_NEAR(result.joint_velocity[0], 0.04, 1.0e-4);
+}
+
+TEST(HierarchicalVelocityQp, NumericalGuardFailureFallsBackAndKeepsSnapshot)
+{
+  auto config = make_config();
+  config.solver_max_iterations = 1;
+  config.solver_absolute_tolerance = 1.0e-12;
+  config.solver_relative_tolerance = 1.0e-12;
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix3d axes = Eigen::Matrix3d::Identity();
+  auto task = make_task(
+    axes, Eigen::Vector3d::Zero(), Eigen::MatrixXd(0, 3), Eigen::VectorXd(0));
+  for (Eigen::Index index = 0; index < 3; ++index) {
+    LinearVelocityConstraint guard;
+    guard.coefficients = axes.row(index).transpose();
+    guard.lower_bound = 0.5;
+    guard.upper_bound = 1.0;
+    task.preferred_primary_constraints.push_back(guard);
+  }
+
+  const QpResult result = solver.solve(task, make_state(3), make_limits(3));
+
+  ASSERT_TRUE(result.command_available()) << "guard=" <<
+        static_cast<int>(result.preferred_primary_status)
+                                          << " fallback=" << result.preferred_primary_fallback_used
+                                          << " primary=" << static_cast<int>(result.primary_status)
+                                          << " iterations=" << result.primary_iterations;
+  EXPECT_EQ(result.status, QpStatus::kPrimaryOnly);
+  EXPECT_TRUE(result.preferred_primary_fallback_used);
+  EXPECT_EQ(result.preferred_primary_status, QpStageStatus::kMaxIterations);
+  EXPECT_EQ(result.primary_status, QpStageStatus::kSolved);
+  EXPECT_GT(result.primary_iterations, 1);
+  ASSERT_TRUE(result.primary_failure_snapshot.has_value());
+  EXPECT_EQ(result.primary_failure_snapshot->max_iter, 1);
+  EXPECT_EQ(result.joint_velocity.norm(), 0.0);
+}
+
+TEST(HierarchicalVelocityQp, LowerFailureRetainsGuardedPrimaryCommand)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 1> axis;
+  axis << 1.0;
+  auto task = make_task(
+    axis, Eigen::VectorXd::Constant(1, 0.104), axis,
+    Eigen::VectorXd::Constant(1, 0.5));
+  LinearVelocityConstraint preferred;
+  preferred.coefficients = axis.transpose();
+  preferred.lower_bound = -10.0;
+  preferred.upper_bound = 0.1;
+  task.preferred_primary_constraints.push_back(preferred);
+  LinearVelocityConstraint secondary_conflict;
+  secondary_conflict.coefficients = axis.transpose();
+  secondary_conflict.lower_bound = 0.2;
+  secondary_conflict.upper_bound = 1.0;
+  task.secondary_constraints.push_back(secondary_conflict);
+
+  const QpResult result = solver.solve(task, make_state(1), make_limits(1));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_EQ(result.status, QpStatus::kPrimaryOnly);
+  EXPECT_FALSE(result.preferred_primary_fallback_used);
+  EXPECT_EQ(result.preferred_primary_status, QpStageStatus::kSolved);
+  EXPECT_EQ(result.secondary_status, QpStageStatus::kInfeasible);
+  EXPECT_NEAR(result.joint_velocity[0], 0.1, 1.0e-4);
+}
+
+TEST(HierarchicalVelocityQp, TertiaryFailureKeepsLastSolvedHigherRankCommand)
+{
+  auto config = make_config();
+  config.solver_max_iterations = 1;
+  config.solver_absolute_tolerance = 1.0e-12;
+  config.solver_relative_tolerance = 1.0e-12;
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> gaze;
+  gaze << 1.0, 0.0;
+  const Eigen::MatrixXd no_secondary(0, 2);
+  auto task = make_task(
+    gaze, Eigen::VectorXd::Zero(1), no_secondary, Eigen::VectorXd(0));
+  LinearVelocityConstraint extra_preservation;
+  extra_preservation.coefficients = Eigen::Vector2d(1.0, 1.0);
+  extra_preservation.lower_bound = -1.0;
+  extra_preservation.upper_bound = 1.0;
+  task.secondary_constraints.push_back(extra_preservation);
+  Eigen::Matrix<double, 1, 2> extras;
+  extras << 0.0, 1.0;
+  task.tertiary_matrix = extras;
+  task.tertiary_reference = Eigen::VectorXd::Constant(1, 1.0);
+  task.tertiary_weights = Eigen::VectorXd::Ones(1);
+
+  const QpResult result = solver.solve(task, make_state(2), make_limits(2));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_EQ(result.tertiary_status, QpStageStatus::kMaxIterations);
+  EXPECT_EQ(result.status, QpStatus::kPartial);
+  EXPECT_FALSE(result.fully_solved());
+  EXPECT_NEAR(result.joint_velocity[0], 0.0, kTolerance);
+  EXPECT_NEAR(result.joint_velocity[1], 0.0, kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, TertiaryExactRecoveryPreservesPrimaryObjective)
+{
+  auto config = make_config();
+  config.solver_max_iterations = 1;
+  config.solver_absolute_tolerance = 1.0e-12;
+  config.solver_relative_tolerance = 1.0e-12;
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> primary;
+  primary << 1.0, 0.0;
+  const Eigen::MatrixXd no_secondary(0, 2);
+  auto task = make_task(
+    primary, Eigen::VectorXd::Zero(1), no_secondary, Eigen::VectorXd(0));
+  Eigen::Matrix<double, 1, 2> tertiary;
+  tertiary << 0.0, 1.0;
+  task.tertiary_matrix = tertiary;
+  task.tertiary_reference = Eigen::VectorXd::Constant(1, 0.75);
+  task.tertiary_weights = Eigen::VectorXd::Ones(1);
+
+  const QpResult result = solver.solve(task, make_state(2), make_limits(2));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_EQ(result.tertiary_status, QpStageStatus::kSolved);
+  EXPECT_EQ(result.tertiary_retry_count, 1);
+  EXPECT_NEAR(result.joint_velocity[0], 0.0, kTolerance);
+  EXPECT_NEAR(result.joint_velocity[1], 0.75, kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, DistanceFailureKeepsLastSolvedPostureCommand)
+{
+  auto config = make_config();
+  config.solver_max_iterations = 1;
+  config.solver_absolute_tolerance = 1.0e-12;
+  config.solver_relative_tolerance = 1.0e-12;
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 3> gaze;
+  gaze << 1.0, 0.0, 0.0;
+  Eigen::Matrix<double, 1, 3> bend;
+  bend << 0.0, 1.0, 0.0;
+  auto task = make_task(
+    gaze, Eigen::VectorXd::Zero(1), bend, Eigen::VectorXd::Zero(1));
+  Eigen::Matrix<double, 1, 3> extras;
+  extras << 0.0, 0.0, 1.0;
+  task.tertiary_matrix = extras;
+  task.tertiary_reference = Eigen::VectorXd::Zero(1);
+  task.tertiary_weights = Eigen::VectorXd::Ones(1);
+  task.distance_matrix = extras;
+  task.distance_reference = Eigen::VectorXd::Ones(1);
+  task.distance_weights = Eigen::VectorXd::Ones(1);
+
+  const QpResult result = solver.solve(task, make_state(3), make_limits(3));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_EQ(result.secondary_status, QpStageStatus::kSolved);
+  EXPECT_EQ(result.tertiary_status, QpStageStatus::kSolved);
+  EXPECT_EQ(result.distance_status, QpStageStatus::kMaxIterations);
+  EXPECT_EQ(result.status, QpStatus::kPartial);
+  EXPECT_FALSE(result.fully_solved());
+  EXPECT_TRUE(result.distance_feasible_approximation_used);
+  EXPECT_GT(result.distance_feasible_approximation_alpha, 0.0);
+  ASSERT_TRUE(result.distance_failure_snapshot.has_value());
+  EXPECT_NEAR(result.distance_failure_snapshot->rho, 2.0, 1.0e-12);
+  EXPECT_EQ(result.distance_failure_snapshot->adaptive_rho_interval, 50);
+  EXPECT_EQ(result.distance_failure_snapshot->max_iter, 1);
+  EXPECT_NEAR(result.joint_velocity[0], 0.0, kTolerance);
+  EXPECT_NEAR(result.joint_velocity[1], 0.0, kTolerance);
+  EXPECT_GT(result.joint_velocity[2], 0.0);
+}
+
+TEST(HierarchicalVelocityQp, DistanceApproximationKeepsJointCollisionAndPreservationRows)
+{
+  auto config = make_config();
+  config.solver_max_iterations = 1;
+  config.solver_absolute_tolerance = 1.0e-12;
+  config.solver_relative_tolerance = 1.0e-12;
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 3> gaze;
+  gaze << 1.0, 0.0, 0.0;
+  Eigen::Matrix<double, 1, 3> bend;
+  bend << 0.0, 1.0, 0.0;
+  auto task = make_task(
+    gaze, Eigen::VectorXd::Zero(1), bend, Eigen::VectorXd::Zero(1));
+  task.distance_matrix = Eigen::Matrix<double, 1, 3>(0.0, 0.0, 1.0);
+  task.distance_reference = Eigen::VectorXd::Constant(1, 10.0);
+  task.distance_weights = Eigen::VectorXd::Ones(1);
+
+  LinearVelocityConstraint collision;
+  collision.coefficients = Eigen::Vector3d(0.0, 0.0, 1.0);
+  collision.upper_bound = 0.05;
+  const auto limits = make_limits(3);
+  const QpResult result = solver.solve(task, make_state(3), limits, {collision});
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_EQ(result.status, QpStatus::kPartial);
+  EXPECT_EQ(result.distance_status, QpStageStatus::kMaxIterations);
+  EXPECT_TRUE(result.distance_feasible_approximation_used);
+  EXPECT_GT(result.distance_feasible_approximation_alpha, 0.0);
+  EXPECT_LT(result.distance_feasible_approximation_alpha, 1.0);
+  ASSERT_TRUE(result.distance_failure_snapshot.has_value());
+  const QpReplayResult raw_replay =
+    replayQpFailureSnapshot(*result.distance_failure_snapshot);
+  ASSERT_EQ(raw_replay.status, QpStageStatus::kMaxIterations);
+  ASSERT_EQ(raw_replay.physical_solution.size(), 3U);
+  EXPECT_GT(raw_replay.physical_solution[2], collision.upper_bound);
+  EXPECT_NEAR(result.joint_velocity[0], 0.0, config.primary_preservation_tolerance);
+  EXPECT_NEAR(result.joint_velocity[1], 0.0, config.primary_preservation_tolerance);
+  EXPECT_LE(result.joint_velocity[2],
+    collision.upper_bound + config.solution_feasibility_tolerance);
+  EXPECT_GT(result.joint_velocity[2], 0.0);
+}
+
+TEST(HierarchicalVelocityQp, DistanceApproximationMaySelectWarmEndpointAtZeroAlpha)
+{
+  auto config = make_config();
+  config.solver_max_iterations = 1;
+  config.solver_absolute_tolerance = 1.0e-12;
+  config.solver_relative_tolerance = 1.0e-12;
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 3> gaze;
+  gaze << 1.0, 0.0, 0.0;
+  Eigen::Matrix<double, 1, 3> bend;
+  bend << 0.0, 1.0, 0.0;
+  auto task = make_task(
+    gaze, Eigen::VectorXd::Zero(1), bend, Eigen::VectorXd::Zero(1));
+  task.distance_matrix = Eigen::Matrix<double, 1, 3>(0.0, 0.0, 1.0);
+  task.distance_reference = Eigen::VectorXd::Constant(1, 10.0);
+  task.distance_weights = Eigen::VectorXd::Ones(1);
+
+  auto state = make_state(3);
+  state.position[2] = 10.0;
+  const QpResult result = solver.solve(task, state, make_limits(3));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_EQ(result.status, QpStatus::kPartial);
+  EXPECT_EQ(result.distance_status, QpStageStatus::kMaxIterations);
+  EXPECT_TRUE(result.distance_feasible_approximation_used);
+  EXPECT_DOUBLE_EQ(result.distance_feasible_approximation_alpha, 0.0);
+  EXPECT_NEAR(result.joint_velocity[2], 0.0, config.solution_feasibility_tolerance);
+  ASSERT_TRUE(result.distance_failure_snapshot.has_value());
+}
+
+TEST(HierarchicalVelocityQp, CapturedDistanceFailureUsesCostImprovingFeasibleSegment)
+{
+  const auto fixture_path = std::filesystem::path(__FILE__).parent_path() /
+    "fixtures/posture1d_distance_event_24_max_iterations.qpsnap";
+  std::ifstream input(fixture_path);
+  ASSERT_TRUE(input.good()) << fixture_path;
+  QpFailureSnapshot snapshot;
+  ASSERT_TRUE(readQpFailureSnapshot(input, snapshot));
+  ASSERT_EQ(snapshot.stage, QpSolveStage::kDistance);
+
+  const QpReplayResult replay = replayQpFailureSnapshot(snapshot);
+  ASSERT_EQ(replay.setup_return_code, 0);
+  ASSERT_EQ(replay.status, QpStageStatus::kMaxIterations);
+  const Eigen::Index joints = snapshot.variable_count;
+  const Eigen::Index rows = snapshot.constraint_count;
+  Eigen::MatrixXd hessian = Eigen::MatrixXd::Zero(joints, joints);
+  Eigen::MatrixXd constraints = Eigen::MatrixXd::Zero(rows, joints);
+  Eigen::VectorXd shift(joints);
+  Eigen::VectorXd warm(joints);
+  Eigen::VectorXd raw(joints);
+  for (Eigen::Index joint = 0; joint < joints; ++joint) {
+    shift[joint] = snapshot.variable_shift[static_cast<std::size_t>(joint)];
+    warm[joint] = static_cast<double>(snapshot.centered_warm_start[
+        static_cast<std::size_t>(joint)]) + shift[joint];
+    raw[joint] = replay.physical_solution[static_cast<std::size_t>(joint)];
+    for (c_int entry = snapshot.p_column_pointers[static_cast<std::size_t>(joint)];
+      entry < snapshot.p_column_pointers[static_cast<std::size_t>(joint + 1)]; ++entry)
+    {
+      const auto index = static_cast<std::size_t>(entry);
+      const Eigen::Index row = snapshot.p_row_indices[index];
+      hessian(row, joint) = static_cast<double>(snapshot.p_values[index]);
+      hessian(joint, row) = hessian(row, joint);
+    }
+    for (c_int entry = snapshot.a_column_pointers[static_cast<std::size_t>(joint)];
+      entry < snapshot.a_column_pointers[static_cast<std::size_t>(joint + 1)]; ++entry)
+    {
+      const auto index = static_cast<std::size_t>(entry);
+      constraints(snapshot.a_row_indices[index], joint) =
+        static_cast<double>(snapshot.a_values[index]);
+    }
+  }
+  Eigen::VectorXd gradient(joints);
+  for (Eigen::Index joint = 0; joint < joints; ++joint) {
+    gradient[joint] = static_cast<double>(snapshot.q[static_cast<std::size_t>(joint)]);
+  }
+  gradient.noalias() -= hessian * shift;
+  Eigen::VectorXd lower(rows);
+  Eigen::VectorXd upper(rows);
+  for (Eigen::Index row = 0; row < rows; ++row) {
+    lower[row] = static_cast<double>(snapshot.lower[static_cast<std::size_t>(row)]);
+    upper[row] = static_cast<double>(snapshot.upper[static_cast<std::size_t>(row)]);
+  }
+  const Eigen::VectorXd row_shift = constraints * shift;
+  lower += row_shift;
+  upper += row_shift;
+  const auto violation = [&](const Eigen::VectorXd & velocity) {
+      const Eigen::VectorXd values = constraints * velocity;
+      double maximum = 0.0;
+      for (Eigen::Index row = 0; row < rows; ++row) {
+        maximum = std::max(maximum, std::max(
+            lower[row] - values[row], values[row] - upper[row]));
+      }
+      return std::max(maximum, 0.0);
+    };
+  ASSERT_GT(violation(raw), 2.0e-5);
+
+  const auto approximation = detail::minimizeFeasibleDistanceSegment(
+    replay.status, replay.status, hessian, gradient, constraints, lower, upper,
+    warm, raw, 2.0e-5);
+  ASSERT_TRUE(approximation.has_value());
+  EXPECT_GT(approximation->alpha, 0.0);
+  EXPECT_LT(approximation->alpha, 1.0);
+  EXPECT_LE(violation(approximation->velocity), 2.0e-5);
+  const auto objective = [&](const Eigen::VectorXd & velocity) {
+      return 0.5 * velocity.dot(hessian * velocity) + gradient.dot(velocity);
+    };
+  EXPECT_LT(objective(approximation->velocity), objective(warm));
+  EXPECT_NEAR(approximation->alpha, 0.131740381606, 1.0e-6);
+}
+
+void expectCapturedPrimaryFailureReconstructsThroughPublicSolve(
+  const std::string & fixture_name)
+{
+  const auto fixture_path = std::filesystem::path(__FILE__).parent_path() /
+    "fixtures/collision_brake" / fixture_name;
+  std::ifstream input(fixture_path);
+  ASSERT_TRUE(input.good()) << fixture_path;
+  QpFailureSnapshot snapshot;
+  ASSERT_TRUE(readQpFailureSnapshot(input, snapshot));
+  ASSERT_EQ(snapshot.stage, QpSolveStage::kPrimary);
+  ASSERT_EQ(snapshot.variable_count, 6);
+  ASSERT_EQ(snapshot.constraint_count, 11);
+
+  const Eigen::Index joints = snapshot.variable_count;
+  const Eigen::Index rows = snapshot.constraint_count;
+  Eigen::MatrixXd hessian = Eigen::MatrixXd::Zero(joints, joints);
+  Eigen::MatrixXd qp_rows = Eigen::MatrixXd::Zero(rows, joints);
+  for (Eigen::Index column = 0; column < joints; ++column) {
+    for (Eigen::Index offset = snapshot.p_column_pointers[
+        static_cast<std::size_t>(column)];
+      offset < snapshot.p_column_pointers[static_cast<std::size_t>(column + 1)];
+      ++offset)
+    {
+      const Eigen::Index row = snapshot.p_row_indices[static_cast<std::size_t>(offset)];
+      const double value = snapshot.p_values[static_cast<std::size_t>(offset)];
+      hessian(row, column) = value;
+      hessian(column, row) = value;
+    }
+    for (Eigen::Index offset = snapshot.a_column_pointers[
+        static_cast<std::size_t>(column)];
+      offset < snapshot.a_column_pointers[static_cast<std::size_t>(column + 1)];
+      ++offset)
+    {
+      const Eigen::Index row = snapshot.a_row_indices[static_cast<std::size_t>(offset)];
+      qp_rows(row, column) = snapshot.a_values[static_cast<std::size_t>(offset)];
+    }
+  }
+  Eigen::VectorXd shift(joints);
+  Eigen::VectorXd centered_gradient(joints);
+  for (Eigen::Index joint = 0; joint < joints; ++joint) {
+    shift[joint] = snapshot.variable_shift[static_cast<std::size_t>(joint)];
+    centered_gradient[joint] = snapshot.q[static_cast<std::size_t>(joint)];
+  }
+  const Eigen::VectorXd gradient = centered_gradient - hessian * shift;
+
+  auto config = make_production_tolerance_config();
+  config.period_sec = 0.01;
+  config.residual_command_latency_sec = 0.0;
+  config.velocity_regularization = 1.0e-4;
+  config.continuity_weight = 1.0e-3;
+  config.primary_preservation_tolerance = 2.0e-4;
+  config.solution_feasibility_tolerance = 2.0e-5;
+  config.solver_absolute_tolerance = 1.0e-5;
+  config.solver_relative_tolerance = 1.0e-5;
+  config.solver_time_limit_sec = 0.003;
+  config.solver_max_iterations = 2500;
+
+  JointMotionState state;
+  state.position.resize(joints);
+  state.velocity.resize(joints);
+  state.acceleration.resize(joints);
+  if (fixture_name == "primary_event116_max_iterations.qpsnap") {
+    state.position << 0.3437059723922245, 0.60947138355894059, -1.609354537594311,
+      0.36571982006346154, -0.74906290691334054, -0.30685139394365901;
+    state.velocity << -0.0036196985382282759, 0.0, 0.0, 0.039758863401253973,
+      -0.02379920408782743, -0.025992173857248068;
+    state.acceleration << 0.007710815467146942, 4.2238530646894479e-05,
+      0.091310566937858731, 0.13451542532155347, 0.0012005485022925366,
+      -0.5998270646604642;
+  } else {
+    state.position << 0.33843000599947165, 0.63727655890998858, -1.648689068801199,
+      0.58594158975097521, -0.76370035389150281, -0.50383728868907485;
+    state.velocity << -0.0019999856246959188, -6.8002942338763611e-7, 0.002,
+      0.023733423086954541, 0.0019959294517810484, 7.0405414874866179e-7;
+    state.acceleration << -0.19999856246959188, -0.15381153925723462, 0.2,
+      -0.50467282882438003, 0.19959294517810483, 0.11335595661540308;
+  }
+
+  JointMotionLimits limits;
+  limits.lower_position.resize(joints);
+  limits.lower_position << -6.2831853071795862, -2.059488, -3.92699,
+    -6.2831853071795862, -1.6929689999999999, -6.2831853071795862;
+  limits.upper_position.resize(joints);
+  limits.upper_position << 6.2831853071795862, 2.094395, 0.19198599999999999,
+    6.2831853071795862, 3.1415926535897931, 6.2831853071795862;
+  limits.position_margin = Eigen::VectorXd::Zero(joints);
+  limits.max_velocity = Eigen::VectorXd::Ones(joints);
+  limits.max_acceleration = Eigen::VectorXd::Constant(joints, 2.0);
+  limits.max_jerk = Eigen::VectorXd::Constant(joints, 20.0);
+  const auto numerical_policy = NumericalPolicy::fromDiscreteMotionLimits(
+    PositionInterval{-10.0, 10.0}, 1.0, 2.0, 20.0, config.period_sec,
+    SolverResidual{1.0e-6});
+  ASSERT_TRUE(numerical_policy.has_value());
+  limits.numerical_policy = *numerical_policy;
+
+  constexpr double kVelocityRegularization = 1.0e-4;
+  constexpr double kContinuityWeight = 1.0e-3;
+  const Eigen::MatrixXd task_hessian = 0.5 * hessian -
+    (kVelocityRegularization + kContinuityWeight) *
+    Eigen::MatrixXd::Identity(joints, joints);
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigensolver(task_hessian);
+  ASSERT_EQ(eigensolver.info(), Eigen::Success);
+  const Eigen::VectorXd eigenvalues = eigensolver.eigenvalues();
+  const double eigenvalue_scale = std::max(1.0, eigenvalues.cwiseAbs().maxCoeff());
+  constexpr double kRoundoffEigenvalue = 1.0e-12;
+  ASSERT_GE(eigenvalues.minCoeff(), -kRoundoffEigenvalue * eigenvalue_scale);
+
+  Eigen::VectorXd square_root_eigenvalues = Eigen::VectorXd::Zero(joints);
+  Eigen::VectorXd primary_reference = Eigen::VectorXd::Zero(joints);
+  const Eigen::VectorXd reference_rhs = -0.5 *
+    (gradient + 2.0 * kContinuityWeight * state.velocity);
+  for (Eigen::Index index = 0; index < joints; ++index) {
+    const double eigenvalue = eigenvalues[index];
+    if (eigenvalue <= kRoundoffEigenvalue * eigenvalue_scale) {
+      continue;
+    }
+    square_root_eigenvalues[index] = std::sqrt(eigenvalue);
+    primary_reference[index] =
+      eigensolver.eigenvectors().col(index).dot(reference_rhs) /
+      square_root_eigenvalues[index];
+  }
+  const Eigen::MatrixXd primary_matrix = square_root_eigenvalues.asDiagonal() *
+    eigensolver.eigenvectors().transpose();
+  HierarchicalVelocityTask task = make_task(
+    primary_matrix, primary_reference, Eigen::MatrixXd::Zero(0, joints),
+    Eigen::VectorXd(0));
+  const Eigen::MatrixXd reconstructed_hessian = 2.0 *
+    (task.primary_matrix.transpose() * task.primary_matrix +
+    (kVelocityRegularization + kContinuityWeight) *
+    Eigen::MatrixXd::Identity(joints, joints));
+  const Eigen::VectorXd reconstructed_gradient = -2.0 *
+    task.primary_matrix.transpose() * task.primary_reference -
+    2.0 * kContinuityWeight * state.velocity;
+  EXPECT_LE((reconstructed_hessian - hessian).cwiseAbs().maxCoeff(), 1.0e-12);
+  EXPECT_LE((reconstructed_gradient - gradient).cwiseAbs().maxCoeff(), 1.0e-12);
+
+  const auto original_bound = [](const double centered_bound, const double row_shift) {
+      if (centered_bound <= -1.0e29) {
+        return -std::numeric_limits<double>::infinity();
+      }
+      if (centered_bound >= 1.0e29) {
+        return std::numeric_limits<double>::infinity();
+      }
+      return centered_bound + row_shift;
+    };
+  std::vector<LinearVelocityConstraint> constraints;
+  constraints.reserve(4U);
+  for (Eigen::Index row = joints; row < rows - 1; ++row) {
+    LinearVelocityConstraint constraint;
+    constraint.coefficients = qp_rows.row(row).transpose();
+    const double row_shift = qp_rows.row(row).dot(shift);
+    constraint.lower_bound = original_bound(
+      snapshot.lower[static_cast<std::size_t>(row)], row_shift);
+    constraint.upper_bound = original_bound(
+      snapshot.upper[static_cast<std::size_t>(row)], row_shift);
+    constraints.push_back(std::move(constraint));
+  }
+  LinearVelocityConstraint preferred_joint_bound;
+  preferred_joint_bound.coefficients = qp_rows.row(rows - 1).transpose();
+  const double preferred_shift = qp_rows.row(rows - 1).dot(shift);
+  preferred_joint_bound.lower_bound = original_bound(
+    snapshot.lower.back(), preferred_shift);
+  preferred_joint_bound.upper_bound = original_bound(snapshot.upper.back(), preferred_shift);
+  task.preferred_primary_constraints.push_back(std::move(preferred_joint_bound));
+
+  // Confirm every physical next-velocity interval matches the captured box
+  // after undoing the solver's variable shift.
+  for (Eigen::Index joint = 0; joint < joints; ++joint) {
+    EXPECT_NEAR(qp_rows(joint, joint), 1.0, 0.0);
+    const double minimum_acceleration = std::max(
+      -limits.max_acceleration[joint],
+      state.acceleration[joint] - limits.max_jerk[joint] * config.period_sec);
+    const double maximum_acceleration = std::min(
+      limits.max_acceleration[joint],
+      state.acceleration[joint] + limits.max_jerk[joint] * config.period_sec);
+    const double expected_lower = std::max({
+          -limits.max_velocity[joint],
+          state.velocity[joint] + minimum_acceleration * config.period_sec,
+          (limits.lower_position[joint] - state.position[joint]) / config.period_sec});
+    const double expected_upper = std::min({
+          limits.max_velocity[joint],
+          state.velocity[joint] + maximum_acceleration * config.period_sec,
+          (limits.upper_position[joint] - state.position[joint]) / config.period_sec});
+    EXPECT_NEAR(snapshot.lower[static_cast<std::size_t>(joint)] + shift[joint],
+      expected_lower, 1.0e-12) << "joint=" << joint;
+    EXPECT_NEAR(snapshot.upper[static_cast<std::size_t>(joint)] + shift[joint],
+      expected_upper, 1.0e-12) << "joint=" << joint;
+  }
+
+  const HierarchicalVelocityQp solver{config};
+  const QpResult result = solver.solve(task, state, limits, constraints);
+
+  // Force only one iteration to obtain a public-solve snapshot of the exact
+  // reconstructed inputs, independently of whether the full-budget call
+  // converges under this reconstruction's floating-point factorization.
+  auto diagnostic_config = config;
+  diagnostic_config.solver_max_iterations = 1;
+  const QpResult diagnostic = HierarchicalVelocityQp{diagnostic_config}.solve(
+    task, state, limits, constraints);
+  ASSERT_TRUE(diagnostic.primary_failure_snapshot.has_value());
+  const QpFailureSnapshot & generated = *diagnostic.primary_failure_snapshot;
+  EXPECT_EQ(generated.stage, QpSolveStage::kPrimary);
+  EXPECT_EQ(generated.p_column_pointers, snapshot.p_column_pointers);
+  EXPECT_EQ(generated.p_row_indices, snapshot.p_row_indices);
+  EXPECT_EQ(generated.a_column_pointers, snapshot.a_column_pointers);
+  EXPECT_EQ(generated.a_row_indices, snapshot.a_row_indices);
+  ASSERT_EQ(generated.p_values.size(), snapshot.p_values.size());
+  ASSERT_EQ(generated.q.size(), snapshot.q.size());
+  ASSERT_EQ(generated.a_values.size(), snapshot.a_values.size());
+  for (std::size_t i = 0; i < snapshot.p_values.size(); ++i) {
+    EXPECT_NEAR(generated.p_values[i], snapshot.p_values[i], 1.0e-12) << "P[" << i << "]";
+  }
+  for (std::size_t i = 0; i < snapshot.q.size(); ++i) {
+    EXPECT_NEAR(generated.q[i], snapshot.q[i], 1.0e-12) << "q[" << i << "]";
+    EXPECT_NEAR(generated.lower[i], snapshot.lower[i], 1.0e-12) << "l[" << i << "]";
+    EXPECT_NEAR(generated.upper[i], snapshot.upper[i], 1.0e-12) << "u[" << i << "]";
+  }
+  for (std::size_t i = 0; i < snapshot.a_values.size(); ++i) {
+    EXPECT_NEAR(generated.a_values[i], snapshot.a_values[i], 1.0e-12) << "A[" << i << "]";
+  }
+  ASSERT_EQ(generated.centered_warm_start.size(), snapshot.centered_warm_start.size());
+  ASSERT_EQ(generated.variable_shift.size(), snapshot.variable_shift.size());
+  for (std::size_t i = 0; i < snapshot.centered_warm_start.size(); ++i) {
+    EXPECT_NEAR(generated.centered_warm_start[i], snapshot.centered_warm_start[i], 1.0e-12);
+    EXPECT_NEAR(generated.variable_shift[i], snapshot.variable_shift[i], 1.0e-12);
+  }
+  EXPECT_DOUBLE_EQ(generated.rho, snapshot.rho);
+  EXPECT_DOUBLE_EQ(generated.sigma, snapshot.sigma);
+  EXPECT_EQ(generated.scaling, snapshot.scaling);
+  EXPECT_EQ(generated.adaptive_rho, snapshot.adaptive_rho);
+  EXPECT_EQ(generated.adaptive_rho_interval, snapshot.adaptive_rho_interval);
+  EXPECT_DOUBLE_EQ(generated.alpha, snapshot.alpha);
+  EXPECT_DOUBLE_EQ(generated.eps_abs, snapshot.eps_abs);
+  EXPECT_DOUBLE_EQ(generated.eps_rel, snapshot.eps_rel);
+  EXPECT_EQ(generated.max_iter, 1);
+  EXPECT_EQ(snapshot.max_iter, config.solver_max_iterations);
+
+  // Regression contract: retrying a primary MAX_ITER result with the bounded
+  // alternate rho must recover this feasible command without changing the QP.
+  EXPECT_TRUE(result.command_available());
+  EXPECT_TRUE(result.fully_solved());
+  EXPECT_EQ(result.primary_status, QpStageStatus::kSolved);
+  EXPECT_EQ(result.preferred_primary_status, QpStageStatus::kSolved);
+  EXPECT_FALSE(result.preferred_primary_fallback_used);
+  EXPECT_GE(result.primary_retry_count, 1);
+  EXPECT_GT(result.primary_iterations, snapshot.max_iter);
+  for (Eigen::Index row = 0; row < rows; ++row) {
+    const double row_shift = qp_rows.row(row).dot(shift);
+    const double lower = original_bound(
+      snapshot.lower[static_cast<std::size_t>(row)], row_shift);
+    const double upper = original_bound(
+      snapshot.upper[static_cast<std::size_t>(row)], row_shift);
+    const double value = qp_rows.row(row).dot(result.joint_velocity);
+    EXPECT_LE(std::max({lower - value, value - upper, 0.0}),
+      config.solution_feasibility_tolerance) << "row=" << row;
+  }
+  ASSERT_TRUE(result.primary_failure_snapshot.has_value());
+  const QpFailureSnapshot & actual = *result.primary_failure_snapshot;
+  EXPECT_EQ(actual.stage, QpSolveStage::kPrimary);
+  EXPECT_EQ(actual.raw_status_value, snapshot.raw_status_value);
+  EXPECT_EQ(actual.max_iter, snapshot.max_iter);
+  EXPECT_EQ(actual.variable_count, snapshot.variable_count);
+  EXPECT_EQ(actual.constraint_count, snapshot.constraint_count);
+  ASSERT_EQ(actual.p_values.size(), snapshot.p_values.size());
+  ASSERT_EQ(actual.p_row_indices, snapshot.p_row_indices);
+  ASSERT_EQ(actual.p_column_pointers, snapshot.p_column_pointers);
+  ASSERT_EQ(actual.a_values.size(), snapshot.a_values.size());
+  ASSERT_EQ(actual.a_row_indices, snapshot.a_row_indices);
+  ASSERT_EQ(actual.a_column_pointers, snapshot.a_column_pointers);
+  for (std::size_t i = 0; i < snapshot.p_values.size(); ++i) {
+    EXPECT_NEAR(actual.p_values[i], snapshot.p_values[i], 1.0e-12) << "P[" << i << "]";
+  }
+  for (std::size_t i = 0; i < snapshot.q.size(); ++i) {
+    EXPECT_NEAR(actual.q[i], snapshot.q[i], 1.0e-12) << "q[" << i << "]";
+    EXPECT_NEAR(actual.lower[i], snapshot.lower[i], 1.0e-12) << "l[" << i << "]";
+    EXPECT_NEAR(actual.upper[i], snapshot.upper[i], 1.0e-12) << "u[" << i << "]";
+  }
+  for (std::size_t i = 0; i < snapshot.a_values.size(); ++i) {
+    EXPECT_NEAR(actual.a_values[i], snapshot.a_values[i], 1.0e-12) << "A[" << i << "]";
+  }
+}
+
+TEST(HierarchicalVelocityQp, CapturedEvent89PrimaryFailureReconstructsThroughPublicSolve)
+{
+  expectCapturedPrimaryFailureReconstructsThroughPublicSolve(
+    "primary_event89_max_iterations.qpsnap");
+}
+
+TEST(HierarchicalVelocityQp, CapturedEvent116PrimaryFailureReconstructsThroughPublicSolve)
+{
+  expectCapturedPrimaryFailureReconstructsThroughPublicSolve(
+    "primary_event116_max_iterations.qpsnap");
+}
+
+TEST(HierarchicalVelocityQp, CollisionBrakeSnapshotsKeepReplayAndProductionPathsDistinct)
+{
+  const auto load_snapshot = [](const std::string & name) {
+      const auto path = std::filesystem::path(__FILE__).parent_path() /
+        "fixtures/collision_brake" / name;
+      std::ifstream input(path);
+      if (!input.good()) {
+        throw std::runtime_error("cannot open collision brake fixture: " + path.string());
+      }
+      QpFailureSnapshot snapshot;
+      if (!readQpFailureSnapshot(input, snapshot)) {
+        throw std::runtime_error("cannot read collision brake fixture: " + path.string());
+      }
+      return snapshot;
+    };
+
+  const std::array<std::string, 2> fixture_names{
+    "event_1_primary.qpsnap", "event_3_primary.qpsnap"};
+  for (const auto & fixture_name : fixture_names) {
+    SCOPED_TRACE(fixture_name);
+    const QpFailureSnapshot snapshot = load_snapshot(fixture_name);
+    ASSERT_EQ(snapshot.variable_count, 6);
+    ASSERT_EQ(snapshot.constraint_count, 7);
+    ASSERT_EQ(snapshot.classified_status,
+      fixture_name == "event_1_primary.qpsnap" ?
+      QpStageStatus::kSolverError : QpStageStatus::kInfeasible);
+
+    // Replay intentionally remains an immutable diagnostic of the recorded OSQP
+    // settings. The recovery contract below is exercised through HierarchicalVelocityQp::solve.
+    const QpReplayResult replay = replayQpFailureSnapshot(snapshot);
+    ASSERT_EQ(replay.setup_return_code, 0);
+    EXPECT_EQ(replay.status, classifyQpSolverStatus(snapshot.raw_status_value));
+    EXPECT_EQ(replay.status,
+      fixture_name == "event_1_primary.qpsnap" ?
+      QpStageStatus::kSolvedInaccurate : QpStageStatus::kInfeasible);
+    EXPECT_EQ(replay.raw_status_value, snapshot.raw_status_value);
+    EXPECT_GT(replay.primal_residual, 0.0);
+
+    Eigen::MatrixXd hessian = Eigen::MatrixXd::Zero(6, 6);
+    Eigen::MatrixXd rows = Eigen::MatrixXd::Zero(7, 6);
+    Eigen::VectorXd physical_shift(6);
+    for (Eigen::Index joint = 0; joint < 6; ++joint) {
+      physical_shift[joint] = snapshot.variable_shift[static_cast<std::size_t>(joint)];
+      hessian(joint, joint) = snapshot.p_values[static_cast<std::size_t>(joint)];
+      rows(joint, joint) = 1.0;
+      for (c_int entry = snapshot.a_column_pointers[static_cast<std::size_t>(joint)];
+        entry < snapshot.a_column_pointers[static_cast<std::size_t>(joint + 1)]; ++entry)
+      {
+        const auto index = static_cast<std::size_t>(entry);
+        rows(snapshot.a_row_indices[index], joint) =
+          static_cast<double>(snapshot.a_values[index]);
+      }
+    }
+    Eigen::VectorXd centered_gradient(6);
+    for (Eigen::Index joint = 0; joint < 6; ++joint) {
+      centered_gradient[joint] = static_cast<double>(snapshot.q[static_cast<std::size_t>(joint)]);
+    }
+    const Eigen::VectorXd physical_gradient = centered_gradient - hessian * physical_shift;
+    Eigen::VectorXd native_lower(7);
+    Eigen::VectorXd native_upper(7);
+    for (Eigen::Index row = 0; row < 7; ++row) {
+      const double row_shift = rows.row(row).dot(physical_shift);
+      native_lower[row] = static_cast<double>(snapshot.lower[static_cast<std::size_t>(row)]) +
+        row_shift;
+      native_upper[row] = static_cast<double>(snapshot.upper[static_cast<std::size_t>(row)]) +
+        row_shift;
+    }
+    if (fixture_name == "event_1_primary.qpsnap") {
+      ASSERT_EQ(replay.physical_solution.size(), 6U);
+      Eigen::VectorXd clamped = Eigen::Map<const Eigen::VectorXd>(
+        replay.physical_solution.data(), 6);
+      for (Eigen::Index joint = 0; joint < 6; ++joint) {
+        clamped[joint] = std::clamp(clamped[joint], native_lower[joint], native_upper[joint]);
+      }
+      const Eigen::VectorXd clamped_values = rows * clamped;
+      EXPECT_GT(native_lower[6] - clamped_values[6], 2.0e-5);
+    }
+
+    HierarchicalVelocityQpConfig config = make_production_tolerance_config();
+    config.period_sec = 0.01;
+    config.velocity_regularization = 1.0e-4;
+    config.continuity_weight = 0.0;
+    config.solution_feasibility_tolerance = 2.0e-5;
+    config.solver_absolute_tolerance = 1.0e-5;
+    config.solver_relative_tolerance = 1.0e-5;
+    config.solver_max_iterations = 2500;
+    config.solver_time_limit_sec = 0.003;
+    const HierarchicalVelocityQp solver{config};
+    JointMotionState state = make_state(6);
+    state.velocity = physical_shift;
+    JointMotionLimits limits = make_limits(6);
+    limits.max_velocity.setConstant(2.0);
+    limits.max_acceleration.setConstant(10.0);
+    limits.max_jerk.setConstant(20.0);
+    LinearVelocityConstraint collision;
+    collision.coefficients = rows.row(6).transpose();
+    collision.lower_bound = static_cast<double>(snapshot.lower[6]) +
+      rows.row(6).dot(physical_shift);
+    collision.upper_bound = std::numeric_limits<double>::infinity();
+    Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(6, 6);
+    HierarchicalVelocityTask task = make_task(
+      identity, -0.5 * physical_gradient, Eigen::MatrixXd(0, 6), Eigen::VectorXd(0));
+
+    const QpResult result = solver.solve(task, state, limits, {collision});
+    std::ostringstream runtime_snapshot_summary;
+    if (result.primary_failure_snapshot.has_value()) {
+      const auto & runtime_snapshot = *result.primary_failure_snapshot;
+      runtime_snapshot_summary << " runtime_snapshot_raw=" << runtime_snapshot.raw_status_value <<
+        " box_lower/upper=";
+      for (Eigen::Index joint = 0; joint < 6; ++joint) {
+        runtime_snapshot_summary << ' ' <<
+          runtime_snapshot.lower[static_cast<std::size_t>(joint)] <<
+          '/' << runtime_snapshot.upper[static_cast<std::size_t>(joint)] <<
+          " shift=" << runtime_snapshot.variable_shift[static_cast<std::size_t>(joint)];
+      }
+      runtime_snapshot_summary << " row_bounds=" << runtime_snapshot.lower[6] << '/' <<
+        runtime_snapshot.upper[6] << " row_a=";
+      for (Eigen::Index joint = 0; joint < 6; ++joint) {
+        for (c_int entry = runtime_snapshot.a_column_pointers[static_cast<std::size_t>(joint)];
+          entry < runtime_snapshot.a_column_pointers[static_cast<std::size_t>(joint + 1)]; ++entry)
+        {
+          const auto index = static_cast<std::size_t>(entry);
+          if (runtime_snapshot.a_row_indices[index] == 6) {
+            runtime_snapshot_summary << ' ' << runtime_snapshot.a_values[index];
+          }
+        }
+      }
+    }
+    EXPECT_TRUE(result.command_available())
+      << "production-equivalent task status=" << static_cast<int>(result.status) <<
+      " primary_status=" << static_cast<int>(result.primary_status) <<
+      " iterations=" << result.primary_iterations << runtime_snapshot_summary.str();
+    if (result.command_available()) {
+      EXPECT_EQ(result.primary_retry_count, 1);
+      ASSERT_TRUE(result.primary_failure_snapshot.has_value());
+      if (result.primary_failure_snapshot->classified_status == QpStageStatus::kSolverError) {
+        const QpStageStatus raw_status = classifyQpSolverStatus(
+          result.primary_failure_snapshot->raw_status_value);
+        EXPECT_TRUE(raw_status == QpStageStatus::kSolved ||
+          raw_status == QpStageStatus::kSolvedInaccurate);
+      } else {
+        EXPECT_EQ(classifyQpSolverStatus(result.primary_failure_snapshot->raw_status_value),
+          result.primary_failure_snapshot->classified_status);
+      }
+      ASSERT_EQ(result.joint_velocity.size(), 6);
+      EXPECT_TRUE(result.primary_status == QpStageStatus::kSolved ||
+        result.primary_status == QpStageStatus::kSolvedInaccurate);
+      const Eigen::VectorXd native_values = rows * result.joint_velocity;
+      for (Eigen::Index row = 0; row < 7; ++row) {
+        EXPECT_GE(native_values[row], native_lower[row] - config.solution_feasibility_tolerance);
+        EXPECT_LE(native_values[row], native_upper[row] + config.solution_feasibility_tolerance);
+      }
+
+      // Independently verify the diagonal-QP box/row KKT normal-cone
+      // conditions for the recovered command, rather than checking only that
+      // it is feasible.
+      double lambda_lower = 0.0;
+      double lambda_upper = std::numeric_limits<double>::infinity();
+      if (native_values[6] > native_upper[6] - 1.0e-8) {
+        lambda_lower = -std::numeric_limits<double>::infinity();
+        lambda_upper = 0.0;
+      }
+      bool interior_coordinate_seen = false;
+      double interior_lambda = 0.0;
+      for (Eigen::Index joint = 0; joint < 6; ++joint) {
+        const double value = result.joint_velocity[joint];
+        const double objective_gradient = hessian(joint, joint) * value +
+          physical_gradient[joint];
+        const double coefficient = rows(6, joint);
+        if (value > native_lower[joint] + 1.0e-10 &&
+          value < native_upper[joint] - 1.0e-10)
+        {
+          ASSERT_NE(coefficient, 0.0);
+          const double candidate_lambda = objective_gradient / coefficient;
+          if (interior_coordinate_seen) {
+            EXPECT_NEAR(candidate_lambda, interior_lambda,
+              1.0e-8 * std::max(1.0, std::abs(interior_lambda)));
+          } else {
+            interior_coordinate_seen = true;
+            interior_lambda = candidate_lambda;
+          }
+        } else if (value <= native_lower[joint] + 1.0e-10) {
+          if (coefficient > 0.0) {
+            lambda_upper = std::min(lambda_upper, objective_gradient / coefficient);
+          } else if (coefficient < 0.0) {
+            lambda_lower = std::max(lambda_lower, objective_gradient / coefficient);
+          } else {
+            EXPECT_GE(objective_gradient, -1.0e-8);
+          }
+        } else {
+          if (coefficient > 0.0) {
+            lambda_lower = std::max(lambda_lower, objective_gradient / coefficient);
+          } else if (coefficient < 0.0) {
+            lambda_upper = std::min(lambda_upper, objective_gradient / coefficient);
+          } else {
+            EXPECT_LE(objective_gradient, 1.0e-8);
+          }
+        }
+      }
+      if (interior_coordinate_seen) {
+        EXPECT_NEAR(interior_lambda, std::clamp(interior_lambda, lambda_lower, lambda_upper),
+          1.0e-8 * std::max(1.0, std::abs(interior_lambda)));
+      }
+      EXPECT_LE(lambda_lower, lambda_upper);
+    }
+
+    HierarchicalVelocityQpConfig one_iteration_config = config;
+    one_iteration_config.solver_max_iterations = 1;
+    // Use an unsupported two-row structure so a one-iteration raw vector can
+    // never be promoted by the exact single-row recovery path.
+    one_iteration_config.solver_time_limit_sec = 0.1;
+    const QpResult max_iteration_control = HierarchicalVelocityQp{
+      one_iteration_config}.solve(task, state, limits, {collision, collision});
+    EXPECT_FALSE(max_iteration_control.command_available());
+    EXPECT_EQ(max_iteration_control.primary_status, QpStageStatus::kMaxIterations);
+    EXPECT_EQ(max_iteration_control.primary_retry_count, 1);
+    EXPECT_EQ(max_iteration_control.primary_iterations, 2);
+
+    LinearVelocityConstraint impossible = collision;
+    impossible.lower_bound = 1.0;
+    const QpResult infeasible_control = solver.solve(task, state, limits, {impossible});
+    EXPECT_FALSE(infeasible_control.command_available());
+    EXPECT_EQ(infeasible_control.primary_status, QpStageStatus::kInfeasible);
+    EXPECT_EQ(infeasible_control.primary_retry_count, 0);
+  }
+}
+
+TEST(HierarchicalVelocityQp, ExactBoxRowRecoveryMatchesIndependentTwoDimensionalOptimum)
+{
+  auto config = make_config();
+  config.solver_max_iterations = 1;
+  config.solver_time_limit_sec = 0.1;
+  const HierarchicalVelocityQp solver{config};
+  JointMotionLimits limits = make_limits(2);
+  limits.max_velocity.setConstant(0.5);
+  LinearVelocityConstraint halfspace;
+  halfspace.coefficients = Eigen::Vector2d::Ones();
+  halfspace.lower_bound = 0.5;
+  halfspace.upper_bound = std::numeric_limits<double>::infinity();
+  const Eigen::Matrix2d identity = Eigen::Matrix2d::Identity();
+  const HierarchicalVelocityTask task = make_task(
+    identity, Eigen::Vector2d::Zero(), Eigen::MatrixXd(0, 2), Eigen::VectorXd(0));
+
+  const QpResult result = solver.solve(task, make_state(2), limits, {halfspace});
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_EQ(result.primary_status, QpStageStatus::kSolved);
+  EXPECT_EQ(result.primary_retry_count, 1);
+  // Independent 2D candidates: the unconstrained minimizer (0,0) is infeasible;
+  // the x+y=0.5 line has its minimum at (0.25,0.25), cost 0.125, while feasible
+  // box-edge minima are (0.5,0) and (0,0.5), each with greater cost 0.25.
+  EXPECT_NEAR(result.joint_velocity[0], 0.25, kTolerance);
+  EXPECT_NEAR(result.joint_velocity[1], 0.25, kTolerance);
+  EXPECT_NEAR(result.joint_velocity.squaredNorm(), 0.125, 2.0 * kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, DistanceApproximationZeroAlphaAndFailureEligibility)
+{
+  constexpr double kTolerance = 2.0e-5;
+  Eigen::Matrix2d hessian = 2.0 * Eigen::Matrix2d::Identity();
+  Eigen::Vector2d gradient(-2.0, 0.0);
+  Eigen::Matrix<double, 4, 2> constraints;
+  constraints << 1.0, 0.0,
+    0.0, 1.0,
+    1.0, 0.0,
+    1.0, 0.0;
+  Eigen::Vector4d lower(-1.0, -1.0, -1.0, -kTolerance);
+  Eigen::Vector4d upper(1.0, 1.0, -kTolerance, kTolerance);
+  const Eigen::Vector2d warm = Eigen::Vector2d::Zero();
+  const Eigen::Vector2d raw(2.0, 0.0);
+
+  const auto approximation = detail::minimizeFeasibleDistanceSegment(
+    QpStageStatus::kMaxIterations, QpStageStatus::kMaxIterations,
+    hessian, gradient, constraints, lower, upper, warm, raw, kTolerance);
+  ASSERT_TRUE(approximation.has_value());
+  EXPECT_DOUBLE_EQ(approximation->alpha, 0.0);
+  EXPECT_DOUBLE_EQ(approximation->velocity[0], warm[0]);
+
+  EXPECT_FALSE(detail::minimizeFeasibleDistanceSegment(
+      QpStageStatus::kInfeasible, QpStageStatus::kInfeasible,
+      hessian, gradient, constraints, lower, upper, warm, raw, kTolerance).has_value());
+  EXPECT_FALSE(detail::minimizeFeasibleDistanceSegment(
+      QpStageStatus::kSolverError, QpStageStatus::kSolverError,
+      hessian, gradient, constraints, lower, upper, warm, raw, kTolerance).has_value());
+  EXPECT_TRUE(detail::minimizeFeasibleDistanceSegment(
+      QpStageStatus::kSolverError, QpStageStatus::kSolved,
+      hessian, gradient, constraints, lower, upper, warm, raw, kTolerance).has_value());
+  Eigen::Vector2d non_finite_raw = raw;
+  non_finite_raw[0] = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(detail::minimizeFeasibleDistanceSegment(
+      QpStageStatus::kMaxIterations, QpStageStatus::kMaxIterations,
+      hessian, gradient, constraints, lower, upper, warm, non_finite_raw,
+      kTolerance).has_value());
+  EXPECT_FALSE(detail::minimizeFeasibleDistanceSegment(
+      QpStageStatus::kMaxIterations, QpStageStatus::kMaxIterations,
+      hessian, gradient, constraints, lower, upper, warm, Eigen::VectorXd(0),
+      kTolerance).has_value());
+  EXPECT_FALSE(detail::minimizeFeasibleDistanceSegment(
+      QpStageStatus::kSolved, QpStageStatus::kSolved,
+      hessian, gradient, constraints, lower, upper, warm, raw,
+      kTolerance).has_value());
+}
+
 TEST(HierarchicalVelocityQp, PrimaryOrientationWinsAConflictingSecondaryRequest)
 {
   const HierarchicalVelocityQpConfig config = make_config();
@@ -221,6 +1688,192 @@ TEST(HierarchicalVelocityQp, PrimaryOrientationWinsAConflictingSecondaryRequest)
     result.joint_velocity[0],
     0.8 - config.primary_preservation_tolerance - kTolerance);
   EXPECT_LT(result.joint_velocity[0], 0.81);
+}
+
+TEST(HierarchicalVelocityQp, SecondaryIntervalLimitsComfortWithoutWidening)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> primary;
+  primary << 1.0, 1.0;
+  Eigen::Matrix<double, 1, 2> comfort;
+  comfort << 1.0, 0.0;
+  HierarchicalVelocityTask task = make_task(
+    primary, Eigen::VectorXd::Constant(1, 1.0),
+    comfort, Eigen::VectorXd::Constant(1, 0.5));
+  LinearVelocityConstraint interval;
+  interval.coefficients = Eigen::Vector2d(1.0, 0.0);
+  interval.lower_bound = 0.0;
+  interval.upper_bound = 0.1;
+  task.secondary_constraints.push_back(interval);
+
+  const QpResult result = solver.solve(task, make_state(2), make_limits(2));
+
+  ASSERT_TRUE(result.fully_solved());
+  EXPECT_NEAR(result.achieved_primary_velocity[0], 1.0,
+    config.primary_preservation_tolerance + kTolerance);
+  EXPECT_NEAR(result.joint_velocity[0], 0.1,
+    config.solution_feasibility_tolerance + kTolerance);
+  EXPECT_NEAR(result.joint_velocity[1], 0.9,
+    config.primary_preservation_tolerance + kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, ConstraintsOnlySecondaryPreservesPrimaryForBothSigns)
+{
+  const auto config = make_production_tolerance_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> primary;
+  primary << 1.0, 0.0;
+  const Eigen::MatrixXd no_secondary_objective(0, 2);
+
+  for (const double sign : {-1.0, 1.0}) {
+    JointMotionState state = make_state(2);
+    state.velocity[0] = sign * 0.2;
+    HierarchicalVelocityTask task = make_task(
+      primary, Eigen::VectorXd::Constant(1, sign * 0.2),
+      no_secondary_objective, Eigen::VectorXd(0));
+    LinearVelocityConstraint interval;
+    interval.coefficients = Eigen::Vector2d::Ones();
+    interval.lower_bound = sign > 0.0 ? 0.29 : -0.31;
+    interval.upper_bound = sign > 0.0 ? 0.31 : -0.29;
+    task.secondary_constraints.push_back(interval);
+    JointMotionLimits limits = make_limits(2);
+    set_feasible_regression_limits(limits);
+
+    const QpResult result = solver.solve(task, state, limits);
+
+    ASSERT_TRUE(result.fully_solved()) << "sign=" << sign << " status=" <<
+      static_cast<int>(result.status) << " primary=" <<
+      static_cast<int>(result.primary_status) << " secondary=" <<
+      static_cast<int>(result.secondary_status);
+    EXPECT_EQ(result.secondary_status, QpStageStatus::kSolved) << "sign=" << sign;
+    ASSERT_EQ(result.joint_velocity.size(), 2);
+    EXPECT_NEAR(result.joint_velocity[0], sign * 0.2,
+      config.primary_preservation_tolerance + kTolerance) << "sign=" << sign;
+    EXPECT_GE(sign * result.joint_velocity[1],
+      0.09 - config.primary_preservation_tolerance -
+      config.solution_feasibility_tolerance - kTolerance) << "sign=" << sign;
+    EXPECT_GE(sign * result.joint_velocity[0] + sign * result.joint_velocity[1],
+      0.29 - config.solution_feasibility_tolerance - kTolerance) << "sign=" << sign;
+    EXPECT_LE(sign * result.joint_velocity[0] + sign * result.joint_velocity[1],
+      0.31 + config.solution_feasibility_tolerance + kTolerance) << "sign=" << sign;
+  }
+}
+
+TEST(HierarchicalVelocityQp, ConstraintsOnlySecondaryConflictFallsBackToPrimary)
+{
+  const auto config = make_production_tolerance_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 1> primary;
+  primary << 1.0;
+  JointMotionState state = make_state(1);
+  state.velocity[0] = 0.4;
+  const Eigen::MatrixXd no_secondary_objective(0, 1);
+  HierarchicalVelocityTask task = make_task(
+    primary, Eigen::VectorXd::Constant(1, 0.4),
+    no_secondary_objective, Eigen::VectorXd(0));
+  LinearVelocityConstraint interval;
+  interval.coefficients = Eigen::VectorXd::Ones(1);
+  interval.lower_bound = 0.8;
+  interval.upper_bound = 1.0;
+  task.secondary_constraints.push_back(interval);
+
+  JointMotionLimits limits = make_limits(1);
+  set_feasible_regression_limits(limits);
+  const QpResult result = solver.solve(task, state, limits);
+
+  ASSERT_TRUE(result.command_available()) << "status=" <<
+    static_cast<int>(result.status) << " primary=" <<
+    static_cast<int>(result.primary_status) << " secondary=" <<
+    static_cast<int>(result.secondary_status);
+  EXPECT_EQ(result.status, QpStatus::kPrimaryOnly);
+  EXPECT_EQ(result.primary_status, QpStageStatus::kSolved);
+  EXPECT_EQ(result.secondary_status, QpStageStatus::kInfeasible);
+  ASSERT_EQ(result.joint_velocity.size(), 1);
+  EXPECT_NEAR(result.joint_velocity[0], 0.4,
+    config.solution_feasibility_tolerance + kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, EmptySecondaryObjectiveAndConstraintsKeepsPrimaryOnlyBehavior)
+{
+  const auto config = make_production_tolerance_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> primary;
+  primary << 1.0, 0.0;
+  const Eigen::MatrixXd no_secondary_objective(0, 2);
+  const HierarchicalVelocityTask task = make_task(
+    primary, Eigen::VectorXd::Constant(1, 0.25),
+    no_secondary_objective, Eigen::VectorXd(0));
+
+  JointMotionState state = make_state(2);
+  state.velocity[0] = 0.25;
+  JointMotionLimits limits = make_limits(2);
+  set_feasible_regression_limits(limits);
+  const QpResult result = solver.solve(task, state, limits);
+
+  ASSERT_TRUE(result.command_available()) << "status=" <<
+    static_cast<int>(result.status) << " primary=" <<
+    static_cast<int>(result.primary_status) << " secondary=" <<
+    static_cast<int>(result.secondary_status);
+  ASSERT_TRUE(result.fully_solved());
+  EXPECT_EQ(result.secondary_status, QpStageStatus::kNotRun);
+  EXPECT_EQ(result.secondary_iterations, 0);
+  ASSERT_EQ(result.joint_velocity.size(), 2);
+  EXPECT_NEAR(result.joint_velocity[0], 0.25, kTolerance);
+  EXPECT_NEAR(result.joint_velocity[1], 0.0, kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, ConstraintsOnlySecondaryAtZeroControlRemainsStationary)
+{
+  const auto config = make_production_tolerance_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 2> primary;
+  primary << 1.0, 0.0;
+  const Eigen::MatrixXd no_secondary_objective(0, 2);
+  HierarchicalVelocityTask task = make_task(
+    primary, Eigen::VectorXd::Zero(1), no_secondary_objective, Eigen::VectorXd(0));
+  LinearVelocityConstraint interval;
+  interval.coefficients = Eigen::Vector2d(0.0, 1.0);
+  interval.lower_bound = -0.1;
+  interval.upper_bound = 0.1;
+  task.secondary_constraints.push_back(interval);
+
+  JointMotionLimits limits = make_limits(2);
+  set_feasible_regression_limits(limits);
+  const QpResult result = solver.solve(task, make_state(2), limits);
+
+  ASSERT_TRUE(result.command_available()) << "status=" <<
+    static_cast<int>(result.status) << " primary=" <<
+    static_cast<int>(result.primary_status) << " secondary=" <<
+    static_cast<int>(result.secondary_status);
+  ASSERT_TRUE(result.fully_solved());
+  EXPECT_EQ(result.secondary_status, QpStageStatus::kSolved);
+  ASSERT_EQ(result.joint_velocity.size(), 2);
+  EXPECT_NEAR(result.joint_velocity.lpNorm<Eigen::Infinity>(), 0.0, kTolerance);
+  EXPECT_NEAR(result.joint_velocity[1], 0.0, kTolerance);
+}
+
+TEST(HierarchicalVelocityQp, InfeasibleSecondaryIntervalFallsBackToPrimaryCommand)
+{
+  const auto config = make_config();
+  const HierarchicalVelocityQp solver{config};
+  Eigen::Matrix<double, 1, 1> joint;
+  joint << 1.0;
+  HierarchicalVelocityTask task = make_task(
+    joint, Eigen::VectorXd::Constant(1, 0.4),
+    joint, Eigen::VectorXd::Constant(1, 1.0));
+  LinearVelocityConstraint interval;
+  interval.coefficients = Eigen::VectorXd::Ones(1);
+  interval.lower_bound = 0.8;
+  interval.upper_bound = 1.0;
+  task.secondary_constraints.push_back(interval);
+
+  const QpResult result = solver.solve(task, make_state(1), make_limits(1));
+
+  ASSERT_TRUE(result.command_available());
+  EXPECT_EQ(result.status, QpStatus::kPrimaryOnly);
+  EXPECT_NEAR(result.joint_velocity[0], 0.4,
+    config.solution_feasibility_tolerance + kTolerance);
 }
 
 TEST(HierarchicalVelocityQp, DefaultPreservationKeepsMultirowPrimaryUnderJerkLimits)

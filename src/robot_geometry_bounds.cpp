@@ -82,6 +82,30 @@ double relativeBound(const JointRadii & first, const JointRadii & second)
   return bound;
 }
 
+std::vector<double> relativeJointCoefficients(
+  const JointRadii & first, const JointRadii & second,
+  const moveit::core::RobotModel & model,
+  const moveit::core::JointModelGroup & group)
+{
+  std::vector<double> result(group.getVariableCount(), 0.0);
+  const auto & variable_names = group.getVariableNames();
+  for (std::size_t index = 0U; index < variable_names.size(); ++index) {
+    const auto * joint = model.getJointOfVariable(variable_names[index]);
+    if (joint == nullptr) {
+      throw std::invalid_argument(
+              "geometry bounds could not resolve a joint-group variable");
+    }
+    const auto first_radius = first.find(joint->getName());
+    const auto second_radius = second.find(joint->getName());
+    const bool first_moves = first_radius != first.end();
+    const bool second_moves = second_radius != second.end();
+    if (first_moves != second_moves) {
+      result[index] = first_moves ? first_radius->second : second_radius->second;
+    }
+  }
+  return result;
+}
+
 }  // namespace
 
 void configureGeometryBounds(
@@ -89,6 +113,10 @@ void configureGeometryBounds(
   const moveit::core::JointModelGroup & group)
 {
   config.distance_bounds.clear();
+  config.distance_joint_bounds_m_per_rad.clear();
+  config.geometry_bounds_model_identity = &model;
+  config.geometry_bounds_group_identity = &group;
+  config.geometry_bounds_variable_names = group.getVariableNames();
   std::map<std::string, JointRadii> radii;
   double maximum_world_bound = 0.0;
   for (const auto * link : model.getLinkModelsWithCollisionGeometry()) {
@@ -96,12 +124,16 @@ void configureGeometryBounds(
     const double world_bound = relativeBound(joint_radii, {});
     maximum_world_bound = std::max(maximum_world_bound, world_bound);
     config.distance_bounds[{link->getName(), ""}] = world_bound;
+    config.distance_joint_bounds_m_per_rad[{link->getName(), ""}] =
+      relativeJointCoefficients(joint_radii, {}, model, group);
     radii.emplace(link->getName(), std::move(joint_radii));
   }
   for (auto first = radii.begin(); first != radii.end(); ++first) {
     for (auto second = std::next(first); second != radii.end(); ++second) {
-      config.distance_bounds[{first->first, second->first}] =
-        relativeBound(first->second, second->second);
+      const auto pair = std::make_pair(first->first, second->first);
+      config.distance_bounds[pair] = relativeBound(first->second, second->second);
+      config.distance_joint_bounds_m_per_rad[pair] = relativeJointCoefficients(
+        first->second, second->second, model, group);
     }
   }
   config.default_distance_lipschitz_m_per_rad = std::max(

@@ -31,6 +31,7 @@ struct ServoExecutionContextRecord
   std::uint8_t target_mode{0U};
   std::uint8_t controller_mode{0U};
   std::int64_t target_id{-1};
+  bool control_time_wait{false};
   bool target_available{false};
   bool target_used_for_reference{false};
   bool face_tracking_published{false};

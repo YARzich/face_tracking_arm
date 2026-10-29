@@ -27,8 +27,11 @@ QpFailureSnapshotEventWriteResult writeQpFailureSnapshotEvent(
       std::ofstream output(path, std::ios::out | std::ios::trunc);
       return output.good() && writeQpFailureSnapshot(output, *snapshot) && output.good();
     };
-  result.snapshots_ok = write_stage(event.primary, "primary", result.primary_path) &&
-    write_stage(event.secondary, "secondary", result.secondary_path);
+  const bool primary_ok = write_stage(event.primary, "primary", result.primary_path);
+  const bool secondary_ok = write_stage(event.secondary, "secondary", result.secondary_path);
+  const bool tertiary_ok = write_stage(event.tertiary, "tertiary", result.tertiary_path);
+  const bool distance_ok = write_stage(event.distance, "distance", result.distance_path);
+  result.snapshots_ok = primary_ok && secondary_ok && tertiary_ok && distance_ok;
 
   std::ofstream index(directory / "events.tsv", std::ios::out | std::ios::app);
   if (!index.good()) {
@@ -41,7 +44,12 @@ QpFailureSnapshotEventWriteResult writeQpFailureSnapshotEvent(
         << static_cast<int>(event.primary_disposition) << '\t'
         << static_cast<int>(event.secondary_disposition) << '\t'
         << (result.snapshots_ok ? 1 : 0) << '\t' << result.primary_path << '\t'
-        << result.secondary_path << '\n';
+        << result.secondary_path << '\t'
+        // Keep the established columns above stable; append fields for the new
+        // optional ranks so existing TSV readers retain their column mapping.
+        << static_cast<int>(event.tertiary_disposition) << '\t'
+        << static_cast<int>(event.distance_disposition) << '\t'
+        << result.tertiary_path << '\t' << result.distance_path << '\n';
   result.index_ok = index.good();
   return result;
 }

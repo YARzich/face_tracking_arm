@@ -31,6 +31,7 @@ enum class CandidateRejectionKind
   kOther,
   kReferenceGuard,
   kCompactStopEnvelope,
+  kCollisionValidation,
 };
 
 inline constexpr double kFiniteEpsilon = 1.0e-12;

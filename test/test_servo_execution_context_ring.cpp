@@ -18,6 +18,7 @@ TEST(ServoExecutionContextRing, PreservesOrderAndReportsBoundedOverflow)
   first.cycle_duration_ns = 1'234'567U;
   ServoExecutionContextRecord second;
   second.tick_sequence = 11U;
+  second.control_time_wait = true;
   ServoExecutionContextRecord rejected;
   rejected.tick_sequence = 12U;
   ASSERT_TRUE(ring.tryPush(first));
@@ -30,6 +31,7 @@ TEST(ServoExecutionContextRing, PreservesOrderAndReportsBoundedOverflow)
   EXPECT_EQ(actual.cycle_duration_ns, 1'234'567U);
   ASSERT_TRUE(ring.tryPop(actual));
   EXPECT_EQ(actual.tick_sequence, 11U);
+  EXPECT_TRUE(actual.control_time_wait);
   EXPECT_FALSE(ring.tryPop(actual));
 }
 

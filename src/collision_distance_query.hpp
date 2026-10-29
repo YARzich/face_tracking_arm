@@ -69,11 +69,23 @@ void appendDistanceCandidates(
   const moveit::core::RobotState & state,
   const moveit::core::JointModelGroup & group);
 
+[[nodiscard]] double pairInterSampleDistanceReserve(
+  const DistanceCandidate & candidate,
+  const moveit::core::RobotState & state,
+  const moveit::core::JointModelGroup & group,
+  const Eigen::VectorXd & joint_uncertainty,
+  const CollisionConstraintConfig & config);
+
 [[nodiscard]] double pairInterSampleUncertainty(
   const DistanceCandidate & candidate,
   const moveit::core::RobotState & state,
   const moveit::core::JointModelGroup & group,
   const Eigen::VectorXd & joint_uncertainty);
+
+[[nodiscard]] double requiredClearanceWithDistanceReserve(
+  const DistanceCandidate & candidate,
+  const CollisionConstraintConfig & config,
+  const double additional_distance_reserve_m);
 
 [[nodiscard]] bool validateCollisionModel(
   const planning_scene::PlanningScene & scene,

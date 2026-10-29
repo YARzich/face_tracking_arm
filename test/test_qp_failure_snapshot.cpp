@@ -5,6 +5,10 @@
 #include <gtest/gtest.h>
 #include <osqp.h>
 
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <vector>
@@ -104,6 +108,14 @@ TEST(QpFailureSnapshot, CapturesAndReplaysInfeasibleMatrixAndCenteredCoordinates
   EXPECT_DOUBLE_EQ(decoded.adaptive_rho_tolerance, snapshot.adaptive_rho_tolerance);
   EXPECT_EQ(replayQpFailureSnapshot(decoded).status, QpStageStatus::kInfeasible);
 
+  QpFailureSnapshot distance_snapshot = snapshot;
+  distance_snapshot.stage = QpSolveStage::kDistance;
+  std::stringstream distance_encoded;
+  ASSERT_TRUE(writeQpFailureSnapshot(distance_encoded, distance_snapshot));
+  QpFailureSnapshot distance_decoded;
+  ASSERT_TRUE(readQpFailureSnapshot(distance_encoded, distance_decoded));
+  EXPECT_EQ(distance_decoded.stage, QpSolveStage::kDistance);
+
   auto mismatched_build = decoded;
   mismatched_build.osqp_version += "-other";
   const auto incompatible = replayQpFailureSnapshot(mismatched_build);
@@ -127,6 +139,55 @@ TEST(QpFailureSnapshot, CapturesMaximumIterationFailure)
   const auto replay = replayQpFailureSnapshot(*result.primary_failure_snapshot);
   ASSERT_EQ(replay.setup_return_code, 0);
   EXPECT_EQ(replay.status, QpStageStatus::kMaxIterations);
+}
+
+TEST(QpFailureSnapshot, ReplaysHeldOutDistanceMatrixWithProductionSettings)
+{
+  // Captured event 1 from held-out runtime session 1792994694798221558;
+  // this was the slowest of eleven matrices under the accepted settings.
+  const auto fixture_path = std::filesystem::path(__FILE__).parent_path() /
+    "fixtures/posture1d_distance_event_1.qpsnap";
+  std::ifstream input(fixture_path);
+  ASSERT_TRUE(input.good()) << fixture_path;
+  QpFailureSnapshot snapshot;
+  ASSERT_TRUE(readQpFailureSnapshot(input, snapshot));
+  ASSERT_EQ(snapshot.stage, QpSolveStage::kDistance);
+
+  snapshot.rho = 2.0;
+  snapshot.adaptive_rho_interval = 50;
+  snapshot.max_iter = 2500;
+  snapshot.solver_budget_sec = 1.0;
+  snapshot.time_limit_sec = 1.0;
+  const auto replay = replayQpFailureSnapshot(snapshot);
+  ASSERT_EQ(replay.setup_return_code, 0);
+  EXPECT_EQ(replay.status, QpStageStatus::kSolved);
+  ASSERT_EQ(replay.physical_solution.size(), static_cast<std::size_t>(snapshot.variable_count));
+
+  std::vector<double> row_values(static_cast<std::size_t>(snapshot.constraint_count), 0.0);
+  for (int column = 0; column < snapshot.variable_count; ++column) {
+    const double centered = replay.physical_solution[static_cast<std::size_t>(column)] -
+      snapshot.variable_shift[static_cast<std::size_t>(column)];
+    for (c_int entry = snapshot.a_column_pointers[static_cast<std::size_t>(column)];
+      entry < snapshot.a_column_pointers[static_cast<std::size_t>(column + 1)]; ++entry)
+    {
+      const auto index = static_cast<std::size_t>(entry);
+      row_values[static_cast<std::size_t>(snapshot.a_row_indices[index])] +=
+        static_cast<double>(snapshot.a_values[index]) * centered;
+    }
+  }
+  double maximum_bound_violation = 0.0;
+  for (int row = 0; row < snapshot.constraint_count; ++row) {
+    const auto index = static_cast<std::size_t>(row);
+    if (std::isfinite(snapshot.lower[index])) {
+      maximum_bound_violation = std::max(
+        maximum_bound_violation, snapshot.lower[index] - row_values[index]);
+    }
+    if (std::isfinite(snapshot.upper[index])) {
+      maximum_bound_violation = std::max(
+        maximum_bound_violation, row_values[index] - snapshot.upper[index]);
+    }
+  }
+  EXPECT_LE(maximum_bound_violation, snapshot.eps_abs);
 }
 
 TEST(QpFailureSnapshot, MapsSolverStatusesIncludingOptionalTimeLimit)
@@ -256,6 +317,22 @@ TEST(QpFailureSnapshotMailbox, RecordsShapeLimitWithoutMatrix)
   EXPECT_EQ(event->primary_disposition,
     QpFailureSnapshotDisposition::kShapeLimitExceeded);
   EXPECT_FALSE(event->primary.has_value());
+}
+
+TEST(QpFailureSnapshotMailbox, CarriesFailureFromLaterDistanceStage)
+{
+  QpResult result;
+  result.distance_status = QpStageStatus::kTimeLimit;
+  result.distance_snapshot_disposition = QpFailureSnapshotDisposition::kShapeLimitExceeded;
+
+  QpFailureSnapshotMailbox mailbox;
+  ASSERT_TRUE(mailbox.trySubmit(std::move(result)));
+  const auto event = mailbox.tryTake();
+
+  ASSERT_TRUE(event.has_value());
+  EXPECT_EQ(event->distance_disposition,
+    QpFailureSnapshotDisposition::kShapeLimitExceeded);
+  EXPECT_FALSE(event->distance.has_value());
 }
 
 }  // namespace

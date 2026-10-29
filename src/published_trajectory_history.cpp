@@ -246,11 +246,42 @@ PublicationMatch PublishedTrajectoryHistory::match(
     const bool latest_record = record == records_.rbegin();
     const bool trajectory_origin_matches =
       record->execution_queue.front().time_stamp == sample_times->trajectory_origin;
-    const auto expected_reference = expectedStateAt(
+    const auto & queue = record->execution_queue;
+    const rclcpp::Time & front_time = queue.front().time_stamp;
+    const bool reference_prestart = latest_record && trajectory_origin_matches &&
+      sample_times->reference < front_time;
+    const bool output_prestart = latest_record && trajectory_origin_matches &&
+      sample_times->output < front_time;
+    const bool hybrid_prestart = reference_prestart || output_prestart;
+
+    auto expected_reference = expectedStateAt(
       *record, sample_times->reference, trajectory_origin_matches);
-    const auto expected_output = expectedStateAt(
-      *record, sample_times->output, trajectory_origin_matches);
+    auto expected_output = expectedStateAt(
+      *record, sample_times->output, trajectory_origin_matches && !hybrid_prestart);
+    if (reference_prestart) {
+      expected_reference = expectedPrestartTerminalHold(
+        *record, rclcpp::Time(state.header.stamp, clock_type), sample_times->reference);
+    }
+    if (output_prestart) {
+      expected_output = expectedPrestartTerminalHold(
+        *record, rclcpp::Time(state.header.stamp, clock_type), sample_times->output);
+    }
     if (!expected_reference.has_value() || !expected_output.has_value()) {
+      continue;
+    }
+
+    const auto exact_zero_finite = [](const std::vector<double> & values) {
+        return std::all_of(values.begin(), values.end(), [](const double value) {
+                   return std::isfinite(value) && value == 0.0;
+        });
+      };
+    if ((reference_prestart &&
+      (state.reference.velocities.size() != expected_reference->velocities.size() ||
+      !exact_zero_finite(state.reference.velocities))) ||
+      (output_prestart && !state.output.velocities.empty() &&
+      (state.output.velocities.size() != expected_output->velocities.size() ||
+      !exact_zero_finite(state.output.velocities))))
+    {
       continue;
     }
 
@@ -274,6 +305,64 @@ PublicationMatch PublishedTrajectoryHistory::match(
   return result;
 }
 
+bool PublishedTrajectoryHistory::isPendingTerminalReplacement(
+  const PublicationMatch & match, const rclcpp::Time & measurement_time) const
+{
+  if (match.kind != PublicationMatchKind::kOlder) {
+    return false;
+  }
+
+  const auto * const older = find(match.publication_id);
+  const auto * const replacement = latest();
+  if (older == nullptr || replacement == nullptr || older->id == replacement->id ||
+    older->execution_queue.size() < 3U || replacement->execution_queue.size() < 3U)
+  {
+    return false;
+  }
+
+  const auto & older_queue = older->execution_queue;
+  const auto & replacement_start = replacement->execution_queue.front();
+  const auto & older_terminal = *std::prev(older_queue.end(), 2);
+  const rcl_clock_type_t clock_type = older_queue.front().time_stamp.get_clock_type();
+  if (measurement_time.get_clock_type() != clock_type ||
+    match.sample_times.trajectory_origin.get_clock_type() != clock_type ||
+    match.sample_times.reference.get_clock_type() != clock_type ||
+    match.sample_times.output.get_clock_type() != clock_type ||
+    replacement_start.time_stamp.get_clock_type() != clock_type ||
+    older->stationary_time.get_clock_type() != clock_type ||
+    match.sample_times.trajectory_origin != older_queue.front().time_stamp ||
+    measurement_time < older->stationary_time ||
+    match.sample_times.reference < older->stationary_time ||
+    match.sample_times.output < older->stationary_time ||
+    !(match.sample_times.reference < replacement_start.time_stamp) ||
+    !(match.sample_times.output < replacement_start.time_stamp) ||
+    !(measurement_time < replacement_start.time_stamp))
+  {
+    return false;
+  }
+
+  const auto same_positions = [](const Eigen::VectorXd & lhs, const Eigen::VectorXd & rhs) {
+      return lhs.size() == rhs.size() && lhs.allFinite() && rhs.allFinite() &&
+             (lhs.array() == rhs.array()).all();
+    };
+  const auto & expected_reference = match.expected_reference;
+  const auto & expected_output = match.expected_output;
+  return expected_reference.terminal_hold && expected_output.terminal_hold &&
+         same_positions(expected_reference.positions, older_terminal.positions) &&
+         same_positions(expected_output.positions, older_terminal.positions) &&
+         expected_reference.velocities.size() == older_terminal.positions.size() &&
+         expected_output.velocities.size() == older_terminal.positions.size() &&
+         expected_reference.velocities.allFinite() &&
+         expected_output.velocities.allFinite() &&
+         expected_reference.velocities.isZero(0.0) &&
+         expected_output.velocities.isZero(0.0) &&
+         same_positions(replacement_start.positions, older_terminal.positions) &&
+         replacement_start.velocities.allFinite() &&
+         replacement_start.accelerations.allFinite() &&
+         replacement_start.velocities.isZero(0.0) &&
+         replacement_start.accelerations.isZero(0.0);
+}
+
 std::optional<ExpectedPositionState> PublishedTrajectoryHistory::expectedAt(
   const PublicationId id, const rclcpp::Time & sample_time) const
 {
@@ -281,7 +370,116 @@ std::optional<ExpectedPositionState> PublishedTrajectoryHistory::expectedAt(
   if (record == nullptr) {
     return std::nullopt;
   }
+  if (record == latest() &&
+    sample_time.get_clock_type() == record->execution_queue.front().time_stamp.get_clock_type() &&
+    sample_time < record->execution_queue.front().time_stamp)
+  {
+    return expectedPrestartTerminalHold(*record, sample_time, sample_time);
+  }
   return expectedStateAt(*record, sample_time, true);
+}
+
+std::optional<ExpectedPositionState> PublishedTrajectoryHistory::expectedPrestartTerminalHold(
+  const PublishedTrajectoryRecord & latest_record, const rclcpp::Time & measurement_time,
+  const rclcpp::Time & sample_time) const
+{
+  if (records_.size() < 2U || records_.back().id != latest_record.id ||
+    latest_record.execution_queue.size() < 3U)
+  {
+    return std::nullopt;
+  }
+
+  const auto & latest_queue = latest_record.execution_queue;
+  const auto & latest_front = latest_queue.front();
+  const rcl_clock_type_t clock_type = latest_front.time_stamp.get_clock_type();
+  if (measurement_time.get_clock_type() != clock_type ||
+    sample_time.get_clock_type() != clock_type ||
+    !(measurement_time < latest_front.time_stamp) || !(sample_time < latest_front.time_stamp) ||
+    latest_front.joint_names.empty() ||
+    latest_front.positions.size() != static_cast<Eigen::Index>(latest_front.joint_names.size()) ||
+    latest_front.velocities.size() != latest_front.positions.size() ||
+    latest_front.accelerations.size() != latest_front.positions.size() ||
+    !latest_front.positions.allFinite() || !latest_front.velocities.allFinite() ||
+    !latest_front.accelerations.allFinite() || !latest_front.velocities.isZero(0.0) ||
+    !latest_front.accelerations.isZero(0.0))
+  {
+    return std::nullopt;
+  }
+
+  const auto same_front = [&latest_front](const PublishedTrajectoryRecord & record) {
+      if (record.execution_queue.size() < 3U) {
+        return false;
+      }
+      const auto & front = record.execution_queue.front();
+      return front.time_stamp.get_clock_type() == latest_front.time_stamp.get_clock_type() &&
+             front.time_stamp == latest_front.time_stamp &&
+             front.joint_names == latest_front.joint_names &&
+             front.positions.size() == latest_front.positions.size() &&
+             front.positions.allFinite() &&
+             (front.positions.array() == latest_front.positions.array()).all() &&
+             front.velocities.size() == latest_front.velocities.size() &&
+             front.accelerations.size() == latest_front.accelerations.size() &&
+             front.velocities.allFinite() && front.accelerations.allFinite() &&
+             front.velocities.isZero(0.0) && front.accelerations.isZero(0.0);
+    };
+
+  auto root = std::prev(records_.end());
+  while (root != records_.begin()) {
+    auto previous = std::prev(root);
+    if (!same_front(*previous)) {
+      break;
+    }
+    root = previous;
+  }
+  if (root == records_.begin()) {
+    return std::nullopt;
+  }
+
+  // The first nonmatching predecessor is the only retained stationary root for this chain.
+  const auto & root_record = *std::prev(root);
+  const auto & root_queue = root_record.execution_queue;
+  if (root_queue.size() < 3U || root_queue.front().joint_names != latest_front.joint_names ||
+    root_record.stationary_time.get_clock_type() != clock_type ||
+    root_record.stationary_time > measurement_time ||
+    root_record.stationary_time > sample_time ||
+    !(root_record.stationary_time < latest_front.time_stamp))
+  {
+    return std::nullopt;
+  }
+
+  const auto transmitted_end = std::prev(root_queue.end(), 2);
+  const auto stationary = std::find_if(
+    root_queue.begin(), root_queue.end(), [&root_record](const auto & state) {
+      return state.time_stamp == root_record.stationary_time;
+    });
+  if (stationary == root_queue.end() || stationary > transmitted_end ||
+    transmitted_end->time_stamp < root_record.stationary_time ||
+    transmitted_end->joint_names != latest_front.joint_names ||
+    transmitted_end->positions.size() != latest_front.positions.size() ||
+    !transmitted_end->positions.allFinite() ||
+    !(transmitted_end->positions.array() == latest_front.positions.array()).all())
+  {
+    return std::nullopt;
+  }
+
+  const Eigen::Index joint_count = latest_front.positions.size();
+  const auto exact_stationary = [&latest_front, joint_count](const auto & state) {
+      return state.joint_names == latest_front.joint_names &&
+             state.positions.size() == joint_count && state.velocities.size() == joint_count &&
+             state.accelerations.size() == joint_count && state.positions.allFinite() &&
+             state.velocities.allFinite() && state.accelerations.allFinite() &&
+             (state.positions.array() == latest_front.positions.array()).all() &&
+             state.velocities.isZero(0.0) && state.accelerations.isZero(0.0);
+    };
+  if (!std::all_of(stationary, root_queue.end(), exact_stationary)) {
+    return std::nullopt;
+  }
+
+  ExpectedPositionState expected;
+  expected.positions = latest_front.positions;
+  expected.velocities = Eigen::VectorXd::Zero(joint_count);
+  expected.terminal_hold = true;
+  return expected;
 }
 
 std::optional<ExpectedPositionState> PublishedTrajectoryHistory::expectedStateAt(

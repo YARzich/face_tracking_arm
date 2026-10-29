@@ -43,10 +43,16 @@ struct CommandSession
   using WallTime = std::chrono::steady_clock::time_point;
 
   const control::PublishedTrajectoryRecord * activePublication() const noexcept;
+  /// True only while the active local branch is one verified constant terminal command.
+  [[nodiscard]] bool hasVerifiedTerminalHold(std::size_t joint_count) const noexcept;
   TimelineRecoveryStatus recoverTimeline(
     std::uint64_t skipped_periods, const rclcpp::Time & current_time,
     std::string & failure_reason, double retained_history_sec, std::size_t joint_count,
     TimelineRecoveryPurpose purpose = TimelineRecoveryPurpose::kDeadline);
+  TimelineRecoveryStatus resumeVerifiedTerminalHold(
+    control::PublicationId expected_publication_id, const rclcpp::Time & current_time,
+    std::int64_t target_command_lead_ns, std::size_t joint_count,
+    bool settled_proof, std::string & failure_reason);
   PublishedBrakeContinuationStatus continuePublishedBrake(
     const rclcpp::Time & decision_time, std::int64_t required_next_command_lead_ns,
     std::string & failure_reason, double retained_history_sec, std::size_t joint_count);
@@ -55,6 +61,7 @@ struct CommandSession
     std::uint64_t observed_skipped_periods, std::int64_t current_time_ns,
     std::int64_t target_command_lead_ns) const;
   void completeDeferredCommandDeadlineRetry() noexcept;
+  void pruneExpiredHistory(const rclcpp::Time & current_time, double retained_history_sec);
   void discardBranch(bool preserveBootstrapReset = false);
   void forgetPublished();
   [[nodiscard]] bool hasRetainedPublication() const noexcept;
@@ -86,6 +93,7 @@ struct CommandSession
     kPublishedTrajectoryHistoryCapacity};
   std::deque<moveit_servo::KinematicState> queue;
   std::optional<control::PublicationId> active_publication_id;
+  std::optional<control::PublicationId> verified_terminal_hold_publication_id;
   std::size_t max_queue_points{0};
   std::size_t startup_warmup_cycles{0};
   bool startup_warmup_complete{false};

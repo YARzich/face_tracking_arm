@@ -6,6 +6,7 @@
 
 #include <Eigen/Core>
 
+#include <chrono>
 #include <cstddef>
 #include <limits>
 #include <map>
@@ -67,6 +68,13 @@ struct CollisionConstraintConfig
 
   /// Geometry-derived pair bounds; an empty second name denotes a world pair.
   std::map<std::pair<std::string, std::string>, double> distance_bounds;
+  /// Startup geometry coefficients in joint-group variable order, in m/rad.
+  /// These are valid only for the exact model/group used to configure them.
+  std::map<std::pair<std::string, std::string>, std::vector<double>>
+  distance_joint_bounds_m_per_rad;
+  const moveit::core::RobotModel * geometry_bounds_model_identity{nullptr};
+  const moveit::core::JointModelGroup * geometry_bounds_group_identity{nullptr};
+  std::vector<std::string> geometry_bounds_variable_names;
 };
 
 /// Derive conservative distance sensitivity from the loaded collision geometry.
@@ -197,28 +205,60 @@ struct CollisionSegmentValidationResult
 {
   bool input_valid{false};
   bool unsafe{true};
+  bool budget_exhausted{false};
   bool robust_clearance_violated{false};
+  /// A queried pair violated hard + tracking + numerical floor without path sampling reserve.
+  bool physical_clearance_violated{false};
+  bool protected_joint_corridor_violated{false};
   std::size_t requested_substeps{0};
+  /// Additional complete validatePath trials used by bounded mesh refinement.
+  std::size_t refinement_attempts{0};
+  /// Samples observed across all refinement trials (samples contains the final trial only).
   std::size_t evaluated_samples{0};
-  /// Number of self/world distance backend calls, including inconclusive block attempts.
+  /// Self/world distance calls across all trials, including inconclusive block attempts.
   std::size_t distance_query_count{0};
-  /// Number of path blocks proven by a distance query and conservative Lipschitz envelope.
+  /// Certified path blocks across all trials; requested_substeps identifies the final mesh.
   std::size_t certified_path_block_count{0};
-  /// Number of block attempts that required subdivision or dense leaf validation.
+  /// Inconclusive path blocks across all trials.
   std::size_t inconclusive_path_block_count{0};
+  /// Earliest dense-grid unsafe sample, or max() if rejection stopped at an
+  /// actual waypoint witness before that earliest dense sample was resolved.
   std::size_t first_unsafe_sample{std::numeric_limits<std::size_t>::max()};
   double first_unsafe_fraction{std::numeric_limits<double>::quiet_NaN()};
-  /// Minimum distance observed at queried anchors or dense leaf samples.
+  /// Minimum distance observed across all refinement trials.
   double minimum_self_distance_m{std::numeric_limits<double>::infinity()};
-  /// Minimum distance observed at queried anchors or dense leaf samples.
+  /// Minimum distance observed across all refinement trials.
   double minimum_world_distance_m{std::numeric_limits<double>::infinity()};
-  /// Minimum distance observed at queried anchors or dense leaf samples.
+  /// Minimum distance observed across all refinement trials.
   double minimum_distance_m{std::numeric_limits<double>::infinity()};
   std::string closest_pair;
   /// Invalid input/query reason, or the first actual clearance violation with its pair.
   std::string failure_reason;
-  /// Actual FCL query anchors, including inconclusive attempts, and dense leaf samples.
+  /// Actual FCL query anchors and dense leaf samples from the final refinement trial.
   std::vector<CollisionSegmentSampleDiagnostic> samples;
+};
+
+/// Per-operation allowance for sampled collision queries. A null budget pointer at
+/// validation call sites preserves unlimited offline/planner behavior.
+class CollisionValidationBudget
+{
+public:
+  using Clock = std::chrono::steady_clock;
+  using TimePoint = Clock::time_point;
+  using NowFunction = TimePoint (*)() noexcept;
+
+  explicit CollisionValidationBudget(
+    TimePoint deadline = TimePoint::max(),
+    std::size_t maximum_distance_queries = std::numeric_limits<std::size_t>::max(),
+    NowFunction now = nullptr) noexcept;
+
+  [[nodiscard]] bool tryConsumeDistanceQuery() noexcept;
+  [[nodiscard]] bool expired() const noexcept;
+
+private:
+  TimePoint deadline_;
+  std::size_t remaining_distance_queries_;
+  NowFunction now_;
 };
 
 /// Discrete distance needed to stop motion toward a boundary with the fastest admissible jerk.
@@ -235,10 +275,9 @@ struct CollisionSegmentValidationResult
   double period_sec,
   double residual_latency_sec);
 
-/// Largest reachable approach velocity that can be issued for one period and still stop before
-/// a boundary. Returns minimum_reachable_velocity when the complete interval is outside the
-/// viability envelope; callers can compare its required stopping distance with the remaining
-/// distance to diagnose that state.
+/// Largest reachable approach velocity that can be issued for one period under the
+/// conservative braking reserve. The cap may be floored to the shared-policy brake anchor;
+/// final segment and full-tail validation remain required for each concrete command.
 [[nodiscard]] double maximumSafeVelocityTowardBoundary(
   double remaining_distance,
   double current_velocity_toward_boundary,
@@ -249,13 +288,14 @@ struct CollisionSegmentValidationResult
   double period_sec,
   double residual_latency_sec);
 
-/// Exact discrete stopping excursion for one concrete candidate joint-velocity vector.
+/// Maximum signed projected excursion for one concrete candidate joint-velocity vector.
 ///
 /// The candidate acceleration is reconstructed with backward Euler from motion_state.velocity.
-/// Residual ticks apply the worst admissible per-joint jerk toward the collision, then every
-/// joint applies its strongest admissible braking jerk. Acceleration saturation is kept per
-/// joint; projected sums of acceleration and jerk are deliberately not used. The returned
-/// distance starts at the candidate state and therefore excludes the candidate's first
+/// Each joint then follows the same scalar policy used by EmergencyBrakeTailGenerator. Residual
+/// latency is rounded up to whole controller periods and modeled as adverse jerk toward the
+/// collision before that policy starts. Joint trajectories are synchronized, stopped joints
+/// remain at their terminal state, and the maximum is taken over the signed sum at each tick.
+/// The returned distance starts at the candidate state and excludes its first
 /// q_next = q + qdot_next * period displacement.
 [[nodiscard]] double jerkLimitedCollisionStoppingDistance(
   const Eigen::VectorXd & distance_gradient,
@@ -265,10 +305,8 @@ struct CollisionSegmentValidationResult
   double period_sec,
   double residual_latency_sec);
 
-/// Projects per-joint limits onto a distance gradient and returns the largest approach speed
-/// whose jerk-limited stopping excursion remains inside remaining_distance. The scalar cap is
-/// evaluated with a component-wise candidate envelope, so every concrete reachable joint
-/// velocity satisfying the returned row is covered by the per-joint stopping simulation.
+/// Projects per-joint limits onto a distance gradient and returns a first-step approach cap
+/// using a fixed reachable-box reserve built from the shared scalar braking policy.
 [[nodiscard]] double maximumSafeCollisionApproachSpeed(
   double remaining_distance,
   const Eigen::VectorXd & distance_gradient,
@@ -351,6 +389,19 @@ public:
     const JointMotionState & candidate_motion_state,
     std::size_t substeps) const;
 
+  /// Retries an inconclusive segment on successively doubled meshes, at most 3 times.
+  /// Each trial keeps the same strict hard, tracking, numerical, and Lipschitz reserves.
+  /// Invalid input, protected-corridor violations, and physical-floor violations are final.
+  [[nodiscard]] CollisionSegmentValidationResult validateSegmentWithRefinement(
+    const planning_scene::PlanningScene & scene,
+    const moveit::core::RobotState & current_robot_state,
+    const moveit::core::JointModelGroup & joint_model_group,
+    const JointMotionState & current_motion_state,
+    const JointMotionState & candidate_motion_state,
+    std::size_t initial_substeps,
+    std::size_t max_refinements = 3U,
+    CollisionValidationBudget * budget = nullptr) const;
+
   /// Checks a piecewise-linear joint-space path. Conservative distance-query anchors may
   /// certify waypoint blocks using the configured Lipschitz bounds; inconclusive blocks are
   /// subdivided, and single-segment leaves use the dense sampled check. No clearance margin
@@ -363,7 +414,22 @@ public:
     const moveit::core::RobotState & start_robot_state,
     const moveit::core::JointModelGroup & joint_model_group,
     const std::vector<JointMotionState> & waypoints,
-    std::size_t substeps_per_segment) const;
+    std::size_t substeps_per_segment,
+    CollisionValidationBudget * budget = nullptr) const;
+
+  /// Retries an inconclusive coarse path mesh on successively doubled meshes, at most 3 times.
+  /// Each mesh uses the same strict hard, tracking, numerical, and Lipschitz reserves.
+  /// Query/evaluated/block counts and minima cover all trials; samples and substeps describe
+  /// only the final trial. Invalid input, protected-corridor violations, and physical-floor
+  /// violations are returned immediately without refinement.
+  [[nodiscard]] CollisionSegmentValidationResult validatePathWithRefinement(
+    const planning_scene::PlanningScene & scene,
+    const moveit::core::RobotState & start_robot_state,
+    const moveit::core::JointModelGroup & joint_model_group,
+    const std::vector<JointMotionState> & waypoints,
+    std::size_t initial_substeps,
+    std::size_t max_refinements = 3U,
+    CollisionValidationBudget * budget = nullptr) const;
 
   [[nodiscard]] const CollisionConstraintConfig & config() const noexcept;
 

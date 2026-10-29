@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "face_tracking_arm/qp_failure_snapshot_io.hpp"
 #include "face_tracking_arm/qp_failure_snapshot_recorder.hpp"
 
 using face_tracking_arm::control::HierarchicalVelocityQp;
@@ -23,6 +24,8 @@ using face_tracking_arm::control::JointMotionState;
 using face_tracking_arm::control::LinearVelocityConstraint;
 using face_tracking_arm::control::QpFailureSnapshotEvent;
 using face_tracking_arm::control::QpFailureSnapshotDisposition;
+using face_tracking_arm::control::QpSolveStage;
+using face_tracking_arm::control::QpFailureSnapshot;
 using face_tracking_arm::control::NumericalPolicy;
 using face_tracking_arm::control::Radians;
 using face_tracking_arm::control::RadiansPerSecond;
@@ -99,6 +102,12 @@ int main(int argc, char ** argv)
   event.latest_publication_id = 601U;
   event.primary_disposition = result.primary_snapshot_disposition;
   event.primary = result.primary_failure_snapshot;
+  event.tertiary_disposition = QpFailureSnapshotDisposition::kCaptured;
+  event.distance_disposition = QpFailureSnapshotDisposition::kCaptured;
+  event.tertiary = result.primary_failure_snapshot;
+  event.tertiary->stage = QpSolveStage::kTertiary;
+  event.distance = result.primary_failure_snapshot;
+  event.distance->stage = QpSolveStage::kDistance;
   if (!writeQpFailureSnapshotEvent(directory, event).index_ok) {
     return fail(directory, 4);
   }
@@ -110,9 +119,26 @@ int main(int argc, char ** argv)
   event.latest_publication_id = 602U;
   const auto write_result = writeQpFailureSnapshotEvent(directory, event);
   if (!write_result.index_ok || !write_result.snapshots_ok ||
-    !std::filesystem::exists(write_result.primary_path))
+    !std::filesystem::exists(write_result.primary_path) ||
+    !std::filesystem::exists(write_result.tertiary_path) ||
+    !std::filesystem::exists(write_result.distance_path))
   {
     return fail(directory, 5);
+  }
+
+  QpFailureSnapshot tertiary_snapshot;
+  std::ifstream tertiary_input(write_result.tertiary_path);
+  if (!tertiary_input || !face_tracking_arm::control::readQpFailureSnapshot(
+      tertiary_input, tertiary_snapshot) || tertiary_snapshot.stage != QpSolveStage::kTertiary)
+  {
+    return fail(directory, 9);
+  }
+  QpFailureSnapshot distance_snapshot;
+  std::ifstream distance_input(write_result.distance_path);
+  if (!distance_input || !face_tracking_arm::control::readQpFailureSnapshot(
+      distance_input, distance_snapshot) || distance_snapshot.stage != QpSolveStage::kDistance)
+  {
+    return fail(directory, 10);
   }
 
   std::ifstream index(directory / "events.tsv");
@@ -120,6 +146,12 @@ int main(int argc, char ** argv)
     std::istreambuf_iterator<char>());
   if (contents.find("2\t102\t201\t302\t402\t502\t602\t") == std::string::npos) {
     return fail(directory, 6);
+  }
+  const std::string appended_columns =
+    "\t1\t0\t1\t" + write_result.primary_path + "\t\t" +
+    "1\t1\t" + write_result.tertiary_path + "\t" + write_result.distance_path + "\n";
+  if (contents.find(appended_columns) == std::string::npos) {
+    return fail(directory, 11);
   }
 
   const pid_t child = fork();
