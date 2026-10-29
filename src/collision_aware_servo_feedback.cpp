@@ -707,19 +707,29 @@ predicted_or_measured_state(
       telemetry_.command_alignment_check_count += 2U;
       following_window_active = true;
 
+      const rclcpp::Time measurement_time = require_hardware_io_status_ ?
+        rclcpp::Time(hardware_status->sample.read_stamp_ns, current_time.get_clock_type()) :
+        rclcpp::Time(controller_state->header.stamp, current_time.get_clock_type());
       if (publication_match.kind == control::PublicationMatchKind::kOlder) {
+        const bool pending_terminal_replacement =
+          commands_.active_publication_id == latest_publication->id &&
+          !commands_.bootstrap_ack_pending && !commands_.bootstrap_reset_ack_pending &&
+          !commands_.rearm_pending && !commands_.published_tail_rearm_pending &&
+          commands_.publications.isPendingTerminalReplacement(
+          publication_match, measurement_time);
+        if (!pending_terminal_replacement) {
+          commands_.active_publication_id = publication_match.publication_id;
+          ++telemetry_.older_publication_recovery_count;
+          failure_reason =
+            "Trajectory controller is executing an older checked publication";
+          return std::nullopt;
+        }
+      } else {
         commands_.active_publication_id = publication_match.publication_id;
-        ++telemetry_.older_publication_recovery_count;
-        failure_reason =
-          "Trajectory controller is executing an older checked publication";
-        return std::nullopt;
       }
-      commands_.active_publication_id = publication_match.publication_id;
       if (require_hardware_io_status_) {
-        const rclcpp::Time read_time(
-          hardware_status->sample.read_stamp_ns, current_time.get_clock_type());
         expected_hardware_sample = commands_.publications.expectedAt(
-          publication_match.publication_id, read_time);
+          publication_match.publication_id, measurement_time);
         if (!expected_hardware_sample.has_value()) {
           failure_reason =
             "Hardware read timestamp is outside the acknowledged checked trajectory";
@@ -852,12 +862,8 @@ predicted_or_measured_state(
     }
   }
 
-  while (!commands_.queue.empty() &&
-    commands_.queue.front().time_stamp <
-    current_time - rclcpp::Duration::from_seconds(servo_parameters_.max_expected_latency))
-  {
-    commands_.queue.pop_front();
-  }
+  commands_.pruneExpiredHistory(
+    current_time, servo_parameters_.max_expected_latency);
   if (!commands_.queue.empty() && commands_.queue.back().time_stamp > current_time) {
     initial_state_received_ = true;
     return commands_.queue.back();

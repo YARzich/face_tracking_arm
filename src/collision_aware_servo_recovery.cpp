@@ -244,6 +244,8 @@ bool CollisionAwareServoComponent::prepare_control_cycle(
         commands_.bootstrap_ack_pending ?
         "Trajectory controller bootstrap acknowledgement timed out in wall time" :
         "Safe re-arm timed out in wall time");
+    } else {
+      current_tick_context_.control_time_wait = true;
     }
     return false;
   }

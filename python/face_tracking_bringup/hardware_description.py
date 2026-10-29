@@ -152,6 +152,8 @@ def control_parameters(config, share, limits, mode='mono_cpu'):
     motion['face_target_freshness_timeout_sec'] = tracking.get(
         'face_target_freshness_timeout_sec', .5)
     motion['face_prediction_timeout_sec'] = tracking.get('face_prediction_timeout_sec', .8)
+    motion['face_distance_min_m'] = tracking['face_distance_min_m']
+    motion['face_distance_max_m'] = tracking['face_distance_max_m']
     table = config['table']
     tracking.update(table_shape=table['shape'], table_dimensions_m=table['dimensions_m'],
                     table_center_m=table['center_m'], table_yaw_rad=math.radians(table['yaw_deg']))

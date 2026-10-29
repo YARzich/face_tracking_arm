@@ -12,6 +12,7 @@ import yaml
 
 from .camera_controls import validate_control_values, validate_driver_parameters
 from .execution_budget_profile import validate_execution_budget_keys
+from .face_distance_config import resolve_face_distance_band
 from .hardware_schema import (
     CAMERA_FIELDS, COMPACT_MANEUVER_FIELDS, CONTROLLER_FIELDS, KALMAN_FIELDS,
     MODE_OPTIONAL, MOUNT_SETUP_FIELDS, ONE_EURO_FIELDS, PERCEPTION_OPTIONAL,
@@ -408,6 +409,7 @@ def _validate_robot_settings(config, *, mock):
         raise ValueError('Unknown tracking.idle_behavior')
     for key in ('minimum_face_distance_m', 'safe_reach_radius_m', 'return_to_rest_delay_sec'):
         t[key] = positive(t[key], 'tracking.' + key)
+    resolve_face_distance_band(t, config['controller'].get('position_deadband_m', .03))
     t['face_target_freshness_timeout_sec'] = positive(
         t.get('face_target_freshness_timeout_sec', .5),
         'tracking.face_target_freshness_timeout_sec')

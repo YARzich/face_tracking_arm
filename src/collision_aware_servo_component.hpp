@@ -83,6 +83,7 @@ enum class CommandPublicationStatus
   kSuccess,
   kRecoverableCommandDeadline,
   kRecoverableTimingFailure,
+  kCollisionValidationBudgetExhausted,
   kInvariantFailure,
 };
 
@@ -189,9 +190,18 @@ private:
 
   void publish_runtime_diagnostics();
 
+  void appendQpDiagnostics(diagnostic_msgs::msg::DiagnosticStatus & status) const;
+
   void appendSegmentDiagnostics(diagnostic_msgs::msg::DiagnosticStatus & status) const;
 
   void control_tick();
+
+  bool recover_command_timeline(
+    const rclcpp::Time & current_time, std::uint64_t skipped_periods);
+
+  bool validate_actual_collision_state(
+    const planning_scene::PlanningScene & planning_scene,
+    const moveit::core::RobotState & robot_state);
 
   bool validateHardwareIoForControlTick();
 
@@ -203,6 +213,12 @@ private:
     const rclcpp::Time & current_time,
     const std::chrono::steady_clock::time_point & current_wall_time,
     const control::ControlTimeObservation & time_observation);
+
+  bool build_and_record_collision_context(
+    const planning_scene::PlanningScene & planning_scene,
+    const moveit::core::RobotState & robot_state,
+    const control::JointMotionState & motion_state,
+    control::CollisionConstraintResult & result);
 
   void process_startup_cycle(
     const moveit_servo::KinematicState & state,
@@ -233,6 +249,28 @@ private:
 
   std::optional<msg::TrackingTarget> current_target(
     const rclcpp::Time & tick_time) const;
+
+  bool target_snapshot_is_current(
+    const msg::TrackingTarget & snapshot, const rclcpp::Time & tick_time,
+    const rclcpp::Time & current_time) const;
+
+  bool prepare_verified_terminal_hold_publication(
+    const rclcpp::Time & tick_time, const msg::TrackingTarget & target,
+    const std::optional<control::PublicationId> & expected_publication_id,
+    const std::optional<rclcpp::Time> & expected_anchor_stamp,
+    const std::optional<std::uint64_t> & expected_hardware_epoch,
+    const std::optional<std::uint64_t> & expected_proven_hold_epoch,
+    std::uint64_t expected_scene_revision,
+    std::optional<planning_scene_monitor::LockedPlanningSceneRO> & locked_scene,
+    planning_scene::PlanningSceneConstPtr & planning_scene);
+
+  std::optional<control::CollisionValidationBudget> make_collision_validation_budget(
+    bool ordinary_face_budget_scope, bool verified_terminal_hold_candidate,
+    const rclcpp::Time & current_time,
+    control::CollisionValidationBudget::Clock::time_point current_wall_time) const;
+
+  bool stop_for_expired_collision_validation_budget(
+    const control::CollisionValidationBudget * budget);
 
   control::QpResult solve_with_telemetry(
     const control::HierarchicalVelocityTask & task,
@@ -270,7 +308,8 @@ private:
     const CommandAttempt attempt,
     std::string & failure_reason,
     const control::CollisionConstraintDiagnostics & collision_diagnostics,
-    CandidateRejectionKind & rejection_kind);
+    CandidateRejectionKind & rejection_kind,
+    control::CollisionValidationBudget * budget = nullptr);
 
   std::optional<control::QpResult> reference_guard_blend(
     const control::QpResult & tracking_result,
@@ -291,7 +330,8 @@ private:
     const std::vector<control::LinearVelocityConstraint> & constraints,
     const control::CollisionConstraintDiagnostics & collision_diagnostics,
     std::optional<ValidatedCommand> & accepted_command,
-    control::QpResult & accepted_qp_result);
+    control::QpResult & accepted_qp_result,
+    control::CollisionValidationBudget * budget = nullptr);
 
   bool try_reference_guard_recovery(
     const moveit::core::RobotStatePtr & robot_state,
@@ -304,7 +344,8 @@ private:
     const std::vector<control::LinearVelocityConstraint> & constraints,
     const control::CollisionConstraintDiagnostics & collision_diagnostics,
     std::optional<ValidatedCommand> & accepted_command,
-    control::QpResult & accepted_qp_result);
+    control::QpResult & accepted_qp_result,
+    control::CollisionValidationBudget * budget = nullptr);
 
   std::optional<moveit_servo::KinematicState> make_next_state(
     const moveit::core::RobotStatePtr & robot_state,
@@ -330,7 +371,8 @@ private:
     const moveit_servo::KinematicState & current_state,
     ValidatedCommand command,
     const rclcpp::Time & current_time,
-    std::string & failure_reason);
+    std::string & failure_reason,
+    control::CollisionValidationBudget * budget = nullptr);
 
   void publish_status(const std::int8_t code, std::string message);
 

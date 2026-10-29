@@ -221,9 +221,14 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
   const CommandAttempt attempt,
   std::string & failure_reason,
   const control::CollisionConstraintDiagnostics & collision_diagnostics,
-  CandidateRejectionKind & rejection_kind)
+  CandidateRejectionKind & rejection_kind,
+  control::CollisionValidationBudget * const budget)
 {
   rejection_kind = CandidateRejectionKind::kOther;
+  if (budget != nullptr && budget->expired()) {
+    failure_reason = "collision validation budget exhausted; keeping the published trajectory";
+    return std::nullopt;
+  }
   auto next_state = make_next_state(
     robot_state, current_state, joint_velocity, failure_reason);
   if (!next_state.has_value()) {
@@ -264,23 +269,39 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
     ++telemetry_.segment_validation_count;
     const auto segment_validation_start = std::chrono::steady_clock::now();
     const control::CollisionSegmentValidationResult segment_result =
-      collision_constraint_builder_->validateSegment(
+      collision_constraint_builder_->validateSegmentWithRefinement(
       planning_scene, *robot_state, *joint_model_group_, current_motion_state,
       candidate_motion_state,
-      static_cast<std::size_t>(parameters_.segment_validation_substeps));
+      static_cast<std::size_t>(parameters_.segment_validation_substeps), 3U, budget);
     (void)telemetry_.segment_validation_statistics.add(std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - segment_validation_start).count());
     telemetry_.observeClearances(
       segment_result.minimum_self_distance_m, segment_result.minimum_world_distance_m);
+    if (segment_result.budget_exhausted || (budget != nullptr && budget->expired())) {
+      failure_reason = "collision validation budget exhausted; keeping the published trajectory";
+      return std::nullopt;
+    }
     if (!segment_result.input_valid || segment_result.unsafe) {
       record_segment_rejection(attempt, segment_result);
       failure_reason = telemetry_.last_segment_rejection_reason;
+      if (segment_result.input_valid && segment_result.unsafe) {
+        rejection_kind = CandidateRejectionKind::kCollisionValidation;
+      }
       return std::nullopt;
     }
   }
 
+  if (budget != nullptr && budget->expired()) {
+    failure_reason = "collision validation budget exhausted; keeping the published trajectory";
+    return std::nullopt;
+  }
+
   control::EmergencyBrakeTail braking_tail =
     emergency_brake_tail_generator_->generate(candidate_motion_state, motion_limits_);
+  if (budget != nullptr && budget->expired()) {
+    failure_reason = "collision validation budget exhausted; keeping the published trajectory";
+    return std::nullopt;
+  }
   if (!braking_tail.command_available()) {
     ++telemetry_.braking_tail_generation_failure_count;
     RCLCPP_WARN(
@@ -303,6 +324,11 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
   if (motion_reference_) {
     const Eigen::VectorXd * previous_guarded_position = &candidate_motion_state.position;
     for (std::size_t tail_index = 0U; tail_index < braking_tail.points.size(); ++tail_index) {
+      if (budget != nullptr && budget->expired()) {
+        failure_reason =
+          "collision validation budget exhausted; keeping the published trajectory";
+        return std::nullopt;
+      }
       const auto & point = braking_tail.points[tail_index];
       const bool same_as_last_guarded =
         point.position.size() == previous_guarded_position->size() &&
@@ -334,8 +360,12 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
     }
   }
 
-  const bool braking_tail_certified = collision_constraint_builder_->canCertifyPath(
+  bool braking_tail_certified = collision_constraint_builder_->canCertifyPath(
     collision_diagnostics, braking_tail.points);
+  if (!braking_tail_certified && budget != nullptr && budget->expired()) {
+    failure_reason = "collision validation budget exhausted; keeping the published trajectory";
+    return std::nullopt;
+  }
   telemetry_.last_braking_tail_certified_segment_count = 0U;
   telemetry_.last_braking_tail_uncertified_segment_count = 0U;
   if (braking_tail_certified) {
@@ -365,9 +395,9 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
     telemetry_.braking_tail_segment_validation_count += tail_segment_count;
     const auto path_validation_start = std::chrono::steady_clock::now();
     const control::CollisionSegmentValidationResult tail_path =
-      collision_constraint_builder_->validatePath(
+      collision_constraint_builder_->validatePathWithRefinement(
       planning_scene, tail_robot_state, *joint_model_group_, braking_tail.points,
-      static_cast<std::size_t>(parameters_.segment_validation_substeps));
+      static_cast<std::size_t>(parameters_.segment_validation_substeps), 3U, budget);
     telemetry_.braking_tail_distance_query_count += tail_path.distance_query_count;
     telemetry_.braking_tail_certified_path_block_count +=
       tail_path.certified_path_block_count;
@@ -377,13 +407,25 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
         std::chrono::steady_clock::now() - path_validation_start).count());
     telemetry_.observeClearances(tail_path.minimum_self_distance_m,
         tail_path.minimum_world_distance_m);
+    if (tail_path.budget_exhausted || (budget != nullptr && budget->expired())) {
+      failure_reason = "collision validation budget exhausted; keeping the published trajectory";
+      return std::nullopt;
+    }
     if (!tail_path.input_valid || tail_path.unsafe) {
       ++telemetry_.braking_tail_collision_rejection_count;
       record_segment_rejection(attempt, tail_path);
       failure_reason = "pre-published braking tail rejected: " +
         telemetry_.last_segment_rejection_reason;
+      if (tail_path.input_valid && tail_path.unsafe) {
+        rejection_kind = CandidateRejectionKind::kCollisionValidation;
+      }
       return std::nullopt;
     }
+  }
+
+  if (budget != nullptr && budget->expired()) {
+    failure_reason = "collision validation budget exhausted; keeping the published trajectory";
+    return std::nullopt;
   }
 
   return ValidatedCommand{std::move(*next_state), std::move(braking_tail)};
@@ -459,7 +501,8 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
   const moveit_servo::KinematicState & current_state,
   ValidatedCommand command,
   const rclcpp::Time & current_time,
-  std::string & failure_reason)
+  std::string & failure_reason,
+  control::CollisionValidationBudget * const budget)
 {
   const std::int64_t initial_lead_ns = seconds_to_nanoseconds(
     servo_parameters_.max_expected_latency);
@@ -470,8 +513,17 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
     failure_reason = "ROS time rewound during a control calculation";
     return CommandPublicationStatus::kInvariantFailure;
   }
-  const auto make_stamp = [this, &scheduling_time, initial_lead_ns, minimum_lead_ns]() {
-      const auto stamp_ns = commands_.time_grid->commandStamp(
+  if (!commands_.time_grid) {
+    failure_reason = "Command epoch has no fixed-period time grid";
+    return CommandPublicationStatus::kInvariantFailure;
+  }
+  auto staged_queue = commands_.queue;
+  auto staged_time_grid = *commands_.time_grid;
+  bool staged_epoch_active = commands_.epoch_active;
+  bool staged_epoch_has_published = commands_.epoch_has_published;
+  const auto make_stamp = [&staged_time_grid, &scheduling_time, initial_lead_ns,
+      minimum_lead_ns]() {
+      const auto stamp_ns = staged_time_grid.commandStamp(
         scheduling_time.nanoseconds(), initial_lead_ns, minimum_lead_ns);
       if (!stamp_ns.has_value()) {
         return std::optional<rclcpp::Time>{};
@@ -480,12 +532,12 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
           *stamp_ns, scheduling_time.get_clock_type())};
     };
 
-  if (!commands_.queue.empty() && !commands_.epoch_active) {
+  if (!staged_queue.empty() && !staged_epoch_active) {
     failure_reason = "Inactive command epoch retained an online branch";
     return CommandPublicationStatus::kInvariantFailure;
   }
-  if (commands_.queue.empty()) {
-    if (commands_.epoch_active) {
+  if (staged_queue.empty()) {
+    if (staged_epoch_active) {
       failure_reason = "Command epoch lost its buffered timeline";
       return CommandPublicationStatus::kInvariantFailure;
     }
@@ -496,12 +548,19 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
       return CommandPublicationStatus::kInvariantFailure;
     }
     seed.time_stamp = *seed_stamp;
-    commands_.queue.push_back(std::move(seed));
-    commands_.epoch_active = true;
-    commands_.epoch_has_published = false;
+    staged_queue.push_back(std::move(seed));
+    staged_epoch_active = true;
+    staged_epoch_has_published = false;
   }
 
-  if (commands_.queue.size() + 1U > commands_.max_queue_points) {
+  const rclcpp::Duration retained_history = rclcpp::Duration::from_seconds(
+    servo_parameters_.max_expected_latency);
+  while (staged_queue.size() > 1U &&
+    staged_queue.front().time_stamp < scheduling_time - retained_history)
+  {
+    staged_queue.pop_front();
+  }
+  if (staged_queue.size() + 1U > commands_.max_queue_points) {
     failure_reason = "Command queue exceeded its calibrated hard size bound";
     return CommandPublicationStatus::kInvariantFailure;
   }
@@ -510,53 +569,65 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
     failure_reason = "Command buffer fell below the minimum safe lead";
     return CommandPublicationStatus::kRecoverableCommandDeadline;
   }
-  const rclcpp::Duration interval = *next_stamp - commands_.queue.back().time_stamp;
-  if (interval.nanoseconds() != commands_.time_grid->periodNs()) {
+  const rclcpp::Duration interval = *next_stamp - staged_queue.back().time_stamp;
+  if (interval.nanoseconds() != staged_time_grid.periodNs()) {
     failure_reason = "Command timeline interval left the fixed control grid";
     return CommandPublicationStatus::kInvariantFailure;
   }
   command.next_state.time_stamp = *next_stamp;
-  commands_.queue.push_back(std::move(command.next_state));
+  staged_queue.push_back(std::move(command.next_state));
 
   if (command.braking_tail.points.size() < 3U ||
     command.braking_tail.first_stationary_point >= command.braking_tail.points.size() ||
     command.braking_tail.points.size() -
     command.braking_tail.first_stationary_point < 3U ||
     !command.braking_tail.points.front().position.isApprox(
-      commands_.queue.back().positions, kFiniteEpsilon) ||
+      staged_queue.back().positions, kFiniteEpsilon) ||
     !command.braking_tail.points.front().velocity.isApprox(
-      commands_.queue.back().velocities, kFiniteEpsilon) ||
+      staged_queue.back().velocities, kFiniteEpsilon) ||
     !command.braking_tail.points.front().acceleration.isApprox(
-      commands_.queue.back().accelerations, kFiniteEpsilon))
+      staged_queue.back().accelerations, kFiniteEpsilon))
   {
     failure_reason = "Validated braking tail does not start at the command branch";
     return CommandPublicationStatus::kInvariantFailure;
   }
 
   const auto * previous_publication = commands_.activePublication();
-  if (previous_publication != nullptr && commands_.queue.size() >= 2U) {
+  if (previous_publication != nullptr && staged_queue.size() >= 2U) {
     const auto & previous_queue = previous_publication->execution_queue;
-    const auto new_branch = std::prev(commands_.queue.end());
-    for (auto branch = commands_.queue.begin(); branch != new_branch; ++branch) {
+    const auto new_branch = std::prev(staged_queue.end());
+    for (auto branch = staged_queue.begin(); branch != new_branch; ++branch) {
       const auto published_match = std::find_if(
         previous_queue.begin(), previous_queue.end(),
         [&branch](const moveit_servo::KinematicState & published_state) {
           return published_state.time_stamp == branch->time_stamp;
         });
-      if (published_match == previous_queue.end() ||
-        !published_match->positions.isApprox(branch->positions, kFiniteEpsilon) ||
-        !published_match->velocities.isApprox(branch->velocities, kFiniteEpsilon) ||
-        !published_match->accelerations.isApprox(branch->accelerations, kFiniteEpsilon))
+      bool shared_published_prefix = published_match != previous_queue.end() &&
+        published_match->positions.isApprox(branch->positions, kFiniteEpsilon) &&
+        published_match->velocities.isApprox(branch->velocities, kFiniteEpsilon) &&
+        published_match->accelerations.isApprox(branch->accelerations, kFiniteEpsilon);
+      if (!shared_published_prefix &&
+        commands_.active_publication_id == previous_publication->id &&
+        commands_.verified_terminal_hold_publication_id == previous_publication->id)
       {
+        const auto expected = commands_.publications.expectedAt(
+          previous_publication->id, branch->time_stamp);
+        shared_published_prefix = expected.has_value() && expected->terminal_hold &&
+          expected->positions.isApprox(branch->positions, kFiniteEpsilon) &&
+          expected->velocities.isZero(kFiniteEpsilon) &&
+          branch->velocities.isZero(kFiniteEpsilon) &&
+          branch->accelerations.isZero(kFiniteEpsilon);
+      }
+      if (!shared_published_prefix) {
         failure_reason = "New command branch does not share the published execution prefix";
         return CommandPublicationStatus::kInvariantFailure;
       }
     }
   }
 
-  std::deque<moveit_servo::KinematicState> publication_queue = commands_.queue;
+  std::deque<moveit_servo::KinematicState> publication_queue = staged_queue;
   const rclcpp::Duration period = rclcpp::Duration::from_nanoseconds(
-    commands_.time_grid->periodNs());
+    staged_time_grid.periodNs());
   for (std::size_t index = 1; index < command.braking_tail.points.size(); ++index) {
     const control::JointMotionState & tail_point = command.braking_tail.points[index];
     moveit_servo::KinematicState state(
@@ -613,8 +684,8 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
     // previous branch point, one period before the new waypoint itself.
     const rclcpp::Time replacement_commit_time =
       previous_publication == nullptr ?
-      commands_.queue.front().time_stamp :
-      std::prev(commands_.queue.end(), 2)->time_stamp;
+      staged_queue.front().time_stamp :
+      std::prev(staged_queue.end(), 2)->time_stamp;
     const double replacement_lead_sec =
       (replacement_commit_time - send_time).seconds();
     if (!std::isfinite(replacement_lead_sec) ||
@@ -633,15 +704,13 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
         "Checked trajectory reached publication with less than the residual safety horizon";
       return CommandPublicationStatus::kRecoverableTimingFailure;
     }
-    telemetry_.last_published_horizon_sec = published_horizon_sec;
-    if (!telemetry_.minimum_published_horizon_sec.has_value() ||
-      published_horizon_sec < *telemetry_.minimum_published_horizon_sec)
-    {
-      telemetry_.minimum_published_horizon_sec = published_horizon_sec;
+    if (budget != nullptr && budget->expired()) {
+      failure_reason = "collision validation budget exhausted; keeping the published trajectory";
+      return CommandPublicationStatus::kCollisionValidationBudgetExhausted;
     }
-    const rclcpp::Time stationary_time = commands_.queue.back().time_stamp +
+    const rclcpp::Time stationary_time = staged_queue.back().time_stamp +
       rclcpp::Duration::from_nanoseconds(
-      commands_.time_grid->periodNs() * static_cast<std::int64_t>(
+      staged_time_grid.periodNs() * static_cast<std::int64_t>(
         command.braking_tail.first_stationary_point));
     const auto publication_id = commands_.publications.append(
       std::move(publication_queue), stationary_time);
@@ -653,6 +722,16 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
       failure_reason = "Published trajectory identity exhausted its diagnostic ID range";
       return CommandPublicationStatus::kInvariantFailure;
     }
+    commands_.queue = std::move(staged_queue);
+    *commands_.time_grid = std::move(staged_time_grid);
+    commands_.epoch_active = staged_epoch_active;
+    commands_.epoch_has_published = staged_epoch_has_published;
+    telemetry_.last_published_horizon_sec = published_horizon_sec;
+    if (!telemetry_.minimum_published_horizon_sec.has_value() ||
+      published_horizon_sec < *telemetry_.minimum_published_horizon_sec)
+    {
+      telemetry_.minimum_published_horizon_sec = published_horizon_sec;
+    }
     const std::size_t tail_start_index = commands_.queue.size() - 1U +
       command.braking_tail.first_stationary_point;
     record_trajectory_publication(
@@ -660,6 +739,7 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
       stationary_time, static_cast<std::uint32_t>(tail_start_index));
     trajectory_publisher_->publish(*trajectory);
     commands_.active_publication_id = *publication_id;
+    commands_.verified_terminal_hold_publication_id.reset();
     telemetry_.last_replacement_lead_sec = replacement_lead_sec;
     if (!telemetry_.minimum_replacement_lead_sec.has_value() ||
       replacement_lead_sec < *telemetry_.minimum_replacement_lead_sec)

@@ -148,6 +148,9 @@ TEST_F(ControllerParameterTest, ActiveOverridesStillUseSafetyValidation)
 TEST(ControllerParameterValidation, RejectsUnsafeMotionFeedbackAndCollisionSettings)
 {
   const std::vector<std::pair<double ControllerParameters::*, double>> invalid_values{
+    {&ControllerParameters::face_distance_min_m, 0.0},
+    {&ControllerParameters::face_distance_max_m,
+      std::numeric_limits<double>::quiet_NaN()},
     {&ControllerParameters::hard_clearance_m, 0.014},
     {&ControllerParameters::collision_query_distance_m, 0.10},
     {&ControllerParameters::residual_command_latency_sec, 0.0},
@@ -167,6 +170,14 @@ TEST(ControllerParameterValidation, RejectsUnsafeMotionFeedbackAndCollisionSetti
     parameters.*member = value;
     EXPECT_THROW(validateControllerParameters(parameters), std::invalid_argument);
   }
+}
+
+TEST(ControllerParameterValidation, RejectsReversedFaceDistanceBand)
+{
+  ControllerParameters parameters;
+  parameters.face_distance_min_m = 0.55;
+  parameters.face_distance_max_m = 0.45;
+  EXPECT_THROW(validateControllerParameters(parameters), std::invalid_argument);
 }
 
 TEST(ControllerParameterValidation, HardwareConfigurationLimitsMatchCppBoundaries)

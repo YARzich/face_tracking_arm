@@ -241,6 +241,42 @@ def test_compact_goal_override_is_optional_and_forwarded_without_a_build(config)
     assert motion['compact_maneuver.speed_scale'] == pytest.approx(0.6)
 
 
+def test_hardware_face_distance_band_is_validated_and_forwarded(config):
+    validated = validate_config(config, 'mono_cpu', mock=True)
+    assert validated['tracking']['face_distance_min_m'] == pytest.approx(.47)
+    assert validated['tracking']['face_distance_max_m'] == pytest.approx(.53)
+    limits = {'joint_limits': {f'joint{i}': {'max_velocity': 1.,
+                                             'max_acceleration': 2., 'max_jerk': 20.}
+                               for i in range(1, 7)}}
+    _, motion, tracking, _ = control_parameters(validated, ROOT, limits)
+    assert motion['face_distance_min_m'] == pytest.approx(.47)
+    assert motion['face_distance_max_m'] == pytest.approx(.53)
+    assert tracking['face_distance_min_m'] == pytest.approx(.47)
+    assert tracking['face_distance_max_m'] == pytest.approx(.53)
+
+
+def test_hardware_legacy_tracking_distance_uses_existing_deadband(config):
+    config['tracking'].pop('face_distance_min_m')
+    config['tracking'].pop('face_distance_max_m')
+    validated = validate_config(config, 'mono_cpu', mock=True)
+    assert validated['tracking']['face_distance_min_m'] == pytest.approx(.47)
+    assert validated['tracking']['face_distance_max_m'] == pytest.approx(.53)
+
+
+@pytest.mark.parametrize('bounds', [
+    {'face_distance_min_m': .47},
+    {'face_distance_min_m': .53, 'face_distance_max_m': .47},
+    {'face_distance_min_m': 0.0, 'face_distance_max_m': .53},
+    {'face_distance_min_m': float('inf'), 'face_distance_max_m': .53},
+])
+def test_hardware_rejects_invalid_face_distance_band(config, bounds):
+    config['tracking'].pop('face_distance_min_m')
+    config['tracking'].pop('face_distance_max_m')
+    config['tracking'].update(bounds)
+    with pytest.raises(ValueError, match='face_distance|distance band'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
 @pytest.mark.parametrize('mode', ['mono_cpu', 'stereo', 'rgbd'])
 @pytest.mark.parametrize('recovery_mode', ['compact', 'disabled'])
 def test_recovery_mode_is_forwarded_for_every_hardware_camera_mode(

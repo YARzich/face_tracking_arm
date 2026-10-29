@@ -46,6 +46,20 @@ std::string optional_double_string(const std::optional<double> & value)
   return value.has_value() ? std::to_string(*value) : "unavailable";
 }
 
+const char * qp_stage_status_name(const control::QpStageStatus status)
+{
+  switch (status) {
+    case control::QpStageStatus::kNotRun: return "not_run";
+    case control::QpStageStatus::kSolved: return "solved";
+    case control::QpStageStatus::kSolvedInaccurate: return "solved_inaccurate";
+    case control::QpStageStatus::kInfeasible: return "infeasible";
+    case control::QpStageStatus::kMaxIterations: return "max_iterations";
+    case control::QpStageStatus::kTimeLimit: return "time_limit";
+    case control::QpStageStatus::kSolverError: return "solver_error";
+  }
+  return "unknown";
+}
+
 std::string json_string(const std::string & value)
 {
   std::string escaped;
@@ -86,6 +100,7 @@ void append_compact_tracking_diagnostics(
   status.values.push_back(key_value("motion_reference_state", reference.state));
   status.values.push_back(key_value("tracking_phase", reference.tracking_phase));
   status.values.push_back(key_value("recovery_mode", reference.recovery_mode));
+  status.values.push_back(key_value("posture_mode", reference.posture_mode));
   status.values.push_back(key_value(
       "disabled_limit_hold_latched",
       reference.disabled_limit_hold_latched ? "true" : "false"));
@@ -590,7 +605,12 @@ void CollisionAwareServoComponent::publish_runtime_diagnostics()
   status.values.push_back(key_value(
     "solver_failure_count", std::to_string(telemetry_.solver_failure_count)));
   status.values.push_back(key_value(
+    "qp_retry_count", std::to_string(telemetry_.qp_retry_count)));
+  status.values.push_back(key_value(
     "primary_only_count", std::to_string(telemetry_.primary_only_count)));
+  status.values.push_back(key_value(
+    "lower_rank_partial_count", std::to_string(telemetry_.lower_rank_partial_count)));
+  appendQpDiagnostics(status);
   status.values.push_back(key_value(
     "braking_event_count", std::to_string(telemetry_.braking_event_count)));
   status.values.push_back(key_value(
@@ -633,6 +653,52 @@ void CollisionAwareServoComponent::publish_runtime_diagnostics()
   diagnostics_publisher_->publish(array);
 }
 
+void CollisionAwareServoComponent::appendQpDiagnostics(
+  diagnostic_msgs::msg::DiagnosticStatus & status) const
+{
+  status.values.push_back(key_value(
+    "qp_last_rank_count", std::to_string(telemetry_.last_qp_rank_count)));
+  const auto append_stage = [&](const char * name, const control::QpStageStatus status_value,
+    const std::size_t iterations, const double solve_time) {
+      const std::string prefix = std::string("qp_last_") + name;
+      status.values.push_back(key_value(prefix + "_status", qp_stage_status_name(status_value)));
+      status.values.push_back(key_value(prefix + "_iterations", std::to_string(iterations)));
+      status.values.push_back(key_value(prefix + "_solve_time_sec", std::to_string(solve_time)));
+    };
+  append_stage("primary", telemetry_.last_qp_primary_status,
+    telemetry_.last_qp_primary_iterations, telemetry_.last_qp_primary_solve_time_sec);
+  status.values.push_back(key_value(
+    "qp_last_preferred_primary_status",
+    qp_stage_status_name(telemetry_.last_qp_preferred_primary_status)));
+  status.values.push_back(key_value(
+    "qp_last_preferred_primary_fallback_used",
+    telemetry_.last_qp_preferred_primary_fallback_used ? "true" : "false"));
+  status.values.push_back(key_value(
+    "qp_preferred_primary_fallback_count",
+    std::to_string(telemetry_.preferred_primary_fallback_count)));
+  append_stage("secondary", telemetry_.last_qp_secondary_status,
+    telemetry_.last_qp_secondary_iterations, telemetry_.last_qp_secondary_solve_time_sec);
+  append_stage("tertiary", telemetry_.last_qp_tertiary_status,
+    telemetry_.last_qp_tertiary_iterations, telemetry_.last_qp_tertiary_solve_time_sec);
+  append_stage("distance", telemetry_.last_qp_distance_status,
+    telemetry_.last_qp_distance_iterations, telemetry_.last_qp_distance_solve_time_sec);
+  status.values.push_back(key_value(
+    "qp_last_distance_feasible_approximation_used",
+    telemetry_.last_qp_distance_feasible_approximation_used ? "true" : "false"));
+  status.values.push_back(key_value(
+    "qp_last_distance_feasible_approximation_alpha",
+    std::to_string(telemetry_.last_qp_distance_feasible_approximation_alpha)));
+  status.values.push_back(key_value(
+    "qp_distance_feasible_approximation_count",
+    std::to_string(telemetry_.distance_feasible_approximation_count)));
+  status.values.push_back(key_value(
+    "qp_last_requested_distance_rate_mps",
+    optional_double_string(telemetry_.last_requested_distance_rate)));
+  status.values.push_back(key_value(
+    "qp_last_achieved_distance_rate_mps",
+    optional_double_string(telemetry_.last_achieved_distance_rate)));
+}
+
 void CollisionAwareServoComponent::appendSegmentDiagnostics(
   diagnostic_msgs::msg::DiagnosticStatus & status) const
 {
@@ -650,6 +716,9 @@ void CollisionAwareServoComponent::appendSegmentDiagnostics(
   status.values.push_back(key_value(
     "braking_segment_rejection_count",
     std::to_string(telemetry_.braking_segment_rejection_count)));
+  status.values.push_back(key_value(
+    "collision_validation_budget_exhaustion_count",
+    std::to_string(telemetry_.collision_validation_budget_exhaustion_count)));
   status.values.push_back(key_value(
     "last_segment_rejection_attempt", telemetry_.last_segment_rejection_attempt));
   status.values.push_back(key_value(
@@ -755,6 +824,7 @@ void CollisionAwareServoComponent::drain_execution_context()
     set_stamp(message.header.stamp, record.control_stamp_ns);
     message.tick_sequence = record.tick_sequence;
     message.cycle_duration_ns = record.cycle_duration_ns;
+    message.control_time_wait = record.control_time_wait;
     message.controller_mode = record.controller_mode;
     message.face_tracking_published = record.face_tracking_published;
     message.active_collision_rows = record.active_collision_rows;
@@ -850,15 +920,18 @@ void CollisionAwareServoComponent::log_qp_failure(
   const std::vector<control::LinearVelocityConstraint> & constraints,
   const control::CollisionConstraintDiagnostics & collision_diagnostics) const
 {
-  RCLCPP_WARN(
-    get_logger(),
+  RCLCPP_WARN_THROTTLE(
+    get_logger(), *get_clock(), 1000,
     "%s QP command unavailable: status=%d, primary=%d, secondary=%d, "
-    "primary_iterations=%d, secondary_iterations=%d, constraints=%zu, "
+    "tertiary=%d, distance=%d, primary_iterations=%d, secondary_iterations=%d, "
+    "tertiary_iterations=%d, distance_iterations=%d, constraints=%zu, "
     "distance_rows=%zu, outside_viability=%zu, "
     "min_distance=%.6f m, pair='%s'",
     command_attempt_name(attempt), static_cast<int>(result.status),
     static_cast<int>(result.primary_status), static_cast<int>(result.secondary_status),
-    result.primary_iterations, result.secondary_iterations, constraints.size(),
+    static_cast<int>(result.tertiary_status), static_cast<int>(result.distance_status),
+    result.primary_iterations, result.secondary_iterations,
+    result.tertiary_iterations, result.distance_iterations, constraints.size(),
     collision_diagnostics.active_distance_constraints,
     collision_diagnostics.outside_viability_contacts,
     collision_diagnostics.minimum_distance_m, collision_diagnostics.closest_pair.c_str());

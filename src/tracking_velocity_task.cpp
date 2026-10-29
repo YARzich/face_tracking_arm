@@ -37,12 +37,19 @@ bool valid_rotation(const Eigen::Matrix3d & rotation)
 
 bool valid_config(const TrackingVelocityTaskConfig & config)
 {
-  return positive_finite(config.position_gain) &&
+  const bool distance_disabled = std::isnan(config.face_distance_min_m) &&
+    std::isnan(config.face_distance_max_m);
+  const bool distance_enabled = std::isfinite(config.face_distance_min_m) &&
+    std::isfinite(config.face_distance_max_m) && config.face_distance_min_m > 0.0 &&
+    config.face_distance_max_m > config.face_distance_min_m;
+  return (distance_disabled || distance_enabled) &&
+         positive_finite(config.position_gain) &&
          positive_finite(config.orientation_gain) &&
          nonnegative_finite(config.position_deadband_m) &&
          nonnegative_finite(config.pointing_deadband_rad) &&
          nonnegative_finite(config.roll_deadband_rad) &&
          positive_finite(config.maximum_linear_reference_mps) &&
+         positive_finite(config.control_period_sec) &&
          positive_finite(config.maximum_angular_reference_radps) &&
          positive_finite(config.roll_weight);
 }
@@ -75,6 +82,13 @@ Eigen::Vector3d outside_deadband(const Eigen::Vector3d & value, const double dea
   const double norm = value.norm();
   return norm > deadband ? Eigen::Vector3d(value * ((norm - deadband) / norm)) :
          Eigen::Vector3d::Zero();
+}
+
+Eigen::Vector2d outside_deadband(const Eigen::Vector2d & value, const double deadband)
+{
+  const double norm = value.norm();
+  return norm > deadband ? Eigen::Vector2d(value * ((norm - deadband) / norm)) :
+         Eigen::Vector2d::Zero();
 }
 
 Eigen::Vector3d limit_norm(const Eigen::Vector3d & value, const double maximum)
@@ -179,12 +193,13 @@ std::optional<TrackingGeometry> computeTrackingGeometry(
   }
 
   if (compute_primary) {
-    const Eigen::Vector3d pointing_reference = config.orientation_gain *
-      outside_deadband(pointing_error, config.pointing_deadband_rad);
-    Eigen::Vector2d reference(
-      result.left.dot(pointing_reference), result.up.dot(pointing_reference));
-    reference += Eigen::Vector2d(
+    const Eigen::Vector2d pointing_error_2d(
+      result.left.dot(pointing_error), result.up.dot(pointing_error));
+    const Eigen::Vector2d pointing_feedforward_2d(
       result.left.dot(desired_angular_velocity), result.up.dot(desired_angular_velocity));
+    Eigen::Vector2d reference = outside_deadband(Eigen::Vector2d(
+        config.orientation_gain * pointing_error_2d + pointing_feedforward_2d),
+      config.orientation_gain * config.pointing_deadband_rad);
     const double pointing_speed = reference.norm();
     if (pointing_speed > config.maximum_angular_reference_radps) {
       reference *= config.maximum_angular_reference_radps / pointing_speed;
@@ -321,6 +336,45 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
     config.maximum_linear_reference_mps);
 
   const auto linear_jacobian = jacobian.topRows(3);
+  const bool face_distance_enabled = face_position.has_value() &&
+    std::isfinite(config.face_distance_min_m) && std::isfinite(config.face_distance_max_m);
+  if (face_distance_enabled) {
+    const Eigen::Vector3d monitor_from_face = current.translation() - *face_position;
+    const double face_distance_m = monitor_from_face.norm();
+    if (!std::isfinite(face_distance_m) || face_distance_m <= kGeometryEpsilon) {
+      return std::nullopt;
+    }
+    const Eigen::Vector3d radial = monitor_from_face / face_distance_m;
+    result.face_distance_matrix.resize(1, jacobian.cols());
+    result.face_distance_matrix.row(0) = radial.transpose() * linear_jacobian;
+    const double face_radial_velocity = radial.dot(face_velocity);
+    const double lower_rate =
+      (config.face_distance_min_m - face_distance_m) * config.position_gain +
+      face_radial_velocity;
+    const double upper_rate =
+      (config.face_distance_max_m - face_distance_m) * config.position_gain +
+      face_radial_velocity;
+    LinearVelocityConstraint interval;
+    interval.coefficients = result.face_distance_matrix.row(0).transpose();
+    interval.lower_bound = lower_rate;
+    interval.upper_bound = upper_rate;
+    result.face_distance_outside_band =
+      face_distance_m<config.face_distance_min_m ||
+        face_distance_m> config.face_distance_max_m;
+    result.face_distance_interval = std::move(interval);
+    const double correction_error = face_distance_m < config.face_distance_min_m ?
+      config.face_distance_min_m - face_distance_m :
+      (face_distance_m > config.face_distance_max_m ?
+      config.face_distance_max_m - face_distance_m : 0.0);
+    const double distance_reference = result.face_distance_outside_band ?
+      config.position_gain * correction_error + face_radial_velocity : 0.0;
+    result.face_distance_reference = Eigen::VectorXd::Constant(1, std::clamp(
+        distance_reference, -config.maximum_linear_reference_mps,
+        config.maximum_linear_reference_mps));
+    result.position_error_m = std::max(
+      0.0, std::max(config.face_distance_min_m - face_distance_m,
+      face_distance_m - config.face_distance_max_m));
+  }
   result.task.primary_matrix = primary_geometry->primary_matrix;
   result.task.primary_reference = primary_geometry->primary_reference;
   if (face_position) {
@@ -338,9 +392,29 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
     result.task.primary_reference[2] = screen_horizontal_edge ?
       screen_horizontal_edge->task.primary_reference[0] : screen_geometry->roll_reference;
     result.task.primary_weights = Eigen::Vector3d(1.0, 1.0, config.roll_weight);
-    result.task.secondary_matrix = linear_jacobian;
-    result.task.secondary_reference = linear_reference;
-    result.task.secondary_weights = Eigen::Vector3d::Ones();
+    if (face_distance_enabled) {
+      result.task.secondary_matrix.resize(0, jacobian.cols());
+      result.task.secondary_reference.resize(0);
+      result.task.secondary_weights.resize(0);
+      if (result.face_distance_outside_band) {
+        // Keep the face distance objective soft and strictly below pose tasks.
+        // A full Cartesian screen-velocity objective follows the face ray while
+        // suppressing nullspace tangential motion near the reach limit.
+        result.task.distance_matrix = linear_jacobian;
+        const Eigen::Vector3d face_radial =
+          (current.translation() - *face_position).normalized();
+        result.task.distance_reference = face_radial * result.face_distance_reference[0];
+        result.task.distance_weights = Eigen::VectorXd::Ones(3);
+      } else {
+        result.task.distance_matrix.resize(0, jacobian.cols());
+        result.task.distance_reference.resize(0);
+        result.task.distance_weights.resize(0);
+      }
+    } else {
+      result.task.secondary_matrix = linear_jacobian;
+      result.task.secondary_reference = linear_reference;
+      result.task.secondary_weights = Eigen::Vector3d::Ones();
+    }
   } else {
     result.task.primary_weights = Eigen::Vector2d::Ones();
     result.task.secondary_matrix.resize(4, jacobian.cols());
@@ -359,10 +433,12 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
   }
   const bool roll_is_observable = face_position ? screen_horizontal_edge.has_value() :
     screen_geometry->roll_authority > kGeometryEpsilon;
-  result.accepted = result.position_error_m <= config.position_deadband_m &&
+  result.accepted = (face_distance_enabled ? result.position_error_m == 0.0 :
+    result.position_error_m <= config.position_deadband_m) &&
     result.pointing_error_rad <= config.pointing_deadband_rad &&
     (!roll_is_observable || result.roll_error_rad <= config.roll_deadband_rad) &&
-    result.task.primary_reference.isZero(0.0) && result.task.secondary_reference.isZero(0.0);
+    result.task.primary_reference.isZero(0.0) && result.task.secondary_reference.isZero(0.0) &&
+    result.task.distance_reference.isZero(0.0);
   return result;
 }
 

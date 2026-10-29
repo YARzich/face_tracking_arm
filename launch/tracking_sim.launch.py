@@ -100,6 +100,10 @@ def generate_launch_description() -> LaunchDescription:
         default_value=str(share / 'config/moveit/collision_aware_servo.yaml'),
         description=('Controller YAML. Point to a source-tree copy to edit simulation settings '
                      'without rebuilding the installed package.'))
+    tracking_config_argument = DeclareLaunchArgument(
+        'tracking_config_file', default_value='',
+        description=('Optional tracking YAML with face-distance bounds; defaults to the '
+                     'installed config/tracking.yaml.'))
     setup = OpaqueFunction(function=assemble_simulation)
     return LaunchDescription([
         headless_argument, calibration_mode_argument, servo_backend_argument,
@@ -107,5 +111,6 @@ def generate_launch_description() -> LaunchDescription:
         visualize_target_argument, smoothing_plugin_argument, camera_mode_argument,
         camera_baseline_argument, *camera_arguments, idle_argument,
         perception_status_argument, world_argument, collision_aware_servo_config_argument,
+        tracking_config_argument,
         initial_argument, test_world_box_argument, table_enabled_argument,
         robot_model_argument, start_pose_argument, setup])

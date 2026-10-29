@@ -7,6 +7,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
+#include <limits>
 #include <optional>
 
 #include "face_tracking_arm/hierarchical_velocity_qp.hpp"
@@ -25,10 +26,17 @@ struct TrackingVelocityTaskConfig
   /// Deadband for the horizontal screen-edge tilt objective.
   double roll_deadband_rad{0.01};
   double maximum_linear_reference_mps{0.18};
+  /// Physical one-cycle scale used to select when posture may activate.
+  /// MotionReference also reuses it for the idle-only radial guard tolerance.
+  double control_period_sec{0.01};
   double maximum_angular_reference_radps{0.70};
   /// Relative roll residual weight in the primary full-orientation FACE task.
   /// The field name is retained for parameter/API compatibility.
   double roll_weight{0.5};
+  /// Disabled when both are NaN; when enabled, bounds are measured from the
+  /// command/control frame to the current face point.
+  double face_distance_min_m{std::numeric_limits<double>::quiet_NaN()};
+  double face_distance_max_m{std::numeric_limits<double>::quiet_NaN()};
 };
 
 struct GazeKinematics
@@ -51,6 +59,14 @@ struct TrackingVelocityTaskResult
   /// Target-only angular feed-forward in those rows, excluding orientation_gain.
   Eigen::Vector3d face_primary_feedforward_radps{Eigen::Vector3d::Zero()};
   bool has_face_primary_roll{false};
+  /// Radial face-distance objective and applied allowed interval, kept separate
+  /// so the caller can place distance and posture at the required hierarchy levels.
+  Eigen::MatrixXd face_distance_matrix;
+  Eigen::VectorXd face_distance_reference;
+  /// Descriptive signed rate interval for the configured band; never a hard row.
+  std::optional<LinearVelocityConstraint> face_distance_interval;
+  /// True while outside the configured band. Distance never gates posture.
+  bool face_distance_outside_band{false};
   /// All errors are within their deadbands and both combined references are zero.
   /// This is a geometric condition, not evidence that the robot has stopped.
   bool accepted{false};
@@ -85,8 +101,10 @@ struct FaceReturnPointingTask
 /// adds the desired look-at frame's angular motion; target-position velocity adds
 /// translational feed-forward. Speed caps apply after adding feedback and feed-forward.
 /// Ordinary FACE tracking prioritizes both screen-normal axes and gravity-upright
-/// screen roll, with translation secondary. An optional gaze frame replaces the
-/// two-axis pointing task while physical screen roll remains primary.
+/// screen roll. The radial face-distance request is a final soft objective toward
+/// the nearest band edge; it is zero inside the band, leaving radial motion free.
+/// An optional gaze frame replaces the two-axis pointing task while physical screen
+/// roll remains primary.
 /// Fixed-orientation tracking without a face keeps roll secondary. The
 /// roll_weight name is retained for parameter/API compatibility even though it
 /// weights a primary residual for ordinary FACE.

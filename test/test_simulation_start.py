@@ -156,6 +156,7 @@ def test_launch_bootstraps_installed_helpers_without_project_pythonpath(tmp_path
     for filename in (
         '__init__.py', 'robot_profile.py', 'simulation_start.py',
         'simulation_config.py', 'simulation_launch.py', 'mount_collisions.py',
+        'face_distance_config.py',
     ):
         shutil.copyfile(PACKAGE / 'python/face_tracking_bringup' / filename,
                         installed / filename)

@@ -36,7 +36,8 @@ CAMERA_FIELDS = frozenset(('device width height fps pixel_format driver_paramete
                            'control_values camera_name calibration_file frame_id image_topic '
                            'info_topic depth_topic optical_xyz_m optical_rpy_deg').split())
 TRACKING_OPTIONAL = frozenset((
-    'face_target_freshness_timeout_sec face_prediction_timeout_sec rest_position_m').split())
+    'face_target_freshness_timeout_sec face_prediction_timeout_sec rest_position_m '
+    'face_distance_min_m face_distance_max_m').split())
 MODE_OPTIONAL = {
     'mono_cpu': frozenset(('sync_slop_sec',)),
     'stereo': frozenset(('num_disparities', 'block_size')),

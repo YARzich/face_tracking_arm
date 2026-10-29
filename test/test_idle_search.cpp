@@ -50,6 +50,22 @@ TEST(IdleSearch, LocalSearchTransitionsAtCurrentBaseAngle)
   EXPECT_DOUBLE_EQ(search.goal()[2], 0.0);
 }
 
+TEST(IdleSearch, HoldPauseDoesNotConsumeLocalSearchDuration)
+{
+  Eigen::VectorXd current = Eigen::VectorXd::Zero(6);
+  Eigen::VectorXd lower = Eigen::VectorXd::Constant(6, -2.0);
+  Eigen::VectorXd upper = Eigen::VectorXd::Constant(6, 2.0);
+  IdleSearch search;
+  IdleSearchConfig config;
+  search.start(current, current, lower, upper, 0, config, true, 1.0);
+  search.update(current, 6.0);
+  EXPECT_EQ(search.phase(), "SEARCH_LOCAL");
+  search.pause(6.01);
+  search.resume(20.0);
+  search.update(current, 21.02);
+  EXPECT_EQ(search.phase(), "SEARCH_PLANNING");
+}
+
 TEST(IdleSearch, RejectsInvalidConfiguration)
 {
   IdleSearch search;

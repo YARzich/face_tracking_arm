@@ -23,6 +23,7 @@
 #include "face_tracking_arm/published_trajectory_history.hpp"
 #include "face_tracking_arm/target_motion_estimator.hpp"
 #include "face_tracking_arm/tracking_velocity_task.hpp"
+#include "face_tracking_arm/posture_preference.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -85,6 +86,7 @@ struct MotionReferenceDiagnostics
   std::string state{"HOLD"};
   std::string tracking_phase{"FACE"};
   std::string recovery_mode{"compact"};
+  std::string posture_mode{"unavailable"};
   std::string compact_phase{"INACTIVE"};
   std::string compact_reason;
   std::string last_plan_message{"not requested"};
@@ -386,6 +388,8 @@ private:
   const moveit::core::LinkModel * base_link_{nullptr};
   Eigen::VectorXd rest_positions_;
   Eigen::VectorXd search_positions_;
+  PosturePreferenceConfig posture_preference_config_;
+  bool posture_preference_calibrated_{false};
   Eigen::Index search_base_index_{0};
   std::optional<IdleSearch> search_;
   IdleSearchConfig search_config_;
@@ -394,6 +398,7 @@ private:
   CompactPathReferenceSettings compact_goal_settings_{3.0, 0.10};
   bool search_enabled_{true};
   std::string search_pattern_;
+  bool search_paused_{false};
   std::unique_ptr<BackgroundPathPlanner> planner_;
   double planner_goal_tolerance_rad_{0.01};
   JointPathFollower follower_;

@@ -12,11 +12,13 @@
 #include <utility>
 
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
+#include <moveit/robot_model/revolute_joint_model.hpp>
 
 #include "face_tracking_arm/pointing_geometry.hpp"
 #include "face_tracking_arm/compact_upright.hpp"
 #include "face_tracking_arm/detail/scalar_braking_policy.hpp"
 #include "face_tracking_arm/face_target_age_policy.hpp"
+#include "face_tracking_arm/posture_preference.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -50,6 +52,85 @@ std::string jsonNumber(const double value)
   std::ostringstream stream;
   stream << std::setprecision(17) << value;
   return stream.str();
+}
+
+std::optional<LinearVelocityConstraint> makeJoint3ComfortBounds(
+  const JointMotionState & motion, const JointMotionLimits & limits,
+  const Eigen::Index joint_index, const double lower_position,
+  const double upper_position, const double period_sec,
+  const double residual_latency_sec)
+{
+  const Eigen::Index count = motion.position.size();
+  if (joint_index < 0 || joint_index >= count || motion.velocity.size() != count ||
+    motion.acceleration.size() != count || limits.max_velocity.size() != count ||
+    limits.max_acceleration.size() != count || limits.max_jerk.size() != count ||
+    !motion.position.allFinite() || !motion.velocity.allFinite() ||
+    !motion.acceleration.allFinite() || !std::isfinite(lower_position) ||
+    !std::isfinite(upper_position) || upper_position <= lower_position ||
+    !std::isfinite(period_sec) || period_sec <= 0.0 ||
+    !std::isfinite(residual_latency_sec) || residual_latency_sec < 0.0)
+  {
+    return std::nullopt;
+  }
+
+  const double position = motion.position[joint_index];
+  const double velocity = motion.velocity[joint_index];
+  const double acceleration = motion.acceleration[joint_index];
+  const double max_velocity = limits.max_velocity[joint_index];
+  const double max_acceleration = limits.max_acceleration[joint_index];
+  const double max_jerk = limits.max_jerk[joint_index];
+  if (!std::isfinite(max_velocity) || max_velocity <= 0.0 ||
+    !std::isfinite(max_acceleration) || max_acceleration <= 0.0 ||
+    !std::isfinite(max_jerk) || max_jerk <= 0.0 ||
+    position < lower_position || position > upper_position ||
+    !limits.numerical_policy || !limits.numerical_policy->valid() ||
+    classifyVelocity(RadiansPerSecond{velocity}, RadiansPerSecond{max_velocity},
+      limits.numerical_policy->velocity_error) == BoundaryClass::kOutside ||
+    classifyAcceleration(RadiansPerSecondSquared{acceleration},
+      RadiansPerSecondSquared{max_acceleration},
+      limits.numerical_policy->acceleration_error) == BoundaryClass::kOutside)
+  {
+    return std::nullopt;
+  }
+
+  const double bounded_acceleration = std::clamp(
+    acceleration, -max_acceleration, max_acceleration);
+  const double jerk_step = max_jerk * period_sec;
+  const double minimum_acceleration = std::max(
+    -max_acceleration, bounded_acceleration - jerk_step);
+  const double maximum_acceleration = std::min(
+    max_acceleration, bounded_acceleration + jerk_step);
+  const double minimum_reachable_velocity = std::max(
+    -max_velocity, velocity + minimum_acceleration * period_sec);
+  const double maximum_reachable_velocity = std::min(
+    max_velocity, velocity + maximum_acceleration * period_sec);
+  if (!std::isfinite(minimum_reachable_velocity) ||
+    !std::isfinite(maximum_reachable_velocity) ||
+    minimum_reachable_velocity > maximum_reachable_velocity)
+  {
+    return std::nullopt;
+  }
+
+  const double upper_velocity = maximumSafeVelocityTowardBoundary(
+    upper_position - position, velocity, minimum_reachable_velocity,
+    maximum_reachable_velocity, max_acceleration, max_jerk,
+    period_sec, residual_latency_sec);
+  const double lower_velocity = -maximumSafeVelocityTowardBoundary(
+    position - lower_position, -velocity, -maximum_reachable_velocity,
+    -minimum_reachable_velocity, max_acceleration, max_jerk,
+    period_sec, residual_latency_sec);
+  if (!std::isfinite(lower_velocity) || !std::isfinite(upper_velocity) ||
+    lower_velocity > upper_velocity)
+  {
+    return std::nullopt;
+  }
+
+  LinearVelocityConstraint constraint;
+  constraint.coefficients = Eigen::VectorXd::Zero(count);
+  constraint.coefficients[joint_index] = 1.0;
+  constraint.lower_bound = lower_velocity;
+  constraint.upper_bound = upper_velocity;
+  return constraint;
 }
 
 std::string jsonVector(const Eigen::VectorXd & value)
@@ -495,6 +576,82 @@ MotionReference::MotionReference(
     throw std::invalid_argument("Motion reference requires a named rest posture");
   }
   named_state.copyJointGroupPositions(group_, rest_positions_);
+
+  const auto & joint_names = group_->getVariableNames();
+  const auto joint3_position = std::find(joint_names.begin(), joint_names.end(), "joint3");
+  const auto * joint3_model = robot_model_->getJointModel("joint3");
+  const auto * joint3_revolute = dynamic_cast<const moveit::core::RevoluteJointModel *>(
+    joint3_model);
+  const auto * shoulder_link = robot_model_->getLinkModel("link2");
+  const auto * elbow_link = robot_model_->getLinkModel("link3");
+  const auto * wrist_link = robot_model_->getLinkModel("link4");
+  const auto named_bend_angle = [&](const std::string & pose_name, double & q3,
+    double & bend_angle) {
+      moveit::core::RobotState posture(robot_model_);
+      posture.setToDefaultValues();
+      if (!posture.setToDefaultValues(group_, pose_name)) {
+        return false;
+      }
+      posture.update();
+      Eigen::VectorXd positions;
+      posture.copyJointGroupPositions(group_, positions);
+      if (joint3_position == joint_names.end() || !joint3_model || !joint3_revolute ||
+        !shoulder_link || !elbow_link || !wrist_link ||
+        positions.size() != static_cast<Eigen::Index>(joint_names.size()))
+      {
+        return false;
+      }
+      q3 = positions[std::distance(joint_names.begin(), joint3_position)];
+      const Eigen::Vector3d shoulder = posture.getGlobalLinkTransform(
+        shoulder_link).translation();
+      const Eigen::Vector3d elbow = posture.getGlobalLinkTransform(elbow_link).translation();
+      const Eigen::Vector3d wrist = posture.getGlobalLinkTransform(wrist_link).translation();
+      const auto * parent = joint3_model->getParentLinkModel();
+      const auto * child = joint3_model->getChildLinkModel();
+      if (!parent || !child) {
+        return false;
+      }
+      const Eigen::Vector3d axis = posture.getGlobalLinkTransform(parent).linear() *
+        child->getJointOriginTransform().linear() * joint3_revolute->getAxis();
+      const Eigen::Vector3d upper_arm = elbow - shoulder;
+      const Eigen::Vector3d forearm = wrist - elbow;
+      if (!axis.allFinite() || !upper_arm.allFinite() || !forearm.allFinite() ||
+        axis.squaredNorm() <= 0.0 || upper_arm.norm() <= 0.0 || forearm.norm() <= 0.0)
+      {
+        return false;
+      }
+      bend_angle = std::atan2(
+        axis.normalized().dot(upper_arm.cross(forearm)), upper_arm.dot(forearm));
+      return std::isfinite(q3) && std::isfinite(bend_angle);
+    };
+  double rest_joint3 = 0.0;
+  double rest_bend_angle = 0.0;
+  double search_joint3 = 0.0;
+  double search_bend_angle = 0.0;
+  const auto joint3_index = std::distance(joint_names.begin(), joint3_position);
+  const bool joint3_limits_available = joint3_position != joint_names.end() &&
+    limits_.lower_position.size() > joint3_index &&
+    limits_.upper_position.size() > joint3_index;
+  const bool rest_bend_available = joint3_limits_available &&
+    named_bend_angle("rest", rest_joint3, rest_bend_angle);
+  if (rest_bend_available) {
+    search_joint3 = rest_joint3;
+    search_bend_angle = rest_bend_angle;
+    // A disabled optional search mode must not make posture calibration fail.
+    // If no named search pose is present, the normal rest posture is the source.
+    (void)named_bend_angle("search", search_joint3, search_bend_angle);
+    const auto bend_calibration = calibratePostureBend(
+      rest_joint3, rest_bend_angle, search_joint3, search_bend_angle,
+      limits_.lower_position[joint3_index], limits_.upper_position[joint3_index]);
+    if (bend_calibration.valid) {
+      posture_preference_config_.j3_index = joint3_index;
+      posture_preference_config_.joint3_angle_offset_rad = bend_calibration.angle_offset_rad;
+      posture_preference_config_.preferred_bend_sign = bend_calibration.preferred_sign;
+      posture_preference_config_.comfortable_joint3_lower = bend_calibration.joint3_lower;
+      posture_preference_config_.comfortable_joint3_upper = bend_calibration.joint3_upper;
+      posture_preference_calibrated_ = true;
+    }
+  }
 
   rcl_interfaces::msg::ParameterDescriptor descriptor;
   descriptor.read_only = true;
@@ -1387,6 +1544,7 @@ void MotionReference::reset(const bool preserve_compact_maneuver)
   rest_mode_ = RestMode::kNone;
   rest_upright_start_active_ = false;
   search_pattern_.clear();
+  search_paused_ = false;
   rest_completed_ = false;
   rest_settling_ = false;
   target_id_.reset();
@@ -1643,8 +1801,14 @@ std::optional<HierarchicalVelocityTask> MotionReference::faceTask(
   config.position_deadband_m = parameters_.position_deadband_m;
   config.pointing_deadband_rad = parameters_.pointing_deadband_rad;
   config.maximum_linear_reference_mps = parameters_.maximum_linear_reference_mps;
+  config.control_period_sec = parameters_.control_period_sec;
   config.maximum_angular_reference_radps = parameters_.maximum_angular_reference_radps;
   config.roll_weight = parameters_.secondary_roll_weight;
+  const bool posture_enabled = face_tracking && !compactManeuverActive();
+  if (posture_enabled) {
+    config.face_distance_min_m = parameters_.face_distance_min_m;
+    config.face_distance_max_m = parameters_.face_distance_max_m;
+  }
   config.horizontal_edge_primary =
     !compactManeuverActive() || compact_face_return_pending_;
   const Eigen::Quaterniond orientation(
@@ -1653,7 +1817,7 @@ std::optional<HierarchicalVelocityTask> MotionReference::faceTask(
   if (!orientation.coeffs().allFinite() || orientation.norm() < 1.0e-9) {
     return std::nullopt;
   }
-  const auto task = makeTrackingVelocityTask(
+  auto task = makeTrackingVelocityTask(
     state.getGlobalLinkTransform(command_link_), jacobian,
     Eigen::Vector3d(target.pose.position.x, target.pose.position.y, target.pose.position.z),
     face_tracking ? std::optional<Eigen::Vector3d>{Eigen::Vector3d(
@@ -1662,6 +1826,105 @@ std::optional<HierarchicalVelocityTask> MotionReference::faceTask(
     target_motion.goal_velocity, gaze);
   if (!task) {
     return std::nullopt;
+  }
+  if (posture_enabled && face_tracking) {
+    const auto * base_link = robot_model_->getLinkModel("link_base");
+    const auto * elbow_link = robot_model_->getLinkModel("link3");
+    const auto * wrist_link = robot_model_->getLinkModel("link4");
+    JointMotionState state_motion;
+    state.copyJointGroupPositions(group_, state_motion.position);
+    const bool have_brake_motion = state.hasVelocities() && state.hasAccelerations();
+    if (have_brake_motion) {
+      state.copyJointGroupVelocities(group_, state_motion.velocity);
+      state.copyJointGroupAccelerations(group_, state_motion.acceleration);
+    }
+    const Eigen::Index joints = state_motion.position.size();
+    const Eigen::VectorXd & q = state_motion.position;
+    const auto world_linear_jacobian = [&](const moveit::core::LinkModel * link,
+      Eigen::MatrixXd & output) {
+        Eigen::MatrixXd full;
+        if (!link || !state.getJacobian(
+            group_, link, Eigen::Vector3d::Zero(), full, false) ||
+          full.rows() != 6 || full.cols() != q.size())
+        {
+          return false;
+        }
+        output = full.topRows(3);
+        if (root) {
+          output = (state.getGlobalLinkTransform(root).linear() * output).eval();
+        }
+        return output.allFinite();
+      };
+    Eigen::MatrixXd base_jacobian, elbow_jacobian, wrist_jacobian;
+    const bool posture_kinematics_available = base_link && elbow_link && wrist_link &&
+      q.size() == 6 && limits_.lower_position.size() > 5 &&
+      limits_.upper_position.size() > 5 &&
+      world_linear_jacobian(elbow_link, elbow_jacobian) &&
+      world_linear_jacobian(wrist_link, wrist_jacobian);
+    if (posture_kinematics_available) {
+      // link_base is the fixed root of the xarm6 planning group. Its Jacobian
+      // is exactly zero; querying it as a group target can fail because it is
+      // outside the group's moving chain.
+      base_jacobian = Eigen::MatrixXd::Zero(3, q.size());
+    }
+    PosturePreferenceConfig posture_config = posture_preference_config_;
+    posture_config.position_margin_j5_rad = limits_.position_margin.size() > 4 ?
+      limits_.position_margin[4] : parameters_.joint_position_margin_rad;
+    posture_config.position_margin_j6_rad = limits_.position_margin.size() > 5 ?
+      limits_.position_margin[5] : parameters_.joint_position_margin_rad;
+    posture_config.position_gain = parameters_.position_gain;
+    posture_config.maximum_linear_reference_mps = parameters_.maximum_linear_reference_mps;
+    posture_config.maximum_angular_reference_radps = parameters_.maximum_angular_reference_radps;
+    posture_config.control_period_sec = parameters_.control_period_sec;
+    posture_config.lower_j5 = posture_kinematics_available ? limits_.lower_position[4] : 0.0;
+    posture_config.upper_j5 = posture_kinematics_available ? limits_.upper_position[4] : 0.0;
+    posture_config.lower_j6 = posture_kinematics_available ? limits_.lower_position[5] : 0.0;
+    posture_config.upper_j6 = posture_kinematics_available ? limits_.upper_position[5] : 0.0;
+    const auto comfort = posture_kinematics_available && posture_preference_calibrated_ ?
+      makePosturePreferenceObjective(
+      state.getGlobalLinkTransform(base_link).translation(),
+      state.getGlobalLinkTransform(elbow_link).translation(),
+      state.getGlobalLinkTransform(wrist_link).translation(),
+      Eigen::Vector3d(target.face.x, target.face.y, target.face.z), base_jacobian,
+      elbow_jacobian, wrist_jacobian, q, posture_config) : PosturePreferenceObjective{};
+    if (comfort.valid) {
+      diagnostics_.posture_mode = comfort.branch_comfortable ? "preserve" : "recover";
+    }
+    task->task.secondary_matrix.resize(0, joints);
+    task->task.secondary_reference.resize(0);
+    task->task.secondary_weights.resize(0);
+    task->task.tertiary_matrix.resize(0, joints);
+    task->task.tertiary_reference.resize(0);
+    task->task.tertiary_weights.resize(0);
+    if (comfort.valid && comfort.matrix.rows() > 0) {
+      Eigen::Index first_extra_row = 0;
+      if (!comfort.branch_comfortable) {
+        task->task.secondary_matrix = comfort.matrix.topRows(1);
+        task->task.secondary_reference = comfort.reference.head(1);
+        task->task.secondary_weights = comfort.weights.head(1);
+        first_extra_row = 1;
+      }
+      if (first_extra_row < comfort.matrix.rows()) {
+        task->task.tertiary_matrix = comfort.matrix.bottomRows(
+          comfort.matrix.rows() - first_extra_row);
+        task->task.tertiary_reference = comfort.reference.tail(
+          comfort.reference.size() - first_extra_row);
+        task->task.tertiary_weights = comfort.weights.tail(
+          comfort.weights.size() - first_extra_row);
+      }
+    }
+    if (comfort.valid && comfort.branch_comfortable && have_brake_motion) {
+      const Eigen::Index joint3 = static_cast<Eigen::Index>(posture_config.j3_index);
+      const auto preservation = makeJoint3ComfortBounds(
+        state_motion, limits_, joint3, posture_config.comfortable_joint3_lower,
+        posture_config.comfortable_joint3_upper, parameters_.control_period_sec,
+        parameters_.residual_command_latency_sec);
+      if (preservation) {
+        task->task.preferred_primary_constraints.push_back(*preservation);
+      } else {
+        diagnostics_.posture_mode = "unavailable";
+      }
+    }
   }
   if (return_pointing) {
     if (!face_tracking) {
@@ -3874,7 +4137,8 @@ bool MotionReference::handleCompactPreparation(
         return true;
       }
     }
-    result.task = faceTask(state, *target, target_motion, result);
+    result.task = faceTask(
+      state, *target, target_motion, result);
     result.actual_face_alignment = fresh_actual_state ?
       measureActualFaceAlignment(
       state, *target, time_sec, actual_feedback, actual_feedback_time_sec) : std::nullopt;
@@ -3921,6 +4185,8 @@ bool MotionReference::handleRestSearchMode(
   {
     const RestMode requested = target->mode == msg::TrackingTarget::REST ? RestMode::kRest :
       RestMode::kSearch;
+    const bool resume_search = requested == RestMode::kSearch && search_paused_ &&
+      search_ && search_pattern_ == target->search_pattern;
     if (rest_mode_ != requested ||
       (requested == RestMode::kSearch && search_pattern_ != target->search_pattern))
     {
@@ -3933,9 +4199,17 @@ bool MotionReference::handleRestSearchMode(
       rest_settling_ = false;
       if (requested == RestMode::kSearch) {
         search_pattern_ = target->search_pattern;
-        search_->start(position, search_positions_, limits_.lower_position +
-          limits_.position_margin, limits_.upper_position - limits_.position_margin,
-          search_base_index_, search_config_, search_pattern_ == "local_then_sweep", time_sec);
+        if (resume_search) {
+          search_->resume(time_sec);
+        } else {
+          search_->start(position, search_positions_, limits_.lower_position +
+            limits_.position_margin, limits_.upper_position - limits_.position_margin,
+            search_base_index_, search_config_, search_pattern_ == "local_then_sweep", time_sec);
+        }
+        search_paused_ = false;
+      } else {
+        search_pattern_.clear();
+        search_paused_ = false;
       }
     }
     if (search_ && requested == RestMode::kSearch) {
@@ -4108,6 +4382,17 @@ bool MotionReference::handleRestSearchMode(
       return true;
     }
     if (requested == RestMode::kSearch && search_->preparing()) {
+      if (rest_settling_) {
+        if (error < kRestReleaseRad) {
+          diagnostics_.state = "SEARCH_SETTLING";
+          if (error >= kRestArrivalRad) {
+            result.task = pathTask(state, position, goal, 1.0, 0.10, true);
+            result.follows_path = result.task.has_value();
+          }
+          return true;
+        }
+        rest_settling_ = false;
+      }
       if (!pending_generation_ && !planner_->isBusy()) {
         pending_generation_ = planner_->submit(state, goal, scene_revision);
         ++diagnostics_.plans_requested;
@@ -4178,6 +4463,7 @@ MotionReferenceResult MotionReference::update(
   const PublishedTrajectoryRecord * latest_publication)
 {
   MotionReferenceResult result;
+  diagnostics_.posture_mode = "unavailable";
   if (std::isfinite(time_sec)) {
     if (last_control_time_sec_ && time_sec < *last_control_time_sec_) {
       // Keep the limit hold across a ROS clock epoch reset, but allow the new
@@ -4185,6 +4471,15 @@ MotionReferenceResult MotionReference::update(
       disabled_limit_hold_source_stamp_ns_.reset();
       last_real_face_target_.reset();
       last_real_face_motion_.reset();
+      if (rest_mode_ != RestMode::kNone || search_paused_) {
+        planner_->cancel();
+        pending_generation_.reset();
+        follower_.reset();
+        rest_mode_ = RestMode::kNone;
+        rest_settling_ = false;
+        search_pattern_.clear();
+        search_paused_ = false;
+      }
     }
     last_control_time_sec_ = time_sec;
   }
@@ -4199,7 +4494,22 @@ MotionReferenceResult MotionReference::update(
     upright_roll_guard_armed_ = false;
     diagnostics_.upright_roll_guard_armed = false;
   }
+  if (search_paused_ && mode != msg::TrackingTarget::HOLD &&
+    mode != msg::TrackingTarget::SEARCH)
+  {
+    search_pattern_.clear();
+    search_paused_ = false;
+  }
   if (rest_mode_ != RestMode::kNone && !idle) {
+    const bool preserve_search_on_hold = mode == msg::TrackingTarget::HOLD &&
+      rest_mode_ == RestMode::kSearch && search_.has_value();
+    if (preserve_search_on_hold) {
+      search_->pause(time_sec);
+      search_paused_ = true;
+    } else {
+      search_pattern_.clear();
+      search_paused_ = false;
+    }
     planner_->cancel();
     pending_generation_.reset();
     follower_.reset();
@@ -4503,7 +4813,8 @@ MotionReferenceResult MotionReference::update(
   rest_completed_ = false;
   rest_settling_ = false;
   if (has_face || mode == msg::TrackingTarget::POSE) {
-    result.task = faceTask(state, *target, target_motion, result, has_face);
+    result.task = faceTask(
+      state, *target, target_motion, result, has_face);
     if (!has_face) {
       diagnostics_.state = result.task ? "POSE" : "INVALID_TASK";
       diagnostics_.tracking_phase = "POSE";

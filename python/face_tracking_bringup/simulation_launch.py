@@ -374,14 +374,9 @@ def _configuration(context, share):
         idle_behavior=value('idle_behavior'),
         require_perception_status=value('require_perception_status') == 'true',
         controller_config_file=value('collision_aware_servo_config_file'),
+        tracking_config_file=value('tracking_config_file'),
         table_enabled=context.launch_configurations.get('table_enabled', 'true') == 'true')
     table_enabled = context.launch_configurations.get('table_enabled', 'true') == 'true'
-    if context.launch_configurations.get('test_world_box', 'false') == 'true':
-        if not table_enabled:
-            raise ValueError('test_world_box cannot be combined with table_enabled:=false')
-        config.tracking.update(
-            table_shape='box', table_dimensions_m=[0.10, 0.10, 0.10],
-            table_center_m=[0.50, 0.0, 1.15], table_yaw_rad=0.0)
     if not table_enabled:
         config.tracking['table_dimensions_m'] = [0.0, 0.0]
         config.controller['table_collision_enabled'] = False

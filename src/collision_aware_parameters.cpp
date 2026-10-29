@@ -102,6 +102,10 @@ ControllerParameters declareControllerParameters(rclcpp::Node & node)
   result.position_gain = node.declare_parameter<double>("position_gain", result.position_gain);
   result.orientation_gain = node.declare_parameter<double>(
     "orientation_gain", result.orientation_gain);
+  result.face_distance_min_m = node.declare_parameter<double>(
+    "face_distance_min_m", result.face_distance_min_m);
+  result.face_distance_max_m = node.declare_parameter<double>(
+    "face_distance_max_m", result.face_distance_max_m);
   result.maximum_linear_reference_mps = node.declare_parameter<double>(
     "maximum_linear_reference_mps", result.maximum_linear_reference_mps);
   result.maximum_angular_reference_radps = node.declare_parameter<double>(
@@ -242,6 +246,9 @@ void validateControllerParameters(const ControllerParameters & parameters)
     parameters.command_frame != "monitor_control_frame" ||
     !positive(parameters.position_gain) ||
     !positive(parameters.orientation_gain) ||
+    !positive(parameters.face_distance_min_m) ||
+    !positive(parameters.face_distance_max_m) ||
+    parameters.face_distance_min_m >= parameters.face_distance_max_m ||
     !positive(parameters.maximum_linear_reference_mps) ||
     !positive(parameters.maximum_angular_reference_radps) ||
     !std::isfinite(parameters.position_deadband_m) ||

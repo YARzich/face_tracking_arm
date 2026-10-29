@@ -77,6 +77,190 @@ TEST(TrackingVelocityTask, AcceptedStaticPoseHasNoBackgroundMotionPreference)
   EXPECT_TRUE(result->face_primary_feedforward_radps.isZero(kTolerance));
 }
 
+TEST(TrackingVelocityTask, FaceDistanceBandUsesControlFrameAndHasNoPointTargetInside)
+{
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  current.translation() = Eigen::Vector3d(0.5, 0.0, 0.0);
+  current.linear() = Eigen::Matrix3d::Identity();
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+
+  const auto inside = makeTrackingVelocityTask(
+    current, Eigen::MatrixXd::Identity(6, 6), current.translation(),
+    Eigen::Vector3d(1.0, 0.0, 0.0), Eigen::Matrix3d::Identity(), config);
+  ASSERT_TRUE(inside.has_value());
+  ASSERT_TRUE(inside->face_distance_interval.has_value());
+  EXPECT_FALSE(inside->face_distance_outside_band);
+  EXPECT_EQ(inside->task.secondary_matrix.rows(), 0);
+  EXPECT_EQ(inside->task.distance_matrix.rows(), 0)
+    << "A band membership must leave distance motion free";
+  ASSERT_EQ(inside->face_distance_matrix.rows(), 1);
+  EXPECT_NEAR(inside->face_distance_matrix(0, 0), -1.0, kTolerance);
+  EXPECT_NEAR(inside->face_distance_reference[0], 0.0, kTolerance);
+  EXPECT_NEAR(inside->face_distance_interval->lower_bound, -0.15, kTolerance);
+  EXPECT_NEAR(inside->face_distance_interval->upper_bound, 0.15, kTolerance);
+  EXPECT_DOUBLE_EQ(inside->position_error_m, 0.0);
+
+  current.translation() = Eigen::Vector3d(0.55, 0.0, 0.0);
+  const auto another_inside = makeTrackingVelocityTask(
+    current, Eigen::MatrixXd::Identity(6, 6), current.translation(),
+    Eigen::Vector3d(1.0, 0.0, 0.0), Eigen::Matrix3d::Identity(), config);
+  ASSERT_TRUE(another_inside.has_value());
+  EXPECT_FALSE(another_inside->face_distance_outside_band);
+  EXPECT_NEAR(another_inside->face_distance_reference[0], 0.0, kTolerance);
+  EXPECT_EQ(another_inside->task.secondary_matrix.rows(), 0);
+
+  current.translation() = Eigen::Vector3d(0.7, 0.1, -0.1);
+  const auto outside = makeTrackingVelocityTask(
+    current, Eigen::MatrixXd::Identity(6, 6), current.translation(),
+    Eigen::Vector3d(1.0, 0.0, 0.0), Eigen::Matrix3d::Identity(), config,
+    Eigen::Vector3d(0.03, -0.01, 0.02));
+  ASSERT_TRUE(outside.has_value());
+  ASSERT_TRUE(outside->face_distance_interval.has_value());
+  EXPECT_TRUE(outside->face_distance_outside_band);
+  const Eigen::Vector3d radial =
+    (current.translation() - Eigen::Vector3d(1.0, 0.0, 0.0)).normalized();
+  EXPECT_NEAR(outside->position_error_m, 0.4 - std::sqrt(0.11), kTolerance);
+  EXPECT_EQ(outside->task.secondary_matrix.rows(), 0);
+  ASSERT_EQ(outside->task.distance_matrix.rows(), 3);
+  EXPECT_TRUE(outside->task.distance_matrix.isApprox(
+      Eigen::MatrixXd::Identity(6, 6).topRows(3), kTolerance));
+  EXPECT_TRUE(outside->task.distance_reference.isApprox(
+      radial * outside->face_distance_reference[0], kTolerance));
+  EXPECT_TRUE(outside->task.distance_weights.isApprox(Eigen::VectorXd::Ones(3), kTolerance));
+
+  config.face_distance_max_m = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(makeTrackingVelocityTask(
+      current, Eigen::MatrixXd::Identity(6, 6), current.translation(),
+      Eigen::Vector3d(1.0, 0.0, 0.0), Eigen::Matrix3d::Identity(), config));
+}
+
+TEST(TrackingVelocityTask, FarDistanceRemainsSeparateSoftCartesianObjectiveAlongFaceRay)
+{
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  current.translation() = Eigen::Vector3d::Zero();
+  current.linear() = Eigen::Matrix3d::Identity();
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+  constexpr double kFarDistance = 3.0;
+  const Eigen::Vector3d face(kFarDistance, 0.0, 0.0);
+
+  const auto far = makeTrackingVelocityTask(
+    current, Eigen::MatrixXd::Identity(6, 6), current.translation(), face,
+    Eigen::Matrix3d::Identity(), config);
+  ASSERT_TRUE(far.has_value());
+  ASSERT_TRUE(far->face_distance_outside_band);
+  EXPECT_NEAR(far->position_error_m, kFarDistance - config.face_distance_max_m, kTolerance);
+  ASSERT_EQ(far->face_distance_matrix.rows(), 1);
+  EXPECT_NEAR(far->face_distance_reference[0], -config.maximum_linear_reference_mps,
+    kTolerance)
+    << "Unreachable distance should request only the maximum available approach rate";
+
+  EXPECT_EQ(far->task.secondary_matrix.rows(), 0)
+    << "Distance is a final soft objective and must not replace the gaze hierarchy level";
+  EXPECT_TRUE(far->task.secondary_constraints.empty())
+    << "An unreachable distance target must not become a hard velocity interval";
+  ASSERT_EQ(far->task.distance_matrix.rows(), 3);
+  EXPECT_TRUE(far->task.distance_matrix.isApprox(
+      Eigen::MatrixXd::Identity(6, 6).topRows(3), kTolerance));
+  EXPECT_TRUE(far->task.distance_reference.isApprox(
+      (current.translation() - face).normalized() * far->face_distance_reference[0],
+      kTolerance));
+}
+
+TEST(TrackingVelocityTask, DistanceObjectiveActivatesOnlyOutsideTheConfiguredBand)
+{
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+  const Eigen::Vector3d face(1.0, 0.0, 0.0);
+  const Eigen::MatrixXd jacobian = Eigen::MatrixXd::Identity(6, 6);
+
+  for (const double distance : {0.3995, 0.6005}) {
+    current.translation().x() = 1.0 - distance;
+    const auto outside = makeTrackingVelocityTask(
+      current, jacobian, current.translation(), face, Eigen::Matrix3d::Identity(), config);
+    ASSERT_TRUE(outside.has_value());
+    ASSERT_TRUE(outside->face_distance_outside_band);
+    ASSERT_TRUE(outside->face_distance_interval);
+    ASSERT_EQ(outside->task.distance_matrix.rows(), 3);
+    EXPECT_TRUE(outside->task.secondary_constraints.empty());
+    EXPECT_EQ(outside->task.secondary_matrix.rows(), 0);
+    const Eigen::Vector3d expected = (current.translation() - face).normalized() *
+      config.position_gain * (distance < 0.4 ? 0.4 - distance : 0.6 - distance);
+    EXPECT_TRUE(outside->task.distance_reference.isApprox(expected, kTolerance));
+  }
+
+  for (const double distance : {0.4, 0.4005, 0.5, 0.5995, 0.6}) {
+    current.translation().x() = 1.0 - distance;
+    const auto inside = makeTrackingVelocityTask(
+      current, jacobian, current.translation(), face, Eigen::Matrix3d::Identity(), config,
+      Eigen::Vector3d(-0.025, 0.0, 0.0));
+    ASSERT_TRUE(inside.has_value());
+    ASSERT_FALSE(inside->face_distance_outside_band);
+    ASSERT_TRUE(inside->face_distance_interval);
+    EXPECT_EQ(inside->task.distance_matrix.rows(), 0)
+      << "An empty distance level leaves motion within the band unconstrained";
+    EXPECT_EQ(inside->task.distance_reference.size(), 0);
+    EXPECT_TRUE(inside->task.secondary_constraints.empty());
+  }
+}
+
+TEST(TrackingVelocityTask, ToleranceShellRetainsConfiguredIntervalAndAcceptance)
+{
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.position_deadband_m = 0.03;
+  config.face_distance_min_m = 0.37;
+  config.face_distance_max_m = 0.43;
+  const Eigen::Vector3d face(1.0, 0.0, 0.0);
+  const Eigen::MatrixXd jacobian = Eigen::MatrixXd::Identity(6, 6);
+
+  for (const double distance : {0.3688, 0.4312}) {
+    current.translation().x() = 1.0 - distance;
+    const auto stationary = makeTrackingVelocityTask(
+      current, jacobian, current.translation(), face, Eigen::Matrix3d::Identity(), config);
+    ASSERT_TRUE(stationary.has_value());
+    ASSERT_TRUE(stationary->face_distance_interval.has_value());
+    EXPECT_TRUE(stationary->face_distance_outside_band);
+    EXPECT_FALSE(stationary->accepted)
+      << "The posture shell does not widen configured-band acceptance";
+    EXPECT_NEAR(stationary->position_error_m, 0.0012, 1.0e-12);
+    EXPECT_EQ(stationary->task.secondary_matrix.rows(), 0);
+    EXPECT_EQ(stationary->task.distance_matrix.rows(), 3);
+    EXPECT_NEAR(stationary->face_distance_interval->lower_bound,
+      config.position_gain * (config.face_distance_min_m - distance), 1.0e-12);
+    EXPECT_NEAR(stationary->face_distance_interval->upper_bound,
+      config.position_gain * (config.face_distance_max_m - distance), 1.0e-12);
+
+    const Eigen::Vector3d face_velocity(-0.025, 0.0, 0.0);
+    const auto moving = makeTrackingVelocityTask(
+      current, jacobian, current.translation(), face, Eigen::Matrix3d::Identity(), config,
+      face_velocity);
+    ASSERT_TRUE(moving.has_value());
+    ASSERT_TRUE(moving->face_distance_interval.has_value());
+    EXPECT_TRUE(moving->face_distance_outside_band);
+    EXPECT_NEAR(moving->face_distance_reference[0],
+      config.position_gain * (distance < config.face_distance_min_m ?
+      config.face_distance_min_m - distance : config.face_distance_max_m - distance) + 0.025,
+      1.0e-12);
+  }
+
+  for (const double distance : {config.face_distance_min_m, config.face_distance_max_m}) {
+    current.translation().x() = 1.0 - distance;
+    const auto at_configured_edge = makeTrackingVelocityTask(
+      current, jacobian, current.translation(), face, Eigen::Matrix3d::Identity(), config);
+    ASSERT_TRUE(at_configured_edge.has_value());
+    EXPECT_TRUE(at_configured_edge->accepted);
+    EXPECT_FALSE(at_configured_edge->face_distance_outside_band);
+    EXPECT_EQ(at_configured_edge->task.distance_matrix.rows(), 0);
+    EXPECT_EQ(at_configured_edge->task.secondary_matrix.rows(), 0);
+  }
+}
+
 TEST(TrackingVelocityTask, FaceEdgeRecoveryKeepsOnlyPrimaryEdgeRowAndZeroSecondary)
 {
   HierarchicalVelocityTask face_task;
@@ -141,6 +325,39 @@ TEST(TrackingVelocityTask, SeparatesTargetFeedforwardFromGainCorrectedError)
   EXPECT_NEAR(result->face_primary_feedforward_radps[2], 0.0, kTolerance);
 }
 
+TEST(TrackingVelocityTask, GazeDeadbandAppliesToCombinedFeedbackAndFeedforward)
+{
+  const Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  const Eigen::Vector3d face(1.0, 0.0, 0.0);
+  TrackingVelocityTaskConfig config;
+  config.orientation_gain = 4.0;
+  config.pointing_deadband_rad = 0.01;
+
+  const auto slow_feedforward = makeTrackingVelocityTask(
+    current, Eigen::MatrixXd::Identity(6, 6), Eigen::Vector3d::Zero(), face,
+    Eigen::Matrix3d::Identity(), config, Eigen::Vector3d(0.0, 0.02, 0.0));
+  ASSERT_TRUE(slow_feedforward.has_value());
+  EXPECT_NEAR(slow_feedforward->face_primary_feedforward_radps.head<2>().norm(),
+    0.02, kTolerance);
+  EXPECT_TRUE(slow_feedforward->task.primary_reference.head<2>().isZero(kTolerance))
+    << "Target motion inside the gaze quiet zone must not bypass it";
+
+  const auto fast_feedforward = makeTrackingVelocityTask(
+    current, Eigen::MatrixXd::Identity(6, 6), Eigen::Vector3d::Zero(), face,
+    Eigen::Matrix3d::Identity(), config, Eigen::Vector3d(0.0, 0.15, 0.0));
+  ASSERT_TRUE(fast_feedforward.has_value());
+  EXPECT_NEAR(fast_feedforward->task.primary_reference.head<2>().norm(), 0.11, 1.0e-6)
+    << "The continuous deadzone should retain feed-forward above gain*deadband";
+
+  config.pointing_deadband_rad = 0.0;
+  const auto no_deadband = makeTrackingVelocityTask(
+    current, Eigen::MatrixXd::Identity(6, 6), Eigen::Vector3d::Zero(), face,
+    Eigen::Matrix3d::Identity(), config, Eigen::Vector3d(0.0, 0.02, 0.0));
+  ASSERT_TRUE(no_deadband.has_value());
+  EXPECT_TRUE(no_deadband->task.primary_reference.head<2>().isApprox(
+      no_deadband->face_primary_feedforward_radps.head<2>(), kTolerance));
+}
+
 TEST(TrackingVelocityTask, PointingAndUprightRollJacobiansMatchFiniteDifference)
 {
   Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
@@ -202,9 +419,10 @@ TEST(TrackingVelocityTask, MovingFaceFeedForwardMatchesPointingFiniteDifference)
   const Eigen::Vector3d face(0.8, 0.6, 1.7);
   const Eigen::Vector3d face_velocity(0.12, -0.20, 0.09);
   current.linear() = upright_rotation(face - current.translation());
+  const TrackingVelocityTaskConfig config = zero_deadbands();
   const auto result = makeTrackingVelocityTask(
     current, Eigen::MatrixXd::Identity(6, 6), current.translation(), face,
-    Eigen::Matrix3d::Identity(), TrackingVelocityTaskConfig{}, face_velocity);
+    Eigen::Matrix3d::Identity(), config, face_velocity);
   ASSERT_TRUE(result.has_value());
   EXPECT_FALSE(result->accepted);
   EXPECT_TRUE(result->task.secondary_reference.head<3>().isZero(kTolerance));

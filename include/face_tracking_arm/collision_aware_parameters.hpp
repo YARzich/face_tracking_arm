@@ -37,10 +37,13 @@ struct ControllerParameters
 
   double position_gain{1.5};
   double orientation_gain{4.0};
+  double face_distance_min_m{0.37};
+  double face_distance_max_m{0.43};
   double maximum_linear_reference_mps{0.18};
   double maximum_angular_reference_radps{0.70};
   double position_deadband_m{0.10};
-  double pointing_deadband_rad{0.005};
+  /// Ordinary FACE gaze quiet zone, applied to feedback plus target feed-forward.
+  double pointing_deadband_rad{0.01};
   double primary_orientation_tolerance_radps{0.0002};
   double secondary_roll_weight{0.5};
   double velocity_regularization_weight{1.0e-4};
@@ -66,7 +69,7 @@ struct ControllerParameters
   double numerical_distance_reserve_m{0.0001};
   double default_distance_lipschitz_m_per_rad{2.6193};
 
-  int solver_max_iterations{2000};
+  int solver_max_iterations{2500};
   double solver_absolute_tolerance{1.0e-5};
   double solver_relative_tolerance{1.0e-5};
   double solver_time_limit_sec{0.003};

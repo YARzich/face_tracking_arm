@@ -89,9 +89,13 @@ bool CollisionAwareServoComponent::try_reference_guard_blend(
   const std::vector<control::LinearVelocityConstraint> & constraints,
   const control::CollisionConstraintDiagnostics & collision_diagnostics,
   std::optional<ValidatedCommand> & accepted_command,
-  control::QpResult & accepted_qp_result)
+  control::QpResult & accepted_qp_result,
+  control::CollisionValidationBudget * const budget)
 {
   for (const double tracking_weight : {0.5, 0.25}) {
+    if (budget != nullptr && budget->expired()) {
+      return false;
+    }
     auto blended_result = reference_guard_blend(
       tracking_result, brake_result, primary_matrix, constraints, tracking_weight);
     if (!blended_result) {
@@ -102,7 +106,7 @@ bool CollisionAwareServoComponent::try_reference_guard_blend(
     auto blended_command = validated_candidate(
       robot_state, current_state, motion_state, blended_result->joint_velocity,
       planning_scene, segment_validation_required, CommandAttempt::kTracking,
-      blend_failure, collision_diagnostics, blend_rejection_kind);
+      blend_failure, collision_diagnostics, blend_rejection_kind, budget);
     if (blended_command) {
       accepted_command = std::move(blended_command);
       accepted_qp_result = std::move(*blended_result);
@@ -123,15 +127,22 @@ bool CollisionAwareServoComponent::try_reference_guard_recovery(
   const std::vector<control::LinearVelocityConstraint> & constraints,
   const control::CollisionConstraintDiagnostics & collision_diagnostics,
   std::optional<ValidatedCommand> & accepted_command,
-  control::QpResult & accepted_qp_result)
+  control::QpResult & accepted_qp_result,
+  control::CollisionValidationBudget * const budget)
 {
   const auto recovery_task = control::makeFaceEdgeOnlyRecoveryTask(
     face_task, has_face_primary_roll);
   if (!recovery_task) {
     return false;
   }
+  if (budget != nullptr && budget->expired()) {
+    return false;
+  }
   control::QpResult recovery_result =
     solve_with_telemetry(*recovery_task, motion_state, constraints);
+  if (budget != nullptr && budget->expired()) {
+    return false;
+  }
   if (!recovery_result.command_available()) {
     log_qp_failure(
       CommandAttempt::kTracking, recovery_result, motion_state, constraints,
@@ -144,7 +155,7 @@ bool CollisionAwareServoComponent::try_reference_guard_recovery(
   auto recovery_command = validated_candidate(
     robot_state, current_state, motion_state, recovery_result.joint_velocity,
     planning_scene, segment_validation_required, CommandAttempt::kTracking,
-    recovery_failure, collision_diagnostics, recovery_rejection_kind);
+    recovery_failure, collision_diagnostics, recovery_rejection_kind, budget);
   if (!recovery_command) {
     return false;
   }
@@ -198,9 +209,12 @@ void CollisionAwareServoComponent::publish_control_status(
     publish_status(
       moveit_msgs::msg::ServoStatus::DECELERATE_FOR_COLLISION,
       accepted_qp_result.fully_solved() ? "Collision avoidance constraint active" :
-      "Safe primary orientation command only");
+      "Collision avoidance constraint active; lower-priority objective not completed");
   } else {
-    publish_status(moveit_msgs::msg::ServoStatus::NO_WARNING, "No warnings");
+    publish_status(
+      moveit_msgs::msg::ServoStatus::NO_WARNING,
+      accepted_qp_result.fully_solved() ? "No warnings" :
+      "Safe higher-priority tracking command; lower-priority objective not completed");
   }
 }
 
@@ -376,6 +390,391 @@ bool CollisionAwareServoComponent::validateHardwareIoForControlTick()
   return true;
 }
 
+bool CollisionAwareServoComponent::build_and_record_collision_context(
+  const planning_scene::PlanningScene & planning_scene,
+  const moveit::core::RobotState & robot_state,
+  const control::JointMotionState & motion_state,
+  control::CollisionConstraintResult & result)
+{
+  const auto collision_build_start = std::chrono::steady_clock::now();
+  result = collision_constraint_builder_->build(
+    planning_scene, robot_state, *joint_model_group_, motion_state, motion_limits_,
+    parameters_.control_period_sec);
+  (void)telemetry_.collision_build_statistics.add(std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - collision_build_start).count());
+  (void)telemetry_.collision_self_query_statistics.add(result.diagnostics.self_query_ms);
+  (void)telemetry_.collision_world_query_statistics.add(result.diagnostics.world_query_ms);
+  telemetry_.last_minimum_self_distance_m = result.diagnostics.minimum_self_distance_m;
+  telemetry_.last_minimum_world_distance_m = result.diagnostics.minimum_world_distance_m;
+  telemetry_.observeClearances(
+    result.diagnostics.minimum_self_distance_m, result.diagnostics.minimum_world_distance_m);
+  for (const auto & pair : result.diagnostics.pairs) {
+    const double headroom = pair.distance_m - pair.required_clearance_m;
+    const std::string pair_name = pair.first_body + " <-> " + pair.second_body;
+    if (std::isfinite(headroom) &&
+      (!telemetry_.last_minimum_robust_headroom_m.has_value() ||
+      headroom < *telemetry_.last_minimum_robust_headroom_m))
+    {
+      telemetry_.last_minimum_robust_headroom_m = headroom;
+      telemetry_.last_minimum_robust_headroom_pair = pair_name;
+    }
+    if (std::isfinite(headroom) &&
+      (!telemetry_.minimum_observed_robust_headroom_m.has_value() ||
+      headroom < *telemetry_.minimum_observed_robust_headroom_m))
+    {
+      telemetry_.minimum_observed_robust_headroom_m = headroom;
+      telemetry_.minimum_observed_robust_headroom_pair = pair_name;
+    }
+  }
+  telemetry_.last_closest_pair = result.diagnostics.closest_pair;
+  telemetry_.last_active_collision_rows =
+    result.diagnostics.active_distance_constraints;
+  current_tick_context_.active_collision_rows = static_cast<std::uint32_t>(
+    result.diagnostics.active_distance_constraints);
+  current_tick_context_.collision_distance_available = std::isfinite(
+    result.diagnostics.minimum_world_distance_m);
+  if (current_tick_context_.collision_distance_available) {
+    current_tick_context_.minimum_world_distance_m = result.diagnostics.minimum_world_distance_m;
+  }
+  const std::size_t closest_length = std::min(
+    result.diagnostics.closest_pair.size(), sizeof(current_tick_context_.closest_pair) - 1U);
+  std::copy_n(
+    result.diagnostics.closest_pair.data(), closest_length, current_tick_context_.closest_pair);
+  current_tick_context_.closest_pair[closest_length] = '\0';
+  for (const auto & pair : result.diagnostics.pairs) {
+    if (pair.kind != control::CollisionPairKind::kWorld || !pair.constraint_added ||
+      !std::isfinite(pair.distance_m))
+    {
+      continue;
+    }
+    if (!current_tick_context_.active_world_pair_available ||
+      pair.distance_m < current_tick_context_.active_world_pair_distance_m)
+    {
+      current_tick_context_.active_world_pair_available = true;
+      current_tick_context_.active_world_pair_distance_m = pair.distance_m;
+      constexpr std::size_t capacity = sizeof(current_tick_context_.active_world_pair);
+      std::size_t offset = 0U;
+      const std::size_t first_length = std::min(pair.first_body.size(), capacity - 1U);
+      std::copy_n(
+        pair.first_body.data(), first_length, current_tick_context_.active_world_pair);
+      offset += first_length;
+      for (const char character : std::array<char, 5>{' ', '<', '-', '>', ' '}) {
+        if (offset >= capacity - 1U) {
+          break;
+        }
+        current_tick_context_.active_world_pair[offset++] = character;
+      }
+      const std::size_t second_length = std::min(
+        pair.second_body.size(), capacity - 1U - offset);
+      std::copy_n(
+        pair.second_body.data(), second_length,
+        current_tick_context_.active_world_pair + offset);
+      offset += second_length;
+      current_tick_context_.active_world_pair[offset] = '\0';
+    }
+  }
+  telemetry_.last_outside_collision_viability_contacts =
+    result.diagnostics.outside_viability_contacts;
+  if (!result.diagnostics.valid) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "Collision constraint build failed: reason='%s', min_distance=%.6f m, pair='%s'",
+      result.diagnostics.failure_reason.c_str(), result.diagnostics.minimum_distance_m,
+      result.diagnostics.closest_pair.c_str());
+    enter_safety_wait(
+      "Collision constraints unavailable: " + result.diagnostics.failure_reason);
+    return false;
+  }
+  return true;
+}
+
+bool CollisionAwareServoComponent::recover_command_timeline(
+  const rclcpp::Time & current_time, const std::uint64_t skipped_periods)
+{
+  // Recover to the epoch's initial lead, which includes one control period
+  // beyond the send-time minimum for the next computation to complete.
+  const std::int64_t retry_target_lead_ns = seconds_to_nanoseconds(
+    servo_parameters_.max_expected_latency);
+  const auto timeline_recovery_periods = commands_.timelineRecoveryPeriods(
+    skipped_periods, current_time.nanoseconds(), retry_target_lead_ns);
+  if (!timeline_recovery_periods.has_value()) {
+    enter_controlled_rearm("Deferred command deadline has no active command-grid anchor");
+    return false;
+  }
+  std::string timeline_recovery_failure;
+  TimelineRecoveryStatus timeline_recovery_status = commands_.recoverTimeline(
+    *timeline_recovery_periods, current_time, timeline_recovery_failure,
+    servo_parameters_.max_expected_latency, parameters_.joint_names.size());
+  if (timeline_recovery_status == TimelineRecoveryStatus::kExhaustedPublishedSuffix) {
+    const auto target = current_target(current_time);
+    const auto expected_publication_id = commands_.active_publication_id;
+    const bool expected_epoch_active = commands_.epoch_active;
+    const bool expected_epoch_published = commands_.epoch_has_published;
+    const std::uint64_t expected_scene_revision =
+      planning_scene_collision_revision_.load(std::memory_order_acquire);
+    if (target && target->mode == msg::TrackingTarget::FACE &&
+      expected_publication_id.has_value() && expected_epoch_active &&
+      expected_epoch_published && expected_scene_revision == last_validated_scene_revision_)
+    {
+      std::string terminal_hold_reason;
+      const RearmReadiness readiness = safe_rearm_ready(
+        current_time, terminal_hold_reason);
+      const std::uint64_t current_scene_revision =
+        planning_scene_collision_revision_.load(std::memory_order_acquire);
+      const bool identity_unchanged = commands_.epoch_active &&
+        commands_.epoch_has_published &&
+        commands_.active_publication_id == expected_publication_id;
+      if (current_scene_revision != expected_scene_revision ||
+        current_scene_revision != last_validated_scene_revision_ || !identity_unchanged)
+      {
+        ++telemetry_.planning_scene_invalidation_count;
+        if (require_hardware_io_status_) {
+          request_hardware_inhibit();
+        }
+        enter_safety_wait(
+          "Terminal hold recovery lost its published command or validated collision scene");
+        return false;
+      }
+      if (readiness == RearmReadiness::kUnsafe) {
+        if (require_hardware_io_status_) {
+          request_hardware_inhibit();
+        }
+        enter_safety_wait(std::move(terminal_hold_reason));
+        return false;
+      }
+      if (readiness == RearmReadiness::kWaiting) {
+        publish_status(
+          moveit_msgs::msg::ServoStatus::DECELERATE_FOR_COLLISION,
+          std::move(terminal_hold_reason));
+        return false;
+      }
+
+      timeline_recovery_failure.clear();
+      timeline_recovery_status = commands_.resumeVerifiedTerminalHold(
+        *expected_publication_id, current_time, retry_target_lead_ns,
+        parameters_.joint_names.size(), true,
+        timeline_recovery_failure);
+    }
+  }
+  if (timeline_recovery_status != TimelineRecoveryStatus::kSuccess) {
+    ++telemetry_.timeline_recovery_failures;
+    std::string message = "Published command timeline recovery failed: " +
+      timeline_recovery_failure;
+    if (timeline_recovery_status == TimelineRecoveryStatus::kExhaustedPublishedSuffix) {
+      enter_controlled_rearm(std::move(message));
+    } else {
+      if (require_hardware_io_status_) {
+        request_hardware_inhibit();
+      }
+      enter_safety_wait(std::move(message));
+    }
+    return false;
+  }
+  commands_.completeDeferredCommandDeadlineRetry();
+  return true;
+}
+
+bool CollisionAwareServoComponent::prepare_verified_terminal_hold_publication(
+  const rclcpp::Time & tick_time, const msg::TrackingTarget & target,
+  const std::optional<control::PublicationId> & expected_publication_id,
+  const std::optional<rclcpp::Time> & expected_anchor_stamp,
+  const std::optional<std::uint64_t> & expected_hardware_epoch,
+  const std::optional<std::uint64_t> & expected_proven_hold_epoch,
+  const std::uint64_t expected_scene_revision,
+  std::optional<planning_scene_monitor::LockedPlanningSceneRO> & locked_scene,
+  planning_scene::PlanningSceneConstPtr & planning_scene)
+{
+  const auto command_identity_is_current = [this, &expected_publication_id,
+      &expected_anchor_stamp]() {
+      return expected_publication_id.has_value() && expected_anchor_stamp.has_value() &&
+             commands_.epoch_active && commands_.epoch_has_published &&
+             commands_.active_publication_id == expected_publication_id &&
+             commands_.hasVerifiedTerminalHold(parameters_.joint_names.size()) &&
+             !commands_.queue.empty() &&
+             commands_.queue.back().time_stamp == *expected_anchor_stamp;
+    };
+  const auto scene_is_current = [this, expected_scene_revision]() {
+      const std::uint64_t revision =
+        planning_scene_collision_revision_.load(std::memory_order_acquire);
+      return revision == expected_scene_revision &&
+             revision == last_validated_scene_revision_;
+    };
+  const auto target_is_current = [this, &target, &tick_time](const rclcpp::Time & at_time) {
+      const auto current = current_target(at_time);
+      return target_snapshot_is_current(target, tick_time, at_time) && current.has_value() &&
+             current->mode == target.mode && current->target_id == target.target_id &&
+             accept_pose_commands_.load(std::memory_order_acquire) &&
+             !pause_requested_.load(std::memory_order_acquire);
+    };
+  const auto fail_invariant = [this](std::string reason) {
+      if (require_hardware_io_status_) {
+        request_hardware_inhibit();
+      }
+      enter_safety_wait(std::move(reason));
+    };
+
+  if (!scene_is_current() || !planning_scene || !command_identity_is_current()) {
+    fail_invariant("Verified terminal hold lost its publication or validated collision scene");
+    return false;
+  }
+  const rclcpp::Time check_time = now();
+  if (check_time < tick_time) {
+    fail_invariant("ROS time rewound during verified terminal-hold validation");
+    return false;
+  }
+  if (!target_is_current(check_time)) {
+    return false;
+  }
+  const double anchor_lead_sec =
+    (commands_.queue.back().time_stamp - check_time).seconds();
+  if (!std::isfinite(anchor_lead_sec)) {
+    fail_invariant("Verified terminal-hold anchor has a non-finite send lead");
+    return false;
+  }
+  if (anchor_lead_sec + kFiniteEpsilon >= parameters_.residual_command_latency_sec) {
+    return true;
+  }
+
+  locked_scene.reset();
+  planning_scene.reset();
+  if (!validateHardwareIoForControlTick()) {
+    return false;
+  }
+  if ((expected_hardware_epoch.has_value() &&
+    (!cycle_hardware_io_status_.has_value() ||
+    cycle_hardware_io_status_->sample.epoch != *expected_hardware_epoch)) ||
+    (expected_proven_hold_epoch.has_value() &&
+    proven_q_hold_epoch_ != expected_proven_hold_epoch))
+  {
+    fail_invariant("Hardware I/O epoch changed during late terminal-hold validation");
+    return false;
+  }
+
+  std::string terminal_hold_reason;
+  const RearmReadiness readiness = safe_rearm_ready(check_time, terminal_hold_reason);
+  locked_scene.emplace(planning_scene_monitor_);
+  planning_scene = *locked_scene;
+  const rclcpp::Time proof_time = now();
+  if (!planning_scene || !scene_is_current() || !command_identity_is_current()) {
+    fail_invariant("Verified terminal hold or collision scene changed during late proof");
+    return false;
+  }
+  if (readiness == RearmReadiness::kUnsafe) {
+    fail_invariant(std::move(terminal_hold_reason));
+    return false;
+  }
+  if (proof_time < check_time) {
+    fail_invariant("ROS time rewound during late terminal-hold proof");
+    return false;
+  }
+  if (!target_is_current(proof_time)) {
+    return false;
+  }
+  if (readiness == RearmReadiness::kWaiting) {
+    publish_status(
+      moveit_msgs::msg::ServoStatus::DECELERATE_FOR_COLLISION,
+      std::move(terminal_hold_reason));
+    return false;
+  }
+
+  const std::int64_t target_lead_ns = seconds_to_nanoseconds(
+    servo_parameters_.max_expected_latency);
+  std::string resume_failure;
+  if (commands_.resumeVerifiedTerminalHold(
+      *expected_publication_id, proof_time, target_lead_ns,
+      parameters_.joint_names.size(), true, resume_failure) != TimelineRecoveryStatus::kSuccess)
+  {
+    fail_invariant(std::move(resume_failure));
+    return false;
+  }
+  return true;
+}
+
+std::optional<control::CollisionValidationBudget>
+CollisionAwareServoComponent::make_collision_validation_budget(
+  const bool ordinary_face_budget_scope, const bool verified_terminal_hold_candidate,
+  const rclcpp::Time & current_time,
+  const control::CollisionValidationBudget::Clock::time_point current_wall_time) const
+{
+  if (!ordinary_face_budget_scope || verified_terminal_hold_candidate ||
+    !commands_.epoch_active || !commands_.epoch_has_published ||
+    commands_.activePublication() == nullptr || commands_.queue.empty())
+  {
+    return std::nullopt;
+  }
+
+  const double replacement_lead_sec =
+    (commands_.queue.back().time_stamp - current_time).seconds();
+  const double available_budget_sec = std::isfinite(replacement_lead_sec) ?
+    std::max(0.0, replacement_lead_sec - parameters_.residual_command_latency_sec) : 0.0;
+  const auto budget_duration = std::chrono::duration_cast<
+    control::CollisionValidationBudget::Clock::duration>(
+    std::chrono::duration<double>(available_budget_sec));
+  return control::CollisionValidationBudget(current_wall_time + budget_duration);
+}
+
+bool CollisionAwareServoComponent::stop_for_expired_collision_validation_budget(
+  const control::CollisionValidationBudget * const budget)
+{
+  if (budget == nullptr || !budget->expired()) {
+    return false;
+  }
+  ++telemetry_.collision_validation_budget_exhaustion_count;
+  controller_mode_ = ControllerMode::kBraking;
+  publish_status(
+    moveit_msgs::msg::ServoStatus::DECELERATE_FOR_COLLISION,
+    "Collision validation budget exhausted; continuing the published safe trajectory");
+  return true;
+}
+
+bool CollisionAwareServoComponent::validate_actual_collision_state(
+  const planning_scene::PlanningScene & planning_scene,
+  const moveit::core::RobotState & robot_state)
+{
+  auto actual_robot_state = std::make_shared<moveit::core::RobotState>(robot_state);
+  control::ActualPositionEncoding actual_position_encoding =
+    control::ActualPositionEncoding::kDouble;
+  if (require_hardware_io_status_) {
+    const auto hardware_status = current_hardware_io_status();
+    if (!hardware_status || !hardware_status->valid) {
+      request_hardware_inhibit();
+      enter_safety_wait("Hardware read is unavailable for actual collision validation");
+      return false;
+    }
+    actual_robot_state->setJointGroupPositions(
+      joint_model_group_, hardware_status->sample.position.data());
+    actual_robot_state->update(true);
+    actual_position_encoding = control::ActualPositionEncoding::kSdkFloatPromotedToDouble;
+  }
+  const control::CollisionActualStateValidationResult actual_state_validation =
+    collision_constraint_builder_->validateActualState(
+    planning_scene, *actual_robot_state, *joint_model_group_, actual_position_encoding);
+  ++telemetry_.actual_state_validation_count;
+  telemetry_.last_actual_minimum_self_distance_m =
+    std::isfinite(actual_state_validation.minimum_self_distance_m) ?
+    std::optional<double>{actual_state_validation.minimum_self_distance_m} : std::nullopt;
+  telemetry_.last_actual_minimum_world_distance_m =
+    std::isfinite(actual_state_validation.minimum_world_distance_m) ?
+    std::optional<double>{actual_state_validation.minimum_world_distance_m} : std::nullopt;
+  telemetry_.last_actual_closest_pair = actual_state_validation.closest_pair.empty() ?
+    "outside hard-clearance query" : actual_state_validation.closest_pair;
+  telemetry_.observeClearances(
+    actual_state_validation.minimum_self_distance_m,
+    actual_state_validation.minimum_world_distance_m);
+  if (!actual_state_validation.input_valid || actual_state_validation.unsafe) {
+    ++telemetry_.actual_state_validation_failure_count;
+    const std::string reason = !actual_state_validation.input_valid ?
+      actual_state_validation.failure_reason :
+      "hard-clearance/corridor violation for " + telemetry_.last_actual_closest_pair;
+    if (require_hardware_io_status_) {
+      request_hardware_inhibit();
+    }
+    enter_safety_wait("Measured robot state is unsafe: " + reason);
+    return false;
+  }
+  return true;
+}
+
 void CollisionAwareServoComponent::control_tick()
 {
   const rclcpp::Time current_time = now();
@@ -392,35 +791,9 @@ void CollisionAwareServoComponent::control_tick()
     return;
   }
 
-  // Recover to the epoch's initial lead, which includes one control period
-  // beyond the send-time minimum for the next computation to complete.
-  const std::int64_t retry_target_lead_ns = seconds_to_nanoseconds(
-    servo_parameters_.max_expected_latency);
-  const auto timeline_recovery_periods = commands_.timelineRecoveryPeriods(
-    time_observation.skipped_periods, current_time.nanoseconds(), retry_target_lead_ns);
-  if (!timeline_recovery_periods.has_value()) {
-    enter_controlled_rearm("Deferred command deadline has no active command-grid anchor");
+  if (!recover_command_timeline(current_time, time_observation.skipped_periods)) {
     return;
   }
-  std::string timeline_recovery_failure;
-  const TimelineRecoveryStatus timeline_recovery_status = commands_.recoverTimeline(
-    *timeline_recovery_periods, current_time, timeline_recovery_failure,
-    servo_parameters_.max_expected_latency, parameters_.joint_names.size());
-  if (timeline_recovery_status != TimelineRecoveryStatus::kSuccess) {
-    ++telemetry_.timeline_recovery_failures;
-    std::string message = "Published command timeline recovery failed: " +
-      timeline_recovery_failure;
-    if (timeline_recovery_status == TimelineRecoveryStatus::kExhaustedPublishedSuffix) {
-      enter_controlled_rearm(std::move(message));
-    } else {
-      if (require_hardware_io_status_) {
-        request_hardware_inhibit();
-      }
-      enter_safety_wait(std::move(message));
-    }
-    return;
-  }
-  commands_.completeDeferredCommandDeadlineRetry();
 
   std::string state_failure_reason;
   bool requires_latched_halt = false;
@@ -468,8 +841,9 @@ void CollisionAwareServoComponent::control_tick()
   robot_state = std::make_shared<moveit::core::RobotState>(*robot_state);
   robot_state->update(true);
 
-  planning_scene_monitor::LockedPlanningSceneRO locked_scene(planning_scene_monitor_);
-  const planning_scene::PlanningSceneConstPtr planning_scene = locked_scene;
+  std::optional<planning_scene_monitor::LockedPlanningSceneRO> locked_scene;
+  locked_scene.emplace(planning_scene_monitor_);
+  planning_scene::PlanningSceneConstPtr planning_scene = *locked_scene;
   const std::uint64_t collision_scene_revision = planning_scene_collision_revision_.load(
     std::memory_order_acquire);
   if (commands_.epoch_active && collision_scene_revision != last_validated_scene_revision_) {
@@ -482,45 +856,7 @@ void CollisionAwareServoComponent::control_tick()
     return;
   }
   last_validated_scene_revision_ = collision_scene_revision;
-  auto actual_robot_state = std::make_shared<moveit::core::RobotState>(*robot_state);
-  control::ActualPositionEncoding actual_position_encoding =
-    control::ActualPositionEncoding::kDouble;
-  if (require_hardware_io_status_) {
-    const auto hardware_status = current_hardware_io_status();
-    if (!hardware_status || !hardware_status->valid) {
-      request_hardware_inhibit();
-      enter_safety_wait("Hardware read is unavailable for actual collision validation");
-      return;
-    }
-    actual_robot_state->setJointGroupPositions(
-      joint_model_group_, hardware_status->sample.position.data());
-    actual_robot_state->update(true);
-    actual_position_encoding = control::ActualPositionEncoding::kSdkFloatPromotedToDouble;
-  }
-  const control::CollisionActualStateValidationResult actual_state_validation =
-    collision_constraint_builder_->validateActualState(
-    *planning_scene, *actual_robot_state, *joint_model_group_, actual_position_encoding);
-  ++telemetry_.actual_state_validation_count;
-  telemetry_.last_actual_minimum_self_distance_m =
-    std::isfinite(actual_state_validation.minimum_self_distance_m) ?
-    std::optional<double>{actual_state_validation.minimum_self_distance_m} : std::nullopt;
-  telemetry_.last_actual_minimum_world_distance_m =
-    std::isfinite(actual_state_validation.minimum_world_distance_m) ?
-    std::optional<double>{actual_state_validation.minimum_world_distance_m} : std::nullopt;
-  telemetry_.last_actual_closest_pair = actual_state_validation.closest_pair.empty() ?
-    "outside hard-clearance query" : actual_state_validation.closest_pair;
-  telemetry_.observeClearances(
-    actual_state_validation.minimum_self_distance_m,
-    actual_state_validation.minimum_world_distance_m);
-  if (!actual_state_validation.input_valid || actual_state_validation.unsafe) {
-    ++telemetry_.actual_state_validation_failure_count;
-    const std::string reason = !actual_state_validation.input_valid ?
-      actual_state_validation.failure_reason :
-      "hard-clearance/corridor violation for " + telemetry_.last_actual_closest_pair;
-    if (require_hardware_io_status_) {
-      request_hardware_inhibit();
-    }
-    enter_safety_wait("Measured robot state is unsafe: " + reason);
+  if (!validate_actual_collision_state(*planning_scene, *robot_state)) {
     return;
   }
 
@@ -535,102 +871,15 @@ void CollisionAwareServoComponent::control_tick()
   motion_state.acceleration = state->accelerations;
   telemetry_.observeMotionState(motion_state);
 
-  const auto collision_build_start = std::chrono::steady_clock::now();
-  const control::CollisionConstraintResult collision_result =
-    collision_constraint_builder_->build(
-    *planning_scene, *robot_state, *joint_model_group_, motion_state, motion_limits_,
-    parameters_.control_period_sec);
-  (void)telemetry_.collision_build_statistics.add(std::chrono::duration<double, std::milli>(
-      std::chrono::steady_clock::now() - collision_build_start).count());
-  (void)telemetry_.collision_self_query_statistics.add(collision_result.diagnostics.self_query_ms);
-  (void)telemetry_.collision_world_query_statistics.add(
-      collision_result.diagnostics.world_query_ms);
-  telemetry_.last_minimum_self_distance_m =
-    collision_result.diagnostics.minimum_self_distance_m;
-  telemetry_.last_minimum_world_distance_m =
-    collision_result.diagnostics.minimum_world_distance_m;
-  telemetry_.observeClearances(
-    collision_result.diagnostics.minimum_self_distance_m,
-    collision_result.diagnostics.minimum_world_distance_m);
-  for (const auto & pair : collision_result.diagnostics.pairs) {
-    const double headroom = pair.distance_m - pair.required_clearance_m;
-    const std::string pair_name = pair.first_body + " <-> " + pair.second_body;
-    if (std::isfinite(headroom) &&
-      (!telemetry_.last_minimum_robust_headroom_m.has_value() ||
-      headroom < *telemetry_.last_minimum_robust_headroom_m))
-    {
-      telemetry_.last_minimum_robust_headroom_m = headroom;
-      telemetry_.last_minimum_robust_headroom_pair = pair_name;
-    }
-    if (std::isfinite(headroom) &&
-      (!telemetry_.minimum_observed_robust_headroom_m.has_value() ||
-      headroom < *telemetry_.minimum_observed_robust_headroom_m))
-    {
-      telemetry_.minimum_observed_robust_headroom_m = headroom;
-      telemetry_.minimum_observed_robust_headroom_pair = pair_name;
-    }
+  if (commands_.startup_warmup_complete && !commands_.epoch_active) {
+    process_startup_cycle(*state, *robot_state, *planning_scene);
+    return;
   }
-  telemetry_.last_closest_pair = collision_result.diagnostics.closest_pair;
-  telemetry_.last_active_collision_rows =
-    collision_result.diagnostics.active_distance_constraints;
-  current_tick_context_.active_collision_rows = static_cast<std::uint32_t>(
-    collision_result.diagnostics.active_distance_constraints);
-  current_tick_context_.collision_distance_available = std::isfinite(
-    collision_result.diagnostics.minimum_world_distance_m);
-  if (current_tick_context_.collision_distance_available) {
-    current_tick_context_.minimum_world_distance_m =
-      collision_result.diagnostics.minimum_world_distance_m;
-  }
-  const std::size_t closest_length = std::min(
-    collision_result.diagnostics.closest_pair.size(),
-    sizeof(current_tick_context_.closest_pair) - 1U);
-  std::copy_n(
-    collision_result.diagnostics.closest_pair.data(), closest_length,
-    current_tick_context_.closest_pair);
-  current_tick_context_.closest_pair[closest_length] = '\0';
-  for (const auto & pair : collision_result.diagnostics.pairs) {
-    if (pair.kind != control::CollisionPairKind::kWorld || !pair.constraint_added ||
-      !std::isfinite(pair.distance_m))
-    {
-      continue;
-    }
-    if (!current_tick_context_.active_world_pair_available ||
-      pair.distance_m < current_tick_context_.active_world_pair_distance_m)
-    {
-      current_tick_context_.active_world_pair_available = true;
-      current_tick_context_.active_world_pair_distance_m = pair.distance_m;
-      constexpr std::size_t capacity = sizeof(current_tick_context_.active_world_pair);
-      std::size_t offset = 0U;
-      const std::size_t first_length = std::min(pair.first_body.size(), capacity - 1U);
-      std::copy_n(
-        pair.first_body.data(), first_length, current_tick_context_.active_world_pair);
-      offset += first_length;
-      for (const char character : std::array<char, 5>{' ', '<', '-', '>', ' '}) {
-        if (offset >= capacity - 1U) {
-          break;
-        }
-        current_tick_context_.active_world_pair[offset++] = character;
-      }
-      const std::size_t second_length = std::min(
-        pair.second_body.size(), capacity - 1U - offset);
-      std::copy_n(
-        pair.second_body.data(), second_length,
-        current_tick_context_.active_world_pair + offset);
-      offset += second_length;
-      current_tick_context_.active_world_pair[offset] = '\0';
-    }
-  }
-  telemetry_.last_outside_collision_viability_contacts =
-    collision_result.diagnostics.outside_viability_contacts;
-  if (!collision_result.diagnostics.valid) {
-    RCLCPP_ERROR(
-      get_logger(),
-      "Collision constraint build failed: reason='%s', min_distance=%.6f m, pair='%s'",
-      collision_result.diagnostics.failure_reason.c_str(),
-      collision_result.diagnostics.minimum_distance_m,
-      collision_result.diagnostics.closest_pair.c_str());
-    enter_safety_wait(
-      "Collision constraints unavailable: " + collision_result.diagnostics.failure_reason);
+
+  control::CollisionConstraintResult collision_result;
+  if (!build_and_record_collision_context(
+    *planning_scene, *robot_state, motion_state, collision_result))
+  {
     return;
   }
 
@@ -668,6 +917,31 @@ void CollisionAwareServoComponent::control_tick()
     actual_feedback_time_sec, motion_state, active_publication, latest_publication);
   current_tick_context_.target_used_for_reference =
     tracking_requested && reference.tracking.has_value();
+  const bool ordinary_face_budget_scope = target &&
+    target->mode == msg::TrackingTarget::FACE && tracking_requested && reference.tracking &&
+    reference.tracking->has_face_primary_roll && !reference.follows_path &&
+    !motion_reference_->compactManeuverActive();
+  const bool verified_terminal_hold_candidate = ordinary_face_budget_scope &&
+    commands_.hasVerifiedTerminalHold(parameters_.joint_names.size());
+  const auto verified_terminal_publication_id = verified_terminal_hold_candidate ?
+    commands_.active_publication_id : std::optional<control::PublicationId>{};
+  const auto verified_terminal_anchor_stamp = verified_terminal_hold_candidate ?
+    std::optional<rclcpp::Time>{commands_.queue.back().time_stamp} :
+  std::optional<rclcpp::Time>{};
+  const std::optional<std::uint64_t> verified_terminal_hardware_epoch =
+    require_hardware_io_status_ && cycle_hardware_io_status_.has_value() ?
+    std::optional<std::uint64_t>{cycle_hardware_io_status_->sample.epoch} :
+  std::nullopt;
+  const auto verified_terminal_proven_hold_epoch = proven_q_hold_.has_value() ?
+    proven_q_hold_epoch_ : std::optional<std::uint64_t>{};
+  auto collision_validation_budget = make_collision_validation_budget(
+    ordinary_face_budget_scope, verified_terminal_hold_candidate, current_time,
+    current_wall_time);
+  control::CollisionValidationBudget * const collision_budget =
+    collision_validation_budget ? &*collision_validation_budget : nullptr;
+  if (stop_for_expired_collision_validation_budget(collision_budget)) {
+    return;
+  }
   if (reference.motion_reference_support_unavailable) {
     mitigated_failure =
       "Motion-reference safety support is unavailable; using the validated braking command";
@@ -693,9 +967,14 @@ void CollisionAwareServoComponent::control_tick()
     (void)telemetry_.pointing_error_statistics.add(reference.tracking->pointing_error_rad);
   }
   if (reference.task && !reference.motion_reference_support_unavailable) {
-    const auto & task = reference.task;
-    control::QpResult tracking_result =
-      solve_with_telemetry(*task, motion_state, constraints);
+    auto task = *reference.task;
+    if (stop_for_expired_collision_validation_budget(collision_budget)) {
+      return;
+    }
+    control::QpResult tracking_result = solve_with_telemetry(task, motion_state, constraints);
+    if (stop_for_expired_collision_validation_budget(collision_budget)) {
+      return;
+    }
     if (!tracking_result.command_available()) {
       log_qp_failure(
         CommandAttempt::kTracking, tracking_result, motion_state, constraints,
@@ -712,7 +991,10 @@ void CollisionAwareServoComponent::control_tick()
       accepted_command = validated_candidate(
         robot_state, *state, motion_state, tracking_result.joint_velocity,
         *planning_scene, segment_validation_required, CommandAttempt::kTracking,
-        candidate_failure, collision_result.diagnostics, rejection_kind);
+        candidate_failure, collision_result.diagnostics, rejection_kind, collision_budget);
+      if (stop_for_expired_collision_validation_budget(collision_budget)) {
+        return;
+      }
       if (accepted_command.has_value()) {
         accepted_qp_result = tracking_result;
         controller_mode_ = ControllerMode::kTracking;
@@ -738,8 +1020,14 @@ void CollisionAwareServoComponent::control_tick()
   }
 
   if (!accepted_command.has_value()) {
+    if (stop_for_expired_collision_validation_budget(collision_budget)) {
+      return;
+    }
     const control::QpResult braking_result =
       brake_with_telemetry(motion_state, collision_result.constraints);
+    if (stop_for_expired_collision_validation_budget(collision_budget)) {
+      return;
+    }
     if (!braking_result.command_available()) {
       log_qp_failure(
         CommandAttempt::kBraking, braking_result, motion_state,
@@ -766,7 +1054,11 @@ void CollisionAwareServoComponent::control_tick()
     accepted_command = validated_candidate(
       robot_state, *state, motion_state, braking_result.joint_velocity,
       *planning_scene, segment_validation_required, CommandAttempt::kBraking,
-      braking_candidate_failure, collision_result.diagnostics, rejection_kind);
+      braking_candidate_failure, collision_result.diagnostics, rejection_kind,
+      collision_budget);
+    if (stop_for_expired_collision_validation_budget(collision_budget)) {
+      return;
+    }
     if (!accepted_command.has_value()) {
       const auto continuation_status = tryContinuePublishedBrake(
         current_time, target, tracking_requested, collision_scene_revision);
@@ -793,7 +1085,10 @@ void CollisionAwareServoComponent::control_tick()
           robot_state, *state, motion_state, *planning_scene,
           segment_validation_required, *guard_rejected_tracking_result, braking_result,
           reference.task->primary_matrix, constraints, collision_result.diagnostics,
-          accepted_command, accepted_qp_result);
+          accepted_command, accepted_qp_result, collision_budget);
+      }
+      if (stop_for_expired_collision_validation_budget(collision_budget)) {
+        return;
       }
       if (reference_guard_blend_accepted) {
         controller_mode_ = ControllerMode::kTracking;
@@ -810,7 +1105,11 @@ void CollisionAwareServoComponent::control_tick()
             robot_state, *state, motion_state, *planning_scene,
             segment_validation_required, *reference.task,
             reference.tracking->has_face_primary_roll, constraints,
-            collision_result.diagnostics, accepted_command, accepted_qp_result);
+            collision_result.diagnostics, accepted_command, accepted_qp_result,
+            collision_budget);
+          if (stop_for_expired_collision_validation_budget(collision_budget)) {
+            return;
+          }
         }
         if (reference_guard_recovery_accepted) {
           controller_mode_ = ControllerMode::kTracking;
@@ -839,21 +1138,48 @@ void CollisionAwareServoComponent::control_tick()
     return;
   }
 
+  if (verified_terminal_hold_candidate && !prepare_verified_terminal_hold_publication(
+      current_time, *target, verified_terminal_publication_id,
+      verified_terminal_anchor_stamp, verified_terminal_hardware_epoch,
+      verified_terminal_proven_hold_epoch, collision_scene_revision,
+      locked_scene, planning_scene))
+  {
+    return;
+  }
+
   std::string publication_failure;
+  if (stop_for_expired_collision_validation_budget(collision_budget)) {
+    return;
+  }
   const CommandPublicationStatus publication_status = enqueue_and_publish(
-    *state, std::move(*accepted_command), current_time, publication_failure);
+    *state, std::move(*accepted_command), current_time, publication_failure, collision_budget);
+  if (publication_status == CommandPublicationStatus::kCollisionValidationBudgetExhausted) {
+    (void)stop_for_expired_collision_validation_budget(collision_budget);
+    return;
+  }
   if (publication_status != CommandPublicationStatus::kSuccess) {
     if (reference.tracking) {
       motion_reference_->recordFaceCommand(
         *reference.tracking, accepted_qp_result, current_time.seconds(), false,
         reference.actual_face_alignment);
     }
-    if (publication_status == CommandPublicationStatus::kRecoverableCommandDeadline &&
-      commands_.deferCommandDeadlineRetry())
+    if (publication_status == CommandPublicationStatus::kRecoverableCommandDeadline ||
+      publication_status == CommandPublicationStatus::kRecoverableTimingFailure)
     {
-      // Drop this stale candidate. The next cycle may only resume from an
-      // exact point in the already-published, validated trajectory suffix.
-      return;
+      const bool continuation_mode = target &&
+        (target->mode == msg::TrackingTarget::FACE || target->mode == msg::TrackingTarget::REST);
+      if (tracking_requested && continuation_mode) {
+        const auto continuation_status = tryContinuePublishedBrake(
+          current_time, target, tracking_requested, collision_scene_revision);
+        if (continuation_status != PublishedBrakeContinuationStatus::kNotEligible) {
+          return;
+        }
+      }
+      if (commands_.deferCommandDeadlineRetry()) {
+        // Drop this stale candidate. The next cycle may only resume from an
+        // exact point in the already-published, validated trajectory suffix.
+        return;
+      }
     }
     if (publication_status == CommandPublicationStatus::kRecoverableCommandDeadline ||
       publication_status == CommandPublicationStatus::kRecoverableTimingFailure)
@@ -879,11 +1205,11 @@ void CollisionAwareServoComponent::control_tick()
   update_pause_after_publication();
 
   const bool collision_avoidance_active =
-    collision_result.diagnostics.active_distance_constraints > 0U ||
-    !accepted_qp_result.fully_solved();
+    collision_result.diagnostics.active_distance_constraints > 0U;
   publish_control_status(
     collision_avoidance_active, reference_guard_blend_accepted,
-    reference_guard_recovery_accepted, mitigated_failure, accepted_qp_result,
+    reference_guard_recovery_accepted,
+    mitigated_failure, accepted_qp_result,
     mitigated_status);
 }
 
@@ -946,11 +1272,19 @@ PublishedBrakeContinuationStatus CollisionAwareServoComponent::tryContinuePublis
       controller_mode_ = ControllerMode::kBraking;
       publish_status(
         moveit_msgs::msg::ServoStatus::DECELERATE_FOR_COLLISION,
-        "Continuing one exact sample from the validated published braking suffix");
+        "Continuing exact samples from the validated published braking suffix");
       return PublishedBrakeContinuationStatus::kContinued;
     case PublishedBrakeContinuationStatus::kNotEligible:
       return reject_reference_path(PublishedBrakeContinuationStatus::kNotEligible);
     case PublishedBrakeContinuationStatus::kExhaustedPublishedSuffix:
+      if (target->mode == msg::TrackingTarget::FACE) {
+        controller_mode_ = ControllerMode::kBraking;
+        publish_status(
+          moveit_msgs::msg::ServoStatus::DECELERATE_FOR_COLLISION,
+          "Published FACE braking suffix is exhausted; keeping it for next-tick proof");
+        // kContinued means only that this tick keeps the existing publication unchanged.
+        return PublishedBrakeContinuationStatus::kContinued;
+      }
       enter_controlled_rearm(
         "Published braking continuation has no transmitted future sample: " +
         continuation_failure);
@@ -980,8 +1314,12 @@ control::QpResult CollisionAwareServoComponent::solve_with_telemetry(
   control::QpResult handoff;
   handoff.primary_snapshot_disposition = result.primary_snapshot_disposition;
   handoff.secondary_snapshot_disposition = result.secondary_snapshot_disposition;
+  handoff.tertiary_snapshot_disposition = result.tertiary_snapshot_disposition;
+  handoff.distance_snapshot_disposition = result.distance_snapshot_disposition;
   handoff.primary_failure_snapshot = std::move(result.primary_failure_snapshot);
   handoff.secondary_failure_snapshot = std::move(result.secondary_failure_snapshot);
+  handoff.tertiary_failure_snapshot = std::move(result.tertiary_failure_snapshot);
+  handoff.distance_failure_snapshot = std::move(result.distance_failure_snapshot);
   control::QpFailureSnapshotContext context;
   context.ros_stamp_ns = now().nanoseconds();
   context.steady_stamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1010,8 +1348,12 @@ control::QpResult CollisionAwareServoComponent::brake_with_telemetry(
   control::QpResult handoff;
   handoff.primary_snapshot_disposition = result.primary_snapshot_disposition;
   handoff.secondary_snapshot_disposition = result.secondary_snapshot_disposition;
+  handoff.tertiary_snapshot_disposition = result.tertiary_snapshot_disposition;
+  handoff.distance_snapshot_disposition = result.distance_snapshot_disposition;
   handoff.primary_failure_snapshot = std::move(result.primary_failure_snapshot);
   handoff.secondary_failure_snapshot = std::move(result.secondary_failure_snapshot);
+  handoff.tertiary_failure_snapshot = std::move(result.tertiary_failure_snapshot);
+  handoff.distance_failure_snapshot = std::move(result.distance_failure_snapshot);
   control::QpFailureSnapshotContext context;
   context.ros_stamp_ns = now().nanoseconds();
   context.steady_stamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(

@@ -2,6 +2,8 @@ face_tracking_controller:
   ros__parameters:
     idle_behavior: rest
     minimum_face_distance_m: 0.40
+    face_distance_min_m: 0.37
+    face_distance_max_m: 0.43
     safe_reach_radius_m: 0.65
     # Tolerate brief detector / DDS scheduling gaps on modest hardware without
     # flickering FACE -> HOLD. A genuinely lost target still returns to REST

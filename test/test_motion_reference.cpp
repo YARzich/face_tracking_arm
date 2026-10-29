@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include <Eigen/Geometry>
+#include <Eigen/LU>
 #include <geometric_shapes/shapes.h>
 #include <gtest/gtest.h>
 
@@ -10,8 +11,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <iomanip>
+#include <iostream>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -24,17 +28,23 @@
 #include <utility>
 #include <vector>
 
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 
 #include "collision_aware_servo_component.hpp"
+#include "collision_stopping.hpp"
 #include "face_tracking_arm/face_tracking_policy.hpp"
 #include "face_tracking_arm/motion_reference.hpp"
 #include "face_tracking_arm/pointing_geometry.hpp"
 #include "face_tracking_arm/compact_upright.hpp"
 #include "face_tracking_arm/emergency_brake_tail.hpp"
 #include "face_tracking_arm/horizontal_edge_upright.hpp"
+#include "face_tracking_arm/qp_failure_snapshot_io.hpp"
 #include "face_tracking_arm/tracking_velocity_task.hpp"
+#include "face_tracking_arm/posture_preference.hpp"
+#include "face_tracking_arm/detail/scalar_braking_policy.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -73,6 +83,16 @@ public:
   {
     return reference.compact_preparation_ ?
            reference.compact_preparation_->candidates.size() : 0U;
+  }
+
+  [[nodiscard]] static double comfortableJoint3Lower(const MotionReference & reference)
+  {
+    return reference.posture_preference_config_.comfortable_joint3_lower;
+  }
+
+  [[nodiscard]] static double comfortableJoint3Upper(const MotionReference & reference)
+  {
+    return reference.posture_preference_config_.comfortable_joint3_upper;
   }
 
   [[nodiscard]] static CompactGoal candidate(
@@ -132,6 +152,38 @@ public:
     reference.rest_settling_ = false;
     return reference.follower_.setPath(path, position, time_sec);
   }
+
+  static bool installFaceFollowerPathForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const std::vector<Eigen::VectorXd> & path, const double time_sec)
+  {
+    Eigen::VectorXd position;
+    state.copyJointGroupPositions(reference.group_, position);
+    return reference.follower_.setPath(path, position, time_sec);
+  }
+
+  static bool installSearchFollowerPathForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const std::vector<Eigen::VectorXd> & path, const double time_sec)
+  {
+    Eigen::VectorXd position;
+    state.copyJointGroupPositions(reference.group_, position);
+    reference.planner_->cancel();
+    reference.pending_generation_.reset();
+    reference.rest_mode_ = MotionReference::RestMode::kSearch;
+    return reference.follower_.setPath(path, position, time_sec);
+  }
+
+  [[nodiscard]] static Eigen::VectorXd searchGoal(const MotionReference & reference)
+  {
+    return reference.search_->goal();
+  }
+
+  [[nodiscard]] static bool plannerBusy(const MotionReference & reference)
+  {
+    return reference.planner_->isBusy();
+  }
+
 
   static double assemblyRadiusForTest(
     const MotionReference & reference, const moveit::core::RobotState & state)
@@ -440,6 +492,65 @@ public:
       "/test/servo_status", rclcpp::QoS(1));
   }
 
+  static void installTrajectoryPublisher(CollisionAwareServoComponent & component)
+  {
+    component.trajectory_publisher_ = component.create_publisher<
+      trajectory_msgs::msg::JointTrajectory>("/test/command", rclcpp::QoS(1));
+  }
+
+  static std::size_t trajectorySubscriberCount(const CollisionAwareServoComponent & component)
+  {
+    return component.trajectory_publisher_ ?
+           component.trajectory_publisher_->get_subscription_count() : 0U;
+  }
+
+  static void prepareStartupControlTick(
+    CollisionAwareServoComponent & component, const bool warmup_complete)
+  {
+    component.commands_.startup_warmup_complete = warmup_complete;
+    component.accept_pose_commands_.store(true, std::memory_order_release);
+    component.trajectory_controller_active_.store(true, std::memory_order_release);
+  }
+
+  static std::size_t qpSampleCount(const CollisionAwareServoComponent & component)
+  {
+    return component.telemetry_.qp_statistics.count();
+  }
+
+  static std::size_t pointingSampleCount(const CollisionAwareServoComponent & component)
+  {
+    return component.telemetry_.pointing_error_statistics.count();
+  }
+
+  static std::uint64_t actualStateValidationCount(
+    const CollisionAwareServoComponent & component)
+  {
+    return component.telemetry_.actual_state_validation_count;
+  }
+
+  static std::uint64_t bootstrapSegmentValidationCount(
+    const CollisionAwareServoComponent & component)
+  {
+    return component.telemetry_.bootstrap_segment_validation_count;
+  }
+
+  static std::size_t bootstrapSourceStableSamples(
+    const CollisionAwareServoComponent & component)
+  {
+    return component.commands_.bootstrap_source_stable_samples;
+  }
+
+  static bool epochActive(const CollisionAwareServoComponent & component)
+  {
+    return component.commands_.epoch_active;
+  }
+
+  static bool rearmPending(const CollisionAwareServoComponent & component)
+  {
+    return component.commands_.rearm_pending ||
+           component.commands_.published_tail_rearm_pending;
+  }
+
   static void setControllerState(
     CollisionAwareServoComponent & component, const Eigen::VectorXd & positions,
     const Eigen::VectorXd * feedback_positions = nullptr,
@@ -465,6 +576,168 @@ public:
     state.speed_scaling_factor = 1.0;
     std::lock_guard<std::mutex> lock(component.controller_state_mutex_);
     component.latest_controller_state_ = std::move(state);
+  }
+
+  static bool setControllerTerminalTimeline(
+    CollisionAwareServoComponent & component, const Eigen::VectorXd & positions,
+    const rclcpp::Time & trajectory_origin, const rclcpp::Time & reference_time,
+    const rclcpp::Time & header_stamp)
+  {
+    control_msgs::msg::JointTrajectoryControllerState state;
+    const auto set_stamp = [](
+      const rclcpp::Time & value, builtin_interfaces::msg::Time & output) {
+        output.sec = static_cast<std::int32_t>(value.nanoseconds() / 1000000000LL);
+        output.nanosec = static_cast<std::uint32_t>(value.nanoseconds() % 1000000000LL);
+      };
+    const auto set_duration = [](
+      const std::int64_t nanoseconds, builtin_interfaces::msg::Duration & output) {
+        output.sec = static_cast<std::int32_t>(nanoseconds / 1000000000LL);
+        output.nanosec = static_cast<std::uint32_t>(nanoseconds % 1000000000LL);
+      };
+    if (trajectory_origin.get_clock_type() != header_stamp.get_clock_type() ||
+      reference_time.get_clock_type() != header_stamp.get_clock_type() ||
+      trajectory_origin > reference_time || reference_time > header_stamp)
+    {
+      return false;
+    }
+    set_stamp(header_stamp, state.header.stamp);
+    state.joint_names = component.parameters_.joint_names;
+    const std::vector<double> values(positions.data(), positions.data() + positions.size());
+    state.reference.positions = values;
+    state.reference.velocities.assign(values.size(), 0.0);
+    state.feedback.positions = values;
+    state.feedback.velocities.assign(values.size(), 0.0);
+    state.output.positions = values;
+    state.output.velocities.assign(values.size(), 0.0);
+    state.speed_scaling_factor = 1.0;
+    set_duration((reference_time - trajectory_origin).nanoseconds(),
+      state.reference.time_from_start);
+    set_duration((header_stamp - trajectory_origin).nanoseconds(),
+      state.feedback.time_from_start);
+    std::lock_guard<std::mutex> lock(component.controller_state_mutex_);
+    component.latest_controller_state_ = std::move(state);
+    return true;
+  }
+
+  static bool setControllerHybridTimeline(
+    CollisionAwareServoComponent & component, const Eigen::VectorXd & reference_positions,
+    const Eigen::VectorXd & output_positions, const Eigen::VectorXd & output_velocities,
+    const rclcpp::Time & trajectory_origin, const rclcpp::Time & reference_time,
+    const rclcpp::Time & header_stamp)
+  {
+    control_msgs::msg::JointTrajectoryControllerState state;
+    const auto set_stamp = [](
+      const rclcpp::Time & value, builtin_interfaces::msg::Time & output) {
+        output.sec = static_cast<std::int32_t>(value.nanoseconds() / 1000000000LL);
+        output.nanosec = static_cast<std::uint32_t>(value.nanoseconds() % 1000000000LL);
+      };
+    const auto set_duration = [](
+      const std::int64_t nanoseconds, builtin_interfaces::msg::Duration & output) {
+        std::int64_t seconds = nanoseconds / 1000000000LL;
+        std::int64_t subsecond = nanoseconds % 1000000000LL;
+        if (subsecond < 0) {
+          --seconds;
+          subsecond += 1000000000LL;
+        }
+        output.sec = static_cast<std::int32_t>(seconds);
+        output.nanosec = static_cast<std::uint32_t>(subsecond);
+      };
+    if (trajectory_origin.get_clock_type() != header_stamp.get_clock_type() ||
+      reference_time.get_clock_type() != header_stamp.get_clock_type() ||
+      output_positions.size() != reference_positions.size() ||
+      output_velocities.size() != reference_positions.size())
+    {
+      return false;
+    }
+    set_stamp(header_stamp, state.header.stamp);
+    state.joint_names = component.parameters_.joint_names;
+    const std::vector<double> reference_values(
+      reference_positions.data(), reference_positions.data() + reference_positions.size());
+    const std::vector<double> output_values(
+      output_positions.data(), output_positions.data() + output_positions.size());
+    const std::vector<double> velocity_values(
+      output_velocities.data(), output_velocities.data() + output_velocities.size());
+    state.reference.positions = reference_values;
+    state.reference.velocities.assign(reference_values.size(), 0.0);
+    state.feedback.positions = reference_values;
+    state.feedback.velocities.assign(reference_values.size(), 0.0);
+    state.output.positions = output_values;
+    state.output.velocities = velocity_values;
+    state.speed_scaling_factor = 1.0;
+    set_duration((reference_time - trajectory_origin).nanoseconds(),
+      state.reference.time_from_start);
+    set_duration((header_stamp - trajectory_origin).nanoseconds(),
+      state.feedback.time_from_start);
+    std::lock_guard<std::mutex> lock(component.controller_state_mutex_);
+    component.latest_controller_state_ = std::move(state);
+    return true;
+  }
+
+  static std::optional<std::uint64_t> appendStationaryPublication(
+    CollisionAwareServoComponent & component, const Eigen::VectorXd & positions,
+    const rclcpp::Time & start, const bool buffer_as_current)
+  {
+    std::deque<moveit_servo::KinematicState> queue;
+    for (std::int64_t step = 0; step < 4; ++step) {
+      moveit_servo::KinematicState point;
+      point.joint_names = component.parameters_.joint_names;
+      point.positions = positions;
+      point.velocities = Eigen::VectorXd::Zero(positions.size());
+      point.accelerations = Eigen::VectorXd::Zero(positions.size());
+      point.time_stamp = start + rclcpp::Duration::from_nanoseconds(step * 10'000'000LL);
+      queue.push_back(std::move(point));
+    }
+    const auto stationary_time = queue[2U].time_stamp;
+    const auto id = component.commands_.publications.append(queue, stationary_time);
+    if (id && buffer_as_current) {
+      component.commands_.queue.clear();
+      component.commands_.queue.push_back(queue.front());
+      component.commands_.active_publication_id = id;
+      component.commands_.epoch_active = true;
+      component.commands_.epoch_has_published = true;
+      component.commands_.startup_warmup_complete = true;
+    }
+    return id;
+  }
+
+  static std::optional<std::uint64_t> appendFinitePublication(
+    CollisionAwareServoComponent & component, const Eigen::VectorXd & start_positions,
+    const Eigen::VectorXd & next_positions, const rclcpp::Time & start,
+    const bool buffer_as_current)
+  {
+    std::deque<moveit_servo::KinematicState> queue;
+    const double interval = 0.01;
+    const Eigen::VectorXd interval_velocity = (next_positions - start_positions) / interval;
+    for (std::int64_t step = 0; step < 4; ++step) {
+      moveit_servo::KinematicState point;
+      point.joint_names = component.parameters_.joint_names;
+      point.positions = step == 0 ? start_positions : next_positions;
+      if (step == 1) {
+        point.velocities = interval_velocity;
+      } else {
+        point.velocities = Eigen::VectorXd::Zero(start_positions.size());
+      }
+      point.accelerations = Eigen::VectorXd::Zero(start_positions.size());
+      point.time_stamp = start + rclcpp::Duration::from_nanoseconds(step * 10'000'000LL);
+      queue.push_back(std::move(point));
+    }
+    const auto stationary_time = queue[2U].time_stamp;
+    const auto id = component.commands_.publications.append(queue, stationary_time);
+    if (id && buffer_as_current) {
+      component.commands_.queue.clear();
+      component.commands_.queue.push_back(queue.front());
+      component.commands_.active_publication_id = id;
+      component.commands_.epoch_active = true;
+      component.commands_.epoch_has_published = true;
+      component.commands_.startup_warmup_complete = true;
+    }
+    return id;
+  }
+
+  static std::uint64_t olderPublicationRecoveryCount(
+    const CollisionAwareServoComponent & component)
+  {
+    return component.telemetry_.older_publication_recovery_count;
   }
 
   static void publishHardwareSample(
@@ -570,6 +843,172 @@ public:
     component.control_tick();
   }
 
+  static bool installRecoveredCapacityQueue(
+    CollisionAwareServoComponent & component, const Eigen::VectorXd & positions,
+    const rclcpp::Time & now)
+  {
+    constexpr std::int64_t period_ns = 10'000'000LL;
+    constexpr std::size_t max_points = 13U;
+    constexpr std::uint64_t recovered_periods = 12U;
+    component.commands_ = {};
+    component.commands_.time_grid = std::make_unique<control::ControlTimeGrid>(period_ns);
+    component.commands_.max_queue_points = max_points;
+    component.parameters_.residual_command_latency_sec = 0.0;
+    component.servo_parameters_.max_expected_latency = 0.02;
+
+    const rclcpp::Time anchor = now + rclcpp::Duration::from_nanoseconds(60'000'000LL);
+    const rclcpp::Time first_stamp = anchor - rclcpp::Duration::from_nanoseconds(
+      static_cast<std::int64_t>(recovered_periods) * period_ns);
+    std::deque<moveit_servo::KinematicState> published_queue;
+    for (std::size_t index = 0U; index < 20U; ++index) {
+      moveit_servo::KinematicState point(static_cast<int>(positions.size()));
+      point.joint_names = component.parameters_.joint_names;
+      point.positions = positions;
+      point.velocities = Eigen::VectorXd::Zero(positions.size());
+      point.accelerations = Eigen::VectorXd::Zero(positions.size());
+      point.time_stamp = first_stamp + rclcpp::Duration::from_nanoseconds(
+        static_cast<std::int64_t>(index) * period_ns);
+      published_queue.push_back(std::move(point));
+    }
+    if (!component.commands_.time_grid->commandStamp(
+        first_stamp.nanoseconds() - period_ns, period_ns, period_ns))
+    {
+      return false;
+    }
+    const auto publication_id = component.commands_.publications.append(
+      published_queue, anchor);
+    if (!publication_id) {
+      return false;
+    }
+    component.commands_.queue.push_back(published_queue.front());
+    component.commands_.active_publication_id = publication_id;
+    component.commands_.epoch_active = true;
+    component.commands_.epoch_has_published = true;
+    std::string reason;
+    if (component.commands_.recoverTimeline(
+        recovered_periods, now, reason, 0.05, positions.size()) !=
+      TimelineRecoveryStatus::kSuccess)
+    {
+      return false;
+    }
+    const auto * recovered_publication = component.commands_.activePublication();
+    if (recovered_publication == nullptr ||
+      component.commands_.queue.size() != recovered_periods ||
+      component.commands_.queue.back().time_stamp != anchor)
+    {
+      return false;
+    }
+    for (std::size_t index = 0U; index < recovered_periods; ++index) {
+      const auto & actual = component.commands_.queue[index];
+      const auto & expected = recovered_publication->execution_queue[index + 1U];
+      if (actual.time_stamp != expected.time_stamp ||
+        !actual.positions.isApprox(expected.positions) ||
+        !actual.velocities.isApprox(expected.velocities) ||
+        !actual.accelerations.isApprox(expected.accelerations))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static CommandPublicationStatus appendStationaryCommand(
+    CollisionAwareServoComponent & component, const Eigen::VectorXd & positions,
+    const rclcpp::Time & now, std::string & reason)
+  {
+    if (!component.trajectory_publisher_) {
+      component.trajectory_publisher_ = component.create_publisher<
+        trajectory_msgs::msg::JointTrajectory>("/test/queue_capacity", rclcpp::QoS(1));
+    }
+    moveit_servo::KinematicState next_state(static_cast<int>(positions.size()));
+    next_state.joint_names = component.parameters_.joint_names;
+    next_state.positions = positions;
+    next_state.velocities = Eigen::VectorXd::Zero(positions.size());
+    next_state.accelerations = Eigen::VectorXd::Zero(positions.size());
+    control::EmergencyBrakeTail tail;
+    tail.status = control::EmergencyBrakeTailStatus::kSuccess;
+    tail.first_stationary_point = 0U;
+    for (std::size_t index = 0U; index < 3U; ++index) {
+      tail.points.push_back(control::JointMotionState{
+          positions, Eigen::VectorXd::Zero(positions.size()),
+          Eigen::VectorXd::Zero(positions.size())});
+    }
+    const moveit_servo::KinematicState current_state = next_state;
+    return component.enqueue_and_publish(
+      current_state, ValidatedCommand{std::move(next_state), std::move(tail)}, now, reason);
+  }
+
+  static CommandPublicationStatus appendMismatchedTailCommand(
+    CollisionAwareServoComponent & component,
+    const Eigen::VectorXd & positions,
+    const rclcpp::Time & now,
+    std::string & reason)
+  {
+    moveit_servo::KinematicState next_state(static_cast<int>(positions.size()));
+    next_state.joint_names = component.parameters_.joint_names;
+    next_state.positions = positions;
+    next_state.velocities = Eigen::VectorXd::Zero(positions.size());
+    next_state.accelerations = Eigen::VectorXd::Zero(positions.size());
+    control::EmergencyBrakeTail tail;
+    tail.status = control::EmergencyBrakeTailStatus::kSuccess;
+    tail.first_stationary_point = 0U;
+    for (std::size_t index = 0U; index < 3U; ++index) {
+      Eigen::VectorXd point_position = positions;
+      if (index == 0U) {
+        point_position[0] += 0.01;
+      }
+      tail.points.push_back(control::JointMotionState{
+          point_position, Eigen::VectorXd::Zero(positions.size()),
+          Eigen::VectorXd::Zero(positions.size())});
+    }
+    return component.enqueue_and_publish(
+      next_state, ValidatedCommand{std::move(next_state), std::move(tail)}, now, reason);
+  }
+
+  static std::size_t commandQueueSize(const CollisionAwareServoComponent & component)
+  {
+    return component.commands_.queue.size();
+  }
+
+  static std::optional<control::PublicationId> activePublicationId(
+    const CollisionAwareServoComponent & component)
+  {
+    return component.commands_.active_publication_id;
+  }
+
+  static std::size_t publicationHistorySize(
+    const CollisionAwareServoComponent & component)
+  {
+    return component.commands_.publications.size();
+  }
+
+  static rclcpp::Time commandQueueBackStamp(const CollisionAwareServoComponent & component)
+  {
+    return component.commands_.queue.back().time_stamp;
+  }
+
+  static std::optional<std::int64_t> nextGridStamp(
+    const CollisionAwareServoComponent & component, const rclcpp::Time & now)
+  {
+    auto grid = *component.commands_.time_grid;
+    return grid.commandStamp(now.nanoseconds(), 0, 0);
+  }
+
+  static std::optional<std::uint64_t> periodsUntilGridTarget(
+    const CollisionAwareServoComponent & component, const rclcpp::Time & now,
+    const std::int64_t target_lead_ns)
+  {
+    return component.commands_.time_grid ?
+           component.commands_.time_grid->periodsUntilCommandLead(
+      now.nanoseconds(), target_lead_ns) : std::nullopt;
+  }
+
+  static rclcpp::Time commandQueueStampAt(
+    const CollisionAwareServoComponent & component, const std::size_t index)
+  {
+    return component.commands_.queue[index].time_stamp;
+  }
+
   static void setContinuationTarget(
     CollisionAwareServoComponent & component, const msg::TrackingTarget & target)
   {
@@ -577,10 +1016,63 @@ public:
     component.latest_pose_ = target;
   }
 
+  static void setGazeboFeedbackForTest(CollisionAwareServoComponent & component)
+  {
+    component.require_hardware_io_status_ = false;
+  }
+
+  static TimelineRecoveryStatus resumeVerifiedTerminalHold(
+    CollisionAwareServoComponent & component, const rclcpp::Time & current_time,
+    const std::int64_t target_lead_ns, std::string & reason)
+  {
+    return component.commands_.resumeVerifiedTerminalHold(
+      *component.commands_.active_publication_id, current_time, target_lead_ns,
+      component.parameters_.joint_names.size(), true, reason);
+  }
+
+  static bool prepareVerifiedTerminalHoldPublication(
+    CollisionAwareServoComponent & component, const rclcpp::Time & tick_time,
+    const msg::TrackingTarget & target, const std::uint64_t scene_revision)
+  {
+    const auto expected_publication_id = component.commands_.active_publication_id;
+    std::optional<planning_scene_monitor::LockedPlanningSceneRO> locked_scene;
+    locked_scene.emplace(component.planning_scene_monitor_);
+    planning_scene::PlanningSceneConstPtr scene = *locked_scene;
+    const std::optional<std::uint64_t> hardware_epoch =
+      component.cycle_hardware_io_status_.has_value() ?
+      std::optional<std::uint64_t>{
+      component.cycle_hardware_io_status_->sample.epoch} : std::nullopt;
+    const std::optional<std::uint64_t> proven_hold_epoch =
+      component.proven_q_hold_.has_value() ? component.proven_q_hold_epoch_ : std::nullopt;
+    return component.prepare_verified_terminal_hold_publication(
+      tick_time, target, expected_publication_id,
+      component.commands_.queue.empty() ? std::nullopt :
+      std::optional<rclcpp::Time>{component.commands_.queue.back().time_stamp},
+      hardware_epoch, proven_hold_epoch, scene_revision, locked_scene, scene);
+  }
+
+  static std::string lastServoStatusMessage(
+    const CollisionAwareServoComponent & component)
+  {
+    return component.telemetry_.last_servo_status_message;
+  }
+
+  static bool hasVerifiedTerminalHold(const CollisionAwareServoComponent & component)
+  {
+    return component.commands_.hasVerifiedTerminalHold(
+      component.parameters_.joint_names.size());
+  }
+
   static void setPlanningSceneRevision(
     CollisionAwareServoComponent & component, const std::uint64_t revision)
   {
     component.planning_scene_collision_revision_.store(revision, std::memory_order_release);
+  }
+
+  static void setMaximumExpectedLatency(
+    CollisionAwareServoComponent & component, const double seconds)
+  {
+    component.servo_parameters_.max_expected_latency = seconds;
   }
 
   static bool installPublishedBrakeSuffix(
@@ -640,6 +1132,12 @@ public:
   }
 
   static bool restFollowerActive(const CollisionAwareServoComponent & component)
+  {
+    return component.motion_reference_ &&
+           MotionReferenceTestPeer::followerActive(*component.motion_reference_);
+  }
+
+  static bool referenceFollowerActive(const CollisionAwareServoComponent & component)
   {
     return component.motion_reference_ &&
            MotionReferenceTestPeer::followerActive(*component.motion_reference_);
@@ -872,6 +1370,22 @@ public:
       CommandAttempt::kTracking, reason, CollisionConstraintDiagnostics{}, rejection_kind);
   }
 
+  static std::optional<ValidatedCommand> validateCapturedCandidate(
+    CollisionAwareServoComponent & component,
+    const moveit::core::RobotStatePtr & robot_state,
+    const moveit_servo::KinematicState & current_state,
+    const JointMotionState & current_motion_state,
+    const Eigen::VectorXd & joint_velocity,
+    const planning_scene::PlanningScene & scene,
+    const CollisionConstraintDiagnostics & diagnostics,
+    std::string & reason,
+    CandidateRejectionKind & rejection_kind)
+  {
+    return component.validated_candidate(
+      robot_state, current_state, current_motion_state, joint_velocity, scene, true,
+      CommandAttempt::kTracking, reason, diagnostics, rejection_kind);
+  }
+
   static bool tryReferenceGuardBlend(
     CollisionAwareServoComponent & component,
     const moveit::core::RobotStatePtr & robot_state,
@@ -889,6 +1403,18 @@ public:
       robot_state, current_state, motion_state, scene, true, tracking_result,
       brake_result, primary_matrix, constraints, CollisionConstraintDiagnostics{},
       accepted_command, accepted_qp_result);
+  }
+
+
+  static Eigen::VectorXd exactBrakeAnchor(
+    const CollisionAwareServoComponent & component, const JointMotionState & motion_state)
+  {
+    const auto tail = component.emergency_brake_tail_generator_->generate(
+      motion_state, component.motion_limits_);
+    if (!tail.command_available() || tail.points.size() < 2U) {
+      return Eigen::VectorXd{};
+    }
+    return tail.points[1U].velocity;
   }
 
   static void installVelocityQp(
@@ -1229,6 +1755,72 @@ std::string readModelFile(const std::string & path)
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
+struct Posture1CFixture
+{
+  int id{};
+  bool good{};
+  Eigen::VectorXd joints;
+  Eigen::Vector3d shoulder;
+  Eigen::Vector3d elbow;
+  Eigen::Vector3d wrist;
+  Eigen::Vector3d face;
+};
+
+std::vector<Posture1CFixture> readPosture1CFixtures()
+{
+  boost::property_tree::ptree document;
+  std::istringstream json(readModelFile(TEST_POSTURE1C_POSES_FILE));
+  boost::property_tree::read_json(json, document);
+  const auto vector_field = [](const boost::property_tree::ptree & object,
+    const std::string & key) {
+      Eigen::Vector3d result;
+      Eigen::Index index = 0;
+      for (const auto & value : object.get_child(key)) {
+        if (index >= result.size()) {
+          throw std::runtime_error("Expected 3D posture fixture vector: " + key);
+        }
+        result[index++] = value.second.get_value<double>();
+      }
+      if (index != result.size()) {
+        throw std::runtime_error("Expected 3D posture fixture vector: " + key);
+      }
+      return result;
+    };
+  std::vector<Posture1CFixture> result;
+  for (const auto & entry : document.get_child("poses")) {
+    const auto & object = entry.second;
+    Posture1CFixture fixture;
+    fixture.id = object.get<int>("id");
+    const auto label = object.get<std::string>("label");
+    if (label != "GOOD" && label != "BAD") {
+      throw std::runtime_error("Invalid posture fixture label: " + label);
+    }
+    fixture.good = label == "GOOD";
+    fixture.joints.resize(6);
+    for (Eigen::Index joint = 0; joint < 6; ++joint) {
+      const std::string key = "joint" + std::to_string(joint + 1);
+      fixture.joints[joint] = object.get<double>("joints." + key);
+    }
+    const auto & mainchain = object.get_child("mainchain");
+    fixture.shoulder = vector_field(mainchain, "S_link2_m");
+    fixture.elbow = vector_field(mainchain, "E_link3_m");
+    fixture.wrist = vector_field(mainchain, "W_link4_m");
+    fixture.face = vector_field(object, "face_target_m");
+    result.push_back(std::move(fixture));
+  }
+  return result;
+}
+
+double independentElbowFaceSide(
+  const Eigen::Vector3d & origin, const Eigen::Vector3d & elbow,
+  const Eigen::Vector3d & wrist, const Eigen::Vector3d & face)
+{
+  const Eigen::Vector3d w = wrist - origin;
+  const Eigen::Vector3d e = elbow - origin;
+  const Eigen::Vector3d f = face - origin;
+  return e.dot(f) - (e.dot(w) * f.dot(w)) / w.squaredNorm();
+}
+
 /// The real xArm6 description is expanded by CMake, never by a running test.
 /// No controller, sensor, simulator or robot command publisher is started here.
 class MotionReferenceTest : public ::testing::Test
@@ -1256,7 +1848,7 @@ protected:
       <link name="test_camera_optical"/>
       <joint name="test_camera_mount" type="fixed">
         <parent link="monitor_control_frame"/><child link="test_camera_optical"/>
-        <origin xyz="0 0 0.125" rpy="-1.57079632679 0 -1.57079632679"/>
+        <origin xyz="0.0095 0 0.12525" rpy="-1.57079632679 0 -1.57079632679"/>
       </joint>)");
     std::string semantic = readModelFile(TEST_ROBOT_SRDF_FILE);
     if (!searchEnabled()) {
@@ -1847,6 +2439,120 @@ TEST_F(MotionReferenceTest, StaleInitialReadEpochWaitsUntilFreshActiveProvenance
   EXPECT_FALSE(CollisionAwareServoComponentTestPeer::hasPublishedCommand(*component));
 }
 
+TEST_F(MotionReferenceTest, InactiveWarmEpochSkipsTrackingWorkAndKeepsBootstrapGuards)
+{
+  monitor_->startStateMonitor("/joint_states");
+  auto joint_state_publisher = node_->create_publisher<sensor_msgs::msg::JointState>(
+    "/joint_states", rclcpp::QoS(10).reliable());
+  auto command_subscriber = node_->create_subscription<trajectory_msgs::msg::JointTrajectory>(
+    "/test/command", rclcpp::QoS(1), [](trajectory_msgs::msg::JointTrajectory::ConstSharedPtr) {});
+
+  const auto hold = state();
+  Eigen::VectorXd positions;
+  hold.copyJointGroupPositions(group_, positions);
+  const auto publish_joint_state = [&]() {
+      sensor_msgs::msg::JointState message;
+      message.header.stamp = node_->now();
+      message.name = parameters_.joint_names;
+      message.position.assign(positions.data(), positions.data() + positions.size());
+      message.velocity.assign(positions.size(), 0.0);
+      joint_state_publisher->publish(message);
+      rclcpp::spin_some(node_);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    };
+
+  auto component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  CollisionAwareServoComponentTestPeer::installVelocityQp(*component, qp_config);
+  CollisionAwareServoComponentTestPeer::installMotionReference(
+    *component, std::move(reference_));
+  CollisionAwareServoComponentTestPeer::installStatusPublisher(*component);
+  CollisionAwareServoComponentTestPeer::installTrajectoryPublisher(*component);
+  CollisionAwareServoComponentTestPeer::prepareStartupControlTick(*component, false);
+  for (std::uint64_t sequence = 1U; sequence <= 3U; ++sequence) {
+    publish_joint_state();
+    CollisionAwareServoComponentTestPeer::publishHardwareSample(
+      *component, positions, 11U, sequence);
+  }
+  for (std::size_t attempt = 0U; attempt < 100U &&
+    CollisionAwareServoComponentTestPeer::trajectorySubscriberCount(*component) == 0U;
+    ++attempt)
+  {
+    rclcpp::spin_some(node_);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_GT(CollisionAwareServoComponentTestPeer::trajectorySubscriberCount(*component), 0U);
+
+  auto face = faceAlongLookDirection(hold);
+  const auto set_fresh_face = [&]() {
+      const auto stamp = component->now();
+      face.header.stamp = stamp;
+      face.face_stamp = stamp;
+      CollisionAwareServoComponentTestPeer::setContinuationTarget(*component, face);
+    };
+  set_fresh_face();
+
+  const auto qp_samples_before =
+    CollisionAwareServoComponentTestPeer::qpSampleCount(*component);
+  const auto pointing_samples_before =
+    CollisionAwareServoComponentTestPeer::pointingSampleCount(*component);
+  const auto actual_validations_before =
+    CollisionAwareServoComponentTestPeer::actualStateValidationCount(*component);
+  const auto bootstrap_segments_before =
+    CollisionAwareServoComponentTestPeer::bootstrapSegmentValidationCount(*component);
+
+  CollisionAwareServoComponentTestPeer::controlTick(*component);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::qpSampleCount(*component),
+    qp_samples_before + 1U);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::pointingSampleCount(*component),
+    pointing_samples_before + 1U);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::actualStateValidationCount(*component),
+    actual_validations_before + 1U);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::bootstrapSourceStableSamples(*component), 0U);
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::epochActive(*component));
+
+  CollisionAwareServoComponentTestPeer::prepareStartupControlTick(*component, true);
+  ASSERT_FALSE(CollisionAwareServoComponentTestPeer::epochActive(*component));
+  publish_joint_state();
+  CollisionAwareServoComponentTestPeer::publishHardwareSample(
+    *component, positions, 11U, 4U);
+  std::this_thread::sleep_for(std::chrono::milliseconds(15));
+  set_fresh_face();
+  const auto fast_qp_samples_before =
+    CollisionAwareServoComponentTestPeer::qpSampleCount(*component);
+  const auto fast_pointing_samples_before =
+    CollisionAwareServoComponentTestPeer::pointingSampleCount(*component);
+  const auto fast_actual_validations_before =
+    CollisionAwareServoComponentTestPeer::actualStateValidationCount(*component);
+
+  CollisionAwareServoComponentTestPeer::controlTick(*component);
+  (void)command_subscriber;
+
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::qpSampleCount(*component),
+    fast_qp_samples_before);
+  EXPECT_EQ(
+    CollisionAwareServoComponentTestPeer::pointingSampleCount(*component),
+    fast_pointing_samples_before);
+  EXPECT_EQ(
+    CollisionAwareServoComponentTestPeer::actualStateValidationCount(*component),
+    fast_actual_validations_before + 1U);
+  EXPECT_EQ(
+    CollisionAwareServoComponentTestPeer::bootstrapSourceStableSamples(*component), 1U);
+  EXPECT_EQ(
+    CollisionAwareServoComponentTestPeer::bootstrapSegmentValidationCount(*component),
+    bootstrap_segments_before);
+}
+
 TEST_F(MotionReferenceTest, RecoverableTfGapKeepsCheckedTailWithoutHardwareInhibit)
 {
   auto component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
@@ -1865,6 +2571,108 @@ TEST_F(MotionReferenceTest, RecoverableTfGapKeepsCheckedTailWithoutHardwareInhib
   ASSERT_TRUE(CollisionAwareServoComponentTestPeer::retainStationaryPublicationAndRecover(
       *component, "TF sample was temporarily unavailable"));
   EXPECT_FALSE(CollisionAwareServoComponentTestPeer::hardwareInhibitPending(*component));
+}
+
+TEST_F(MotionReferenceTest, FreshAppendPrunesOnlyExpiredRecoveredQueuePrefix)
+{
+  auto component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  Eigen::VectorXd positions(6);
+  state().copyJointGroupPositions(group_, positions);
+  const rclcpp::Time now = component->now();
+
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::installRecoveredCapacityQueue(
+      *component, positions, now));
+  const rclcpp::Time recovered_branch =
+    CollisionAwareServoComponentTestPeer::commandQueueBackStamp(*component);
+  ASSERT_EQ(CollisionAwareServoComponentTestPeer::commandQueueSize(*component), 12U);
+
+  std::string failure_reason;
+  const auto status = CollisionAwareServoComponentTestPeer::appendStationaryCommand(
+    *component, positions, now, failure_reason);
+
+  ASSERT_EQ(status, CommandPublicationStatus::kSuccess) << failure_reason;
+  const std::size_t queue_size =
+    CollisionAwareServoComponentTestPeer::commandQueueSize(*component);
+  ASSERT_LE(queue_size, 13U);
+  ASSERT_GE(queue_size, 2U);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::commandQueueStampAt(
+      *component, queue_size - 2U), recovered_branch);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::commandQueueBackStamp(*component),
+    recovered_branch + rclcpp::Duration::from_nanoseconds(10'000'000LL));
+}
+
+TEST_F(MotionReferenceTest, FailedPostEnqueueValidationPreservesPublishedSuffixAndGrid)
+{
+  auto component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  Eigen::VectorXd positions(6);
+  state().copyJointGroupPositions(group_, positions);
+  auto rest_reference = std::make_unique<MotionReference>(
+    node_, monitor_, parameters_, limits_, collision_config_);
+  Eigen::VectorXd goal_position = positions;
+  goal_position[0] += 0.01;
+  ASSERT_TRUE(MotionReferenceTestPeer::installRestFollowerPathForTest(
+      *rest_reference, state(), {positions, goal_position}, 0.0));
+  CollisionAwareServoComponentTestPeer::installMotionReference(
+    *component, std::move(rest_reference));
+  const rclcpp::Time start = component->now();
+  const rclcpp::Time publication_start =
+    start + rclcpp::Duration::from_nanoseconds(100'000'000LL);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::installPublishedBrakeSuffix(
+      *component, positions, publication_start, kSceneRevision));
+  CollisionAwareServoComponentTestPeer::setMaximumExpectedLatency(*component, 0.03);
+  const std::size_t queue_size =
+    CollisionAwareServoComponentTestPeer::commandQueueSize(*component);
+  const rclcpp::Time queue_back =
+    CollisionAwareServoComponentTestPeer::commandQueueBackStamp(*component);
+  const auto next_grid_stamp =
+    CollisionAwareServoComponentTestPeer::nextGridStamp(*component, start);
+  const auto active_publication_id =
+    CollisionAwareServoComponentTestPeer::activePublicationId(*component);
+  const std::size_t publication_history_size =
+    CollisionAwareServoComponentTestPeer::publicationHistorySize(*component);
+  const auto expected_continuation_stamp =
+    CollisionAwareServoComponentTestPeer::nextPublishedBrakeStamp(*component, 1U);
+
+  std::string failure_reason;
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::appendMismatchedTailCommand(
+      *component, positions, start, failure_reason),
+    CommandPublicationStatus::kInvariantFailure) << failure_reason;
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::commandQueueSize(*component), queue_size);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::commandQueueBackStamp(*component), queue_back);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::nextGridStamp(*component, start),
+    next_grid_stamp);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::activePublicationId(*component),
+    active_publication_id);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::publicationHistorySize(*component),
+    publication_history_size);
+
+  auto rest_target = target(msg::TrackingTarget::REST);
+  rest_target.target_id = 1;
+  rest_target.header.stamp = start;
+  CollisionAwareServoComponentTestPeer::setContinuationTarget(*component, rest_target);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::tryContinuePublishedBrake(
+      *component, start, rest_target, kSceneRevision),
+    PublishedBrakeContinuationStatus::kContinued);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::continuationQueueTailStamp(*component),
+    expected_continuation_stamp);
 }
 
 TEST_F(MotionReferenceTest, RestBrakeContinuationKeepsPathOnlyForFreshMatchingTarget)
@@ -1954,6 +2762,175 @@ TEST_F(MotionReferenceTest, RestBrakeContinuationKeepsPathOnlyForFreshMatchingTa
     EXPECT_EQ(CollisionAwareServoComponentTestPeer::continuationQueueSize(*component), 1U)
       << invalidation;
   }
+}
+
+TEST_F(MotionReferenceTest, ExhaustedFacePublishedSuffixPreservesFollowerUntilFreshProof)
+{
+  auto component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  auto face_reference = std::make_unique<MotionReference>(
+    node_, monitor_, parameters_, limits_, collision_config_);
+  const auto start_state = state();
+  Eigen::VectorXd start_position;
+  start_state.copyJointGroupPositions(group_, start_position);
+  Eigen::VectorXd goal_position = start_position;
+  goal_position[0] += 0.01;
+  ASSERT_TRUE(MotionReferenceTestPeer::installFaceFollowerPathForTest(
+    *face_reference, start_state, {start_position, goal_position}, 0.0));
+  CollisionAwareServoComponentTestPeer::installMotionReference(
+    *component, std::move(face_reference));
+
+  const rclcpp::Time start = component->now();
+  auto face_target = target(msg::TrackingTarget::FACE);
+  face_target.target_id = 1;
+  face_target.header.stamp = start;
+  face_target.face_stamp = start;
+  CollisionAwareServoComponentTestPeer::setContinuationTarget(*component, face_target);
+  const rclcpp::Time publication_start =
+    start - rclcpp::Duration::from_nanoseconds(100'000'000LL);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::installPublishedBrakeSuffix(
+    *component, start_position, publication_start, kSceneRevision, 2U, 4U));
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::referenceFollowerActive(*component));
+
+  const std::size_t queue_size =
+    CollisionAwareServoComponentTestPeer::continuationQueueSize(*component);
+  const auto queue_tail =
+    CollisionAwareServoComponentTestPeer::continuationQueueTailStamp(*component);
+  const auto grid_periods_to_fixed_target =
+    CollisionAwareServoComponentTestPeer::periodsUntilGridTarget(
+    *component, start, 1'000'000'000LL);
+  const auto active_publication_id =
+    CollisionAwareServoComponentTestPeer::activePublicationId(*component);
+  ASSERT_TRUE(active_publication_id);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::epochActive(*component));
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::rearmPending(*component));
+
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::tryContinuePublishedBrake(
+    *component, start, face_target, kSceneRevision),
+    PublishedBrakeContinuationStatus::kContinued);
+
+  EXPECT_TRUE(CollisionAwareServoComponentTestPeer::referenceFollowerActive(*component));
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::continuationQueueSize(*component), queue_size);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::continuationQueueTailStamp(*component),
+    queue_tail);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::periodsUntilGridTarget(
+      *component, start, 1'000'000'000LL), grid_periods_to_fixed_target);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::activePublicationId(*component),
+    active_publication_id);
+  EXPECT_TRUE(CollisionAwareServoComponentTestPeer::epochActive(*component));
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::rearmPending(*component));
+}
+
+TEST_F(MotionReferenceTest, VerifiedFaceTerminalHoldWaitsWithoutMutatingPublishedPath)
+{
+  monitor_->startStateMonitor("/joint_states");
+  auto component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*component);
+  CollisionAwareServoComponentTestPeer::installStatusPublisher(*component);
+
+  const rclcpp::Time tick_time = component->now();
+  auto original_target = target(msg::TrackingTarget::FACE);
+  original_target.target_id = 1U;
+  original_target.header.stamp = tick_time;
+  original_target.face_stamp = tick_time;
+  CollisionAwareServoComponentTestPeer::setContinuationTarget(*component, original_target);
+
+  const auto robot_state = state();
+  Eigen::VectorXd positions;
+  robot_state.copyJointGroupPositions(group_, positions);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::installPublishedBrakeSuffix(
+    *component, positions,
+    tick_time - rclcpp::Duration::from_nanoseconds(100'000'000LL), kSceneRevision, 2U, 4U));
+  std::string resume_reason;
+  ASSERT_EQ(CollisionAwareServoComponentTestPeer::resumeVerifiedTerminalHold(
+      *component, tick_time - rclcpp::Duration::from_nanoseconds(50'000'000LL), 0,
+      resume_reason), TimelineRecoveryStatus::kSuccess) << resume_reason;
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::hasVerifiedTerminalHold(*component));
+
+  const std::size_t original_queue_size =
+    CollisionAwareServoComponentTestPeer::commandQueueSize(*component);
+  const auto original_queue_back =
+    CollisionAwareServoComponentTestPeer::commandQueueBackStamp(*component);
+  const auto original_publication_id =
+    CollisionAwareServoComponentTestPeer::activePublicationId(*component);
+  const std::size_t original_publication_count =
+    CollisionAwareServoComponentTestPeer::publicationHistorySize(*component);
+  const auto original_grid_stamp =
+    CollisionAwareServoComponentTestPeer::nextGridStamp(*component, tick_time);
+  ASSERT_TRUE(original_publication_id);
+
+  // The full candidate and its braking tail still receive ordinary collision certification.
+  moveit_servo::KinematicState current(static_cast<int>(positions.size()));
+  current.joint_names = parameters_.joint_names;
+  current.positions = positions;
+  current.velocities = Eigen::VectorXd::Zero(positions.size());
+  current.accelerations = Eigen::VectorXd::Zero(positions.size());
+  current.time_stamp = tick_time;
+  const JointMotionState stationary{
+    positions, current.velocities, current.accelerations};
+  std::string validation_reason;
+  {
+    planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+    ASSERT_TRUE(locked_scene);
+    const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+    const auto certified = CollisionAwareServoComponentTestPeer::validateCandidate(
+      *component, std::make_shared<moveit::core::RobotState>(robot_state), current,
+      stationary, current.velocities, *scene, validation_reason);
+    ASSERT_TRUE(certified) << validation_reason;
+    ASSERT_TRUE(certified->braking_tail.command_available());
+  }
+
+  auto stale_target = original_target;
+  stale_target.header.stamp = tick_time - rclcpp::Duration::from_seconds(1.0);
+  stale_target.face_stamp = stale_target.header.stamp;
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::prepareVerifiedTerminalHoldPublication(
+    *component, tick_time, stale_target, kSceneRevision));
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::activePublicationId(*component),
+    original_publication_id);
+
+  auto changed_target = original_target;
+  changed_target.target_id = 2U;
+  CollisionAwareServoComponentTestPeer::setContinuationTarget(*component, changed_target);
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::prepareVerifiedTerminalHoldPublication(
+    *component, tick_time, original_target, kSceneRevision));
+  CollisionAwareServoComponentTestPeer::setContinuationTarget(*component, original_target);
+
+  // Same FACE identity with a newer accepted sample remains eligible. Missing fresh
+  // controller proof waits while preserving the already-published stationary branch.
+  auto refreshed_target = original_target;
+  refreshed_target.header.stamp = component->now();
+  refreshed_target.face_stamp = refreshed_target.header.stamp;
+  CollisionAwareServoComponentTestPeer::setContinuationTarget(*component, refreshed_target);
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::prepareVerifiedTerminalHoldPublication(
+    *component, tick_time, original_target, kSceneRevision));
+  EXPECT_NE(CollisionAwareServoComponentTestPeer::lastServoStatusMessage(*component).find(
+      "Safe re-arm is waiting"), std::string::npos);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::commandQueueSize(*component),
+    original_queue_size);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::commandQueueBackStamp(*component),
+    original_queue_back);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::activePublicationId(*component),
+    original_publication_id);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::publicationHistorySize(*component),
+    original_publication_count);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::nextGridStamp(*component, tick_time),
+    original_grid_stamp);
+  EXPECT_TRUE(CollisionAwareServoComponentTestPeer::hasVerifiedTerminalHold(*component));
 }
 
 TEST_F(MotionReferenceTest, ExhaustedRestPublishedSuffixDropsFollowerPath)
@@ -2102,7 +3079,7 @@ TEST_F(MotionReferenceTest, HardwareQHoldSurvivesBootstrapAndIsInvalidatedByNewE
     task.secondary_reference = Eigen::VectorXd(0);
     task.secondary_weights = Eigen::VectorXd(0);
     HierarchicalVelocityQpConfig qp_config;
-    qp_config.period_sec = 0.01;
+    qp_config.period_sec = parameters_.control_period_sec;
     const HierarchicalVelocityQp solver(qp_config);
     const JointMotionState hold_motion{hold, Eigen::VectorXd::Zero(6),
       Eigen::VectorXd::Zero(6)};
@@ -2233,6 +3210,144 @@ TEST_F(MotionReferenceTest, HardwareQHoldSurvivesBootstrapAndIsInvalidatedByNewE
   EXPECT_TRUE(requires_latched_halt);
   EXPECT_NE(reason.find("wire interval"), std::string::npos) << reason;
   EXPECT_FALSE(CollisionAwareServoComponentTestPeer::hasPublishedCommand(*component));
+}
+
+TEST_F(MotionReferenceTest, PredictKeepsLatestBufferedBranchDuringPendingTerminalReplacement)
+{
+  monitor_->startStateMonitor("/joint_states");
+  auto joint_state_publisher = node_->create_publisher<sensor_msgs::msg::JointState>(
+    "/joint_states", rclcpp::QoS(10).reliable());
+  auto hold_robot_state = state();
+  Eigen::VectorXd hold;
+  hold_robot_state.copyJointGroupPositions(group_, hold);
+  hold_robot_state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(hold.size()));
+  hold_robot_state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(hold.size()));
+  hold_robot_state.update();
+
+  sensor_msgs::msg::JointState joint_state;
+  joint_state.header.stamp = node_->now();
+  joint_state.name = parameters_.joint_names;
+  joint_state.position.assign(hold.data(), hold.data() + hold.size());
+  joint_state.velocity.assign(hold.size(), 0.0);
+  joint_state_publisher->publish(joint_state);
+  rclcpp::spin_some(node_);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const auto state_monitor = monitor_->getStateMonitor();
+  ASSERT_TRUE(state_monitor);
+  ASSERT_TRUE(state_monitor->haveCompleteState(
+      node_->now() - rclcpp::Duration::from_seconds(0.5)));
+
+  auto component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  std::vector<PositionBoundSet> bounds;
+  bounds.reserve(parameters_.joint_names.size());
+  for (std::size_t index = 0; index < parameters_.joint_names.size(); ++index) {
+    const auto & joint_bounds = model_->getVariableBounds(parameters_.joint_names[index]);
+    const PositionInterval physical{joint_bounds.min_position_, joint_bounds.max_position_};
+    const double center = hold[static_cast<Eigen::Index>(index)];
+    bounds.push_back(PositionBoundSet{
+          physical, physical, physical, PositionInterval{center - 0.15, center + 0.15}});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::publishHardwareSample(*component, hold, 21U, 1U);
+
+  const rclcpp::Time header_stamp = component->now();
+  const rclcpp::Time old_origin = header_stamp - rclcpp::Duration::from_nanoseconds(200'000'000LL);
+  const rclcpp::Time replacement_start = header_stamp +
+    rclcpp::Duration::from_nanoseconds(1'000'000'000LL);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::appendStationaryPublication(
+      *component, hold, old_origin, false).has_value());
+  const auto latest_id = CollisionAwareServoComponentTestPeer::appendStationaryPublication(
+    *component, hold, replacement_start, true);
+  ASSERT_TRUE(latest_id.has_value());
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setControllerTerminalTimeline(
+      *component, hold, old_origin, header_stamp, header_stamp));
+
+  std::string reason;
+  bool requires_latched_halt = false;
+  const auto predicted = CollisionAwareServoComponentTestPeer::predict(
+    *component, reason, requires_latched_halt);
+  ASSERT_TRUE(predicted.has_value()) << reason;
+  EXPECT_FALSE(requires_latched_halt);
+  EXPECT_EQ(predicted->time_stamp.nanoseconds(), replacement_start.nanoseconds());
+  EXPECT_LT((predicted->positions - hold).norm(), 1.0e-12);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::activePublicationId(*component), latest_id);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::olderPublicationRecoveryCount(*component), 0U);
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::rearmPending(*component));
+}
+
+TEST_F(MotionReferenceTest, PredictAcceptsFutureOriginHybridPendingTerminalHandoff)
+{
+  monitor_->startStateMonitor("/joint_states");
+  auto joint_state_publisher = node_->create_publisher<sensor_msgs::msg::JointState>(
+    "/joint_states", rclcpp::QoS(10).reliable());
+  auto hold_robot_state = state();
+  Eigen::VectorXd hold;
+  hold_robot_state.copyJointGroupPositions(group_, hold);
+  hold_robot_state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(hold.size()));
+  hold_robot_state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(hold.size()));
+  hold_robot_state.update();
+
+  sensor_msgs::msg::JointState joint_state;
+  joint_state.header.stamp = node_->now();
+  joint_state.name = parameters_.joint_names;
+  joint_state.position.assign(hold.data(), hold.data() + hold.size());
+  joint_state.velocity.assign(hold.size(), 0.0);
+  joint_state_publisher->publish(joint_state);
+  rclcpp::spin_some(node_);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const auto state_monitor = monitor_->getStateMonitor();
+  ASSERT_TRUE(state_monitor);
+  ASSERT_TRUE(state_monitor->haveCompleteState(
+      node_->now() - rclcpp::Duration::from_seconds(0.5)));
+
+  auto component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  std::vector<PositionBoundSet> bounds;
+  bounds.reserve(parameters_.joint_names.size());
+  for (std::size_t index = 0; index < parameters_.joint_names.size(); ++index) {
+    const auto & joint_bounds = model_->getVariableBounds(parameters_.joint_names[index]);
+    const PositionInterval physical{joint_bounds.min_position_, joint_bounds.max_position_};
+    const double center = hold[static_cast<Eigen::Index>(index)];
+    bounds.push_back(PositionBoundSet{
+          physical, physical, physical, PositionInterval{center - 0.15, center + 0.15}});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::publishHardwareSample(*component, hold, 21U, 1U);
+
+  const rclcpp::Time header_stamp = component->now();
+  const rclcpp::Time old_origin =
+    header_stamp - rclcpp::Duration::from_nanoseconds(200'000'000LL);
+  const rclcpp::Time replacement_start =
+    header_stamp + rclcpp::Duration::from_nanoseconds(2'000'000LL);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::appendStationaryPublication(
+      *component, hold, old_origin, false).has_value());
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::appendStationaryPublication(
+      *component, hold, replacement_start, false).has_value());
+  const Eigen::VectorXd next_positions = hold +
+    Eigen::VectorXd::Constant(hold.size(), 0.001);
+  const Eigen::VectorXd interval_velocity =
+    (next_positions - hold) / 0.01;
+  const auto latest_id = CollisionAwareServoComponentTestPeer::appendFinitePublication(
+    *component, hold, next_positions, replacement_start, true);
+  ASSERT_TRUE(latest_id.has_value());
+
+  const Eigen::VectorXd output_positions = hold +
+    0.8 * (next_positions - hold);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setControllerHybridTimeline(
+      *component, hold, output_positions, interval_velocity, replacement_start,
+      header_stamp, header_stamp));
+
+  std::string reason;
+  bool requires_latched_halt = false;
+  const auto predicted = CollisionAwareServoComponentTestPeer::predict(
+    *component, reason, requires_latched_halt);
+  ASSERT_TRUE(predicted.has_value()) << reason;
+  EXPECT_FALSE(requires_latched_halt);
+  EXPECT_LT((predicted->positions - hold).norm(), 1.0e-12);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::activePublicationId(*component), latest_id);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::olderPublicationRecoveryCount(*component), 0U);
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::rearmPending(*component));
 }
 
 TEST_F(MotionReferenceTest, ComponentAdmissionKeepsInclusiveQvAndSaturatedAjEndpoints)
@@ -2686,7 +3801,7 @@ TEST_F(MotionReferenceRecoveryDisabledTest, AvailablePairKeepsNormalFaceTracking
   const auto result = update(robot_state, face);
 
   ASSERT_TRUE(result.task);
-  ASSERT_TRUE(result.tracking);
+  ASSERT_TRUE(result.tracking) << reference_->diagnostics().state;
   EXPECT_FALSE(reference_->compactManeuverActive());
   EXPECT_EQ(reference_->diagnostics().state, "FACE");
 }
@@ -2756,6 +3871,72 @@ TEST_F(MotionReferenceTest, PublicYawReversalReleasesTheLatchedJ1Hold)
   EXPECT_FALSE(reversed_update.j1_hold_position_rad);
   EXPECT_EQ(reference_->diagnostics().j1_hold_direction, 0);
   EXPECT_DOUBLE_EQ(reference_->diagnostics().j1_hold_q, 0.0);
+
+  auto bad_state = state();
+  bad_state.setVariablePosition("joint1", 6.20);
+  bad_state.setVariablePosition("joint2", 0.233);
+  bad_state.setVariablePosition("joint3", -2.30);
+  bad_state.setVariablePosition("joint4", 0.0168);
+  bad_state.setVariablePosition("joint5", -0.8338);
+  bad_state.setVariablePosition("joint6", 6.27);
+  bad_state.update(true);
+  ASSERT_TRUE(bad_state.satisfiesBounds(group_));
+  Eigen::VectorXd bad_position;
+  bad_state.copyJointGroupPositions(group_, bad_position);
+  const JointMotionState bad_settled{
+    bad_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  reference_ = std::make_unique<MotionReference>(
+    node_, monitor_, parameters_, limits_, collision_config_);
+  const auto bad_edge = update(
+    bad_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, bad_settled);
+  ASSERT_TRUE(bad_edge.task);
+  ASSERT_TRUE(bad_edge.j1_hold_position_rad);
+  ASSERT_EQ(reference_->diagnostics().posture_mode, "recover");
+  const auto bad_held_direction = static_cast<BaseJointDirection>(
+    reference_->diagnostics().j1_hold_direction);
+  std::optional<msg::TrackingTarget> bad_reversed_target;
+  for (const double offset : {0.30, -0.30}) {
+    auto candidate = targetWithYawOffset(bad_state, offset);
+    const auto assessment = pairYawAssessment(bad_state, candidate);
+    if (assessment.valid && assessment.demand_present &&
+      assessment.j1.required_direction != BaseJointDirection::kNone &&
+      assessment.j1.required_direction != bad_held_direction)
+    {
+      bad_reversed_target = std::move(candidate);
+      break;
+    }
+  }
+  ASSERT_TRUE(bad_reversed_target);
+  const auto bad_reversed = update(
+    bad_state, bad_reversed_target, nullptr, nullptr, bad_settled);
+  ASSERT_TRUE(bad_reversed.task);
+  EXPECT_FALSE(bad_reversed.j1_hold_position_rad);
+  EXPECT_EQ(reference_->diagnostics().j1_hold_direction, 0);
+  EXPECT_EQ(reference_->diagnostics().posture_mode, "recover");
+
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+  const auto collision = collision_builder.build(
+    *scene, bad_state, *group_, bad_settled, limits_, parameters_.control_period_sec);
+  auto constraints = collision.constraints;
+  constraints.insert(
+    constraints.end(), bad_reversed.compact_roll_constraints.begin(),
+    bad_reversed.compact_roll_constraints.end());
+  const auto bad_qp = solver.solve(
+    *bad_reversed.task, bad_settled, limits_, constraints);
+  ASSERT_TRUE(bad_qp.command_available());
 }
 
 TEST_F(MotionReferenceTest, FreshPairAvailabilityCancelsPreparationBeforeCommit)
@@ -3863,6 +5044,7 @@ TEST_F(MotionReferenceTest, ReferenceGuardBlendUsesValidatedBrakeFallback)
   EXPECT_TRUE(selected_qp.joint_velocity.isApprox(brake_velocity, 1.0e-12));
 }
 
+
 TEST_F(MotionReferenceTest, CapturedLowFaceEdgeRecoveryPassesReconstructedFullValidation)
 {
   // Reconstruction from the low-target capture at sim 108.0 s. Runtime did not
@@ -4507,6 +5689,10 @@ TEST_F(MotionReferenceCameraTest, GazeFaceKeepsPhysicalScreenRollPrimary)
   const Eigen::Isometry3d optical_pose = robot_state.getGlobalLinkTransform(gaze_link);
   const Eigen::Vector3d target_face =
     optical_pose.translation() + 0.8 * optical_pose.linear().col(2);
+  const Eigen::Vector3d monitor_position =
+    robot_state.getGlobalLinkTransform("monitor_control_frame").translation();
+  const double measured_monitor_face_distance = (monitor_position - target_face).norm();
+  ASSERT_GT(measured_monitor_face_distance, parameters_.face_distance_max_m);
   face.face.x = target_face.x();
   face.face.y = target_face.y();
   face.face.z = target_face.z();
@@ -4514,8 +5700,17 @@ TEST_F(MotionReferenceCameraTest, GazeFaceKeepsPhysicalScreenRollPrimary)
   ASSERT_TRUE(result.tracking);
   ASSERT_TRUE(result.task);
   EXPECT_NEAR(result.tracking->pointing_error_rad, 0.0, 1.0e-8);
+  ASSERT_TRUE(result.tracking->face_distance_interval);
+  EXPECT_TRUE(result.tracking->face_distance_outside_band);
+  EXPECT_EQ(result.task->secondary_matrix.rows(), 0);
+  ASSERT_EQ(result.task->distance_matrix.rows(), 3)
+    << "Out-of-band distance follows the face ray as a final soft task";
+  ASSERT_EQ(result.task->preferred_primary_constraints.size(), 1U)
+    << "A GOOD J3 comfort bound remains active while distance is out of band";
+  EXPECT_NEAR(result.tracking->position_error_m,
+    measured_monitor_face_distance - parameters_.face_distance_max_m, 1.0e-8);
   EXPECT_EQ(result.task->primary_matrix.rows(), 3);
-  EXPECT_EQ(result.task->secondary_matrix.rows(), 3);
+  EXPECT_EQ(result.task->secondary_matrix.rows(), 0);
   EXPECT_TRUE(result.tracking->has_face_primary_roll);
   EXPECT_TRUE(reference_->diagnostics().upright_roll_guard_armed);
   EXPECT_EQ(result.compact_roll_constraints.size(), 3U);
@@ -4532,6 +5727,17 @@ TEST_F(MotionReferenceCameraTest, GazeFaceKeepsPhysicalScreenRollPrimary)
     screen_jacobian.bottomRows(3) =
       (root_rotation * screen_jacobian.bottomRows(3)).eval();
   }
+  EXPECT_TRUE(result.task->distance_matrix.isApprox(screen_jacobian.topRows(3)));
+  const Eigen::Vector3d radial_direction =
+    (monitor_position - target_face).normalized();
+  const Eigen::Vector3d expected_linear_reference =
+    radial_direction * result.tracking->face_distance_reference[0];
+  EXPECT_TRUE(result.task->distance_reference.isApprox(expected_linear_reference));
+  EXPECT_NEAR(radial_direction.dot(result.task->distance_reference),
+    result.tracking->face_distance_reference[0], 1.0e-8);
+  EXPECT_NEAR(((Eigen::Matrix3d::Identity() -
+    radial_direction * radial_direction.transpose()) * result.task->distance_reference,
+    Eigen::Vector3d::Zero()).norm(), 0.0, 1.0e-8);
   TrackingVelocityTaskConfig config;
   config.orientation_gain = parameters_.orientation_gain;
   config.maximum_angular_reference_radps = parameters_.maximum_angular_reference_radps;
@@ -4550,6 +5756,3768 @@ TEST_F(MotionReferenceCameraTest, GazeFaceKeepsPhysicalScreenRollPrimary)
   EXPECT_FALSE(reference_->compactManeuverActive());
   EXPECT_EQ(reference_->diagnostics().tracking_phase, "FACE");
   EXPECT_EQ(reference_->diagnostics().compact_generation, 0U);
+}
+
+TEST_F(MotionReferenceTest, Posture1CDistanceIntervalRemainsDiagnosticOnly)
+{
+  parameters_.position_deadband_m = 0.03;
+
+  const auto robot_state = state();
+  const Eigen::Vector3d screen =
+    robot_state.getGlobalLinkTransform("monitor_control_frame").translation();
+  auto target = faceAlongLookDirection(robot_state);
+  const Eigen::Vector3d initial_face(target.face.x, target.face.y, target.face.z);
+  const Eigen::Vector3d ray = (initial_face - screen).normalized();
+  const double delta = parameters_.maximum_linear_reference_mps *
+    parameters_.control_period_sec;
+  ASSERT_GT(delta, 0.0);
+  ASSERT_LT(2.0 * delta,
+    parameters_.face_distance_max_m - parameters_.face_distance_min_m);
+
+  const auto make_target_at_distance = [&](const double distance, const double stamp_sec) {
+      auto command = target;
+      const Eigen::Vector3d face = screen + distance * ray;
+      command.face.x = face.x();
+      command.face.y = face.y();
+      command.face.z = face.z();
+      const auto stamp = rclcpp::Time(
+        static_cast<std::int64_t>(std::llround(stamp_sec * 1.0e9)), RCL_ROS_TIME);
+      command.header.stamp = stamp;
+      command.face_stamp = stamp;
+      return command;
+    };
+  const auto update_at_distance = [&](const double distance) {
+      reference_.reset();
+      reference_ = std::make_unique<MotionReference>(
+        node_, monitor_, parameters_, limits_, collision_config_);
+      constexpr double kStampSec = 100.0;
+      return update(robot_state, make_target_at_distance(distance, kStampSec),
+        nullptr, nullptr, std::nullopt, kSceneRevision, kStampSec);
+    };
+  const auto expect_no_distance_constraint = [](const auto & result) {
+      ASSERT_TRUE(result.tracking);
+      ASSERT_TRUE(result.task);
+      for (const auto & constraint : result.task->secondary_constraints) {
+        EXPECT_FALSE(constraint.coefficients.isApprox(
+            result.tracking->face_distance_matrix.row(0).transpose(), 1.0e-8));
+      }
+    };
+  const auto below = update_at_distance(
+    parameters_.face_distance_min_m - 0.5 * delta);
+  ASSERT_TRUE(below.tracking);
+  ASSERT_TRUE(below.task);
+  ASSERT_TRUE(below.tracking->face_distance_interval);
+  ASSERT_TRUE(below.tracking->face_distance_outside_band);
+  expect_no_distance_constraint(below);
+  EXPECT_TRUE(below.task->primary_matrix.isApprox(
+      below.tracking->task.primary_matrix, 1.0e-12));
+  EXPECT_TRUE(below.task->primary_reference.isApprox(
+      below.tracking->task.primary_reference, 1.0e-12));
+  EXPECT_TRUE(below.task->primary_weights.isApprox(
+      below.tracking->task.primary_weights, 1.0e-12));
+
+  const auto above = update_at_distance(
+    parameters_.face_distance_max_m + 0.5 * delta);
+  ASSERT_TRUE(above.tracking);
+  ASSERT_TRUE(above.task);
+  ASSERT_TRUE(above.tracking->face_distance_interval);
+  ASSERT_TRUE(above.tracking->face_distance_outside_band);
+  expect_no_distance_constraint(above);
+  EXPECT_TRUE(above.task->primary_matrix.isApprox(
+      above.tracking->task.primary_matrix, 1.0e-12));
+  EXPECT_TRUE(above.task->primary_reference.isApprox(
+      above.tracking->task.primary_reference, 1.0e-12));
+  EXPECT_TRUE(above.task->primary_weights.isApprox(
+      above.tracking->task.primary_weights, 1.0e-12));
+
+  const double in_band_distance = 0.5 * (
+    parameters_.face_distance_min_m + parameters_.face_distance_max_m);
+  const auto inside = update_at_distance(in_band_distance);
+  ASSERT_TRUE(inside.tracking);
+  ASSERT_TRUE(inside.task);
+  ASSERT_TRUE(inside.tracking->face_distance_interval);
+  ASSERT_FALSE(inside.tracking->face_distance_outside_band);
+  expect_no_distance_constraint(inside);
+  bool inside_has_radial_row = false;
+  for (Eigen::Index row = 0; row < inside.task->secondary_matrix.rows(); ++row) {
+    inside_has_radial_row = inside_has_radial_row ||
+      inside.task->secondary_matrix.row(row).isApprox(
+      inside.tracking->face_distance_matrix.row(0), 1.0e-8);
+  }
+  EXPECT_FALSE(inside_has_radial_row)
+    << "Inside the band, posture stays active without an extra radial hold objective";
+
+  const auto outside_shell = update_at_distance(
+    parameters_.face_distance_min_m - 2.0 * delta);
+  ASSERT_TRUE(outside_shell.tracking);
+  ASSERT_TRUE(outside_shell.task);
+  ASSERT_TRUE(outside_shell.tracking->face_distance_interval);
+  EXPECT_TRUE(outside_shell.tracking->face_distance_outside_band);
+  expect_no_distance_constraint(outside_shell);
+  EXPECT_EQ(outside_shell.task->distance_matrix.rows(), 3);
+  const double outside_distance = parameters_.face_distance_min_m - 2.0 * delta;
+  const Eigen::Vector3d outside_face = screen + outside_distance * ray;
+  const Eigen::Vector3d outside_radial = (screen - outside_face).normalized();
+  EXPECT_NEAR(outside_radial.dot(outside_shell.task->distance_reference),
+    outside_shell.tracking->face_distance_reference[0], 1.0e-8);
+  EXPECT_NEAR(((Eigen::Matrix3d::Identity() -
+    outside_radial * outside_radial.transpose()) *
+    outside_shell.task->distance_reference).norm(), 0.0, 1.0e-8);
+}
+
+TEST_F(MotionReferenceTest, Posture1CApprovedFixturesUseWorldBaseOrigin)
+{
+  const auto fixtures = readPosture1CFixtures();
+  ASSERT_EQ(fixtures.size(), 10U);
+  const auto named_bend = [this](const std::string & name) {
+      moveit::core::RobotState state(model_);
+      if (!state.setToDefaultValues(group_, name)) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      state.update();
+      Eigen::VectorXd q;
+      state.copyJointGroupPositions(group_, q);
+      const auto * joint_model = model_->getJointModel("joint3");
+      const auto * revolute = dynamic_cast<const moveit::core::RevoluteJointModel *>(joint_model);
+      const auto * parent = joint_model ? joint_model->getParentLinkModel() : nullptr;
+      const auto * child = joint_model ? joint_model->getChildLinkModel() : nullptr;
+      if (!revolute || !parent || !child || q.size() != 6) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      const Eigen::Vector3d shoulder = state.getGlobalLinkTransform("link2").translation();
+      const Eigen::Vector3d elbow = state.getGlobalLinkTransform("link3").translation();
+      const Eigen::Vector3d wrist = state.getGlobalLinkTransform("link4").translation();
+      const Eigen::Vector3d axis = state.getGlobalLinkTransform(parent).linear() *
+        child->getJointOriginTransform().linear() * revolute->getAxis();
+      const Eigen::Vector3d upper_arm = elbow - shoulder;
+      const Eigen::Vector3d forearm = wrist - elbow;
+      return std::optional<std::pair<double, double>>{{q[2], std::atan2(
+          axis.normalized().dot(upper_arm.cross(forearm)), upper_arm.dot(forearm))}};
+    };
+  const auto rest = named_bend("rest");
+  const auto search = named_bend("search");
+  ASSERT_TRUE(rest);
+  ASSERT_TRUE(search);
+  const auto calibration = calibratePostureBend(
+    rest->first, rest->second, search->first, search->second,
+    limits_.lower_position[2], limits_.upper_position[2]);
+  ASSERT_TRUE(calibration.valid);
+  int base_matches = 0;
+  int shoulder_matches = 0;
+  int bend_matches = 0;
+  for (const auto & fixture : fixtures) {
+    SCOPED_TRACE("POSTURE-1C fixture " + std::to_string(fixture.id));
+    moveit::core::RobotState robot_state(model_);
+    robot_state.setToDefaultValues();
+    for (Eigen::Index joint = 0; joint < fixture.joints.size(); ++joint) {
+      robot_state.setVariablePosition("joint" + std::to_string(joint + 1), fixture.joints[joint]);
+    }
+    robot_state.update();
+    ASSERT_TRUE(robot_state.satisfiesBounds(group_));
+
+    const Eigen::Vector3d base =
+      robot_state.getGlobalLinkTransform("link_base").translation();
+    const Eigen::Vector3d shoulder =
+      robot_state.getGlobalLinkTransform("link2").translation();
+    const Eigen::Vector3d elbow =
+      robot_state.getGlobalLinkTransform("link3").translation();
+    const Eigen::Vector3d wrist =
+      robot_state.getGlobalLinkTransform("link4").translation();
+    const Eigen::MatrixXd base_jacobian = Eigen::MatrixXd::Zero(3, 6);
+    const auto world_linear_jacobian = [this, &robot_state](
+      const std::string & link_name, Eigen::MatrixXd & output) {
+        Eigen::MatrixXd full;
+        if (!robot_state.getJacobian(
+            group_, model_->getLinkModel(link_name), Eigen::Vector3d::Zero(), full, false) ||
+          full.rows() != 6 || full.cols() != 6)
+        {
+          return false;
+        }
+        const auto * root = group_->getJointModels().front()->getParentLinkModel();
+        output = full.topRows(3);
+        if (root) {
+          output = (robot_state.getGlobalLinkTransform(root).linear() * output).eval();
+        }
+        return output.allFinite();
+      };
+    Eigen::MatrixXd elbow_jacobian;
+    Eigen::MatrixXd wrist_jacobian;
+    ASSERT_TRUE(world_linear_jacobian("link3", elbow_jacobian));
+    ASSERT_TRUE(world_linear_jacobian("link4", wrist_jacobian));
+    EXPECT_TRUE(shoulder.isApprox(fixture.shoulder, 2.0e-6));
+    EXPECT_TRUE(elbow.isApprox(fixture.elbow, 2.0e-6));
+    EXPECT_TRUE(wrist.isApprox(fixture.wrist, 2.0e-6));
+    EXPECT_NEAR(base.x(), 0.0, 1.0e-9);
+    EXPECT_NEAR(base.y(), 0.0, 1.0e-9);
+    EXPECT_NEAR(base.z(), 0.75, 1.0e-9);
+
+    // The approved labels are an independent oracle. This scalar is evaluated
+    // directly from the fixture FK points, without calling the production helper.
+    const double base_side = independentElbowFaceSide(
+      base, fixture.elbow, fixture.wrist, fixture.face);
+    const double shoulder_side = independentElbowFaceSide(
+      fixture.shoulder, fixture.elbow, fixture.wrist, fixture.face);
+    const bool base_classifies_good = base_side < 0.0;
+    const bool shoulder_classifies_good = shoulder_side < 0.0;
+    EXPECT_EQ(base_classifies_good, fixture.good)
+      << "base-side C=" << base_side << " (world base z=" << base.z() << ")";
+    base_matches += base_classifies_good == fixture.good ? 1 : 0;
+    shoulder_matches += shoulder_classifies_good == fixture.good ? 1 : 0;
+
+    Eigen::VectorXd q;
+    robot_state.copyJointGroupPositions(group_, q);
+    const auto * joint3_model = model_->getJointModel("joint3");
+    const auto * joint3 = dynamic_cast<const moveit::core::RevoluteJointModel *>(joint3_model);
+    ASSERT_NE(joint3, nullptr);
+    const auto * joint3_parent = joint3_model->getParentLinkModel();
+    const auto * joint3_child = joint3_model->getChildLinkModel();
+    ASSERT_NE(joint3_parent, nullptr);
+    ASSERT_NE(joint3_child, nullptr);
+    const Eigen::Vector3d axis = robot_state.getGlobalLinkTransform(joint3_parent).linear() *
+      joint3_child->getJointOriginTransform().linear() * joint3->getAxis();
+    const Eigen::Vector3d upper_arm = elbow - shoulder;
+    const Eigen::Vector3d forearm = wrist - elbow;
+    const double bend_angle = std::atan2(
+      axis.normalized().dot(upper_arm.cross(forearm)), upper_arm.dot(forearm));
+    const double signed_bend = calibration.preferred_sign * std::sin(bend_angle);
+    EXPECT_EQ(signed_bend >= calibration.minimum_comfortable_sin, fixture.good)
+      << "actual FK bend sin=" << signed_bend << " threshold="
+      << calibration.minimum_comfortable_sin;
+    PosturePreferenceConfig config;
+    config.joint3_angle_offset_rad = calibration.angle_offset_rad;
+    config.preferred_bend_sign = calibration.preferred_sign;
+    config.comfortable_joint3_lower = calibration.joint3_lower;
+    config.comfortable_joint3_upper = calibration.joint3_upper;
+    config.position_margin_j5_rad = 0.0;
+    config.position_margin_j6_rad = 0.0;
+    const auto production = makePosturePreferenceObjective(
+      base, elbow, wrist, fixture.face, base_jacobian, elbow_jacobian,
+      wrist_jacobian, q, config);
+    ASSERT_TRUE(production.valid);
+    const bool bend_classifies_good = q[2] >= calibration.joint3_lower &&
+      q[2] <= calibration.joint3_upper;
+    EXPECT_EQ(bend_classifies_good, fixture.good)
+      << "calibrated J3 interval [" << calibration.joint3_lower << ", "
+      << calibration.joint3_upper << "] q3=" << q[2];
+    bend_matches += bend_classifies_good == fixture.good ? 1 : 0;
+    EXPECT_EQ(production.branch_comfortable, fixture.good)
+      << "Production branch classification disagrees with approved label; independent "
+      << "C(link_base)=" << base_side << " C(link2)=" << shoulder_side;
+    if (!fixture.good) {
+      ASSERT_GT(production.matrix.rows(), 0);
+      EXPECT_GT(production.reference[0], 0.0)
+        << "Outside the comfort branch, the soft objective must progress toward it";
+    }
+    // The branch label is anatomical and must survive polar J1 rotation and
+    // an arbitrary change of F. Rotate the known FK geometry about link_base,
+    // then try face points on both sides and near the gaze-axis pole.
+    for (const double polar_delta : {-1.1, 0.7}) {
+      const Eigen::Matrix3d polar = Eigen::AngleAxisd(polar_delta,
+        Eigen::Vector3d::UnitZ()).toRotationMatrix();
+      Eigen::VectorXd polar_q = q;
+      polar_q[0] += polar_delta;
+      const Eigen::Vector3d polar_elbow = base + polar * (elbow - base);
+      const Eigen::Vector3d polar_wrist = base + polar * (wrist - base);
+      const Eigen::Vector3d polar_face = base + polar * (fixture.face - base);
+      const std::array<Eigen::Vector3d, 3> face_variants{
+        polar_face,
+        base + polar * Eigen::Vector3d(0.35, 0.22, 0.08),
+        base + polar * Eigen::Vector3d(0.35, -0.22, -0.08)};
+      for (std::size_t variant = 0; variant < face_variants.size(); ++variant) {
+        const auto stable = makePosturePreferenceObjective(
+          base, polar_elbow, polar_wrist, face_variants[variant], base_jacobian,
+          elbow_jacobian, wrist_jacobian, polar_q, config);
+        ASSERT_TRUE(stable.valid);
+        EXPECT_EQ(stable.branch_comfortable, fixture.good)
+          << "label changed under polar delta=" << polar_delta << " F variant=" << variant;
+      }
+    }
+  }
+
+  EXPECT_EQ(base_matches, 10)
+    << "All approved poses classify only when link_base's world transform is used";
+  EXPECT_EQ(shoulder_matches, 6)
+    << "The link2-origin counterexample proves the shoulder substitution changes approved labels";
+  EXPECT_EQ(bend_matches, 10)
+    << "Named-pose calibrated anatomical bend must reproduce all ten approved labels";
+}
+
+TEST_F(MotionReferenceTest, Posture1CBadFixturesHaveSafeLocalTrackingCorrection)
+{
+  const auto fixtures = readPosture1CFixtures();
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  const double side_reserve = parameters_.maximum_linear_reference_mps *
+    parameters_.control_period_sec;
+  int checked_bad_fixtures = 0;
+  int corrected_bad_fixtures = 0;
+  std::ostringstream analysis;
+
+  for (const auto & fixture : fixtures) {
+    if (fixture.good) {
+      continue;
+    }
+    SCOPED_TRACE("POSTURE-1C BAD fixture " + std::to_string(fixture.id));
+    ++checked_bad_fixtures;
+    moveit::core::RobotState robot_state(model_);
+    robot_state.setToDefaultValues();
+    for (Eigen::Index joint = 0; joint < fixture.joints.size(); ++joint) {
+      robot_state.setVariablePosition("joint" + std::to_string(joint + 1), fixture.joints[joint]);
+    }
+    robot_state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+    robot_state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+    robot_state.update();
+    ASSERT_TRUE(robot_state.satisfiesBounds(group_)) << "fixture q violates URDF limits";
+    Eigen::VectorXd q;
+    robot_state.copyJointGroupPositions(group_, q);
+    const JointMotionState motion{
+      q, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+    const auto actual = collision_builder.validateActualState(*scene, robot_state, *group_);
+    analysis << "fixture=" << fixture.id << " actual_valid=" << actual.input_valid
+             << " actual_unsafe=" << actual.unsafe << " actual_collision="
+             << actual.collision_detected << " actual_min_distance_m="
+             << actual.minimum_distance_m << " closest_pair=" << actual.closest_pair
+             << " actual_reason=" << actual.failure_reason;
+    if (!actual.input_valid || actual.unsafe) {
+      ADD_FAILURE() << "Unsafe POSTURE-1C BAD seed " << fixture.id
+                    << "; refusing to assess its correction. " << actual.failure_reason;
+      analysis << " correction=skipped\n";
+      continue;
+    }
+    const auto robust = collision_builder.validatePose(*scene, robot_state, *group_, motion);
+    analysis << " robust_valid=" << robust.input_valid << " robust_unsafe=" << robust.unsafe
+             << " robust_clearance_violated=" << robust.robust_clearance_violated
+             << " robust_min_distance_m=" << robust.minimum_distance_m
+             << " robust_pair=" << robust.closest_pair << " robust_reason="
+             << robust.failure_reason;
+    if (!robust.input_valid || robust.unsafe) {
+      ADD_FAILURE() << "POSTURE-1C BAD seed " << fixture.id
+                    << " fails robust stationary clearance; refusing correction claim. "
+                    << robust.failure_reason;
+      analysis << " correction=skipped\n";
+      continue;
+    }
+
+    msg::TrackingTarget face = faceAlongLookDirection(robot_state);
+    face.face.x = fixture.face.x();
+    face.face.y = fixture.face.y();
+    face.face.z = fixture.face.z();
+    const auto result = update(robot_state, face);
+    ASSERT_TRUE(result.tracking) << reference_->diagnostics().state;
+    ASSERT_TRUE(result.task);
+    ASSERT_FALSE(result.tracking->face_distance_outside_band);
+    ASSERT_TRUE(result.tracking->face_distance_interval);
+    ASSERT_GT(result.task->secondary_matrix.rows(), 0);
+
+    auto full_task = *result.task;
+    const auto collision = collision_builder.build(
+      *scene, robot_state, *group_, motion, limits_, parameters_.control_period_sec);
+    const QpResult qp = solver.solve(full_task, motion, limits_, collision.constraints);
+    ASSERT_TRUE(qp.command_available()) << "QP status=" << static_cast<int>(qp.status);
+    ASSERT_EQ(qp.joint_velocity.size(), 6);
+
+    const Eigen::Vector3d base = robot_state.getGlobalLinkTransform("link_base").translation();
+    const double c_before = independentElbowFaceSide(
+      base, fixture.elbow, fixture.wrist, fixture.face);
+    const Eigen::Vector3d w = fixture.wrist - base;
+    const Eigen::Vector3d f = fixture.face - base;
+    const double f_perp_norm =
+      (f - w * (f.dot(w) / w.squaredNorm())).norm();
+    ASSERT_GT(f_perp_norm, 1.0e-6);
+    const double clearance_before = -c_before / f_perp_norm;
+    ASSERT_GT(c_before, 0.0) << "BAD fixture must start on the target-side of link_base SW";
+    ASSERT_LT(clearance_before, -side_reserve);
+
+    auto next_state = robot_state;
+    const Eigen::VectorXd next_q = q + parameters_.control_period_sec * qp.joint_velocity;
+    next_state.setJointGroupPositions(group_, next_q);
+    next_state.update(true);
+    const Eigen::Vector3d next_base =
+      next_state.getGlobalLinkTransform("link_base").translation();
+    const Eigen::Vector3d next_elbow =
+      next_state.getGlobalLinkTransform("link3").translation();
+    const Eigen::Vector3d next_wrist =
+      next_state.getGlobalLinkTransform("link4").translation();
+    const double c_after = independentElbowFaceSide(
+      next_base, next_elbow, next_wrist, fixture.face);
+    const Eigen::Vector3d next_w = next_wrist - next_base;
+    const Eigen::Vector3d next_f = fixture.face - next_base;
+    const double clearance_after = -(c_after) /
+      (next_f - next_w * (next_f.dot(next_w) / next_w.squaredNorm())).norm();
+    analysis << " clearance_m=" << clearance_before << " -> " << clearance_after
+             << " qp_status=" << static_cast<int>(qp.status)
+             << " qdot=" << qp.joint_velocity.transpose();
+    EXPECT_GT(clearance_after, clearance_before)
+      << "fixture=" << fixture.id << " c=" << c_before << " -> " << c_after
+      << " qdot=" << qp.joint_velocity.transpose();
+
+    const double feasibility_tolerance =
+      solver.config().solution_feasibility_tolerance +
+      4.0 * solver.config().solver_absolute_tolerance;
+    const auto & distance = *result.tracking->face_distance_interval;
+    const double distance_rate = distance.coefficients.dot(qp.joint_velocity);
+    EXPECT_GE(distance_rate, distance.lower_bound - feasibility_tolerance);
+    EXPECT_LE(distance_rate, distance.upper_bound + feasibility_tolerance);
+    ASSERT_EQ(qp.achieved_primary_velocity.size(), result.task->primary_matrix.rows());
+    EXPECT_LE((result.task->primary_matrix * qp.joint_velocity -
+      qp.achieved_primary_velocity).norm(),
+      solver.config().primary_preservation_tolerance + feasibility_tolerance);
+    const auto next_actual = collision_builder.validateActualState(*scene, next_state, *group_);
+    EXPECT_TRUE(next_actual.input_valid) << next_actual.failure_reason;
+    EXPECT_FALSE(next_actual.unsafe) << next_actual.failure_reason;
+    const JointMotionState next_motion{
+      next_q, qp.joint_velocity,
+      Eigen::VectorXd::Zero(qp.joint_velocity.size())};
+    const auto next_robust = collision_builder.validatePose(
+      *scene, next_state, *group_, next_motion);
+    EXPECT_TRUE(next_robust.input_valid) << next_robust.failure_reason;
+    EXPECT_FALSE(next_robust.unsafe) << next_robust.failure_reason;
+    analysis << " next_actual_unsafe=" << next_actual.unsafe
+             << " next_robust_unsafe=" << next_robust.unsafe
+             << " next_robust_reason=" << next_robust.failure_reason << '\n';
+    ++corrected_bad_fixtures;
+  }
+  EXPECT_EQ(checked_bad_fixtures, 5);
+  RecordProperty("posture1c_bad_seed_model_analysis", analysis.str());
+  EXPECT_EQ(corrected_bad_fixtures, 5)
+    << "Every BAD fixture must have a safe start before its local QP correction is assessed";
+}
+
+TEST_F(MotionReferenceTest, Posture1DFixtureGoodSeedsHoldAndBadSeedsMakeSafeBendProgress)
+{
+  constexpr double kComfortLower = -1.95514;
+  constexpr double kComfortUpper = -0.3696309078954824;
+  constexpr double kOneDegreeRad = 3.14159265358979323846 / 180.0;
+  constexpr int kGoodHoldSteps = 500;
+  constexpr int kBadMaximumSteps = 3000;
+  constexpr int kRecoveredHoldSteps = 500;
+  const double dt = parameters_.control_period_sec;
+  const auto fixtures = readPosture1CFixtures();
+  ASSERT_EQ(fixtures.size(), 10U);
+
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = dt;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+  std::ostringstream report;
+  double time_sec = 300.0;
+  int checked_good = 0;
+  int checked_bad = 0;
+
+  for (const auto & fixture : fixtures) {
+    if ((fixture.good && (fixture.id < 2 || fixture.id > 5)) ||
+      (!fixture.good && (fixture.id < 6 || fixture.id > 9)))
+    {
+      continue;
+    }
+    SCOPED_TRACE("POSTURE-1D fixture " + std::to_string(fixture.id));
+    reference_.reset();
+    reference_ = std::make_unique<MotionReference>(
+      node_, monitor_, parameters_, limits_, collision_config_);
+    moveit::core::RobotState state(model_);
+    state.setToDefaultValues();
+    for (Eigen::Index joint = 0; joint < fixture.joints.size(); ++joint) {
+      state.setVariablePosition("joint" + std::to_string(joint + 1), fixture.joints[joint]);
+    }
+    state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+    state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+    state.update();
+    ASSERT_TRUE(state.satisfiesBounds(group_));
+
+    auto face = fixture.good ? faceAlongLookDirection(state) : target(msg::TrackingTarget::FACE);
+    if (!fixture.good) {
+      face.face.x = fixture.face.x();
+      face.face.y = fixture.face.y();
+      face.face.z = fixture.face.z();
+    } else {
+      const Eigen::Vector3d screen =
+        state.getGlobalLinkTransform("monitor_control_frame").translation();
+      const Eigen::Vector3d nominal_face(face.face.x, face.face.y, face.face.z);
+      const Eigen::Vector3d ray = (nominal_face - screen).normalized();
+      const Eigen::Vector3d fixed_face = screen + 0.40 * ray;
+      face.face.x = fixed_face.x();
+      face.face.y = fixed_face.y();
+      face.face.z = fixed_face.z();
+    }
+    face.target_id = static_cast<std::uint32_t>(100 + fixture.id);
+    Eigen::VectorXd initial_q;
+    state.copyJointGroupPositions(group_, initial_q);
+    const int maximum_steps = fixture.good ? kGoodHoldSteps : kBadMaximumSteps;
+    int comfortable_streak = 0;
+    int first_comfortable_step = -1;
+    double maximum_comfort_excursion = 0.0;
+    double maximum_q3 = initial_q[2];
+    int completed_steps = 0;
+
+    for (int step = 0; step < maximum_steps; ++step) {
+      time_sec += dt;
+      const auto stamp = rclcpp::Time(
+        static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+      face.header.stamp = stamp;
+      face.face_stamp = stamp;
+      const auto result = update(
+        state, face, nullptr, nullptr, std::nullopt, kSceneRevision, time_sec);
+      ASSERT_TRUE(result.tracking) << "step=" << step;
+      ASSERT_TRUE(result.task) << "step=" << step;
+      if (step == 0) {
+        EXPECT_EQ(reference_->diagnostics().posture_mode, fixture.good ? "preserve" : "recover");
+        if (fixture.good) {
+          EXPECT_TRUE(reference_->diagnostics().upright_roll_guard_armed);
+          EXPECT_FALSE(result.compact_roll_constraints.empty());
+        }
+      }
+
+      Eigen::VectorXd q, qd, qdd;
+      state.copyJointGroupPositions(group_, q);
+      state.copyJointGroupVelocities(group_, qd);
+      state.copyJointGroupAccelerations(group_, qdd);
+      const JointMotionState motion{q, qd, qdd};
+      const auto collision = collision_builder.build(
+        *scene, state, *group_, motion, limits_, dt);
+      const QpResult qp = solver.solve(*result.task, motion, limits_, collision.constraints);
+      ASSERT_TRUE(qp.command_available()) << "step=" << step
+                                          << " status=" << static_cast<int>(qp.status);
+      ASSERT_EQ(qp.joint_velocity.size(), 6);
+      const Eigen::VectorXd next_q = q + dt * qp.joint_velocity;
+      const Eigen::VectorXd next_qdd = (qp.joint_velocity - qd) / dt;
+      state.setJointGroupPositions(group_, next_q);
+      state.setJointGroupVelocities(group_, qp.joint_velocity);
+      state.setJointGroupAccelerations(group_, next_qdd);
+      state.update(true);
+      ASSERT_TRUE(state.satisfiesBounds(group_)) << "step=" << step;
+      EXPECT_FALSE(scene->isStateColliding(state, group_->getName())) << "step=" << step;
+
+      Eigen::VectorXd current_q;
+      state.copyJointGroupPositions(group_, current_q);
+      maximum_q3 = std::max(maximum_q3, current_q[2]);
+      const double excursion = std::max({
+            0.0, kComfortLower - current_q[2], current_q[2] - kComfortUpper});
+      maximum_comfort_excursion = std::max(maximum_comfort_excursion, excursion);
+      if (current_q[2] >= kComfortLower && current_q[2] <= kComfortUpper) {
+        ++comfortable_streak;
+        if (first_comfortable_step < 0) {
+          first_comfortable_step = step;
+        }
+      } else {
+        comfortable_streak = 0;
+        first_comfortable_step = -1;
+      }
+      completed_steps = step + 1;
+      if (!fixture.good && comfortable_streak >= kRecoveredHoldSteps) {
+        break;
+      }
+    }
+
+    if (fixture.good) {
+      ++checked_good;
+      EXPECT_LE(maximum_comfort_excursion, kOneDegreeRad)
+        << "GOOD fixture must remain in the calibrated branch within the practical 1-degree "
+        << "allowance; raw excursion=" << maximum_comfort_excursion;
+      Eigen::VectorXd final_q;
+      state.copyJointGroupPositions(group_, final_q);
+      EXPECT_GE(final_q[2], kComfortLower - kOneDegreeRad);
+      EXPECT_LE(final_q[2], kComfortUpper + kOneDegreeRad);
+      if (fixture.id == 2) {
+        auto lost_target = target(msg::TrackingTarget::HOLD);
+        lost_target.target_id = face.target_id;
+        time_sec += dt;
+        auto stamp = rclcpp::Time(
+          static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+        lost_target.header.stamp = stamp;
+        const auto lost = update(
+          state, lost_target, nullptr, nullptr, std::nullopt, kSceneRevision, time_sec);
+        EXPECT_FALSE(lost.task);
+        Eigen::VectorXd before_loss_q, before_loss_qd, before_loss_qdd;
+        state.copyJointGroupPositions(group_, before_loss_q);
+        state.copyJointGroupVelocities(group_, before_loss_qd);
+        state.copyJointGroupAccelerations(group_, before_loss_qdd);
+
+        face.target_id += 1000U;
+        time_sec += dt;
+        stamp = rclcpp::Time(
+          static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+        face.header.stamp = stamp;
+        face.face_stamp = stamp;
+        const auto returned = update(
+          state, face, nullptr, nullptr, std::nullopt, kSceneRevision, time_sec);
+        ASSERT_TRUE(returned.tracking);
+        ASSERT_TRUE(returned.task);
+        EXPECT_EQ(reference_->diagnostics().posture_mode, "preserve");
+        EXPECT_TRUE(reference_->diagnostics().upright_roll_guard_armed);
+        Eigen::VectorXd after_return_q, after_return_qd, after_return_qdd;
+        state.copyJointGroupPositions(group_, after_return_q);
+        state.copyJointGroupVelocities(group_, after_return_qd);
+        state.copyJointGroupAccelerations(group_, after_return_qdd);
+        EXPECT_TRUE(after_return_q.isApprox(before_loss_q, 1.0e-12));
+        EXPECT_TRUE(after_return_qd.isApprox(before_loss_qd, 1.0e-12));
+        EXPECT_TRUE(after_return_qdd.isApprox(before_loss_qdd, 1.0e-12));
+        EXPECT_GE(after_return_q[2], kComfortLower - kOneDegreeRad);
+        EXPECT_LE(after_return_q[2], kComfortUpper + kOneDegreeRad);
+      }
+      report << "GOOD" << fixture.id << " steps=" << completed_steps
+             << " q3=" << final_q[2] << " max_excursion_rad="
+             << maximum_comfort_excursion << '\n';
+    } else {
+      ++checked_bad;
+      EXPECT_GT(maximum_q3, initial_q[2] + 0.005)
+        << "BAD fixture must make measurable inward bend progress without sacrificing safe "
+        << "commands; initial_q3=" << initial_q[2] << " max_q3=" << maximum_q3;
+      const bool recovered = comfortable_streak >= kRecoveredHoldSteps;
+      EXPECT_TRUE(recovered)
+        << "Recorded BAD fixture must recover within the 30-second model budget and remain "
+        << "comfortable for five seconds; fixture=" << fixture.id
+        << " steps=" << completed_steps << " q3=" << maximum_q3;
+      report << "BAD" << fixture.id << " steps=" << completed_steps
+             << " max_q3=" << maximum_q3 << " recovered=" << recovered;
+      if (recovered) {
+        report << " recovery_sec=" << first_comfortable_step * dt
+               << " held_sec=" << kRecoveredHoldSteps * dt;
+      }
+      report << '\n';
+    }
+  }
+
+  EXPECT_EQ(checked_good, 4);
+  EXPECT_EQ(checked_bad, 4);
+  RecordProperty("posture1d_fixture_seed_rollouts", report.str());
+  std::cout << "POSTURE-1D fixture seed rollouts\n" << report.str();
+}
+
+TEST_F(MotionReferenceTest, Posture1CQuietFaceHoldClampsResidualNullspaceMotion)
+{
+  const auto fixtures = readPosture1CFixtures();
+  const auto good = std::find_if(fixtures.begin(), fixtures.end(),
+      [](const Posture1CFixture & fixture) {return fixture.id == 1 && fixture.good;});
+  ASSERT_NE(good, fixtures.end());
+
+  parameters_.position_deadband_m = 0.03;
+  reference_.reset();
+  reference_ = std::make_unique<MotionReference>(
+    node_, monitor_, parameters_, limits_, collision_config_);
+
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+
+  moveit::core::RobotState robot_state(model_);
+  robot_state.setToDefaultValues();
+  for (Eigen::Index joint = 0; joint < good->joints.size(); ++joint) {
+    robot_state.setVariablePosition("joint" + std::to_string(joint + 1), good->joints[joint]);
+  }
+  robot_state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+  robot_state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+  robot_state.update();
+  ASSERT_TRUE(robot_state.satisfiesBounds(group_));
+  const Eigen::Vector3d screen =
+    robot_state.getGlobalLinkTransform("monitor_control_frame").translation();
+  auto target = faceAlongLookDirection(robot_state);
+  Eigen::Vector3d face(target.face.x, target.face.y, target.face.z);
+  const Eigen::Vector3d ray = (face - screen).normalized();
+
+  const auto set_face_range = [&target](const Eigen::Vector3d & origin,
+    const Eigen::Vector3d & direction, const double range) {
+      const Eigen::Vector3d value = origin + range * direction;
+      target.face.x = value.x();
+      target.face.y = value.y();
+      target.face.z = value.z();
+    };
+  const auto stamp_target = [&target](const double time_sec) {
+      const auto stamp = rclcpp::Time(
+        static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+      target.header.stamp = stamp;
+      target.face_stamp = stamp;
+    };
+
+  // A stationary compatible GOOD pose is a zero-motion control for the same
+  // calibrated branch and actual FACE geometry used by the residual cases.
+  constexpr double kFixedFaceDistance = 0.40;
+  set_face_range(screen, ray, kFixedFaceDistance);
+  stamp_target(1.0);
+  auto stationary = update(robot_state, target, nullptr, nullptr, std::nullopt,
+      kSceneRevision, 1.0);
+  ASSERT_TRUE(stationary.tracking);
+  ASSERT_TRUE(stationary.task);
+  ASSERT_TRUE(stationary.tracking->face_distance_interval);
+  const Eigen::VectorXd zero = Eigen::VectorXd::Zero(6);
+  Eigen::VectorXd still_q;
+  robot_state.copyJointGroupPositions(group_, still_q);
+  const JointMotionState still_motion{still_q, zero, zero};
+  const auto still_collision = collision_builder.build(
+    *scene, robot_state, *group_, still_motion, limits_, parameters_.control_period_sec);
+  const QpResult still_qp = solver.solve(
+    *stationary.task, still_motion, limits_, still_collision.constraints);
+  ASSERT_TRUE(still_qp.command_available());
+  EXPECT_LE(still_qp.joint_velocity.norm(), 1.0e-3)
+    << "A zero-velocity, aligned GOOD pose should remain still";
+
+  const std::array<double, 2> residual_magnitudes{0.01, 0.03};
+  const int settling_steps = static_cast<int>(std::ceil(
+      5.0 / parameters_.control_period_sec));
+  const int observation_steps = static_cast<int>(std::ceil(
+      30.0 / parameters_.control_period_sec));
+  const double distance_quiet_limit = 0.01;
+  const TrackingVelocityTaskConfig tracking_config;
+  const double angular_allowance = parameters_.maximum_angular_reference_radps *
+    parameters_.control_period_sec;
+  std::ostringstream residual_report;
+  const Eigen::Vector3d fixed_face = screen + kFixedFaceDistance * ray;
+  const double fixture_distance = (fixed_face - screen).norm();
+  ASSERT_GE(fixture_distance, parameters_.face_distance_min_m);
+  ASSERT_LE(fixture_distance, parameters_.face_distance_max_m);
+
+  int scenario = 0;
+  for (const double magnitude : residual_magnitudes) {
+    for (const double sign : {-1.0, 1.0}) {
+      reference_.reset();
+      reference_ = std::make_unique<MotionReference>(
+        node_, monitor_, parameters_, limits_, collision_config_);
+      moveit::core::RobotState seed(model_);
+      seed.setToDefaultValues();
+      for (Eigen::Index joint = 0; joint < good->joints.size(); ++joint) {
+        seed.setVariablePosition("joint" + std::to_string(joint + 1), good->joints[joint]);
+      }
+      seed.setJointGroupVelocities(group_, zero);
+      seed.setJointGroupAccelerations(group_, zero);
+      seed.update();
+      auto fixed_target = faceAlongLookDirection(seed);
+      fixed_target.face.x = fixed_face.x();
+      fixed_target.face.y = fixed_face.y();
+      fixed_target.face.z = fixed_face.z();
+      const double scenario_start_time = 2.0 + 40.0 * static_cast<double>(scenario++);
+      auto stamp_fixed_target = [&fixed_target](const double time_sec) {
+          const auto stamp = rclcpp::Time(
+            static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+          fixed_target.header.stamp = stamp;
+          fixed_target.face_stamp = stamp;
+        };
+      stamp_fixed_target(scenario_start_time);
+      auto initial = update(seed, fixed_target, nullptr, nullptr, std::nullopt,
+          kSceneRevision, scenario_start_time);
+      ASSERT_TRUE(initial.tracking);
+      ASSERT_TRUE(initial.task);
+      ASSERT_TRUE(initial.tracking->face_distance_interval);
+      ASSERT_FALSE(initial.tracking->face_distance_outside_band);
+
+      Eigen::FullPivLU<Eigen::MatrixXd> primary_decomposition(
+        initial.task->primary_matrix);
+      const Eigen::MatrixXd nullspace = primary_decomposition.kernel();
+      ASSERT_GT(nullspace.cols(), 0);
+      Eigen::VectorXd preferred = Eigen::VectorXd::Zero(6);
+      preferred[1] = 1.0;
+      preferred[2] = 1.0;
+      Eigen::VectorXd residual_direction = nullspace * (nullspace.transpose() * preferred);
+      ASSERT_GT(residual_direction.norm(), 1.0e-8);
+      residual_direction.normalize();
+      Eigen::VectorXd residual_velocity = sign * magnitude * residual_direction;
+      ASSERT_LE(residual_velocity.cwiseAbs().maxCoeff(), limits_.max_velocity.maxCoeff());
+      seed.setJointGroupVelocities(group_, residual_velocity);
+      seed.update();
+
+      double minimum_distance = fixture_distance;
+      double maximum_distance = fixture_distance;
+      double maximum_band_excursion = 0.0;
+      double maximum_settled_band_excursion = 0.0;
+      double maximum_pointing_error = 0.0;
+      double maximum_roll_error = 0.0;
+      int primary_only_after_settle = 0;
+      double settled_distance_min = std::numeric_limits<double>::infinity();
+      double settled_distance_max = 0.0;
+      double maximum_screen_path_10s = 0.0;
+      double maximum_elbow_path_10s = 0.0;
+      double maximum_wrist_path_10s = 0.0;
+      double maximum_distance_span_10s = 0.0;
+      struct HoldSample
+      {
+        double distance;
+        Eigen::Vector3d screen;
+        Eigen::Vector3d elbow;
+        Eigen::Vector3d wrist;
+      };
+      std::vector<HoldSample> hold_samples;
+      const int total_steps = settling_steps + observation_steps;
+      for (int step = 0; step < total_steps; ++step) {
+        Eigen::VectorXd current_q;
+        Eigen::VectorXd current_velocity;
+        Eigen::VectorXd current_acceleration;
+        seed.copyJointGroupPositions(group_, current_q);
+        seed.copyJointGroupVelocities(group_, current_velocity);
+        seed.copyJointGroupAccelerations(group_, current_acceleration);
+        const JointMotionState motion{current_q, current_velocity, current_acceleration};
+        const double time_sec = scenario_start_time +
+          static_cast<double>(step + 1) * parameters_.control_period_sec;
+        stamp_fixed_target(time_sec);
+        const auto result = update(seed, fixed_target, nullptr, nullptr, std::nullopt,
+            kSceneRevision, time_sec);
+        ASSERT_TRUE(result.tracking) << "scenario=" << scenario << " step=" << step;
+        ASSERT_TRUE(result.task);
+        ASSERT_TRUE(result.tracking->face_distance_interval);
+        maximum_pointing_error = std::max(
+          maximum_pointing_error, std::abs(result.tracking->pointing_error_rad));
+        maximum_roll_error = std::max(
+          maximum_roll_error, std::abs(result.tracking->roll_error_rad));
+        const auto collision = collision_builder.build(
+          *scene, seed, *group_, motion, limits_, parameters_.control_period_sec);
+        const QpResult qp = solver.solve(*result.task, motion, limits_, collision.constraints);
+        ASSERT_TRUE(qp.command_available()) << "scenario=" << scenario << " step=" << step
+                                            << " QP=" << static_cast<int>(qp.status);
+        if (step >= settling_steps && qp.status == QpStatus::kPrimaryOnly) {
+          ++primary_only_after_settle;
+        }
+        const Eigen::VectorXd next_q = current_q +
+          parameters_.control_period_sec * qp.joint_velocity;
+        const Eigen::VectorXd next_acceleration =
+          (qp.joint_velocity - current_velocity) / parameters_.control_period_sec;
+        seed.setJointGroupPositions(group_, next_q);
+        seed.setJointGroupVelocities(group_, qp.joint_velocity);
+        seed.setJointGroupAccelerations(group_, next_acceleration);
+        seed.update(true);
+        ASSERT_TRUE(seed.satisfiesBounds(group_)) << "scenario=" << scenario << " step=" << step;
+        const auto actual = collision_builder.validateActualState(*scene, seed, *group_);
+        ASSERT_TRUE(actual.input_valid) << actual.failure_reason;
+        ASSERT_FALSE(actual.unsafe) << actual.failure_reason;
+        const JointMotionState next_motion{next_q, qp.joint_velocity, next_acceleration};
+        const auto robust = collision_builder.validatePose(*scene, seed, *group_, next_motion);
+        ASSERT_TRUE(robust.input_valid) << robust.failure_reason;
+        ASSERT_FALSE(robust.unsafe) << robust.failure_reason;
+
+        const Eigen::Vector3d next_screen =
+          seed.getGlobalLinkTransform("monitor_control_frame").translation();
+        const double next_distance = (next_screen - fixed_face).norm();
+        minimum_distance = std::min(minimum_distance, next_distance);
+        maximum_distance = std::max(maximum_distance, next_distance);
+        const double band_excursion = std::max({
+              0.0, parameters_.face_distance_min_m - next_distance,
+              next_distance - parameters_.face_distance_max_m});
+        maximum_band_excursion = std::max(maximum_band_excursion, band_excursion);
+        if (step >= settling_steps) {
+          const double settled_excursion = std::max({
+                0.0,
+                parameters_.face_distance_min_m -
+                parameters_.maximum_linear_reference_mps * parameters_.control_period_sec -
+                next_distance,
+                next_distance - parameters_.face_distance_max_m -
+                parameters_.maximum_linear_reference_mps * parameters_.control_period_sec});
+          maximum_settled_band_excursion = std::max(
+            maximum_settled_band_excursion, settled_excursion);
+        }
+        if (step >= settling_steps && step % 5 == 0) {
+          const Eigen::Vector3d elbow = seed.getGlobalLinkTransform("link3").translation();
+          const Eigen::Vector3d wrist = seed.getGlobalLinkTransform("link4").translation();
+          hold_samples.push_back({next_distance, next_screen, elbow, wrist});
+          settled_distance_min = std::min(settled_distance_min, next_distance);
+          settled_distance_max = std::max(settled_distance_max, next_distance);
+          const std::size_t samples_per_10s = static_cast<std::size_t>(std::ceil(
+              10.0 / (5.0 * parameters_.control_period_sec))) + 1U;
+          if (hold_samples.size() >= samples_per_10s) {
+            const std::size_t begin = hold_samples.size() - samples_per_10s;
+            double screen_path = 0.0;
+            double elbow_path = 0.0;
+            double wrist_path = 0.0;
+            double window_distance_min = std::numeric_limits<double>::infinity();
+            double window_distance_max = 0.0;
+            for (std::size_t i = begin; i < hold_samples.size(); ++i) {
+              window_distance_min = std::min(window_distance_min, hold_samples[i].distance);
+              window_distance_max = std::max(window_distance_max, hold_samples[i].distance);
+              if (i > begin) {
+                screen_path += (hold_samples[i].screen - hold_samples[i - 1].screen).norm();
+                elbow_path += (hold_samples[i].elbow - hold_samples[i - 1].elbow).norm();
+                wrist_path += (hold_samples[i].wrist - hold_samples[i - 1].wrist).norm();
+              }
+            }
+            maximum_screen_path_10s = std::max(maximum_screen_path_10s, screen_path);
+            maximum_elbow_path_10s = std::max(maximum_elbow_path_10s, elbow_path);
+            maximum_wrist_path_10s = std::max(maximum_wrist_path_10s, wrist_path);
+            maximum_distance_span_10s = std::max(
+              maximum_distance_span_10s, window_distance_max - window_distance_min);
+          }
+        }
+      }
+      residual_report << "magnitude=" << magnitude << " sign=" << sign
+                      << " residual_qdot=" << residual_velocity.transpose()
+                      << " distance_range=" << minimum_distance << ".." << maximum_distance
+                      << " settled_span=" << settled_distance_max - settled_distance_min
+                      << " max_transient_band_excursion=" << maximum_band_excursion
+                      << " settled_band_excursion=" << maximum_settled_band_excursion
+                      << " quiet_path10s(screen/E/W)=" << maximum_screen_path_10s << '/'
+                      << maximum_elbow_path_10s << '/' << maximum_wrist_path_10s
+                      << " dist_span10s=" << maximum_distance_span_10s
+                      << " max_gaze_roll=" << maximum_pointing_error << '/'
+                      << maximum_roll_error << " primary_only_after_settle="
+                      << primary_only_after_settle << '\n';
+      EXPECT_LE(maximum_band_excursion, parameters_.position_deadband_m)
+        << "Transient face-distance excursion exceeds the configured deadband; "
+        << residual_report.str();
+      EXPECT_LE(maximum_pointing_error,
+        parameters_.pointing_deadband_rad + angular_allowance) << residual_report.str();
+      EXPECT_LE(maximum_roll_error,
+        tracking_config.roll_deadband_rad + angular_allowance) << residual_report.str();
+      ASSERT_GE(hold_samples.size(), 2U);
+      EXPECT_GE(hold_samples.size() * 5.0 * parameters_.control_period_sec, 29.0)
+        << "Need a full 30 s post-settle hold; " << residual_report.str();
+      EXPECT_LE(settled_distance_max - settled_distance_min, distance_quiet_limit)
+        << residual_report.str();
+      EXPECT_LE(maximum_screen_path_10s, distance_quiet_limit) << residual_report.str();
+      EXPECT_LE(maximum_elbow_path_10s, distance_quiet_limit) << residual_report.str();
+      EXPECT_LE(maximum_wrist_path_10s, distance_quiet_limit) << residual_report.str();
+      EXPECT_LE(maximum_distance_span_10s, distance_quiet_limit) << residual_report.str();
+      EXPECT_LE(maximum_settled_band_excursion, 0.0) << residual_report.str();
+      EXPECT_EQ(primary_only_after_settle, 0) << residual_report.str();
+    }
+  }
+  RecordProperty("posture1c_residual_nullspace_hold", residual_report.str());
+}
+
+TEST_F(MotionReferenceTest, Posture1DGoodRestKeepsComfortWhileTrackingFarFixedFace)
+{
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+
+  const auto named_bend = [this](const std::string & name) {
+      moveit::core::RobotState named_state(model_);
+      if (!named_state.setToDefaultValues(group_, name)) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      named_state.update();
+      Eigen::VectorXd q;
+      named_state.copyJointGroupPositions(group_, q);
+      const auto * joint = model_->getJointModel("joint3");
+      const auto * revolute = dynamic_cast<const moveit::core::RevoluteJointModel *>(joint);
+      if (!joint || !revolute) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      const auto * parent = joint->getParentLinkModel();
+      const auto * child = joint->getChildLinkModel();
+      if (!parent || !child) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      const Eigen::Vector3d shoulder =
+        named_state.getGlobalLinkTransform("link2").translation();
+      const Eigen::Vector3d elbow =
+        named_state.getGlobalLinkTransform("link3").translation();
+      const Eigen::Vector3d wrist =
+        named_state.getGlobalLinkTransform("link4").translation();
+      const Eigen::Vector3d axis = named_state.getGlobalLinkTransform(parent).linear() *
+        child->getJointOriginTransform().linear() * revolute->getAxis();
+      const Eigen::Vector3d upper = elbow - shoulder;
+      const Eigen::Vector3d forearm = wrist - elbow;
+      const double angle = std::atan2(
+        axis.normalized().dot(upper.cross(forearm)), upper.dot(forearm));
+      return std::optional<std::pair<double, double>>{{q[2], angle}};
+    };
+  const auto rest = named_bend("rest");
+  const auto search = named_bend("search");
+  ASSERT_TRUE(rest);
+  ASSERT_TRUE(search);
+  // This oracle uses the measured xArm6 rest/search joint values and signed
+  // bend angles directly. The interval is the calibrated model interval
+  // recorded in ROADMAP, independent of the production calibration helper.
+  constexpr double kComfortableJoint3Lower = -1.95514;
+  constexpr double kComfortableJoint3Upper = -0.3696309078954824;
+  const double minimum_comfortable_bend_sin =
+    std::min(std::sin(rest->second), std::sin(search->second));
+
+  moveit::core::RobotState state(model_);
+  ASSERT_TRUE(state.setToDefaultValues(group_, "rest"));
+  state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+  state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+  state.update();
+  ASSERT_TRUE(state.satisfiesBounds(group_));
+  msg::TrackingTarget fixed_target = target(msg::TrackingTarget::FACE);
+  fixed_target.face.x = 3.052973146;
+  fixed_target.face.y = 1.907709351;
+  fixed_target.face.z = 1.75;
+
+  double maximum_comfort_excursion_rad = 0.0;
+  double final_pointing_error = 0.0;
+  const double dt = parameters_.control_period_sec;
+  constexpr int kRolloutSteps = 1000;
+  for (int step = 0; step < kRolloutSteps; ++step) {
+    const double time_sec = 1.0 + static_cast<double>(step) * dt;
+    const auto stamp = rclcpp::Time(
+      static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+    fixed_target.header.stamp = stamp;
+    fixed_target.face_stamp = stamp;
+    const auto result = update(
+      state, fixed_target, nullptr, nullptr, std::nullopt, kSceneRevision, time_sec);
+    ASSERT_TRUE(result.tracking) << "step=" << step;
+    ASSERT_TRUE(result.task) << "step=" << step;
+    final_pointing_error = result.tracking->pointing_error_rad;
+
+    Eigen::VectorXd q;
+    Eigen::VectorXd qd;
+    Eigen::VectorXd qdd;
+    state.copyJointGroupPositions(group_, q);
+    state.copyJointGroupVelocities(group_, qd);
+    state.copyJointGroupAccelerations(group_, qdd);
+    const JointMotionState motion{q, qd, qdd};
+    const auto collision = collision_builder.build(
+      *scene, state, *group_, motion, limits_, dt);
+    const QpResult qp = solver.solve(*result.task, motion, limits_, collision.constraints);
+    ASSERT_TRUE(qp.command_available()) << "step=" << step
+                                        << " qp=" << static_cast<int>(qp.status);
+    const Eigen::VectorXd next_q = q + dt * qp.joint_velocity;
+    const Eigen::VectorXd next_qdd = (qp.joint_velocity - qd) / dt;
+    state.setJointGroupPositions(group_, next_q);
+    state.setJointGroupVelocities(group_, qp.joint_velocity);
+    state.setJointGroupAccelerations(group_, next_qdd);
+    state.update(true);
+    ASSERT_TRUE(state.satisfiesBounds(group_)) << "step=" << step;
+    moveit::core::RobotState next_state(model_);
+    next_state.setJointGroupPositions(group_, next_q);
+    next_state.update();
+    const auto next_bend_joint = model_->getJointModel("joint3");
+    const auto * next_revolute =
+      dynamic_cast<const moveit::core::RevoluteJointModel *>(next_bend_joint);
+    ASSERT_NE(next_revolute, nullptr);
+    const auto * next_parent = next_bend_joint->getParentLinkModel();
+    const auto * next_child = next_bend_joint->getChildLinkModel();
+    ASSERT_NE(next_parent, nullptr);
+    ASSERT_NE(next_child, nullptr);
+    const Eigen::Vector3d next_shoulder =
+      next_state.getGlobalLinkTransform("link2").translation();
+    const Eigen::Vector3d next_elbow =
+      next_state.getGlobalLinkTransform("link3").translation();
+    const Eigen::Vector3d next_wrist =
+      next_state.getGlobalLinkTransform("link4").translation();
+    const Eigen::Vector3d next_axis = next_state.getGlobalLinkTransform(next_parent).linear() *
+      next_child->getJointOriginTransform().linear() * next_revolute->getAxis();
+    const double next_bend_angle = std::atan2(
+      next_axis.normalized().dot((next_elbow - next_shoulder).cross(next_wrist - next_elbow)),
+      (next_elbow - next_shoulder).dot(next_wrist - next_elbow));
+    const double joint3_excursion = std::max({
+          0.0, kComfortableJoint3Lower - next_q[2], next_q[2] - kComfortableJoint3Upper});
+    const double bend_sine_excursion = std::max(
+      0.0, minimum_comfortable_bend_sin - std::sin(next_bend_angle));
+    // The QP solves rates; its documented feasibility/absolute residual is
+    // integrated over one controller step. Use that shared command-space
+    // allowance for the independent geometric oracle too.
+    const double command_tolerance = std::max(1.0e-5, dt * (
+          qp_config.solution_feasibility_tolerance + 4.0 * qp_config.solver_absolute_tolerance));
+    maximum_comfort_excursion_rad = std::max(
+      maximum_comfort_excursion_rad,
+      std::max(joint3_excursion, bend_sine_excursion));
+    EXPECT_LE(joint3_excursion, command_tolerance) << "step=" << step;
+    EXPECT_LE(bend_sine_excursion, command_tolerance) << "step=" << step;
+  }
+
+  EXPECT_LE(final_pointing_error,
+    parameters_.pointing_deadband_rad +
+    parameters_.maximum_angular_reference_radps * dt)
+    << "The gaze should settle after the initial 31-degree target change";
+  EXPECT_LE(maximum_comfort_excursion_rad, std::max(1.0e-5, dt * (
+      qp_config.solution_feasibility_tolerance + 4.0 * qp_config.solver_absolute_tolerance)))
+    << "The GOOD rest posture must remain comfortable within one integrated solver residual; "
+    << "model-derived q3 interval=" << kComfortableJoint3Lower << ".."
+    << kComfortableJoint3Upper << " minimum signed bend sine="
+    << minimum_comfortable_bend_sin;
+}
+
+TEST_F(MotionReferenceTest, Posture1DGoodComfortSurvivesDistanceAndFaceTransitions)
+{
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+
+  const double kComfortLower = MotionReferenceTestPeer::comfortableJoint3Lower(*reference_);
+  const double kComfortUpper = MotionReferenceTestPeer::comfortableJoint3Upper(*reference_);
+  moveit::core::RobotState state(model_);
+  ASSERT_TRUE(state.setToDefaultValues(group_, "rest"));
+  state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+  state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+  state.update();
+  ASSERT_TRUE(state.satisfiesBounds(group_));
+
+  const auto signed_bend_sine = [&](const moveit::core::RobotState & sample) {
+      const auto * joint = model_->getJointModel("joint3");
+      const auto * revolute = dynamic_cast<const moveit::core::RevoluteJointModel *>(joint);
+      const auto * parent = joint->getParentLinkModel();
+      const auto * child = joint->getChildLinkModel();
+      const Eigen::Vector3d shoulder = sample.getGlobalLinkTransform("link2").translation();
+      const Eigen::Vector3d elbow = sample.getGlobalLinkTransform("link3").translation();
+      const Eigen::Vector3d wrist = sample.getGlobalLinkTransform("link4").translation();
+      const Eigen::Vector3d axis = sample.getGlobalLinkTransform(parent).linear() *
+        child->getJointOriginTransform().linear() * revolute->getAxis();
+      return std::sin(std::atan2(
+        axis.normalized().dot((elbow - shoulder).cross(wrist - elbow)),
+                 (elbow - shoulder).dot(wrist - elbow)));
+    };
+  const auto fixed_face = [this](const Eigen::Vector3d & point) {
+      auto value = target(msg::TrackingTarget::FACE);
+      value.face.x = point.x();
+      value.face.y = point.y();
+      value.face.z = point.z();
+      return value;
+    };
+  const double dt = parameters_.control_period_sec;
+  double time_sec = 20.0;
+  double maximum_q3_excursion = 0.0;
+  double minimum_signed_bend = std::numeric_limits<double>::infinity();
+  double maximum_q3_speed = 0.0;
+  double maximum_excursion_time = -1.0;
+  double q3_at_maximum_excursion = 0.0;
+  std::string maximum_excursion_phase;
+  int preserve_mode_steps = 0;
+  int recover_mode_steps = 0;
+  std::string first_excursion_phase;
+  double first_excursion_time = -1.0;
+  double qdot_at_first_excursion = 0.0;
+  double first_recover_time = -1.0;
+  double last_recover_time = -1.0;
+  double maximum_speed_time = -1.0;
+  std::string maximum_speed_phase;
+  std::string first_excursion_qp_context;
+  std::string first_recover_qp_context;
+  std::string maximum_excursion_qp_context;
+  std::ostringstream phase_report;
+  const auto run_phase = [&](const std::string & label, const msg::TrackingTarget & fixed_target,
+    const int steps) {
+      double final_pointing_error = std::numeric_limits<double>::infinity();
+      for (int step = 0; step < steps; ++step) {
+        time_sec += dt;
+        auto stamped_target = fixed_target;
+        const auto stamp = rclcpp::Time(
+          static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+        stamped_target.header.stamp = stamp;
+        stamped_target.face_stamp = stamp;
+        const auto result = update(
+          state, stamped_target, nullptr, nullptr, std::nullopt, kSceneRevision, time_sec);
+        if (!result.tracking || !result.task) {
+          ADD_FAILURE() << label << " missing tracking task at step=" << step;
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        const Eigen::Index distance_rows = result.task->distance_matrix.rows();
+        if (distance_rows != 0 && distance_rows != 3) {
+          ADD_FAILURE() << label << " invalid distance rows=" << distance_rows;
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        const bool recovering = reference_->diagnostics().posture_mode == "recover";
+        if (!recovering) {
+          ++preserve_mode_steps;
+        } else {
+          ++recover_mode_steps;
+          last_recover_time = time_sec;
+        }
+        Eigen::VectorXd q, qd, qdd;
+        state.copyJointGroupPositions(group_, q);
+        state.copyJointGroupVelocities(group_, qd);
+        state.copyJointGroupAccelerations(group_, qdd);
+        const JointMotionState motion{q, qd, qdd};
+        const auto collision = collision_builder.build(
+          *scene, state, *group_, motion, limits_, dt);
+        const QpResult qp = solver.solve(*result.task, motion, limits_, collision.constraints);
+        if (!qp.command_available()) {
+          ADD_FAILURE() << label << " step=" << step
+                        << " qp=" << static_cast<int>(qp.status);
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        const Eigen::VectorXd next_q = q + dt * qp.joint_velocity;
+        if (recovering && first_recover_time < 0.0) {
+          first_recover_time = time_sec;
+          const Eigen::VectorXd primary_error = result.task->primary_matrix *
+            qp.joint_velocity - result.task->primary_reference;
+          const Eigen::VectorXd preserved_primary_error = result.task->primary_matrix *
+            qp.joint_velocity - qp.achieved_primary_velocity;
+          std::ostringstream context;
+          context << label << " t=" << time_sec << " q3_before=" << q[2]
+                  << " q3_after=" << next_q[2] << " qdot3_before=" << qd[2]
+                  << " qddot3_before=" << qdd[2] << " qdot3_command="
+                  << qp.joint_velocity[2]
+                  << " qp=" << static_cast<int>(qp.status) << " ranks="
+                  << static_cast<int>(qp.primary_status) << '/'
+                  << static_cast<int>(qp.secondary_status) << '/'
+                  << static_cast<int>(qp.tertiary_status) << '/'
+                  << static_cast<int>(qp.distance_status) << " primary_rows="
+                  << result.task->primary_matrix.rows() << " primary_q3_norm="
+                  << result.task->primary_matrix.col(2).norm() << " primary_ref_norm="
+                  << result.task->primary_reference.norm() << " primary_error_norm="
+                  << primary_error.norm() << " preserved_primary_error_norm="
+                  << preserved_primary_error.norm() << " secondary_rows="
+                  << result.task->secondary_matrix.rows() << " secondary_ref="
+                  << result.task->secondary_reference.transpose() << " secondary_q3="
+                  << (result.task->secondary_matrix.rows() > 0 ?
+          result.task->secondary_matrix(0, 2) : 0.0) << " constraints="
+                  << result.task->secondary_constraints.size();
+          first_recover_qp_context = context.str();
+        }
+        const Eigen::VectorXd next_qdd = (qp.joint_velocity - qd) / dt;
+        state.setJointGroupPositions(group_, next_q);
+        state.setJointGroupVelocities(group_, qp.joint_velocity);
+        state.setJointGroupAccelerations(group_, next_qdd);
+        state.update(true);
+        if (!state.satisfiesBounds(group_)) {
+          ADD_FAILURE() << label << " joint bounds at step=" << step;
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        const double q3_excursion = std::max({
+            0.0, kComfortLower - next_q[2], next_q[2] - kComfortUpper});
+        const double bend = signed_bend_sine(state);
+        if (std::abs(qp.joint_velocity[2]) > maximum_q3_speed) {
+          maximum_q3_speed = std::abs(qp.joint_velocity[2]);
+          maximum_speed_time = time_sec;
+          maximum_speed_phase = label;
+        }
+        if (q3_excursion > 0.0 && first_excursion_time < 0.0) {
+          first_excursion_phase = label;
+          first_excursion_time = time_sec;
+          qdot_at_first_excursion = qp.joint_velocity[2];
+          std::ostringstream context;
+          context << label << " t=" << time_sec << " q3_before=" << q[2]
+                  << " q3_after=" << next_q[2] << " qdot3_before=" << qd[2]
+                  << " qddot3_before=" << qdd[2] << " qdot3_command="
+                  << qp.joint_velocity[2]
+                  << " posture_mode=" << reference_->diagnostics().posture_mode
+                  << " qp=" << static_cast<int>(qp.status) << " ranks="
+                  << static_cast<int>(qp.primary_status) << '/'
+                  << static_cast<int>(qp.secondary_status) << '/'
+                  << static_cast<int>(qp.tertiary_status) << '/'
+                  << static_cast<int>(qp.distance_status) << " task_rows="
+                  << result.task->primary_matrix.rows() << '/'
+                  << result.task->secondary_matrix.rows() << '/'
+                  << result.task->tertiary_matrix.rows() << '/'
+                  << result.task->distance_matrix.rows() << " constraints="
+                  << result.task->secondary_constraints.size();
+          for (const auto & constraint : result.task->secondary_constraints) {
+            if (constraint.coefficients.size() > 2 &&
+              std::abs(constraint.coefficients[2]) > 1.0e-9)
+            {
+              context << " q3_constraint=" << constraint.coefficients[2] << ':'
+                      << constraint.lower_bound << ".." << constraint.upper_bound;
+            }
+          }
+          first_excursion_qp_context = context.str();
+        }
+        if (q3_excursion > maximum_q3_excursion) {
+          maximum_q3_excursion = q3_excursion;
+          maximum_excursion_time = time_sec;
+          q3_at_maximum_excursion = next_q[2];
+          maximum_excursion_phase = label;
+          std::ostringstream context;
+          context << label << " t=" << time_sec << " q3_before=" << q[2]
+                  << " q3_after=" << next_q[2] << " qdot3=" << qp.joint_velocity[2]
+                  << " posture_mode=" << reference_->diagnostics().posture_mode
+                  << " qp=" << static_cast<int>(qp.status) << " ranks="
+                  << static_cast<int>(qp.primary_status) << '/'
+                  << static_cast<int>(qp.secondary_status) << '/'
+                  << static_cast<int>(qp.tertiary_status) << '/'
+                  << static_cast<int>(qp.distance_status) << " task_rows="
+                  << result.task->primary_matrix.rows() << '/'
+                  << result.task->secondary_matrix.rows() << '/'
+                  << result.task->tertiary_matrix.rows() << '/'
+                  << result.task->distance_matrix.rows() << " constraints="
+                  << result.task->secondary_constraints.size();
+          for (const auto & constraint : result.task->secondary_constraints) {
+            if (constraint.coefficients.size() > 2 &&
+              std::abs(constraint.coefficients[2]) > 1.0e-9)
+            {
+              context << " q3_constraint=" << constraint.coefficients[2] << ':'
+                      << constraint.lower_bound << ".." << constraint.upper_bound;
+            }
+          }
+          maximum_excursion_qp_context = context.str();
+        }
+        minimum_signed_bend = std::min(minimum_signed_bend, bend);
+        final_pointing_error = std::abs(result.tracking->pointing_error_rad);
+      }
+      EXPECT_LE(final_pointing_error,
+        parameters_.pointing_deadband_rad + parameters_.maximum_angular_reference_radps * dt)
+        << label << " gaze did not settle";
+      const Eigen::Vector3d screen =
+        state.getGlobalLinkTransform("monitor_control_frame").translation();
+      const Eigen::Vector3d face(
+        fixed_target.face.x, fixed_target.face.y, fixed_target.face.z);
+      const double distance = (screen - face).norm();
+      Eigen::VectorXd final_q;
+      state.copyJointGroupPositions(group_, final_q);
+      phase_report << label << " d=" << distance << " q3=" << final_q[2]
+                   << " bend_sin=" << signed_bend_sine(state)
+                   << " pointing_final=" << final_pointing_error << '\n';
+      return distance;
+    };
+
+  const Eigen::Isometry3d start_screen =
+    state.getGlobalLinkTransform("monitor_control_frame");
+  const Eigen::Vector3d start_face = start_screen.translation() +
+    0.40 * start_screen.linear().col(0);
+  const double initial_distance = run_phase("reachable", fixed_face(start_face), 100);
+  EXPECT_GE(initial_distance, parameters_.face_distance_min_m - 0.01);
+  EXPECT_LE(initial_distance, parameters_.face_distance_max_m + 0.01);
+
+  const double far_distance = run_phase("far", fixed_face(
+      Eigen::Vector3d(3.052973146, 1.907709351, 1.75)), 1000);
+  EXPECT_GT(far_distance, parameters_.face_distance_max_m);
+  const double side_up_distance = run_phase("far-side-up", fixed_face(
+      Eigen::Vector3d(3.052973146, 2.007709351, 1.80)), 500);
+  EXPECT_GT(side_up_distance, parameters_.face_distance_max_m);
+
+  const Eigen::Isometry3d return_screen =
+    state.getGlobalLinkTransform("monitor_control_frame");
+  const Eigen::Vector3d return_face = return_screen.translation() +
+    0.40 * return_screen.linear().col(0);
+  const double returned_distance = run_phase("return-reachable", fixed_face(return_face), 1000);
+  EXPECT_GE(returned_distance, parameters_.face_distance_min_m - 0.01);
+  EXPECT_LE(returned_distance, parameters_.face_distance_max_m + 0.01);
+
+  const Eigen::Isometry3d upper_screen =
+    state.getGlobalLinkTransform("monitor_control_frame");
+  const Eigen::Vector3d upper_face = upper_screen.translation() +
+    parameters_.face_distance_max_m * upper_screen.linear().col(0);
+  const double upper_distance = run_phase("upper-boundary", fixed_face(upper_face), 300);
+  EXPECT_NEAR(upper_distance, parameters_.face_distance_max_m, 0.01);
+  Eigen::VectorXd final_q;
+  state.copyJointGroupPositions(group_, final_q);
+  EXPECT_LE(maximum_q3_excursion, 3.14159265358979323846 / 180.0)
+    << "Small gaze-driven transient must not lose the GOOD branch; " << phase_report.str();
+  EXPECT_GE(final_q[2], kComfortLower);
+  EXPECT_LE(final_q[2], kComfortUpper);
+  EXPECT_GE(signed_bend_sine(state), 0.701883982289872 - 0.003)
+    << phase_report.str();
+  EXPECT_GT(preserve_mode_steps, 0);
+  EXPECT_GT(maximum_q3_speed, 0.0);
+  RecordProperty("posture1d_good_transition_phases", phase_report.str());
+  std::cout << "POSTURE-1D GOOD transitions max_q3_excursion=" << maximum_q3_excursion
+            << " excursion_phase=" << maximum_excursion_phase << " excursion_time=" <<
+    maximum_excursion_time << " q3_at_peak=" << q3_at_maximum_excursion
+            << " first_phase=" << first_excursion_phase << " first_time=" <<
+    first_excursion_time << " qdot_at_first=" << qdot_at_first_excursion
+            << " first_recover=" << first_recover_time << " last_recover=" <<
+    last_recover_time << " max_abs_q3_speed=" << maximum_q3_speed << " max_speed_phase=" <<
+    maximum_speed_phase << " max_speed_time=" << maximum_speed_time << " preserve_steps=" <<
+    preserve_mode_steps << " recover_steps=" << recover_mode_steps
+            << " minimum_bend_sin=" << minimum_signed_bend << " first_excursion_qp={"
+            << first_excursion_qp_context << "} first_recover={" << first_recover_qp_context
+            << "} maximum_excursion_qp={" << maximum_excursion_qp_context << "}\n"
+            << phase_report.str();
+}
+
+TEST_F(MotionReferenceCameraTest, GoodUpperComfortBoundaryKeepsExactOneTickGuard)
+{
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+
+  moveit::core::RobotState state(model_);
+  ASSERT_TRUE(state.setToDefaultValues(group_, "rest"));
+  state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+  state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+  state.update();
+  ASSERT_TRUE(state.satisfiesBounds(group_));
+  Eigen::VectorXd q, qd, qdd;
+  state.copyJointGroupPositions(group_, q);
+  state.copyJointGroupVelocities(group_, qd);
+  state.copyJointGroupAccelerations(group_, qdd);
+  const double comfortable_upper = MotionReferenceTestPeer::comfortableJoint3Upper(*reference_);
+  ASSERT_NEAR(q[2], comfortable_upper, 1.0e-9);
+
+  const Eigen::Isometry3d screen = state.getGlobalLinkTransform("monitor_control_frame");
+  auto face = target(msg::TrackingTarget::FACE);
+  const Eigen::Vector3d face_position = screen.translation() + 0.40 * screen.linear().col(0);
+  face.face.x = face_position.x();
+  face.face.y = face_position.y();
+  face.face.z = face_position.z();
+  const double time_sec = 20.01;
+  const auto stamp = rclcpp::Time(
+    static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+  face.header.stamp = stamp;
+  face.face_stamp = stamp;
+  const auto reference = update(
+    state, face, nullptr, nullptr, std::nullopt, kSceneRevision, time_sec);
+  ASSERT_TRUE(reference.tracking);
+  ASSERT_TRUE(reference.task);
+  EXPECT_EQ(reference_->diagnostics().posture_mode, "preserve");
+  ASSERT_EQ(reference.task->preferred_primary_constraints.size(), 1U);
+
+  const JointMotionState motion{q, qd, qdd};
+  const auto collision = collision_builder.build(
+    *scene, state, *group_, motion, limits_, parameters_.control_period_sec);
+  const QpResult qp = solver.solve(*reference.task, motion, limits_, collision.constraints);
+  ASSERT_TRUE(qp.command_available()) << "status=" << static_cast<int>(qp.status);
+  EXPECT_FALSE(qp.preferred_primary_fallback_used);
+  const Eigen::VectorXd next_q = q + parameters_.control_period_sec * qp.joint_velocity;
+  EXPECT_LE(next_q[2], comfortable_upper)
+    << "Camera gaze primary must respect the exact GOOD comfort guard for this tick; "
+    << "q3=" << q[2] << " qdot3=" << qp.joint_velocity[2]
+    << " pointing_error=" << reference.tracking->pointing_error_rad
+    << " qp=" << static_cast<int>(qp.status) << " ranks="
+    << static_cast<int>(qp.primary_status) << '/'
+    << static_cast<int>(qp.secondary_status);
+}
+
+TEST_F(MotionReferenceCameraTest, Posture1DFastTailCapturedJitterAndMotionControls)
+{
+  // The fixture preserves camera producer stamps and FACE/HOLD availability. HOLD
+  // rows reuse the last valid target; qdd is an adjacent-sample approximation.
+  struct Sample
+  {
+    double sim_sec;
+    double source_sec;
+    Eigen::Vector3d face;
+    Eigen::VectorXd q;
+    Eigen::VectorXd qd;
+    Eigen::VectorXd qdd;
+    bool used;
+  };
+  std::ifstream capture(TEST_POSTURE1D_FAST_TAIL_CAPTURE_FILE);
+  ASSERT_TRUE(capture.good());
+  std::string line;
+  ASSERT_TRUE(static_cast<bool>(std::getline(capture, line)));
+  std::vector<Sample> samples;
+  while (std::getline(capture, line)) {
+    std::stringstream row(line);
+    std::vector<std::string> fields;
+    std::string field;
+    while (std::getline(row, field, ',')) {
+      fields.push_back(field);
+    }
+    ASSERT_EQ(fields.size(), 27U) << line;
+    Sample sample;
+    sample.sim_sec = std::stod(fields[0]);
+    sample.source_sec = std::stod(fields[2]);
+    sample.used = std::stoi(fields[4]) != 0;
+    sample.face = Eigen::Vector3d(
+      std::stod(fields[6]), std::stod(fields[7]), std::stod(fields[8]));
+    sample.q.resize(6);
+    sample.qd.resize(6);
+    sample.qdd.resize(6);
+    for (Eigen::Index joint = 0; joint < 6; ++joint) {
+      sample.q[joint] = std::stod(fields[9 + joint]);
+      sample.qd[joint] = std::stod(fields[15 + joint]);
+      sample.qdd[joint] = std::stod(fields[21 + joint]);
+    }
+    samples.push_back(std::move(sample));
+  }
+  ASSERT_EQ(samples.size(), 351U);
+  constexpr double dt = 0.01;
+  constexpr int replay_ticks = 710;
+  // The piecewise fast/slow target stops at 0.55 s; this ends 30.0 s later.
+  constexpr int overspeed_ticks = 3056;
+  constexpr double first_sim_sec = 99.0;
+  const Eigen::Vector3d fixed_face(1.8902364177247293, -0.0011634283727742813,
+    1.7674253491322234);
+  const Sample & seed = samples.front();
+
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = dt;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+
+  struct Metrics
+  {
+    double pointing_error_max{0.0};
+    double pointing_error_final{0.0};
+    double q3_min{std::numeric_limits<double>::infinity()};
+    double q3_max{-std::numeric_limits<double>::infinity()};
+    double q4_min{std::numeric_limits<double>::infinity()};
+    double q4_max{-std::numeric_limits<double>::infinity()};
+    double q6_min{std::numeric_limits<double>::infinity()};
+    double q6_max{-std::numeric_limits<double>::infinity()};
+    std::array<double, 3> path_m{{0.0, 0.0, 0.0}};
+    std::array<double, 3> late_path_m{{0.0, 0.0, 0.0}};
+    double late_q4_min{std::numeric_limits<double>::infinity()};
+    double late_q4_max{-std::numeric_limits<double>::infinity()};
+    double late_q6_min{std::numeric_limits<double>::infinity()};
+    double late_q6_max{-std::numeric_limits<double>::infinity()};
+    int late_q4_reversals{0};
+    int late_q6_reversals{0};
+    int distance_rows{0};
+    int qp_failures{0};
+    double target_speed_max_mps{0.0};
+    double primary_feedforward_max_radps{0.0};
+    double slow_feedforward_max_radps{0.0};
+  };
+  const auto run = [&](const int mode) {
+      // Recorded target jitter, fixed-target stop, and 20/150 mm/s motion controls.
+      // HOLD rows reuse the last producer-stamped target; this model has no queue/gap replay.
+      reference_ = std::make_unique<MotionReference>(
+        node_, monitor_, parameters_, limits_, collision_config_);
+      moveit::core::RobotState state(model_);
+      state.setToDefaultValues();
+      state.setJointGroupPositions(group_, seed.q);
+      state.setJointGroupVelocities(group_, seed.qd);
+      state.setJointGroupAccelerations(group_, seed.qdd);
+      state.update();
+      EXPECT_TRUE(state.satisfiesBounds(group_));
+      Metrics metrics;
+      std::size_t sample_index = 0U;
+      std::size_t last_used_index = 0U;
+      bool have_previous_frames = false;
+      int previous_q4_sign = 0;
+      int previous_q6_sign = 0;
+      bool have_q4_turn = false;
+      bool have_q6_turn = false;
+      double q4_turn_position = 0.0;
+      double q6_turn_position = 0.0;
+      std::array<Eigen::Vector3d, 3> previous_frames;
+      const auto accumulate_frames = [&](const bool late_window) {
+          const std::array<Eigen::Vector3d, 3> frames{{
+            state.getGlobalLinkTransform("monitor_control_frame").translation(),
+            state.getGlobalLinkTransform("link3").translation(),
+            state.getGlobalLinkTransform("link4").translation()}};
+          if (have_previous_frames) {
+            for (std::size_t i = 0; i < frames.size(); ++i) {
+              metrics.path_m[i] += (frames[i] - previous_frames[i]).norm();
+              if (late_window) {
+                metrics.late_path_m[i] += (frames[i] - previous_frames[i]).norm();
+              }
+            }
+          }
+          previous_frames = frames;
+          have_previous_frames = true;
+        };
+      accumulate_frames(false);
+      const int ticks = mode == 7 ? overspeed_ticks : replay_ticks;
+      for (int step = 0; step < ticks; ++step) {
+        const double time_sec = first_sim_sec + static_cast<double>(step) * dt;
+        while (sample_index + 1U < samples.size() &&
+          samples[sample_index + 1U].sim_sec <= time_sec + 1.0e-9)
+        {
+          ++sample_index;
+        }
+        if (samples[sample_index].used) {
+          last_used_index = sample_index;
+        }
+        const Sample & sample = samples[last_used_index];
+        auto face = target(msg::TrackingTarget::FACE);
+        face.target_id = 8U;
+        const double elapsed_sec = time_sec - first_sim_sec;
+        double synthetic_speed_mps = mode == 5 ? 0.02 : (mode == 6 ? 0.15 : 0.0);
+        Eigen::Vector3d point = mode == 2 ? fixed_face : sample.face;
+        if (mode == 7) {
+          double lateral_offset_m = 0.0;
+          if (elapsed_sec < 0.25) {
+            synthetic_speed_mps = 1.20;
+            lateral_offset_m = synthetic_speed_mps * elapsed_sec;
+          } else if (elapsed_sec < 0.55) {
+            synthetic_speed_mps = 0.15;
+            lateral_offset_m = 1.20 * 0.25 + synthetic_speed_mps * (elapsed_sec - 0.25);
+          } else {
+            lateral_offset_m = 1.20 * 0.25 + 0.15 * 0.30;
+          }
+          point = fixed_face + Eigen::Vector3d(0.0, lateral_offset_m, 0.0);
+        } else if (synthetic_speed_mps > 0.0) {
+          point = fixed_face + Eigen::Vector3d(0.0, synthetic_speed_mps * elapsed_sec, 0.0);
+        }
+        face.face.x = point.x();
+        face.face.y = point.y();
+        face.face.z = point.z();
+        face.header.stamp = rclcpp::Time(
+          static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+        const double source_sec = synthetic_speed_mps > 0.0 ? time_sec : sample.source_sec;
+        face.face_stamp = rclcpp::Time(
+          static_cast<std::int64_t>(std::llround(source_sec * 1.0e9)), RCL_ROS_TIME);
+        auto reference = update(
+          state, face, nullptr, nullptr, std::nullopt, kSceneRevision, time_sec);
+        if (!reference.task || !reference.tracking) {
+          ADD_FAILURE() << "Missing FACE task at step=" << step;
+          break;
+        }
+        metrics.pointing_error_max = std::max(metrics.pointing_error_max,
+          std::abs(reference.tracking->pointing_error_rad));
+        metrics.pointing_error_final = std::abs(reference.tracking->pointing_error_rad);
+        metrics.target_speed_max_mps = std::max(
+          metrics.target_speed_max_mps, synthetic_speed_mps);
+        metrics.primary_feedforward_max_radps = std::max(
+          metrics.primary_feedforward_max_radps,
+          reference.tracking->face_primary_feedforward_radps.norm());
+        if (mode == 7 && elapsed_sec >= 0.35 && elapsed_sec < 0.55) {
+          metrics.slow_feedforward_max_radps = std::max(
+            metrics.slow_feedforward_max_radps,
+            reference.tracking->face_primary_feedforward_radps.norm());
+        }
+        HierarchicalVelocityTask task = *reference.task;
+        Eigen::VectorXd q, qd, qdd;
+        state.copyJointGroupPositions(group_, q);
+        state.copyJointGroupVelocities(group_, qd);
+        state.copyJointGroupAccelerations(group_, qdd);
+        const JointMotionState motion{q, qd, qdd};
+        const auto collision = collision_builder.build(
+          *scene, state, *group_, motion, limits_, dt);
+        const QpResult qp = solver.solve(task, motion, limits_, collision.constraints);
+        if (!qp.command_available()) {
+          ++metrics.qp_failures;
+          ADD_FAILURE() << "No safe command at step=" << step
+                        << " status=" << static_cast<int>(qp.status);
+          break;
+        }
+        metrics.distance_rows += task.distance_matrix.rows() > 0 ? 1 : 0;
+        const Eigen::VectorXd next_q = q + dt * qp.joint_velocity;
+        const Eigen::VectorXd next_qdd = (qp.joint_velocity - qd) / dt;
+        state.setJointGroupPositions(group_, next_q);
+        state.setJointGroupVelocities(group_, qp.joint_velocity);
+        state.setJointGroupAccelerations(group_, next_qdd);
+        state.update(true);
+        EXPECT_TRUE(state.satisfiesBounds(group_)) << "step=" << step;
+        metrics.q3_min = std::min(metrics.q3_min, next_q[2]);
+        metrics.q3_max = std::max(metrics.q3_max, next_q[2]);
+        metrics.q4_min = std::min(metrics.q4_min, next_q[3]);
+        metrics.q4_max = std::max(metrics.q4_max, next_q[3]);
+        metrics.q6_min = std::min(metrics.q6_min, next_q[5]);
+        metrics.q6_max = std::max(metrics.q6_max, next_q[5]);
+        const bool late_window = step >= 410;
+        if (late_window) {
+          metrics.late_q4_min = std::min(metrics.late_q4_min, next_q[3]);
+          metrics.late_q4_max = std::max(metrics.late_q4_max, next_q[3]);
+          metrics.late_q6_min = std::min(metrics.late_q6_min, next_q[5]);
+          metrics.late_q6_max = std::max(metrics.late_q6_max, next_q[5]);
+          const auto count_reversal = [](const double velocity, const double position,
+            int & previous_sign, bool & have_turn, double & turn_position, int & count) {
+              if (std::abs(velocity) < 0.01) {
+                return;
+              }
+              const int sign = velocity > 0.0 ? 1 : -1;
+              if (previous_sign != 0 && sign != previous_sign) {
+                if (have_turn && std::abs(position - turn_position) > 0.0174533) {
+                  ++count;
+                }
+                turn_position = position;
+                have_turn = true;
+              }
+              previous_sign = sign;
+            };
+          count_reversal(qp.joint_velocity[3], next_q[3], previous_q4_sign, have_q4_turn,
+            q4_turn_position, metrics.late_q4_reversals);
+          count_reversal(qp.joint_velocity[5], next_q[5], previous_q6_sign, have_q6_turn,
+            q6_turn_position, metrics.late_q6_reversals);
+        }
+        accumulate_frames(late_window);
+      }
+      return metrics;
+    };
+
+  const std::array<Metrics, 5> metrics{{run(0), run(2), run(5), run(6), run(7)}};
+  std::ostringstream report;
+  const std::array<const char *, 5> names{{
+    "recorded-target", "fixed-target-stop", "moving-20mmps", "moving-150mmps",
+    "overspeed-slow-stop"}};
+  for (std::size_t i = 0; i < metrics.size(); ++i) {
+    report << names[i] << " P/E/W_m=" << metrics[i].path_m[0] << '/'
+           << metrics[i].path_m[1] << '/' << metrics[i].path_m[2]
+           << " q3=" << metrics[i].q3_min << ".." << metrics[i].q3_max
+           << " q4=" << metrics[i].q4_min << ".." << metrics[i].q4_max
+           << " q6=" << metrics[i].q6_min << ".." << metrics[i].q6_max
+           << " pointing_max_rad=" << metrics[i].pointing_error_max
+           << " pointing_final_rad=" << metrics[i].pointing_error_final
+           << " late_P/E/W_m=" << metrics[i].late_path_m[0] << '/'
+           << metrics[i].late_path_m[1] << '/' << metrics[i].late_path_m[2]
+           << " late_q4=" << metrics[i].late_q4_min << ".." << metrics[i].late_q4_max
+           << " late_q6=" << metrics[i].late_q6_min << ".." << metrics[i].late_q6_max
+           << " late_reversals_q4/q6=" << metrics[i].late_q4_reversals << '/'
+           << metrics[i].late_q6_reversals
+           << " target_speed_max_mps=" << metrics[i].target_speed_max_mps
+           << " primary_ff_max_radps=" << metrics[i].primary_feedforward_max_radps
+           << " slow_ff_max_radps=" << metrics[i].slow_feedforward_max_radps
+           << " distance_rows=" << metrics[i].distance_rows
+           << " qp_failures=" << metrics[i].qp_failures << '\n';
+  }
+  // The fixed-target stop control should remain quiet; moving controls should follow.
+  EXPECT_LT(metrics[1].path_m[2], 0.05);
+  EXPECT_LT(metrics[0].pointing_error_max, 0.0174533);
+  EXPECT_LT(metrics[0].late_path_m[2], 0.01);
+  EXPECT_LT(metrics[0].late_q4_max - metrics[0].late_q4_min, 0.03);
+  EXPECT_LT(metrics[0].late_q6_max - metrics[0].late_q6_min, 0.03);
+  EXPECT_LE(metrics[0].late_q4_reversals, 1);
+  EXPECT_LE(metrics[0].late_q6_reversals, 1);
+  EXPECT_GT(metrics[0].q3_min, -1.95514);
+  EXPECT_LT(metrics[2].pointing_error_max, 0.0174533);
+  EXPECT_LT(metrics[3].pointing_error_max, 0.0174533);
+  EXPECT_GT(metrics[3].path_m[2], 0.15);
+  EXPECT_GT(metrics[3].path_m[2], 2.0 * metrics[1].path_m[2]);
+  EXPECT_GT(metrics[4].target_speed_max_mps, 0.18);
+  EXPECT_GT(metrics[4].primary_feedforward_max_radps, 0.70);
+  EXPECT_GT(metrics[4].slow_feedforward_max_radps, 0.05);
+  EXPECT_LT(metrics[4].slow_feedforward_max_radps, 0.70);
+  EXPECT_LT(metrics[4].pointing_error_final, 0.0174533);
+  EXPECT_LE(metrics[4].late_q4_reversals, 2);
+  EXPECT_LE(metrics[4].late_q6_reversals, 2);
+  for (const Metrics & metric : metrics) {
+    EXPECT_EQ(metric.qp_failures, 0);
+  }
+  RecordProperty("posture1d_fast_tail_no_hold_replay", report.str());
+  std::cout << "POSTURE-1D fast-tail 7.1s no-HOLD model approximation\n" << report.str();
+}
+
+TEST_F(MotionReferenceTest, Posture1DFarDistanceSoftTaskSettlesAtReachLimit)
+{
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+  constexpr double kFaceX = 3.052973146;
+  constexpr double kFaceY = 1.907709351;
+  constexpr double kFaceZ = 1.75;
+  const Eigen::Vector3d face(kFaceX, kFaceY, kFaceZ);
+  constexpr int kSteps = 6000;
+  constexpr int kSampleStride = 5;
+  struct Metrics
+  {
+    double monitor_span{0.0};
+    double elbow_span{0.0};
+    double wrist_span{0.0};
+    double monitor_path{0.0};
+    double elbow_path{0.0};
+    double wrist_path{0.0};
+    double distance_min{std::numeric_limits<double>::infinity()};
+    double distance_max{0.0};
+    double maximum_pointing_error{0.0};
+    double mean_radial_rate{0.0};
+    double mean_tangential_speed{0.0};
+    double maximum_joint_speed{0.0};
+    std::size_t rate_samples{0U};
+  };
+  const auto run = [&]() {
+      reference_.reset();
+      reference_ = std::make_unique<MotionReference>(
+        node_, monitor_, parameters_, limits_, collision_config_);
+      moveit::core::RobotState state(model_);
+      if (!state.setToDefaultValues(group_, "rest")) {
+        ADD_FAILURE() << "Could not load named rest witness";
+        return Metrics{};
+      }
+      state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+      state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+      state.update();
+      const msg::TrackingTarget fixed_target = [&]() {
+          auto value = target(msg::TrackingTarget::FACE);
+          value.face.x = face.x();
+          value.face.y = face.y();
+          value.face.z = face.z();
+          return value;
+        }();
+      std::array<Eigen::Vector3d, 3> minimum;
+      std::array<Eigen::Vector3d, 3> maximum;
+      for (auto & value : minimum) {
+        value.setConstant(std::numeric_limits<double>::infinity());
+      }
+      for (auto & value : maximum) {
+        value.setConstant(-std::numeric_limits<double>::infinity());
+      }
+      std::array<Eigen::Vector3d, 3> previous;
+      bool have_previous = false;
+      Metrics metrics;
+      for (int step = 0; step < kSteps; ++step) {
+        const double time_sec = 200.0 + (static_cast<double>(step) + 1.0) *
+          parameters_.control_period_sec;
+        auto stamped_target = fixed_target;
+        const auto stamp = rclcpp::Time(
+          static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+        stamped_target.header.stamp = stamp;
+        stamped_target.face_stamp = stamp;
+        const auto result = update(
+          state, stamped_target, nullptr, nullptr, std::nullopt, kSceneRevision, time_sec);
+        if (!result.tracking || !result.task) {
+          ADD_FAILURE() << "No tracking task at step=" << step;
+          return Metrics{};
+        }
+        const auto & task = *result.task;
+        Eigen::Vector3d tangent1 = Eigen::Vector3d::Zero();
+        Eigen::Vector3d tangent2 = Eigen::Vector3d::Zero();
+        Eigen::MatrixXd linear_jacobian;
+        if (task.distance_matrix.rows() == 3) {
+          Eigen::MatrixXd screen_jacobian;
+          if (!state.getJacobian(
+              group_, model_->getLinkModel("monitor_control_frame"),
+              Eigen::Vector3d::Zero(), screen_jacobian, false))
+          {
+            ADD_FAILURE() << "Could not evaluate screen Jacobian at step=" << step;
+            return Metrics{};
+          }
+          linear_jacobian = screen_jacobian.topRows(3);
+          const auto * root_link = group_->getJointModels().front()->getParentLinkModel();
+          if (root_link) {
+            linear_jacobian = (state.getGlobalLinkTransform(root_link).linear() *
+              linear_jacobian).eval();
+          }
+          const Eigen::Vector3d screen =
+            state.getGlobalLinkTransform("monitor_control_frame").translation();
+          const Eigen::Vector3d radial = (screen - face).normalized();
+          tangent1 = radial.unitOrthogonal().normalized();
+          tangent2 = radial.cross(tangent1).normalized();
+        }
+        Eigen::VectorXd q, qd, qdd;
+        state.copyJointGroupPositions(group_, q);
+        state.copyJointGroupVelocities(group_, qd);
+        state.copyJointGroupAccelerations(group_, qdd);
+        const JointMotionState motion{q, qd, qdd};
+        const auto collision = collision_builder.build(
+          *scene, state, *group_, motion, limits_, parameters_.control_period_sec);
+        const QpResult qp = solver.solve(task, motion, limits_, collision.constraints);
+        if (!qp.command_available()) {
+          ADD_FAILURE() << "No QP command at step=" << step;
+          return Metrics{};
+        }
+        if (step >= 2000 && linear_jacobian.rows() == 3) {
+          metrics.mean_radial_rate +=
+            result.tracking->face_distance_matrix.row(0).dot(qp.joint_velocity);
+          metrics.mean_tangential_speed += std::hypot(
+            (tangent1.transpose() * linear_jacobian * qp.joint_velocity)[0],
+            (tangent2.transpose() * linear_jacobian * qp.joint_velocity)[0]);
+          metrics.maximum_joint_speed = std::max(
+            metrics.maximum_joint_speed, qp.joint_velocity.lpNorm<Eigen::Infinity>());
+          ++metrics.rate_samples;
+        }
+        const Eigen::VectorXd next_q = q + parameters_.control_period_sec * qp.joint_velocity;
+        const Eigen::VectorXd next_qdd = (qp.joint_velocity - qd) /
+          parameters_.control_period_sec;
+        state.setJointGroupPositions(group_, next_q);
+        state.setJointGroupVelocities(group_, qp.joint_velocity);
+        state.setJointGroupAccelerations(group_, next_qdd);
+        state.update(true);
+        if (!state.satisfiesBounds(group_)) {
+          ADD_FAILURE() << "Joint bounds violated at step=" << step;
+          return Metrics{};
+        }
+        if (step < 2000 || step % kSampleStride != 0) {
+          continue;
+        }
+        const std::array<Eigen::Vector3d, 3> points{
+          state.getGlobalLinkTransform("monitor_control_frame").translation(),
+          state.getGlobalLinkTransform("link3").translation(),
+          state.getGlobalLinkTransform("link4").translation()};
+        for (std::size_t index = 0; index < points.size(); ++index) {
+          minimum[index] = minimum[index].cwiseMin(points[index]);
+          maximum[index] = maximum[index].cwiseMax(points[index]);
+          if (have_previous) {
+            if (index == 0) {metrics.monitor_path += (points[index] - previous[index]).norm();}
+            if (index == 1) {metrics.elbow_path += (points[index] - previous[index]).norm();}
+            if (index == 2) {metrics.wrist_path += (points[index] - previous[index]).norm();}
+          }
+          previous[index] = points[index];
+        }
+        have_previous = true;
+        metrics.distance_min = std::min(metrics.distance_min, (face - points[0]).norm());
+        metrics.distance_max = std::max(metrics.distance_max, (face - points[0]).norm());
+        metrics.maximum_pointing_error = std::max(
+          metrics.maximum_pointing_error, std::abs(result.tracking->pointing_error_rad));
+      }
+      metrics.monitor_span = (maximum[0] - minimum[0]).norm();
+      metrics.elbow_span = (maximum[1] - minimum[1]).norm();
+      metrics.wrist_span = (maximum[2] - minimum[2]).norm();
+      if (metrics.rate_samples > 0U) {
+        metrics.mean_radial_rate /= static_cast<double>(metrics.rate_samples);
+        metrics.mean_tangential_speed /= static_cast<double>(metrics.rate_samples);
+      }
+      return metrics;
+    };
+  const Metrics production = run();
+  const auto report = [](const Metrics & value) {
+      std::ostringstream stream;
+      stream << "span(P/E/W)=" << value.monitor_span << '/' << value.elbow_span << '/' <<
+        value.wrist_span << " path(P/E/W)=" << value.monitor_path << '/' <<
+        value.elbow_path << '/' << value.wrist_path << " distance=" <<
+        value.distance_min << ".." << value.distance_max << " pointing=" <<
+        value.maximum_pointing_error << " mean_radial_rate=" << value.mean_radial_rate <<
+        " mean_tangent_speed=" << value.mean_tangential_speed << " max_joint_speed=" <<
+        value.maximum_joint_speed;
+      return stream.str();
+    };
+  RecordProperty("far_distance_settled", report(production));
+  EXPECT_LE(production.monitor_span, 0.01);
+  EXPECT_LE(production.elbow_span, 0.01);
+  EXPECT_LE(production.wrist_span, 0.01);
+  EXPECT_LE(production.monitor_path, 0.04);
+  EXPECT_LE(production.elbow_path, 0.04);
+  EXPECT_LE(production.wrist_path, 0.04);
+  std::cout << "POSTURE-1D far-distance production=" << report(production) << '\n';
+}
+
+TEST_F(MotionReferenceTest, Posture1CQualifiedShellHoldSettlesWithoutPrimaryFallback)
+{
+  parameters_.position_deadband_m = 0.03;
+  reference_.reset();
+  reference_ = std::make_unique<MotionReference>(
+    node_, monitor_, parameters_, limits_, collision_config_);
+
+  // Frozen from runs/lower_narrow120/model_red_seed.json at t=32.93 s, the
+  // start of the first qualified W-path failure. qdd is an estimate from
+  // adjacent JointState velocity samples, not measured controller feedback.
+  const Eigen::VectorXd seed_q = (Eigen::VectorXd(6) <<
+    0.3431167536524256, -0.6451215104369273, -0.4131614728305029,
+    0.8832054107062707, -0.49377890199444197, -0.7513625911319638).finished();
+  const Eigen::VectorXd seed_qd = (Eigen::VectorXd(6) <<
+    0.008830894583498557, 0.0027550561414891265, -0.007382714269534428,
+    0.02533001325449499, -0.003092048824205024, -0.02217623385184244).finished();
+  const Eigen::VectorXd seed_qdd_estimate = (Eigen::VectorXd(6) <<
+    -0.0010566198674565928, 0.00012360055593418068, 0.00046335123802957796,
+    -0.0030232341735942267, -3.5287786790724834e-06, 0.0026979210581949504).finished();
+  const Eigen::Vector3d fixed_face(
+    0.6720479502409709, -7.21194357188413e-07, 1.1499836707827846);
+  constexpr double kCapturedDistanceM = 0.3688014620111739;
+  constexpr double kQuietPathLimitM = 0.01;
+  constexpr double kSettlingSec = 5.0;
+  constexpr double kHoldSec = 30.0;
+  constexpr double kSamplePeriodSec = 0.05;
+
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+  const double dt = parameters_.control_period_sec;
+  const int settling_steps = static_cast<int>(std::ceil(kSettlingSec / dt));
+  const int hold_steps = static_cast<int>(std::ceil(kHoldSec / dt));
+  const int total_steps = settling_steps + hold_steps;
+  const int sample_stride = static_cast<int>(std::llround(kSamplePeriodSec / dt));
+  ASSERT_GT(sample_stride, 0);
+  ASSERT_NEAR(sample_stride * dt, kSamplePeriodSec, 1.0e-9);
+  const double one_step_margin = parameters_.maximum_linear_reference_mps * dt;
+  ASSERT_LE(one_step_margin, 0.5 * (
+      parameters_.face_distance_max_m - parameters_.face_distance_min_m));
+  const TrackingVelocityTaskConfig tracking_config;
+
+  const auto named_bend = [this](const std::string & name) {
+      moveit::core::RobotState named_state(model_);
+      if (!named_state.setToDefaultValues(group_, name)) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      named_state.update();
+      Eigen::VectorXd named_q;
+      named_state.copyJointGroupPositions(group_, named_q);
+      const auto * joint = model_->getJointModel("joint3");
+      const auto * revolute = dynamic_cast<const moveit::core::RevoluteJointModel *>(joint);
+      if (!joint || !revolute || named_q.size() != 6) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      const auto * parent = joint->getParentLinkModel();
+      const auto * child = joint->getChildLinkModel();
+      if (!parent || !child) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      const Eigen::Vector3d shoulder =
+        named_state.getGlobalLinkTransform("link2").translation();
+      const Eigen::Vector3d elbow =
+        named_state.getGlobalLinkTransform("link3").translation();
+      const Eigen::Vector3d wrist =
+        named_state.getGlobalLinkTransform("link4").translation();
+      const Eigen::Vector3d axis = named_state.getGlobalLinkTransform(parent).linear() *
+        child->getJointOriginTransform().linear() * revolute->getAxis();
+      const Eigen::Vector3d upper = elbow - shoulder;
+      const Eigen::Vector3d forearm = wrist - elbow;
+      const double angle = std::atan2(
+        axis.normalized().dot(upper.cross(forearm)), upper.dot(forearm));
+      return std::optional<std::pair<double, double>>{{named_q[2], angle}};
+    };
+  const auto rest = named_bend("rest");
+  const auto search = named_bend("search");
+  ASSERT_TRUE(rest);
+  ASSERT_TRUE(search);
+  const auto bend = calibratePostureBend(
+    rest->first, rest->second, search->first, search->second,
+    limits_.lower_position[2], limits_.upper_position[2]);
+  ASSERT_TRUE(bend.valid);
+  ASSERT_GE(seed_q[2], bend.joint3_lower);
+  ASSERT_LE(seed_q[2], bend.joint3_upper);
+
+  struct HoldSample
+  {
+    Eigen::Vector3d screen;
+    Eigen::Vector3d elbow;
+    Eigen::Vector3d wrist;
+  };
+  struct CaseMetrics
+  {
+    double screen_range{0.0};
+    double elbow_range{0.0};
+    double wrist_range{0.0};
+    double screen_path_10s{0.0};
+    double elbow_path_10s{0.0};
+    double wrist_path_10s{0.0};
+    double distance_min{std::numeric_limits<double>::infinity()};
+    double distance_max{0.0};
+    double max_pointing_error{0.0};
+    double max_roll_error{0.0};
+    double q3_min{std::numeric_limits<double>::infinity()};
+    double q3_max{-std::numeric_limits<double>::infinity()};
+    double final_q3{0.0};
+    double final_distance{0.0};
+    int primary_only_after_settle{0};
+  };
+
+  const auto run_hold = [&](const std::string & label, const Eigen::VectorXd & initial_qd,
+    const Eigen::VectorXd & initial_qdd, const double start_time,
+    CaseMetrics & metrics) {
+      reference_.reset();
+      reference_ = std::make_unique<MotionReference>(
+        node_, monitor_, parameters_, limits_, collision_config_);
+      moveit::core::RobotState seed(model_);
+      seed.setToDefaultValues();
+      for (Eigen::Index joint = 0; joint < seed_q.size(); ++joint) {
+        seed.setVariablePosition("joint" + std::to_string(joint + 1), seed_q[joint]);
+      }
+      seed.setJointGroupVelocities(group_, initial_qd);
+      seed.setJointGroupAccelerations(group_, initial_qdd);
+      seed.update();
+      ASSERT_TRUE(seed.satisfiesBounds(group_)) << label;
+      auto fixed_target = faceAlongLookDirection(seed);
+      fixed_target.face.x = fixed_face.x();
+      fixed_target.face.y = fixed_face.y();
+      fixed_target.face.z = fixed_face.z();
+      const auto stamp_target = [&fixed_target](const double time_sec) {
+          const auto stamp = rclcpp::Time(
+            static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+          fixed_target.header.stamp = stamp;
+          fixed_target.face_stamp = stamp;
+        };
+      stamp_target(start_time);
+      const auto initial = update(seed, fixed_target, nullptr, nullptr, std::nullopt,
+          kSceneRevision, start_time);
+      ASSERT_TRUE(initial.tracking) << label;
+      ASSERT_TRUE(initial.task) << label;
+      ASSERT_TRUE(initial.tracking->face_distance_interval) << label;
+      ASSERT_TRUE(initial.tracking->face_distance_outside_band) << label;
+      const Eigen::Vector3d initial_screen =
+        seed.getGlobalLinkTransform("monitor_control_frame").translation();
+      const double initial_distance = (initial_screen - fixed_face).norm();
+      ASSERT_NEAR(initial_distance, kCapturedDistanceM, 1.0e-5) << label;
+      ASSERT_EQ(initial.task->secondary_matrix.rows(), 0) << label;
+      ASSERT_EQ(initial.task->distance_matrix.rows(), 3) << label
+                                                         <<
+        "Out-of-band distance is soft and lower priority than posture";
+
+      std::vector<HoldSample> samples;
+      const double angular_allowance =
+        parameters_.maximum_angular_reference_radps * dt;
+      metrics.distance_min = initial_distance;
+      metrics.distance_max = initial_distance;
+      double minimum_distance_all = initial_distance;
+      double maximum_distance_all = initial_distance;
+      std::ostringstream case_report;
+      case_report << label << " start_q=" << seed_q.transpose()
+                  << " start_qd=" << initial_qd.transpose()
+                  << " start_qdd=" << initial_qdd.transpose()
+                  << " fixed_F=" << fixed_face.transpose()
+                  << " initial_d=" << initial_distance
+                  << " q3_comfort=" << bend.joint3_lower << ".."
+                  << bend.joint3_upper << " secondary_rows="
+                  << initial.task->secondary_matrix.rows();
+
+      for (int step = 0; step < total_steps; ++step) {
+        Eigen::VectorXd current_q;
+        Eigen::VectorXd current_qd;
+        Eigen::VectorXd current_qdd;
+        seed.copyJointGroupPositions(group_, current_q);
+        seed.copyJointGroupVelocities(group_, current_qd);
+        seed.copyJointGroupAccelerations(group_, current_qdd);
+        const JointMotionState motion{current_q, current_qd, current_qdd};
+        const double time_sec = start_time + static_cast<double>(step + 1) * dt;
+        stamp_target(time_sec);
+        const auto result = update(seed, fixed_target, nullptr, nullptr, std::nullopt,
+            kSceneRevision, time_sec);
+        ASSERT_TRUE(result.tracking) << label << " step=" << step;
+        ASSERT_TRUE(result.task) << label << " step=" << step;
+        ASSERT_TRUE(result.tracking->face_distance_interval) << label << " step=" << step;
+        const auto collision = collision_builder.build(
+          *scene, seed, *group_, motion, limits_, dt);
+        const QpResult qp = solver.solve(*result.task, motion, limits_, collision.constraints);
+        ASSERT_TRUE(qp.command_available()) << label << " step=" << step
+                                            << " QP=" << static_cast<int>(qp.status);
+        const Eigen::VectorXd next_q = current_q + dt * qp.joint_velocity;
+        const Eigen::VectorXd next_qdd = (qp.joint_velocity - current_qd) / dt;
+        seed.setJointGroupPositions(group_, next_q);
+        seed.setJointGroupVelocities(group_, qp.joint_velocity);
+        seed.setJointGroupAccelerations(group_, next_qdd);
+        seed.update(true);
+        ASSERT_TRUE(seed.satisfiesBounds(group_)) << label << " step=" << step;
+        const auto actual = collision_builder.validateActualState(*scene, seed, *group_);
+        ASSERT_TRUE(actual.input_valid) << label << " step=" << step
+                                        << ' ' << actual.failure_reason;
+        ASSERT_FALSE(actual.unsafe) << label << " step=" << step
+                                    << ' ' << actual.failure_reason;
+        const JointMotionState next_motion{next_q, qp.joint_velocity, next_qdd};
+        const auto robust = collision_builder.validatePose(
+          *scene, seed, *group_, next_motion);
+        ASSERT_TRUE(robust.input_valid) << label << " step=" << step
+                                        << ' ' << robust.failure_reason;
+        ASSERT_FALSE(robust.unsafe) << label << " step=" << step
+                                    << ' ' << robust.failure_reason;
+
+        const Eigen::Vector3d screen =
+          seed.getGlobalLinkTransform("monitor_control_frame").translation();
+        const Eigen::Vector3d elbow = seed.getGlobalLinkTransform("link3").translation();
+        const Eigen::Vector3d wrist = seed.getGlobalLinkTransform("link4").translation();
+        const double distance = (screen - fixed_face).norm();
+        minimum_distance_all = std::min(minimum_distance_all, distance);
+        maximum_distance_all = std::max(maximum_distance_all, distance);
+        EXPECT_GE(distance, parameters_.face_distance_min_m - one_step_margin)
+          << label << " step=" << step;
+        EXPECT_LE(distance, parameters_.face_distance_max_m + one_step_margin)
+          << label << " step=" << step;
+        if (step >= settling_steps) {
+          metrics.distance_min = std::min(metrics.distance_min, distance);
+          metrics.distance_max = std::max(metrics.distance_max, distance);
+          metrics.max_pointing_error = std::max(
+            metrics.max_pointing_error, std::abs(result.tracking->pointing_error_rad));
+          metrics.max_roll_error = std::max(
+            metrics.max_roll_error, std::abs(result.tracking->roll_error_rad));
+          metrics.q3_min = std::min(metrics.q3_min, next_q[2]);
+          metrics.q3_max = std::max(metrics.q3_max, next_q[2]);
+          metrics.final_q3 = next_q[2];
+          metrics.final_distance = distance;
+          if (qp.status == QpStatus::kPrimaryOnly) {
+            ++metrics.primary_only_after_settle;
+          }
+        }
+        if (step >= settling_steps - 1 &&
+          (step - (settling_steps - 1)) % sample_stride == 0)
+        {
+          samples.push_back({screen, elbow, wrist});
+        }
+      }
+
+      const auto full_range = [](const std::vector<HoldSample> & values, const int point) {
+          Eigen::Vector3d minimum = Eigen::Vector3d::Constant(
+            std::numeric_limits<double>::infinity());
+          Eigen::Vector3d maximum = Eigen::Vector3d::Constant(
+            -std::numeric_limits<double>::infinity());
+          for (const HoldSample & sample : values) {
+            const Eigen::Vector3d & value = point == 0 ? sample.screen :
+              (point == 1 ? sample.elbow : sample.wrist);
+            minimum = minimum.cwiseMin(value);
+            maximum = maximum.cwiseMax(value);
+          }
+          return (maximum - minimum).norm();
+        };
+      const auto max_sliding_path = [&](const int point) {
+          const std::size_t window = static_cast<std::size_t>(std::llround(
+              10.0 / kSamplePeriodSec)) + 1U;
+          if (samples.size() < window) {
+            return std::numeric_limits<double>::infinity();
+          }
+          double maximum = 0.0;
+          for (std::size_t end = window - 1U; end < samples.size(); ++end) {
+            double path = 0.0;
+            for (std::size_t index = end - window + 2U; index <= end; ++index) {
+              const Eigen::Vector3d & left = point == 0 ? samples[index - 1U].screen :
+                (point == 1 ? samples[index - 1U].elbow : samples[index - 1U].wrist);
+              const Eigen::Vector3d & right = point == 0 ? samples[index].screen :
+                (point == 1 ? samples[index].elbow : samples[index].wrist);
+              path += (right - left).norm();
+            }
+            maximum = std::max(maximum, path);
+          }
+          return maximum;
+        };
+      metrics.screen_range = full_range(samples, 0);
+      metrics.elbow_range = full_range(samples, 1);
+      metrics.wrist_range = full_range(samples, 2);
+      metrics.screen_path_10s = max_sliding_path(0);
+      metrics.elbow_path_10s = max_sliding_path(1);
+      metrics.wrist_path_10s = max_sliding_path(2);
+      case_report << " hold_d=" << metrics.distance_min << ".." << metrics.distance_max
+                  << " all_d=" << minimum_distance_all << ".." << maximum_distance_all
+                  << " final_q3/d=" << metrics.final_q3 << '/' << metrics.final_distance
+                  << " q3_hold=" << metrics.q3_min << ".." << metrics.q3_max
+                  << " primary_only=" << metrics.primary_only_after_settle
+                  << " gaze_roll_max=" << metrics.max_pointing_error << '/'
+                  << metrics.max_roll_error
+                  << " fullspan(P/E/W)=" << metrics.screen_range << '/'
+                  << metrics.elbow_range << '/' << metrics.wrist_range
+                  << " path10s(P/E/W)=" << metrics.screen_path_10s << '/'
+                  << metrics.elbow_path_10s << '/' << metrics.wrist_path_10s
+                  << " samples=" << samples.size();
+      RecordProperty(label, case_report.str());
+      SCOPED_TRACE(case_report.str());
+      EXPECT_EQ(samples.size(), 601U);
+      EXPECT_LE(metrics.screen_range, kQuietPathLimitM);
+      EXPECT_LE(metrics.elbow_range, kQuietPathLimitM);
+      EXPECT_LE(metrics.wrist_range, kQuietPathLimitM);
+      EXPECT_LE(metrics.screen_path_10s, kQuietPathLimitM);
+      EXPECT_LE(metrics.elbow_path_10s, kQuietPathLimitM);
+      EXPECT_LE(metrics.wrist_path_10s, kQuietPathLimitM);
+      EXPECT_LE(metrics.distance_max - metrics.distance_min, kQuietPathLimitM);
+      EXPECT_LE(metrics.max_pointing_error,
+        parameters_.pointing_deadband_rad + angular_allowance);
+      EXPECT_LE(metrics.max_roll_error, tracking_config.roll_deadband_rad + angular_allowance);
+    };
+
+  CaseMetrics measured_state;
+  run_hold("posture1c_lower120_seed_qd_qdd_estimated", seed_qd,
+    seed_qdd_estimate, 100.0, measured_state);
+  EXPECT_EQ(measured_state.primary_only_after_settle, 0)
+    << "The fixed-target hold must not hide secondary fallback after the 5 s settle";
+
+  const Eigen::VectorXd zero = Eigen::VectorXd::Zero(6);
+  CaseMetrics zero_motion_control;
+  run_hold("posture1c_lower120_seed_zero_qd_qdd_control", zero, zero,
+    140.0, zero_motion_control);
+  // This control validates that the path/quietness oracle itself passes from
+  // rest. The pre-fix shell guard may still select primary-only here; record
+  // that separately, but do not make it a second required RED condition.
+  EXPECT_LE(zero_motion_control.screen_path_10s, kQuietPathLimitM);
+  EXPECT_LE(zero_motion_control.elbow_path_10s, kQuietPathLimitM);
+  EXPECT_LE(zero_motion_control.wrist_path_10s, kQuietPathLimitM);
+}
+
+TEST_F(MotionReferenceTest, Posture1CLowerBoundaryRampRecoversWithoutGateCycling)
+{
+  reference_.reset();
+  parameters_.position_deadband_m = 0.03;
+  reference_ = std::make_unique<MotionReference>(
+    node_, monitor_, parameters_, limits_, collision_config_);
+
+  // Captured just before the lower-bound target transition in
+  // runs/boundaries_fixed_lower50 (sim time 8.6 s). The demo target then uses
+  // the recorded quintic smoothstep transition from the original midpoint
+  // FACE point to the fixed lower target over 5 s.
+  constexpr double kSeedQ[6]{
+    6.070616327715556e-07, -0.2510680819273041, -0.37663322650400705,
+    1.0392998105627849e-06, -0.9426496677996122, -4.795719809185696e-07};
+  const Eigen::Vector3d initial_face(
+    0.7499981110465981, -1.017556868225869e-06, 1.149978488041211);
+  const Eigen::Vector3d lower_face(
+    0.6720479502409709, -7.21194357188413e-07, 1.1499836707827846);
+  constexpr double kTargetRampSec = 5.0;
+  constexpr double kSettlingSec = 5.0;
+  constexpr double kHoldSec = 60.0;
+  constexpr double kDistanceQuietLimitM = 0.01;
+  const double dt = parameters_.control_period_sec;
+  const int ramp_steps = static_cast<int>(std::ceil(kTargetRampSec / dt));
+  const int settle_steps = static_cast<int>(std::ceil(kSettlingSec / dt));
+  const int hold_steps = static_cast<int>(std::ceil(kHoldSec / dt));
+  const int recovery_deadline_hold_steps = static_cast<int>(std::ceil(30.0 / dt));
+  const int recovery_deadline_step =
+    ramp_steps + settle_steps + recovery_deadline_hold_steps - 1;
+  const int total_steps = ramp_steps + settle_steps + hold_steps;
+  const double start_time = 80.0;
+
+  moveit::core::RobotState state(model_);
+  state.setToDefaultValues();
+  Eigen::VectorXd q(6);
+  for (Eigen::Index joint = 0; joint < q.size(); ++joint) {
+    q[joint] = kSeedQ[joint];
+    state.setVariablePosition("joint" + std::to_string(joint + 1), q[joint]);
+  }
+  Eigen::VectorXd velocity = Eigen::VectorXd::Zero(6);
+  Eigen::VectorXd acceleration = Eigen::VectorXd::Zero(6);
+  state.setJointGroupVelocities(group_, velocity);
+  state.setJointGroupAccelerations(group_, acceleration);
+  state.update();
+  ASSERT_TRUE(state.satisfiesBounds(group_));
+
+  const auto named_bend = [this](const std::string & name) {
+      moveit::core::RobotState named_state(model_);
+      if (!named_state.setToDefaultValues(group_, name)) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      named_state.update();
+      Eigen::VectorXd named_q;
+      named_state.copyJointGroupPositions(group_, named_q);
+      const auto * joint = model_->getJointModel("joint3");
+      const auto * revolute = dynamic_cast<const moveit::core::RevoluteJointModel *>(joint);
+      if (!joint || !revolute || named_q.size() != 6) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      const auto * parent = joint->getParentLinkModel();
+      const auto * child = joint->getChildLinkModel();
+      if (!parent || !child) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      const Eigen::Vector3d shoulder =
+        named_state.getGlobalLinkTransform("link2").translation();
+      const Eigen::Vector3d elbow =
+        named_state.getGlobalLinkTransform("link3").translation();
+      const Eigen::Vector3d wrist =
+        named_state.getGlobalLinkTransform("link4").translation();
+      const Eigen::Vector3d axis = named_state.getGlobalLinkTransform(parent).linear() *
+        child->getJointOriginTransform().linear() * revolute->getAxis();
+      const Eigen::Vector3d upper = elbow - shoulder;
+      const Eigen::Vector3d forearm = wrist - elbow;
+      const double angle = std::atan2(
+        axis.normalized().dot(upper.cross(forearm)), upper.dot(forearm));
+      return std::optional<std::pair<double, double>>{{named_q[2], angle}};
+    };
+  const auto rest = named_bend("rest");
+  const auto search = named_bend("search");
+  ASSERT_TRUE(rest);
+  ASSERT_TRUE(search);
+  const auto bend_calibration = calibratePostureBend(
+    rest->first, rest->second, search->first, search->second,
+    limits_.lower_position[2], limits_.upper_position[2]);
+  ASSERT_TRUE(bend_calibration.valid);
+  ASSERT_GE(q[2], bend_calibration.joint3_lower);
+  ASSERT_LE(q[2], bend_calibration.joint3_upper)
+    << "Captured pre-transition human seed should lie in the calibrated comfort interval";
+  const double initial_distance = (
+    state.getGlobalLinkTransform("monitor_control_frame").translation() - initial_face).norm();
+  ASSERT_GE(initial_distance, parameters_.face_distance_min_m);
+  ASSERT_LE(initial_distance, parameters_.face_distance_max_m)
+    << "Recorded pre-transition state must begin within the configured FACE band";
+
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = dt;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+
+  auto target = faceAlongLookDirection(state);
+  const auto stamp_target = [&target](const double time, const Eigen::Vector3d & face) {
+      const auto stamp = rclcpp::Time(
+        static_cast<std::int64_t>(std::llround(time * 1.0e9)), RCL_ROS_TIME);
+      target.header.stamp = stamp;
+      target.face_stamp = stamp;
+      target.face.x = face.x();
+      target.face.y = face.y();
+      target.face.z = face.z();
+    };
+  stamp_target(start_time, initial_face);
+  const auto initial = update(state, target, nullptr, nullptr, std::nullopt,
+      kSceneRevision, start_time);
+  ASSERT_TRUE(initial.tracking);
+  ASSERT_TRUE(initial.task);
+  ASSERT_TRUE(initial.tracking->face_distance_interval);
+
+  double minimum_distance = std::numeric_limits<double>::infinity();
+  double maximum_distance = 0.0;
+  double final_distance = initial_distance;
+  double maximum_settled_band_excursion = 0.0;
+  std::size_t distance_band_transitions_in_fixed_hold = 0U;
+  std::size_t distance_band_transitions_before_qualification = 0U;
+  std::size_t posture_mode_transitions_after_qualification = 0U;
+  std::size_t good_guard_transitions_after_qualification = 0U;
+  int gate_inside_steps_in_fixed_hold = 0;
+  int gate_outside_steps_in_fixed_hold = 0;
+  int primary_only_steps_in_fixed_hold = 0;
+  std::array<int, 7> secondary_status_counts{};
+  std::optional<QpFailureSnapshot> first_secondary_failure_snapshot;
+  std::optional<QpFailureSnapshot> first_secondary_infeasible_snapshot;
+  double q3_total_variation_in_fixed_hold = 0.0;
+  std::size_t q3_direction_reversals_in_fixed_hold = 0U;
+  double q3_min_after_ramp = std::numeric_limits<double>::infinity();
+  double q3_max_after_ramp = -std::numeric_limits<double>::infinity();
+  double q3_at_ramp_end = q[2];
+  double q3_at_hold_end = q[2];
+  double q3_at_recovery_deadline = q[2];
+  double distance_at_recovery_deadline = initial_distance;
+  int first_comfortable_step = -1;
+  int quiet_observation_steps = 0;
+  int maximum_qualified_quiet_steps = 0;
+  int continuous_qualified_steps = 0;
+  int previous_gate_after_qualification = -1;
+  std::string previous_posture_mode_after_qualification;
+  int previous_good_guard_after_qualification = -1;
+  bool quiet_qualification_seen = false;
+  bool quiet_steps_preserved_good_mode = true;
+  bool quiet_steps_kept_good_guard = true;
+  int previous_q3_direction = 0;
+  Eigen::VectorXd previous_q = q;
+  std::vector<Eigen::Vector3d> screen_samples;
+  std::vector<Eigen::Vector3d> elbow_samples;
+  std::vector<Eigen::Vector3d> wrist_samples;
+  double maximum_screen_path_10s = 0.0;
+  double maximum_elbow_path_10s = 0.0;
+  double maximum_wrist_path_10s = 0.0;
+  std::ostringstream report;
+
+  for (int step = 0; step < total_steps; ++step) {
+    const double elapsed = static_cast<double>(step) * dt;
+    const double phase = std::clamp(elapsed / kTargetRampSec, 0.0, 1.0);
+    const double smooth = phase * phase * phase *
+      (phase * (phase * 6.0 - 15.0) + 10.0);
+    const Eigen::Vector3d face = initial_face + smooth * (lower_face - initial_face);
+    const double now = start_time + elapsed + dt;
+    stamp_target(now, face);
+    const auto result = update(state, target, nullptr, nullptr, std::nullopt,
+        kSceneRevision, now);
+    ASSERT_TRUE(result.tracking) << "step=" << step;
+    ASSERT_TRUE(result.task) << "step=" << step;
+    ASSERT_TRUE(result.tracking->face_distance_interval) << "step=" << step;
+
+    Eigen::VectorXd current_q;
+    Eigen::VectorXd current_velocity;
+    Eigen::VectorXd current_acceleration;
+    state.copyJointGroupPositions(group_, current_q);
+    state.copyJointGroupVelocities(group_, current_velocity);
+    state.copyJointGroupAccelerations(group_, current_acceleration);
+    const JointMotionState motion{current_q, current_velocity, current_acceleration};
+    const auto collision = collision_builder.build(
+      *scene, state, *group_, motion, limits_, dt);
+    const QpResult qp = solver.solve(*result.task, motion, limits_, collision.constraints);
+    ASSERT_TRUE(qp.command_available()) << "step=" << step
+                                        << " QP=" << static_cast<int>(qp.status);
+    const auto secondary_status_index = static_cast<std::size_t>(qp.secondary_status);
+    if (secondary_status_index < secondary_status_counts.size()) {
+      ++secondary_status_counts[secondary_status_index];
+    }
+    if (!first_secondary_failure_snapshot && qp.secondary_failure_snapshot) {
+      first_secondary_failure_snapshot = qp.secondary_failure_snapshot;
+    }
+    if (!first_secondary_infeasible_snapshot && qp.secondary_failure_snapshot &&
+      qp.secondary_status == QpStageStatus::kInfeasible)
+    {
+      first_secondary_infeasible_snapshot = qp.secondary_failure_snapshot;
+    }
+
+    const Eigen::VectorXd next_q = current_q + dt * qp.joint_velocity;
+    const Eigen::VectorXd next_acceleration = (qp.joint_velocity - current_velocity) / dt;
+    state.setJointGroupPositions(group_, next_q);
+    state.setJointGroupVelocities(group_, qp.joint_velocity);
+    state.setJointGroupAccelerations(group_, next_acceleration);
+    state.update(true);
+    ASSERT_TRUE(state.satisfiesBounds(group_)) << "step=" << step;
+    const auto actual = collision_builder.validateActualState(*scene, state, *group_);
+    ASSERT_TRUE(actual.input_valid) << actual.failure_reason;
+    ASSERT_FALSE(actual.unsafe) << actual.failure_reason;
+
+    const Eigen::Vector3d screen =
+      state.getGlobalLinkTransform("monitor_control_frame").translation();
+    const Eigen::Vector3d elbow = state.getGlobalLinkTransform("link3").translation();
+    const Eigen::Vector3d wrist = state.getGlobalLinkTransform("link4").translation();
+    const double distance = (screen - face).norm();
+    minimum_distance = std::min(minimum_distance, distance);
+    maximum_distance = std::max(maximum_distance, distance);
+    final_distance = distance;
+    if (step == ramp_steps - 1) {
+      q3_at_ramp_end = next_q[2];
+    }
+    const bool fixed_target_hold = step >= ramp_steps;
+    const int gate = result.tracking->face_distance_outside_band ? 0 : 1;
+    if (fixed_target_hold) {
+      if (quiet_qualification_seen) {
+        if (previous_gate_after_qualification >= 0 &&
+          gate != previous_gate_after_qualification)
+        {
+          ++distance_band_transitions_in_fixed_hold;
+        }
+        previous_gate_after_qualification = gate;
+      } else {
+        if (previous_gate_after_qualification >= 0 &&
+          gate != previous_gate_after_qualification)
+        {
+          ++distance_band_transitions_before_qualification;
+        }
+        previous_gate_after_qualification = gate;
+      }
+      gate_inside_steps_in_fixed_hold += gate == 1 ? 1 : 0;
+      gate_outside_steps_in_fixed_hold += gate == 0 ? 1 : 0;
+      if (qp.status == QpStatus::kPrimaryOnly) {
+        ++primary_only_steps_in_fixed_hold;
+      }
+      q3_min_after_ramp = std::min(q3_min_after_ramp, next_q[2]);
+      q3_max_after_ramp = std::max(q3_max_after_ramp, next_q[2]);
+      q3_at_hold_end = next_q[2];
+      if (step == recovery_deadline_step) {
+        q3_at_recovery_deadline = next_q[2];
+        distance_at_recovery_deadline = distance;
+      }
+      const double q3_delta = next_q[2] - previous_q[2];
+      q3_total_variation_in_fixed_hold += std::abs(q3_delta);
+      const int q3_direction = std::abs(q3_delta) > 1.0e-4 ?
+        (q3_delta > 0.0 ? 1 : -1) : 0;
+      if (q3_direction != 0) {
+        if (previous_q3_direction != 0 && q3_direction != previous_q3_direction) {
+          ++q3_direction_reversals_in_fixed_hold;
+        }
+        previous_q3_direction = q3_direction;
+      }
+      const bool branch_comfortable =
+        next_q[2] >= bend_calibration.joint3_lower &&
+        next_q[2] <= bend_calibration.joint3_upper;
+      const std::string posture_mode = reference_->diagnostics().posture_mode;
+      const bool good_guard_active = !result.task->preferred_primary_constraints.empty();
+      const double one_step = parameters_.maximum_linear_reference_mps * dt;
+      const bool distance_settled =
+        distance >= parameters_.face_distance_min_m - one_step &&
+        distance <= parameters_.face_distance_max_m + one_step;
+      if (branch_comfortable && first_comfortable_step < 0) {
+        first_comfortable_step = step;
+      }
+      continuous_qualified_steps = branch_comfortable && distance_settled ?
+        continuous_qualified_steps + 1 : 0;
+      const bool quiet_measurement = continuous_qualified_steps >= settle_steps;
+      if (quiet_measurement && !quiet_qualification_seen) {
+        quiet_qualification_seen = true;
+        previous_gate_after_qualification = gate;
+        previous_posture_mode_after_qualification = posture_mode;
+        previous_good_guard_after_qualification = good_guard_active ? 1 : 0;
+      }
+      if (quiet_measurement) {
+        if (posture_mode != previous_posture_mode_after_qualification) {
+          ++posture_mode_transitions_after_qualification;
+        }
+        const int good_guard = good_guard_active ? 1 : 0;
+        if (good_guard != previous_good_guard_after_qualification) {
+          ++good_guard_transitions_after_qualification;
+        }
+        previous_posture_mode_after_qualification = posture_mode;
+        previous_good_guard_after_qualification = good_guard;
+        quiet_steps_preserved_good_mode = quiet_steps_preserved_good_mode &&
+          posture_mode == "preserve";
+        quiet_steps_kept_good_guard = quiet_steps_kept_good_guard && good_guard_active;
+        ++quiet_observation_steps;
+        maximum_qualified_quiet_steps = std::max(
+          maximum_qualified_quiet_steps, quiet_observation_steps);
+        maximum_settled_band_excursion = std::max(maximum_settled_band_excursion,
+          std::max({0.0, parameters_.face_distance_min_m - one_step - distance,
+              distance - parameters_.face_distance_max_m - one_step}));
+      } else {
+        // Quiet-path evidence starts only after 5 s of simultaneous branch and
+        // range qualification; any interruption starts a new quiet window.
+        quiet_observation_steps = 0;
+        screen_samples.clear();
+        elbow_samples.clear();
+        wrist_samples.clear();
+      }
+      if (quiet_measurement && step % 5 == 0) {
+        screen_samples.push_back(screen);
+        elbow_samples.push_back(elbow);
+        wrist_samples.push_back(wrist);
+        const std::size_t window_samples = static_cast<std::size_t>(std::ceil(
+            10.0 / (5.0 * dt))) + 1U;
+        if (screen_samples.size() >= window_samples) {
+          const std::size_t begin = screen_samples.size() - window_samples;
+          double screen_path = 0.0;
+          double elbow_path = 0.0;
+          double wrist_path = 0.0;
+          for (std::size_t i = begin + 1; i < screen_samples.size(); ++i) {
+            screen_path += (screen_samples[i] - screen_samples[i - 1]).norm();
+            elbow_path += (elbow_samples[i] - elbow_samples[i - 1]).norm();
+            wrist_path += (wrist_samples[i] - wrist_samples[i - 1]).norm();
+          }
+          maximum_screen_path_10s = std::max(maximum_screen_path_10s, screen_path);
+          maximum_elbow_path_10s = std::max(maximum_elbow_path_10s, elbow_path);
+          maximum_wrist_path_10s = std::max(maximum_wrist_path_10s, wrist_path);
+        }
+      }
+    }
+    previous_q = next_q;
+  }
+
+  report << "target_ramp_sec=" << kTargetRampSec
+         << " post_ramp_settle_sec=" << kSettlingSec << " fixed_hold_sec=" << kHoldSec
+         << " initial_distance=" << initial_distance
+         << " distance_range=" << minimum_distance << ".." << maximum_distance
+         << " final_distance=" << final_distance
+         << " settled_band_excursion=" << maximum_settled_band_excursion
+         << " distance_band_transitions=" << distance_band_transitions_in_fixed_hold
+         << " gate_inside/outside=" << gate_inside_steps_in_fixed_hold << '/'
+         << gate_outside_steps_in_fixed_hold
+         << " posture_mode_transitions_after_qualification=" <<
+         posture_mode_transitions_after_qualification
+         << " good_guard_transitions_after_qualification=" <<
+         good_guard_transitions_after_qualification
+         << " quiet_good_mode=" << quiet_steps_preserved_good_mode
+         << " quiet_good_guard=" << quiet_steps_kept_good_guard
+         << " q3_fixed_hold_range=" << q3_min_after_ramp << ".." << q3_max_after_ramp
+         << " q3_ramp_end/final=" << q3_at_ramp_end << '/' << q3_at_hold_end
+         << " recovery_deadline_sec=" <<
+         static_cast<double>(recovery_deadline_hold_steps) * dt
+         << " q3_distance_at_recovery_deadline=" << q3_at_recovery_deadline << '/'
+         << distance_at_recovery_deadline
+         << " q3_total_variation=" << q3_total_variation_in_fixed_hold
+         << " q3_direction_reversals=" << q3_direction_reversals_in_fixed_hold
+         << " q3_comfort_interval=" << bend_calibration.joint3_lower << ".."
+         << bend_calibration.joint3_upper
+         << " first_comfortable_step=" << first_comfortable_step
+         << " quiet_coverage_sec=" << maximum_qualified_quiet_steps * dt
+         << " quiet_current_streak_sec=" << quiet_observation_steps * dt
+         << " distance_band_transitions_prequalification=" <<
+         distance_band_transitions_before_qualification
+         << " primary_only_fixed_hold=" << primary_only_steps_in_fixed_hold
+         << " path10s(P/E/W)=" << maximum_screen_path_10s << '/'
+         << maximum_elbow_path_10s << '/' << maximum_wrist_path_10s;
+  report << " secondary_status_counts(kNotRun,kSolved,kSolvedInaccurate,kInfeasible,"
+            "kMaxIterations,kTimeLimit,kSolverError)=";
+  for (const int count : secondary_status_counts) {
+    report << count << ',';
+  }
+  const auto append_snapshot_values = [&report](
+    const std::string_view name, const auto & values) {
+      report << ' ' << name << '[';
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0U) {
+          report << ',';
+        }
+        report << values[index];
+      }
+      report << ']';
+    };
+  const auto append_snapshot = [&report, &append_snapshot_values](
+    const std::string_view label, const QpFailureSnapshot & snapshot,
+    const char * path_environment) {
+      report << ' ' << label << "(stage=" << static_cast<int>(snapshot.stage)
+             << ",status=" << static_cast<int>(snapshot.classified_status)
+             << ",n=" << snapshot.variable_count << ",m=" << snapshot.constraint_count
+             << ",setup=" << snapshot.setup_return_code
+             << ",solve=" << snapshot.solve_return_code << ")";
+      append_snapshot_values("P_col", snapshot.p_column_pointers);
+      append_snapshot_values("P_row", snapshot.p_row_indices);
+      append_snapshot_values("P", snapshot.p_values);
+      append_snapshot_values("A_col", snapshot.a_column_pointers);
+      append_snapshot_values("A_row", snapshot.a_row_indices);
+      append_snapshot_values("A", snapshot.a_values);
+      append_snapshot_values("l", snapshot.lower);
+      append_snapshot_values("u", snapshot.upper);
+      if (const char * snapshot_path = std::getenv(path_environment)) {
+        std::ofstream snapshot_file(snapshot_path);
+        const bool saved = snapshot_file.good() &&
+          writeQpFailureSnapshot(snapshot_file, snapshot);
+        report << " snapshot_file=" << snapshot_path << ":" << (saved ? "saved" : "failed");
+      }
+    };
+  if (first_secondary_failure_snapshot) {
+    append_snapshot("first_secondary_failure", *first_secondary_failure_snapshot,
+      "POSTURE1C_QP_SNAPSHOT_PATH");
+  } else {
+    report << " first_secondary_failure=none";
+  }
+  if (first_secondary_infeasible_snapshot) {
+    append_snapshot("first_secondary_infeasible", *first_secondary_infeasible_snapshot,
+      "POSTURE1C_QP_INFEASIBLE_SNAPSHOT_PATH");
+  } else {
+    report << " first_secondary_infeasible=none";
+  }
+  RecordProperty("posture1c_lower_boundary_ramp", report.str());
+
+  // The distance-band bit is diagnostic only. Acceptance follows actual posture
+  // mode and GOOD guard continuity after five seconds in the calibrated branch.
+  EXPECT_LE(posture_mode_transitions_after_qualification, 2U) << report.str();
+  EXPECT_LE(good_guard_transitions_after_qualification, 2U) << report.str();
+  EXPECT_TRUE(quiet_steps_preserved_good_mode) << report.str();
+  EXPECT_TRUE(quiet_steps_kept_good_guard) << report.str();
+  EXPECT_GE(q3_at_recovery_deadline, bend_calibration.joint3_lower) << report.str();
+  EXPECT_LE(q3_at_recovery_deadline, bend_calibration.joint3_upper) << report.str();
+  EXPECT_GE(distance_at_recovery_deadline,
+    parameters_.face_distance_min_m - parameters_.maximum_linear_reference_mps * dt)
+    << report.str();
+  EXPECT_LE(distance_at_recovery_deadline,
+    parameters_.face_distance_max_m + parameters_.maximum_linear_reference_mps * dt)
+    << report.str();
+  EXPECT_GE(q3_at_hold_end, bend_calibration.joint3_lower) << report.str();
+  EXPECT_LE(q3_at_hold_end, bend_calibration.joint3_upper) << report.str();
+  const double final_band_margin = parameters_.maximum_linear_reference_mps * dt;
+  EXPECT_GE(final_distance, parameters_.face_distance_min_m - final_band_margin)
+    << report.str();
+  EXPECT_LE(final_distance, parameters_.face_distance_max_m + final_band_margin)
+    << report.str();
+  EXPECT_GE(maximum_qualified_quiet_steps * dt, 30.0) << report.str();
+  EXPECT_LE(maximum_settled_band_excursion, 0.0) << report.str();
+  EXPECT_LE(maximum_screen_path_10s, kDistanceQuietLimitM) << report.str();
+  EXPECT_LE(maximum_elbow_path_10s, kDistanceQuietLimitM) << report.str();
+  EXPECT_LE(maximum_wrist_path_10s, kDistanceQuietLimitM) << report.str();
+}
+
+TEST_F(MotionReferenceTest, Posture1CBad10RecordedEndpointRollsIntoNamedBendBranch)
+{
+  // Match the production FACE tracking deadband used by runtime captures.
+  reference_.reset();
+  parameters_.position_deadband_m = 0.03;
+  reference_ = std::make_unique<MotionReference>(
+    node_, monitor_, parameters_, limits_, collision_config_);
+  // This is the actual final joint state and fixed face target from
+  // runs/bad10_final, where the previous scalar elbow-side check said “good”
+  // although the rendered arm still had the wrong shape.
+  constexpr double kRecordedQ[6]{
+    -5.379036931941633e-06, 1.7178940940293195, -3.6019600429057217,
+    1.3069379082891277e-06, 0.2890940863373446, 2.934930766309014e-06};
+  const Eigen::Vector3d face(
+    1.0510895434142848, -8.73348787353692e-07, 1.1892379220020002);
+
+  const auto named_bend = [this](const std::string & name) {
+      moveit::core::RobotState state(model_);
+      if (!state.setToDefaultValues(group_, name)) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      state.update();
+      Eigen::VectorXd q;
+      state.copyJointGroupPositions(group_, q);
+      const auto * joint_model = model_->getJointModel("joint3");
+      const auto * revolute = dynamic_cast<const moveit::core::RevoluteJointModel *>(joint_model);
+      if (!revolute || q.size() != 6) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      const auto * parent = joint_model->getParentLinkModel();
+      const auto * child = joint_model->getChildLinkModel();
+      if (!parent || !child) {
+        return std::optional<std::pair<double, double>>{};
+      }
+      const Eigen::Vector3d shoulder = state.getGlobalLinkTransform("link2").translation();
+      const Eigen::Vector3d elbow = state.getGlobalLinkTransform("link3").translation();
+      const Eigen::Vector3d wrist = state.getGlobalLinkTransform("link4").translation();
+      const Eigen::Vector3d axis = state.getGlobalLinkTransform(parent).linear() *
+        child->getJointOriginTransform().linear() * revolute->getAxis();
+      const Eigen::Vector3d upper_arm = elbow - shoulder;
+      const Eigen::Vector3d forearm = wrist - elbow;
+      const double angle = std::atan2(
+        axis.normalized().dot(upper_arm.cross(forearm)), upper_arm.dot(forearm));
+      return std::optional<std::pair<double, double>>{{q[2], angle}};
+    };
+  const auto rest = named_bend("rest");
+  const auto search = named_bend("search");
+  ASSERT_TRUE(rest);
+  ASSERT_TRUE(search);
+  const auto calibration = calibratePostureBend(
+    rest->first, rest->second, search->first, search->second,
+    limits_.lower_position[2], limits_.upper_position[2]);
+  ASSERT_TRUE(calibration.valid);
+
+  moveit::core::RobotState robot_state(model_);
+  robot_state.setToDefaultValues();
+  Eigen::VectorXd q(6);
+  for (Eigen::Index i = 0; i < q.size(); ++i) {
+    q[i] = kRecordedQ[i];
+    robot_state.setVariablePosition("joint" + std::to_string(i + 1), q[i]);
+  }
+  robot_state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+  robot_state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+  robot_state.update();
+  ASSERT_TRUE(robot_state.satisfiesBounds(group_));
+  EXPECT_LT(q[2], calibration.joint3_lower);
+
+  const auto bend_sin = [this, &calibration](const moveit::core::RobotState & state) {
+      const auto * joint_model = model_->getJointModel("joint3");
+      const auto * revolute = dynamic_cast<const moveit::core::RevoluteJointModel *>(joint_model);
+      const auto * parent = joint_model->getParentLinkModel();
+      const auto * child = joint_model->getChildLinkModel();
+      const Eigen::Vector3d shoulder = state.getGlobalLinkTransform("link2").translation();
+      const Eigen::Vector3d elbow = state.getGlobalLinkTransform("link3").translation();
+      const Eigen::Vector3d wrist = state.getGlobalLinkTransform("link4").translation();
+      const Eigen::Vector3d axis = state.getGlobalLinkTransform(parent).linear() *
+        child->getJointOriginTransform().linear() * revolute->getAxis();
+      const Eigen::Vector3d upper_arm = elbow - shoulder;
+      const Eigen::Vector3d forearm = wrist - elbow;
+      const double angle = std::atan2(
+        axis.normalized().dot(upper_arm.cross(forearm)), upper_arm.dot(forearm));
+      return calibration.preferred_sign * std::sin(angle);
+    };
+  EXPECT_LT(bend_sin(robot_state), calibration.minimum_comfortable_sin);
+
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+  auto target = faceAlongLookDirection(robot_state);
+  target.face.x = face.x();
+  target.face.y = face.y();
+  target.face.z = face.z();
+  std::ostringstream rollout;
+  double minimum_distance = std::numeric_limits<double>::infinity();
+  double maximum_distance = 0.0;
+  double maximum_pointing_error = 0.0;
+  double maximum_roll_error = 0.0;
+  double maximum_distance_rate_violation = 0.0;
+  double maximum_unconstrained_outward_rate = 0.0;
+  int maximum_unconstrained_rate_step = -1;
+  double maximum_unconstrained_rate_distance = 0.0;
+  int primary_only_steps = 0;
+  int strict_band_excursion_steps = 0;
+  int expanded_band_excursion_steps = 0;
+  std::array<int, 7> secondary_status_counts{};
+  int steps_taken = 0;
+  int continuous_comfort_steps = 0;
+  int continuous_settled_steps = 0;
+  int first_comfort_hold_step = -1;
+  int settled_step = -1;
+  double maximum_strict_band_excursion = 0.0;
+  double final_pointing_error = std::numeric_limits<double>::quiet_NaN();
+  double final_roll_error = std::numeric_limits<double>::quiet_NaN();
+  std::ostringstream fallback_steps;
+  std::ostringstream detailed_status_steps;
+  bool reached_comfort = false;
+  struct QuietSample
+  {
+    double time_sec;
+    double distance_m;
+    Eigen::Vector3d screen;
+    Eigen::Vector3d elbow;
+    Eigen::Vector3d wrist;
+  };
+  std::vector<QuietSample> quiet_samples;
+  double maximum_screen_path_10s = 0.0;
+  double maximum_elbow_path_10s = 0.0;
+  double maximum_wrist_path_10s = 0.0;
+  double maximum_distance_span_10s = 0.0;
+  double maximum_settled_band_excursion = 0.0;
+  int primary_only_after_settling = 0;
+  double settled_distance_min = std::numeric_limits<double>::infinity();
+  double settled_distance_max = 0.0;
+  const int required_comfort_hold_steps = static_cast<int>(std::ceil(
+      2.0 / parameters_.control_period_sec));
+  const int required_settling_steps = static_cast<int>(std::ceil(
+      5.0 / parameters_.control_period_sec));
+  const int required_observation_steps = static_cast<int>(std::ceil(
+      30.0 / parameters_.control_period_sec));
+  const double initial_distance = (
+    robot_state.getGlobalLinkTransform("monitor_control_frame").translation() - face).norm();
+  minimum_distance = initial_distance;
+  maximum_distance = initial_distance;
+  if (initial_distance < parameters_.face_distance_min_m ||
+    initial_distance > parameters_.face_distance_max_m)
+  {
+    ++strict_band_excursion_steps;
+    maximum_strict_band_excursion = std::max({
+          0.0, parameters_.face_distance_min_m - initial_distance,
+          initial_distance - parameters_.face_distance_max_m});
+  }
+  const double distance_activation_margin = parameters_.maximum_linear_reference_mps *
+    parameters_.control_period_sec;
+  const double initial_expanded_excursion = std::max({
+        0.0, parameters_.face_distance_min_m - distance_activation_margin - initial_distance,
+        initial_distance - parameters_.face_distance_max_m - distance_activation_margin});
+  if (initial_expanded_excursion > 0.0) {
+    ++expanded_band_excursion_steps;
+  }
+  // The recorded BAD10 model recovery takes about 12.4 s; allow 15 s to reach
+  // the branch, then five seconds to settle and a full 30 s fixed-F hold.
+  const int recovery_budget_steps = static_cast<int>(std::ceil(
+      15.0 / parameters_.control_period_sec));
+  const int maximum_steps = recovery_budget_steps + required_settling_steps +
+    required_observation_steps;
+  const double settling_band_margin = distance_activation_margin;
+  for (int step = 0; step < maximum_steps; ++step) {
+    steps_taken = step + 1;
+    Eigen::VectorXd current_q;
+    robot_state.copyJointGroupPositions(group_, current_q);
+    Eigen::VectorXd current_velocity;
+    robot_state.copyJointGroupVelocities(group_, current_velocity);
+    Eigen::VectorXd current_acceleration;
+    robot_state.copyJointGroupAccelerations(group_, current_acceleration);
+    const JointMotionState motion{
+      current_q, current_velocity, current_acceleration};
+    const double simulation_time = static_cast<double>(step + 1) *
+      parameters_.control_period_sec;
+    const auto target_stamp = rclcpp::Time(
+      static_cast<std::int64_t>(std::llround(simulation_time * 1.0e9)), RCL_ROS_TIME);
+    target.header.stamp = target_stamp;
+    target.face_stamp = target_stamp;
+    const auto result = update(
+      robot_state, target, nullptr, nullptr, std::nullopt, kSceneRevision, simulation_time);
+    ASSERT_TRUE(result.tracking) << reference_->diagnostics().state;
+    ASSERT_TRUE(result.task);
+    const Eigen::Vector3d monitor_position =
+      robot_state.getGlobalLinkTransform("monitor_control_frame").translation();
+    const double current_distance = (monitor_position - face).norm();
+    minimum_distance = std::min(minimum_distance, current_distance);
+    maximum_distance = std::max(maximum_distance, current_distance);
+    maximum_pointing_error = std::max(
+      maximum_pointing_error, std::abs(result.tracking->pointing_error_rad));
+    maximum_roll_error = std::max(maximum_roll_error, std::abs(result.tracking->roll_error_rad));
+    final_pointing_error = result.tracking->pointing_error_rad;
+    final_roll_error = result.tracking->roll_error_rad;
+    ASSERT_TRUE(result.tracking->face_distance_interval);
+    const auto collision = collision_builder.build(
+      *scene, robot_state, *group_, motion, limits_, parameters_.control_period_sec);
+    const QpResult qp = solver.solve(*result.task, motion, limits_, collision.constraints);
+    ASSERT_TRUE(qp.command_available()) << "step=" << step
+                                        << " status=" << static_cast<int>(qp.status)
+                                        << " q=" << current_q.transpose();
+    ASSERT_EQ(qp.joint_velocity.size(), 6);
+    const double feasibility_tolerance = qp_config.solution_feasibility_tolerance +
+      4.0 * qp_config.solver_absolute_tolerance;
+    const auto & distance = *result.tracking->face_distance_interval;
+    const double distance_rate = distance.coefficients.dot(qp.joint_velocity);
+    const bool distance_interval_applied = std::any_of(
+      result.task->secondary_constraints.begin(), result.task->secondary_constraints.end(),
+      [&distance](const LinearVelocityConstraint & constraint) {
+        return constraint.coefficients.size() == distance.coefficients.size() &&
+               constraint.coefficients.isApprox(distance.coefficients, 1.0e-12) &&
+               std::abs(constraint.lower_bound - distance.lower_bound) <= 1.0e-12 &&
+               std::abs(constraint.upper_bound - distance.upper_bound) <= 1.0e-12;
+      });
+    EXPECT_FALSE(distance_interval_applied)
+      << "step=" << step << " outside_band="
+      << result.tracking->face_distance_outside_band << " secondary_rows="
+      << result.task->secondary_constraints.size();
+    const double rate_violation = std::max({
+          0.0, distance.lower_bound - feasibility_tolerance - distance_rate,
+          distance_rate - distance.upper_bound - feasibility_tolerance});
+    if (distance_interval_applied) {
+      maximum_distance_rate_violation = std::max(maximum_distance_rate_violation, rate_violation);
+    } else {
+      const double outward_rate = current_distance > parameters_.face_distance_max_m ?
+        std::max(0.0, distance_rate) :
+        (current_distance < parameters_.face_distance_min_m ? std::max(0.0, -distance_rate) : 0.0);
+      if (outward_rate > maximum_unconstrained_outward_rate) {
+        maximum_unconstrained_outward_rate = outward_rate;
+        maximum_unconstrained_rate_step = step;
+        maximum_unconstrained_rate_distance = current_distance;
+      }
+    }
+    const auto secondary_status_index = static_cast<std::size_t>(qp.secondary_status);
+    if (secondary_status_index < secondary_status_counts.size()) {
+      ++secondary_status_counts[secondary_status_index];
+    }
+    if (qp.status == QpStatus::kPrimaryOnly) {
+      // A failed secondary stage retains the higher-ranked gaze command. The
+      // distance objective remains a lower-priority soft request.
+      ++primary_only_steps;
+      if (settled_step >= 0) {
+        ++primary_only_after_settling;
+      }
+      if (primary_only_steps <= 12 || result.tracking->face_distance_outside_band ||
+        (step >= 515 && step <= 530))
+      {
+        detailed_status_steps << step << ':' << static_cast<int>(qp.secondary_status)
+                              << ":rows=" << result.task->secondary_matrix.rows()
+                              << ":rate=" << distance_rate << '/' << distance.lower_bound
+                              << ".." << distance.upper_bound << ":q3=" << current_q[2]
+                              << ":d=" << current_distance << ":gaze="
+                              << result.tracking->pointing_error_rad << '/'
+                              << result.tracking->roll_error_rad << ' ';
+      }
+      fallback_steps << step << ':' << static_cast<int>(qp.secondary_status) << ' ';
+    } else if (distance_interval_applied) {
+      EXPECT_LE(rate_violation, 0.0) << "step=" << step << " status="
+                                     << static_cast<int>(qp.status) << " secondary="
+                                     << static_cast<int>(qp.secondary_status) << " rows="
+                                     << result.task->secondary_matrix.rows() << " rate=" <<
+        distance_rate
+                                     << " interval=" << distance.lower_bound << ".." <<
+        distance.upper_bound;
+    }
+    ASSERT_GT(result.task->primary_matrix.rows(), 0);
+
+    const Eigen::VectorXd next_q = current_q + parameters_.control_period_sec *
+      qp.joint_velocity;
+    const Eigen::VectorXd next_acceleration =
+      (qp.joint_velocity - current_velocity) / parameters_.control_period_sec;
+    robot_state.setJointGroupPositions(group_, next_q);
+    robot_state.setJointGroupVelocities(group_, qp.joint_velocity);
+    robot_state.setJointGroupAccelerations(group_, next_acceleration);
+    robot_state.update(true);
+    ASSERT_TRUE(robot_state.satisfiesBounds(group_)) << "step=" << step;
+    const auto actual = collision_builder.validateActualState(*scene, robot_state, *group_);
+    ASSERT_TRUE(actual.input_valid) << "step=" << step << " " << actual.failure_reason;
+    ASSERT_FALSE(actual.unsafe) << "step=" << step << " " << actual.failure_reason;
+    const Eigen::Vector3d next_monitor_position =
+      robot_state.getGlobalLinkTransform("monitor_control_frame").translation();
+    const double next_distance = (next_monitor_position - face).norm();
+    minimum_distance = std::min(minimum_distance, next_distance);
+    maximum_distance = std::max(maximum_distance, next_distance);
+    const double next_band_excursion = std::max({
+          0.0, parameters_.face_distance_min_m - next_distance,
+          next_distance - parameters_.face_distance_max_m});
+    if (next_band_excursion > 0.0) {
+      ++strict_band_excursion_steps;
+      maximum_strict_band_excursion = std::max(
+        maximum_strict_band_excursion, next_band_excursion);
+    }
+    const double next_expanded_excursion = std::max({
+          0.0, parameters_.face_distance_min_m - distance_activation_margin - next_distance,
+          next_distance - parameters_.face_distance_max_m - distance_activation_margin});
+    if (next_expanded_excursion > 0.0) {
+      ++expanded_band_excursion_steps;
+    }
+    rollout << step << " q=" << next_q.transpose()
+            << " bend_sin=" << bend_sin(robot_state)
+            << " d=" << current_distance << "->" << next_distance
+            << " pointing_roll=" << result.tracking->pointing_error_rad << '/'
+            << result.tracking->roll_error_rad
+            << " qp=" << static_cast<int>(qp.status) << '/'
+            << static_cast<int>(qp.secondary_status)
+            << " interval_applied=" << distance_interval_applied
+            << " d_rate=" << distance_rate << " bounds=" << distance.lower_bound
+            << ".." << distance.upper_bound << " collision_clearance="
+            << actual.minimum_distance_m << " qdot=" << qp.joint_velocity.transpose() << '\n';
+    const bool in_comfort = next_q[2] >= calibration.joint3_lower &&
+      next_q[2] <= calibration.joint3_upper &&
+      bend_sin(robot_state) >= calibration.minimum_comfortable_sin;
+    const bool in_settling_band =
+      next_distance >= parameters_.face_distance_min_m - settling_band_margin &&
+      next_distance <= parameters_.face_distance_max_m + settling_band_margin;
+    continuous_comfort_steps = in_comfort && in_settling_band ?
+      continuous_comfort_steps + 1 : 0;
+    if (!reached_comfort && continuous_comfort_steps >= required_comfort_hold_steps) {
+      reached_comfort = true;
+      first_comfort_hold_step = step;
+    }
+    if (reached_comfort) {
+      continuous_settled_steps = in_comfort && in_settling_band ?
+        continuous_settled_steps + 1 : 0;
+      if (settled_step < 0 && continuous_settled_steps >= required_settling_steps) {
+        settled_step = step;
+      }
+    }
+    if (settled_step >= 0) {
+      const double settled_excursion = std::max({
+            0.0, parameters_.face_distance_min_m - settling_band_margin - next_distance,
+            next_distance - parameters_.face_distance_max_m - settling_band_margin});
+      maximum_settled_band_excursion = std::max(
+        maximum_settled_band_excursion, settled_excursion);
+    }
+    if (settled_step >= 0 && step >= settled_step && step % 5 == 0) {
+      quiet_samples.push_back({
+            simulation_time, next_distance, next_monitor_position,
+            robot_state.getGlobalLinkTransform("link3").translation(),
+            robot_state.getGlobalLinkTransform("link4").translation()});
+      settled_distance_min = std::min(settled_distance_min, next_distance);
+      settled_distance_max = std::max(settled_distance_max, next_distance);
+      const std::size_t samples_per_10s = static_cast<std::size_t>(std::ceil(
+          10.0 / (5.0 * parameters_.control_period_sec))) + 1U;
+      if (quiet_samples.size() >= samples_per_10s) {
+        const std::size_t begin = quiet_samples.size() - samples_per_10s;
+        double screen_path = 0.0;
+        double elbow_path = 0.0;
+        double wrist_path = 0.0;
+        double window_distance_min = std::numeric_limits<double>::infinity();
+        double window_distance_max = 0.0;
+        for (std::size_t i = begin; i < quiet_samples.size(); ++i) {
+          window_distance_min = std::min(window_distance_min, quiet_samples[i].distance_m);
+          window_distance_max = std::max(window_distance_max, quiet_samples[i].distance_m);
+          if (i > begin) {
+            screen_path += (quiet_samples[i].screen - quiet_samples[i - 1].screen).norm();
+            elbow_path += (quiet_samples[i].elbow - quiet_samples[i - 1].elbow).norm();
+            wrist_path += (quiet_samples[i].wrist - quiet_samples[i - 1].wrist).norm();
+          }
+        }
+        maximum_screen_path_10s = std::max(maximum_screen_path_10s, screen_path);
+        maximum_elbow_path_10s = std::max(maximum_elbow_path_10s, elbow_path);
+        maximum_wrist_path_10s = std::max(maximum_wrist_path_10s, wrist_path);
+        maximum_distance_span_10s = std::max(
+          maximum_distance_span_10s, window_distance_max - window_distance_min);
+      }
+    }
+  }
+  RecordProperty("posture1c_bad10_bounded_model_rollout", rollout.str());
+  std::ostringstream summary;
+  summary << "POSTURE-1C BAD10 rollout steps=" << steps_taken
+          << " reached_branch_and_settled_distance=" << reached_comfort << " q=";
+  Eigen::VectorXd final_q;
+  robot_state.copyJointGroupPositions(group_, final_q);
+  const double final_distance = (
+    robot_state.getGlobalLinkTransform("monitor_control_frame").translation() - face).norm();
+  summary << final_q.transpose()
+          << " E=" << robot_state.getGlobalLinkTransform("link3").translation().transpose()
+          << " W=" << robot_state.getGlobalLinkTransform("link4").translation().transpose()
+          << " F=" << face.transpose() << " bend_sin=" << bend_sin(robot_state)
+          << " comfort_sin=" << calibration.minimum_comfortable_sin
+          << " distance_range_m=" << minimum_distance << ".." << maximum_distance
+          << " final_distance_m=" << final_distance
+          << " allowed_m=" << parameters_.face_distance_min_m << ".."
+          << parameters_.face_distance_max_m << " strict_band_excursion_samples="
+          << strict_band_excursion_steps << " strict_excursion_sampled_duration_s="
+          << strict_band_excursion_steps * parameters_.control_period_sec
+          << " strict_excursion_max_m=" << maximum_strict_band_excursion
+          << " transient_tolerance_m=" << parameters_.position_deadband_m
+          << " settling_margin_m=" << settling_band_margin
+          << " required_settling_hold_s=" << required_comfort_hold_steps *
+          parameters_.control_period_sec
+          << " first_comfort_hold_time_s=" << (first_comfort_hold_step >= 0 ?
+  (first_comfort_hold_step + 1) * parameters_.control_period_sec : -1.0)
+          << " settled_time_s=" << (settled_step >= 0 ?
+  (settled_step + 1) * parameters_.control_period_sec : -1.0)
+          << " post_settle_observation_s=" << (quiet_samples.empty() ? 0.0 :
+  quiet_samples.back().time_sec - quiet_samples.front().time_sec)
+          << " settled_distance_span_m=" << (settled_distance_max - settled_distance_min)
+          << " quiet_max_screen_path_10s_m=" << maximum_screen_path_10s
+          << " quiet_max_elbow_path_10s_m=" << maximum_elbow_path_10s
+          << " quiet_max_wrist_path_10s_m=" << maximum_wrist_path_10s
+          << " quiet_max_distance_span_10s_m=" << maximum_distance_span_10s
+          << " max_settled_band_excursion_m=" << maximum_settled_band_excursion
+          << " outside_activation_margin_samples=" << expanded_band_excursion_steps
+          << " outside_activation_margin_duration_s="
+          << expanded_band_excursion_steps * parameters_.control_period_sec
+          << " max_pointing_error_rad="
+          << maximum_pointing_error << " max_roll_error_rad=" << maximum_roll_error
+          << " final_pointing_error_rad=" << final_pointing_error
+          << " final_roll_error_rad=" << final_roll_error
+          << " primary_only_steps=" << primary_only_steps
+          << " primary_only_after_settling=" << primary_only_after_settling
+          << " max_applied_interval_rate_violation_mps=" << maximum_distance_rate_violation
+          << " max_unconstrained_outward_rate_mps=" << maximum_unconstrained_outward_rate
+          << " max_unconstrained_outward_rate_step=" << maximum_unconstrained_rate_step
+          << " max_unconstrained_outward_rate_distance_m="
+          << maximum_unconstrained_rate_distance
+          << " secondary_status_counts(kNotRun,kSolved,kSolvedInaccurate,kInfeasible,"
+             "kMaxIterations,kTimeLimit,kSolverError)=";
+  for (const int count : secondary_status_counts) {
+    summary << count << ',';
+  }
+  summary << " primary_only_step_ids(stage2_status)=" << fallback_steps.str()
+          << " fallback_details(step:stage2:rows:rate/interval:q3:d:gaze/roll)="
+          << detailed_status_steps.str();
+  RCLCPP_INFO(node_->get_logger(), "%s", summary.str().c_str());
+  // BAD10 bend recovery has higher priority than distance. Keep recording the
+  // transient excursion in the rollout report, but require distance to return
+  // to the settled band below instead of imposing the former 3 cm transient cap.
+  const TrackingVelocityTaskConfig tracking_config;
+  const double one_cycle_angular_allowance =
+    parameters_.maximum_angular_reference_radps * parameters_.control_period_sec;
+  EXPECT_LE(maximum_pointing_error,
+    parameters_.pointing_deadband_rad + one_cycle_angular_allowance)
+       << "Pointing error exceeded its configured deadband plus one control-cycle allowance; "
+       << summary.str();
+  EXPECT_LE(maximum_roll_error,
+    tracking_config.roll_deadband_rad + one_cycle_angular_allowance)
+       << "Roll error exceeded its configured deadband plus one control-cycle allowance; "
+       << summary.str();
+  EXPECT_TRUE(reached_comfort)
+    << "BAD10 must reach the calibrated rest/search bend branch and hold it inside the "
+       "settling band; final q3="
+    << robot_state.getVariablePosition("joint3")
+    << " FK signed-bend sin=" << bend_sin(robot_state)
+    << " comfort sin=" << calibration.minimum_comfortable_sin;
+  EXPECT_GE(settled_step, 0)
+    << "BAD10 needs five continuous seconds in the calibrated branch and settling band; "
+    << summary.str();
+  EXPECT_GE(quiet_samples.size(), 2U)
+    << "BAD10 needs a full ten-second settled observation window; " << summary.str();
+  EXPECT_GE(quiet_samples.empty() ? 0.0 :
+    quiet_samples.back().time_sec - quiet_samples.front().time_sec, 29.0)
+    << "The fixed-F hold must continue for 30 seconds after settling; " << summary.str();
+  EXPECT_LE(settled_distance_max - settled_distance_min, 0.01)
+    << "Settled face-distance span exceeded 1 cm; " << summary.str();
+  EXPECT_LE(maximum_screen_path_10s, 0.01)
+    << "Screen-center path exceeded 1 cm in a settled ten-second window; " << summary.str();
+  EXPECT_LE(maximum_elbow_path_10s, 0.01)
+    << "Elbow path exceeded 1 cm in a settled ten-second window; " << summary.str();
+  EXPECT_LE(maximum_wrist_path_10s, 0.01)
+    << "Wrist path exceeded 1 cm in a settled ten-second window; " << summary.str();
+  EXPECT_LE(maximum_distance_span_10s, 0.01)
+    << "Face-distance span exceeded 1 cm in a settled ten-second window; " << summary.str();
+  EXPECT_LE(maximum_settled_band_excursion, 0.0)
+    << "Face distance left the existing one-step settled band; " << summary.str();
+  EXPECT_EQ(primary_only_after_settling, 0)
+    << "The settled fixed-F hold must not fall back to primary-only commands; " << summary.str();
+}
+
+TEST_F(MotionReferenceTest, Posture1DBadStartRecoversAcrossNearBandAndFarTargets)
+{
+  constexpr double kRecordedQ[6]{
+    -5.379036931941633e-06, 1.7178940940293195, -3.6019600429057217,
+    1.3069379082891277e-06, 0.2890940863373446, 2.934930766309014e-06};
+  constexpr double kComfortLower = -1.95514;
+  constexpr double kComfortUpper = -0.3696309078954824;
+  constexpr double kMinimumBendSin = 0.701883982289872;
+  parameters_.position_deadband_m = 0.03;
+  const double dt = parameters_.control_period_sec;
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = dt;
+  qp_config.residual_command_latency_sec = 0.0;
+  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
+  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
+  const HierarchicalVelocityQp solver(qp_config);
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+  const std::array<double, 3> requested_distances{
+    parameters_.face_distance_min_m - 0.02,
+    0.5 * (parameters_.face_distance_min_m + parameters_.face_distance_max_m),
+    parameters_.face_distance_max_m + 0.35};
+  const std::array<double, 2> safe_bad_distances{
+    parameters_.face_distance_min_m - 0.02,
+    parameters_.face_distance_max_m + 0.35};
+  for (const double requested_distance : safe_bad_distances) {
+    reference_ = std::make_unique<MotionReference>(
+      node_, monitor_, parameters_, limits_, collision_config_);
+    moveit::core::RobotState safe_bad_state(model_);
+    safe_bad_state.setToDefaultValues();
+    safe_bad_state.setVariablePosition("joint1", kRecordedQ[0]);
+    safe_bad_state.setVariablePosition("joint2", kRecordedQ[1]);
+    safe_bad_state.setVariablePosition("joint3", kRecordedQ[2]);
+    safe_bad_state.setVariablePosition("joint4", kRecordedQ[3]);
+    safe_bad_state.setVariablePosition("joint5", kRecordedQ[4]);
+    safe_bad_state.setVariablePosition("joint6", 6.20);
+    safe_bad_state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+    safe_bad_state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+    safe_bad_state.update(true);
+    ASSERT_TRUE(safe_bad_state.satisfiesBounds(group_));
+    Eigen::VectorXd q, qd, qdd;
+    safe_bad_state.copyJointGroupPositions(group_, q);
+    safe_bad_state.copyJointGroupVelocities(group_, qd);
+    safe_bad_state.copyJointGroupAccelerations(group_, qdd);
+    ASSERT_GT(q[4] - limits_.lower_position[4], limits_.position_margin[4]);
+    ASSERT_GT(limits_.upper_position[4] - q[4], limits_.position_margin[4]);
+    ASSERT_LT(limits_.upper_position[5] - q[5], limits_.position_margin[5]);
+    const JointMotionState motion{q, qd, qdd};
+    auto face_target = faceAlongLookDirection(safe_bad_state);
+    const Eigen::Vector3d screen = safe_bad_state.getGlobalLinkTransform(
+      "monitor_control_frame").translation();
+    const Eigen::Vector3d initial_face(face_target.face.x, face_target.face.y,
+      face_target.face.z);
+    const Eigen::Vector3d face = screen + requested_distance *
+      (initial_face - screen).normalized();
+    face_target.face.x = face.x();
+    face_target.face.y = face.y();
+    face_target.face.z = face.z();
+    const auto stamp = rclcpp::Time(81'000'000'000LL, RCL_ROS_TIME);
+    face_target.header.stamp = stamp;
+    face_target.face_stamp = stamp;
+    const auto result = update(
+      safe_bad_state, face_target, nullptr, nullptr, motion, kSceneRevision, 81.0);
+    ASSERT_TRUE(result.task);
+    EXPECT_EQ(reference_->diagnostics().posture_mode, "recover");
+    ASSERT_TRUE(reference_->diagnostics().upright_roll_guard_armed);
+    ASSERT_FALSE(result.compact_roll_constraints.empty());
+    const auto has_inward_j6_row = [](
+      const Eigen::MatrixXd & matrix, const Eigen::VectorXd & reference) {
+        for (Eigen::Index row = 0; row < matrix.rows(); ++row) {
+          const Eigen::RowVectorXd coefficients = matrix.row(row);
+          if (coefficients.size() == 6 && std::abs(coefficients[5] - 1.0) < 1.0e-9 &&
+            coefficients.head(5).norm() < 1.0e-9 && reference[row] < 0.0)
+          {
+            return true;
+          }
+        }
+        return false;
+      };
+    const bool has_inward_j6_margin_objective =
+      has_inward_j6_row(result.task->secondary_matrix, result.task->secondary_reference) ||
+      has_inward_j6_row(result.task->tertiary_matrix, result.task->tertiary_reference);
+    ASSERT_TRUE(has_inward_j6_margin_objective)
+      << "The BAD witness must exercise the active J6 soft margin";
+    CollisionConstraintBuilder safe_bad_collision_builder(collision_config_);
+    planning_scene_monitor::LockedPlanningSceneRO safe_bad_scene(monitor_);
+    ASSERT_TRUE(safe_bad_scene);
+    const planning_scene::PlanningSceneConstPtr safe_bad_planning_scene = safe_bad_scene;
+    const auto collision = safe_bad_collision_builder.build(
+      *safe_bad_planning_scene, safe_bad_state, *group_, motion, limits_, dt);
+    ASSERT_TRUE(collision.diagnostics.valid);
+    ASSERT_FALSE(collision.diagnostics.collision_detected)
+      << collision.diagnostics.closest_pair << " clearance="
+      << collision.diagnostics.minimum_distance_m;
+    auto constraints = collision.constraints;
+    constraints.insert(
+      constraints.end(), result.compact_roll_constraints.begin(),
+      result.compact_roll_constraints.end());
+    const QpResult qp = solver.solve(*result.task, motion, limits_, constraints);
+    ASSERT_TRUE(qp.command_available())
+      << "distance=" << requested_distance
+      << " qp_status=" << static_cast<int>(qp.status)
+      << " ranks=" << static_cast<int>(qp.primary_status) << '/'
+      << static_cast<int>(qp.secondary_status) << '/'
+      << static_cast<int>(qp.tertiary_status) << '/'
+      << static_cast<int>(qp.distance_status)
+      << " collision_valid=" << collision.diagnostics.valid
+      << " collision_pair=" << collision.diagnostics.closest_pair
+      << " min_distance_m=" << collision.diagnostics.minimum_distance_m
+      << " roll_rows=" << result.compact_roll_constraints.size();
+    EXPECT_GT(qp.joint_velocity[2], 0.0)
+      << "The BAD pose has available inward q3 recovery";
+    const Eigen::VectorXd next_q = q + dt * qp.joint_velocity;
+    safe_bad_state.setJointGroupPositions(group_, next_q);
+    safe_bad_state.update(true);
+    EXPECT_TRUE(safe_bad_state.satisfiesBounds(group_));
+  }
+
+  std::ostringstream summary;
+  double time_sec = 80.0;
+
+  for (const double requested_distance : requested_distances) {
+    reference_.reset();
+    reference_ = std::make_unique<MotionReference>(
+      node_, monitor_, parameters_, limits_, collision_config_);
+    moveit::core::RobotState state(model_);
+    state.setToDefaultValues();
+    for (Eigen::Index joint = 0; joint < 6; ++joint) {
+      state.setVariablePosition("joint" + std::to_string(joint + 1), kRecordedQ[joint]);
+    }
+    state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+    state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+    state.update();
+    ASSERT_TRUE(state.satisfiesBounds(group_));
+    auto face_target = faceAlongLookDirection(state);
+    const Eigen::Vector3d screen =
+      state.getGlobalLinkTransform("monitor_control_frame").translation();
+    const Eigen::Vector3d initial_face(face_target.face.x, face_target.face.y, face_target.face.z);
+    const Eigen::Vector3d ray = (initial_face - screen).normalized();
+    const Eigen::Vector3d face = screen + requested_distance * ray;
+    face_target.face.x = face.x();
+    face_target.face.y = face.y();
+    face_target.face.z = face.z();
+
+    double initial_distance = 0.0;
+    double final_distance = 0.0;
+    for (int step = 0; step < 1700; ++step) {
+      time_sec += dt;
+      const auto stamp = rclcpp::Time(
+        static_cast<std::int64_t>(std::llround(time_sec * 1.0e9)), RCL_ROS_TIME);
+      face_target.header.stamp = stamp;
+      face_target.face_stamp = stamp;
+      const auto result = update(
+        state, face_target, nullptr, nullptr, std::nullopt, kSceneRevision, time_sec);
+      ASSERT_TRUE(result.tracking) << "requested_distance=" << requested_distance
+                                   << " step=" << step;
+      ASSERT_TRUE(result.task) << "requested_distance=" << requested_distance
+                               << " step=" << step;
+      if (step == 0) {
+        initial_distance = (state.getGlobalLinkTransform(
+            "monitor_control_frame").translation() - face).norm();
+        const bool outside = initial_distance<parameters_.face_distance_min_m ||
+            initial_distance> parameters_.face_distance_max_m;
+        EXPECT_EQ(result.task->distance_matrix.rows(), outside ? 3 : 0)
+          << "Distance remains soft only when outside the exact band";
+        EXPECT_EQ(reference_->diagnostics().posture_mode, "recover");
+      }
+      const double actual_distance = (state.getGlobalLinkTransform(
+          "monitor_control_frame").translation() - face).norm();
+      final_distance = actual_distance;
+      Eigen::VectorXd q, qd, qdd;
+      state.copyJointGroupPositions(group_, q);
+      state.copyJointGroupVelocities(group_, qd);
+      state.copyJointGroupAccelerations(group_, qdd);
+      const JointMotionState motion{q, qd, qdd};
+      const auto collision = collision_builder.build(
+        *scene, state, *group_, motion, limits_, dt);
+      const QpResult qp = solver.solve(*result.task, motion, limits_, collision.constraints);
+      ASSERT_TRUE(qp.command_available()) << "requested_distance=" << requested_distance
+                                          << " step=" << step;
+      const Eigen::VectorXd next_q = q + dt * qp.joint_velocity;
+      const Eigen::VectorXd next_qdd = (qp.joint_velocity - qd) / dt;
+      state.setJointGroupPositions(group_, next_q);
+      state.setJointGroupVelocities(group_, qp.joint_velocity);
+      state.setJointGroupAccelerations(group_, next_qdd);
+      state.update(true);
+      ASSERT_TRUE(state.satisfiesBounds(group_)) << "requested_distance=" << requested_distance
+                                                 << " step=" << step;
+    }
+    Eigen::VectorXd final_q;
+    state.copyJointGroupPositions(group_, final_q);
+    const auto * joint = model_->getJointModel("joint3");
+    const auto * revolute = dynamic_cast<const moveit::core::RevoluteJointModel *>(joint);
+    const auto * parent = joint->getParentLinkModel();
+    const auto * child = joint->getChildLinkModel();
+    const Eigen::Vector3d shoulder = state.getGlobalLinkTransform("link2").translation();
+    const Eigen::Vector3d elbow = state.getGlobalLinkTransform("link3").translation();
+    const Eigen::Vector3d wrist = state.getGlobalLinkTransform("link4").translation();
+    const Eigen::Vector3d axis = state.getGlobalLinkTransform(parent).linear() *
+      child->getJointOriginTransform().linear() * revolute->getAxis();
+    const double bend_sin = std::sin(std::atan2(
+      axis.normalized().dot((elbow - shoulder).cross(wrist - elbow)),
+          (elbow - shoulder).dot(wrist - elbow)));
+    EXPECT_GE(final_q[2], kComfortLower) << "requested_distance=" << requested_distance;
+    EXPECT_LE(final_q[2], kComfortUpper) << "requested_distance=" << requested_distance;
+    EXPECT_GE(bend_sin, kMinimumBendSin - 1.0e-4)
+      << "requested_distance=" << requested_distance;
+    summary << "requested=" << requested_distance << " initial=" << initial_distance
+            << " final=" << final_distance << " q3=" << final_q[2]
+            << " bend_sin=" << bend_sin << '\n';
+  }
+  RecordProperty("posture1d_bad_start_multiple_distances", summary.str());
+  std::cout << "POSTURE-1D BAD-start distance witnesses\n" << summary.str();
+}
+
+TEST_F(MotionReferenceTest, FaceRelativeElbowSideUsesActualModelAndPreservesTracking)
+{
+  const auto signed_clearance = [](const moveit::core::RobotState & robot_state,
+    const Eigen::Vector3d & face_point) {
+      const Eigen::Vector3d base =
+        robot_state.getGlobalLinkTransform("link_base").translation();
+      const Eigen::Vector3d e =
+        robot_state.getGlobalLinkTransform("link3").translation() - base;
+      const Eigen::Vector3d w =
+        robot_state.getGlobalLinkTransform("link4").translation() - base;
+      const Eigen::Vector3d f = face_point - base;
+      const Eigen::Vector3d e_perp = e - w * (e.dot(w) / w.squaredNorm());
+      const Eigen::Vector3d f_perp = f - w * (f.dot(w) / w.squaredNorm());
+      const double c = e_perp.dot(f_perp);
+      return std::pair<double, double>{-c / f_perp.norm(), c};
+    };
+  const auto make_face_target = [this](const moveit::core::RobotState & robot_state) {
+      auto face = faceAlongLookDirection(robot_state);
+      const auto * look_link = parameters_.gaze_frame.empty() ? nullptr :
+        model_->getLinkModel(parameters_.gaze_frame);
+      Eigen::Isometry3d look_pose = look_link ?
+        robot_state.getGlobalLinkTransform(look_link) :
+        robot_state.getGlobalLinkTransform("monitor_control_frame");
+      if (look_link) {
+        look_pose.linear() *= face_tracking_arm::opticalToPointingRotation();
+      }
+      const Eigen::Vector3d face_point = look_pose.translation() +
+        0.40 * look_pose.linear().col(0);
+      face.face.x = face_point.x();
+      face.face.y = face_point.y();
+      face.face.z = face_point.z();
+      return face;
+    };
+
+  const auto configure_qp = [this]() {
+      HierarchicalVelocityQpConfig config;
+      config.period_sec = parameters_.control_period_sec;
+      config.residual_command_latency_sec = 0.0;
+      config.velocity_regularization = parameters_.velocity_regularization_weight;
+      config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
+      config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
+      config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
+      config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
+      config.solver_max_iterations = parameters_.solver_max_iterations;
+      return config;
+    };
+  const auto qp_config = configure_qp();
+  const HierarchicalVelocityQp solver(qp_config);
+
+  const double side_reserve = parameters_.maximum_linear_reference_mps *
+    parameters_.control_period_sec;
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  ASSERT_TRUE(locked_scene);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+  CollisionConstraintBuilder collision_builder(collision_config_);
+  moveit::core::RobotState bad_pose(model_);
+  ASSERT_TRUE(bad_pose.setToDefaultValues(group_, "rest"));
+  // Keep this pose inside the FK-calibrated rest/search bend interval so the
+  // face-side preference is active as a secondary preference. Search a small,
+  // deterministic set of named joint values for a genuine negative F-side
+  // case under the model FK and the actual look-ray target.
+  constexpr std::array<double, 3> kJoint1Candidates{0.0, 1.0, -1.0};
+  constexpr std::array<double, 5> kJoint2Candidates{-1.5, -1.0, -0.5, 0.0, 0.5};
+  constexpr std::array<double, 5> kJoint4Candidates{-1.0, -0.5, 0.0, 0.5, 1.0};
+  constexpr std::array<double, 5> kJoint5Candidates{-1.5, -0.75, 0.0, 0.75, 1.5};
+  constexpr std::array<double, 7> kJoint6Candidates{-3.0, -1.5, 0.0, 1.5, 3.0, 4.5, 6.0};
+  const TrackingVelocityTaskConfig tracking_config;
+  Eigen::VectorXd seed_q;
+  bool found_negative_face_seed = false;
+  for (const double q1 : kJoint1Candidates) {
+    for (const double q2 : kJoint2Candidates) {
+      for (const double q4 : kJoint4Candidates) {
+        for (const double q5 : kJoint5Candidates) {
+          for (const double q6 : kJoint6Candidates) {
+            moveit::core::RobotState candidate(model_);
+            ASSERT_TRUE(candidate.setToDefaultValues(group_, "rest"));
+            candidate.setVariablePosition("joint1", q1);
+            candidate.setVariablePosition("joint2", q2);
+            candidate.setVariablePosition("joint3", -0.9);
+            candidate.setVariablePosition("joint4", q4);
+            candidate.setVariablePosition("joint5", q5);
+            candidate.setVariablePosition("joint6", q6);
+            candidate.update();
+            if (!candidate.satisfiesBounds(group_)) {
+              continue;
+            }
+            const auto candidate_face = make_face_target(candidate);
+            const Eigen::Vector3d candidate_target(
+              candidate_face.face.x, candidate_face.face.y, candidate_face.face.z);
+            const auto * look_link = parameters_.gaze_frame.empty() ? nullptr :
+              model_->getLinkModel(parameters_.gaze_frame);
+            Eigen::Isometry3d look_pose = look_link ?
+              candidate.getGlobalLinkTransform(look_link) :
+              candidate.getGlobalLinkTransform("monitor_control_frame");
+            if (look_link) {
+              look_pose.linear() *= face_tracking_arm::opticalToPointingRotation();
+            }
+            const Eigen::Vector3d candidate_ray = candidate_target - look_pose.translation();
+            const double candidate_pointing_error = std::acos(std::clamp(
+                look_pose.linear().col(0).dot(candidate_ray.normalized()), -1.0, 1.0));
+            const auto candidate_edge_task = makeHorizontalEdgePathTask(
+              candidate.getGlobalLinkTransform("monitor_control_frame"),
+              Eigen::MatrixXd::Identity(6, 6), Eigen::VectorXd::Zero(6), tracking_config);
+            const double candidate_clearance =
+              signed_clearance(candidate, candidate_target).first;
+            const double candidate_distance = (
+              candidate.getGlobalLinkTransform("monitor_control_frame").translation() -
+              candidate_target).norm();
+            if (candidate_clearance >= -side_reserve ||
+              candidate_pointing_error > parameters_.pointing_deadband_rad ||
+              !candidate_edge_task ||
+              std::abs(candidate_edge_task->edge_tilt_error_rad) >
+              tracking_config.roll_deadband_rad ||
+              candidate_distance < parameters_.face_distance_min_m ||
+              candidate_distance > parameters_.face_distance_max_m ||
+              scene->isStateColliding(candidate, group_->getName()))
+            {
+              continue;
+            }
+            seed_q.resize(6);
+            candidate.copyJointGroupPositions(group_, seed_q);
+            found_negative_face_seed = true;
+            break;
+          }
+          if (found_negative_face_seed) {break;}
+        }
+        if (found_negative_face_seed) {break;}
+      }
+      if (found_negative_face_seed) {break;}
+    }
+    if (found_negative_face_seed) {break;}
+  }
+  ASSERT_TRUE(found_negative_face_seed)
+    << "No collision-free in-band face target with negative F-side clearance was found";
+  for (Eigen::Index index = 0; index < seed_q.size(); ++index) {
+    bad_pose.setVariablePosition("joint" + std::to_string(index + 1), seed_q[index]);
+  }
+  bad_pose.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(seed_q.size()));
+  bad_pose.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(seed_q.size()));
+  bad_pose.update();
+  ASSERT_TRUE(bad_pose.satisfiesBounds(group_));
+  EXPECT_FALSE(scene->isStateColliding(bad_pose, group_->getName()));
+  Eigen::VectorXd q;
+  bad_pose.copyJointGroupPositions(group_, q);
+  const JointMotionState motion{q, Eigen::VectorXd::Zero(q.size()),
+    Eigen::VectorXd::Zero(q.size())};
+  const auto bad_actual = collision_builder.validateActualState(*scene, bad_pose, *group_);
+  ASSERT_TRUE(bad_actual.input_valid) << bad_actual.failure_reason;
+  ASSERT_FALSE(bad_actual.unsafe) << bad_actual.failure_reason;
+  const auto bad_pose_validation = collision_builder.validatePose(*scene, bad_pose, *group_,
+        motion);
+  ASSERT_TRUE(bad_pose_validation.input_valid) << bad_pose_validation.failure_reason;
+  ASSERT_FALSE(bad_pose_validation.unsafe) << bad_pose_validation.failure_reason;
+  const auto bad_face = make_face_target(bad_pose);
+  const Eigen::Vector3d fixed_face(bad_face.face.x, bad_face.face.y, bad_face.face.z);
+  const double initial_clearance = signed_clearance(bad_pose, fixed_face).first;
+  const double initial_c = signed_clearance(bad_pose, fixed_face).second;
+  ASSERT_LT(initial_clearance, -side_reserve);
+  const auto result = update(bad_pose, bad_face);
+  ASSERT_TRUE(result.tracking) << reference_->diagnostics().state;
+  EXPECT_LE(result.tracking->pointing_error_rad, parameters_.pointing_deadband_rad);
+  EXPECT_LE(result.tracking->roll_error_rad, tracking_config.roll_deadband_rad);
+  ASSERT_TRUE(result.task);
+  ASSERT_FALSE(result.tracking->face_distance_outside_band);
+  ASSERT_TRUE(result.tracking->face_distance_interval);
+  EXPECT_EQ(result.task->distance_matrix.rows(), 0)
+    << "Distance inside its allowed band must not hold the current radius";
+  EXPECT_EQ(result.task->secondary_matrix.rows(), 0)
+    << "The in-branch main-bend objective is empty";
+  ASSERT_GT(result.task->tertiary_matrix.rows(), 0)
+    << "Elbow-side preference is below the main bend";
+  ASSERT_EQ(result.task->preferred_primary_constraints.size(), 1U)
+    << "Only the GOOD J3 braking-aware preservation row is preferred by primary";
+  EXPECT_EQ((result.task->preferred_primary_constraints.front().coefficients.array() !=
+    0.0).count(), 1);
+  EXPECT_DOUBLE_EQ(result.task->preferred_primary_constraints.front().coefficients[2], 1.0);
+  const double active_distance = (fixed_face -
+    bad_pose.getGlobalLinkTransform("monitor_control_frame").translation()).norm();
+  EXPECT_NEAR(result.tracking->face_distance_interval->lower_bound,
+    parameters_.position_gain * (parameters_.face_distance_min_m - active_distance), 1.0e-8);
+  EXPECT_NEAR(result.tracking->face_distance_interval->upper_bound,
+    parameters_.position_gain * (parameters_.face_distance_max_m - active_distance), 1.0e-8);
+
+  auto full_task = *result.task;
+  const auto collision = collision_builder.build(
+    *scene, bad_pose, *group_, motion, limits_, parameters_.control_period_sec);
+  full_task.secondary_constraints.insert(
+    full_task.secondary_constraints.end(),
+    collision.constraints.begin(), collision.constraints.end());
+  const QpResult comfort_qp = solver.solve(full_task, motion, limits_);
+  ASSERT_TRUE(comfort_qp.command_available()) << static_cast<int>(comfort_qp.status);
+  EXPECT_GT(full_task.tertiary_matrix.row(0).dot(comfort_qp.joint_velocity), 0.0)
+    << "q=" << q.transpose() << " s=" << initial_clearance
+    << " qdot=" << comfort_qp.joint_velocity.transpose()
+    << " comfort_ref=" << result.task->secondary_reference.transpose();
+  auto next_pose = bad_pose;
+  next_pose.setJointGroupPositions(
+    group_, q + parameters_.control_period_sec * comfort_qp.joint_velocity);
+  next_pose.update(true);
+  const double next_clearance = signed_clearance(next_pose, fixed_face).first;
+  EXPECT_GT(next_clearance, initial_clearance);
+  EXPECT_GT(initial_c, 0.0);
+
+  const double feasibility_tolerance = qp_config.solution_feasibility_tolerance +
+    4.0 * qp_config.solver_absolute_tolerance;
+  const auto & posture_bound = full_task.preferred_primary_constraints.front();
+  const double joint3_rate = posture_bound.coefficients.dot(comfort_qp.joint_velocity);
+  EXPECT_GE(joint3_rate, posture_bound.lower_bound - feasibility_tolerance);
+  EXPECT_LE(joint3_rate, posture_bound.upper_bound + feasibility_tolerance);
+  ASSERT_EQ(comfort_qp.achieved_primary_velocity.size(),
+    result.task->primary_matrix.rows());
+  EXPECT_LE((full_task.primary_matrix * comfort_qp.joint_velocity -
+    comfort_qp.achieved_primary_velocity).norm(),
+    qp_config.primary_preservation_tolerance + feasibility_tolerance);
+
+  auto perturbed_face = bad_face;
+  perturbed_face.face.y += 0.005;
+  const auto blocked_result = update(bad_pose, perturbed_face);
+  ASSERT_TRUE(blocked_result.tracking);
+  ASSERT_TRUE(blocked_result.task);
+  ASSERT_FALSE(blocked_result.tracking->face_distance_outside_band);
+  ASSERT_GT(blocked_result.task->primary_reference.norm(), 1.0e-5);
+  auto blocked_task = *blocked_result.task;
+  blocked_task.secondary_constraints.insert(
+    blocked_task.secondary_constraints.end(),
+    collision.constraints.begin(), collision.constraints.end());
+  const QpResult blocked_qp = solver.solve(blocked_task, motion, limits_);
+  ASSERT_TRUE(blocked_qp.command_available()) << static_cast<int>(blocked_qp.status);
+  EXPECT_TRUE(blocked_qp.fully_solved() || blocked_qp.status == QpStatus::kPrimaryOnly ||
+    blocked_qp.status == QpStatus::kPartial);
+  EXPECT_GT(blocked_qp.achieved_primary_velocity.norm(), 1.0e-5);
+  EXPECT_LE((blocked_task.primary_matrix * blocked_qp.joint_velocity -
+    blocked_qp.achieved_primary_velocity).norm(),
+    qp_config.primary_preservation_tolerance + feasibility_tolerance);
+
+  moveit::core::RobotState good_pose(model_);
+  ASSERT_TRUE(good_pose.setToDefaultValues(group_, "rest"));
+  good_pose.setVariablePosition("joint1", 0.0);
+  good_pose.setVariablePosition("joint2", -1.178097245096172);
+  good_pose.setVariablePosition("joint3", -0.9);
+  good_pose.setVariablePosition("joint4", 0.0);
+  good_pose.setVariablePosition("joint5", 0.0);
+  good_pose.setVariablePosition("joint6", 0.0);
+  good_pose.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+  good_pose.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+  good_pose.update();
+  ASSERT_TRUE(good_pose.satisfiesBounds(group_));
+  EXPECT_FALSE(scene->isStateColliding(good_pose, group_->getName()));
+  Eigen::VectorXd good_q;
+  good_pose.copyJointGroupPositions(group_, good_q);
+  const JointMotionState good_motion{
+    good_q, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const auto good_actual = collision_builder.validateActualState(*scene, good_pose, *group_);
+  ASSERT_TRUE(good_actual.input_valid) << good_actual.failure_reason;
+  ASSERT_FALSE(good_actual.unsafe) << good_actual.failure_reason;
+  const auto good_pose_validation = collision_builder.validatePose(
+    *scene, good_pose, *group_, good_motion);
+  ASSERT_TRUE(good_pose_validation.input_valid) << good_pose_validation.failure_reason;
+  ASSERT_FALSE(good_pose_validation.unsafe) << good_pose_validation.failure_reason;
+  const auto good_face = make_face_target(good_pose);
+  const Eigen::Vector3d good_target(good_face.face.x, good_face.face.y, good_face.face.z);
+  ASSERT_GT(signed_clearance(good_pose, good_target).first, side_reserve);
+  // Use a fresh reference so this one stationary face sample has zero radial
+  // feed-forward when checking the idle-only allowed envelope.
+  reference_.reset();
+  reference_ = std::make_unique<MotionReference>(
+    node_, monitor_, parameters_, limits_, collision_config_);
+  const auto good_result = update(good_pose, good_face);
+  ASSERT_TRUE(good_result.tracking);
+  ASSERT_TRUE(good_result.task);
+  ASSERT_FALSE(good_result.tracking->face_distance_outside_band);
+  ASSERT_EQ(good_result.task->preferred_primary_constraints.size(), 1U)
+    << "A GOOD J3 pose keeps its braking-aware comfort bound at every distance";
+  EXPECT_EQ(good_result.task->distance_matrix.rows(), 0)
+    << "Inside the band the final distance level is empty, not a radial hold";
+  EXPECT_EQ(good_result.task->secondary_matrix.rows(), 0);
+  EXPECT_EQ(good_result.task->tertiary_matrix.rows(), 0);
+  EXPECT_DOUBLE_EQ(good_result.task->preferred_primary_constraints.front().coefficients[2], 1.0);
+  EXPECT_GE(good_result.task->preferred_primary_constraints.front().lower_bound,
+        -limits_.max_velocity[2]);
+  EXPECT_LE(good_result.task->preferred_primary_constraints.front().upper_bound,
+        limits_.max_velocity[2]);
+  JointMotionState different_queue_state = good_motion;
+  different_queue_state.velocity[2] = 0.2;
+  different_queue_state.acceleration[2] = 0.1;
+  const auto same_control_state = update(
+    good_pose, good_face, nullptr, nullptr, different_queue_state);
+  ASSERT_TRUE(same_control_state.task);
+  ASSERT_EQ(same_control_state.task->preferred_primary_constraints.size(), 1U);
+  EXPECT_DOUBLE_EQ(
+    same_control_state.task->preferred_primary_constraints.front().lower_bound,
+    good_result.task->preferred_primary_constraints.front().lower_bound);
+  EXPECT_DOUBLE_EQ(
+    same_control_state.task->preferred_primary_constraints.front().upper_bound,
+    good_result.task->preferred_primary_constraints.front().upper_bound)
+    << "Comfort bounds use the state shared with QP linearization, not a separate queue sample";
+  moveit::core::RobotState position_only(model_);
+  ASSERT_TRUE(position_only.setToDefaultValues(group_, "rest"));
+  position_only.update();
+  ASSERT_FALSE(position_only.hasVelocities());
+  ASSERT_FALSE(position_only.hasAccelerations());
+  const auto position_only_result = update(position_only, good_face);
+  ASSERT_TRUE(position_only_result.task);
+  EXPECT_TRUE(position_only_result.task->preferred_primary_constraints.empty())
+    << "A position-only RobotState must not fabricate braking bounds from absent motion data";
+  auto full_good_task = *good_result.task;
+  const auto good_collision = collision_builder.build(
+    *scene, good_pose, *group_, good_motion, limits_, parameters_.control_period_sec);
+  full_good_task.secondary_constraints.insert(
+    full_good_task.secondary_constraints.end(),
+    good_collision.constraints.begin(), good_collision.constraints.end());
+  const QpResult settled_qp = solver.solve(full_good_task, good_motion, limits_);
+  ASSERT_TRUE(settled_qp.command_available()) << static_cast<int>(settled_qp.status);
+  EXPECT_LT(settled_qp.joint_velocity.norm(), 1.0e-5);
 }
 
 TEST_F(MotionReferenceCameraTest, GazeFaceRemainsFiniteNearScreenUprightPole)
@@ -5428,19 +10396,21 @@ TEST_F(MotionReferenceTest, CompactQueueTailRowsAllowDumpedStateAndCertifyEmerge
   const EmergencyBrakeTail tail = tail_generator.generate(
     JointMotionState{branch_position, command.joint_velocity, branch_acceleration}, limits_);
   ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
-  bool outward_tail_rejected_by_radius = false;
+  const double committed_radius_cap =
+    reference_->diagnostics().compact_entry_radius_cap_m;
   for (std::size_t index = 0U; index < tail.points.size(); ++index) {
     std::string violation;
-    if (!reference_->validateCompactPathPosition(
+    EXPECT_TRUE(reference_->validateCompactPathPosition(
         start, tail.points[index].position, &violation))
-    {
-      EXPECT_EQ(violation, "assembly radius") << "tail point " << index;
-      outward_tail_rejected_by_radius = true;
-      break;
-    }
+      << "braking tail point " << index << " violates " << violation;
+    auto tail_state = start;
+    tail_state.setJointGroupPositions(group_, tail.points[index].position);
+    tail_state.update(true);
+    const double tail_radius = geometry.maximumAssemblyRadius(tail_state);
+    EXPECT_LE(tail_radius, committed_radius_cap + 1.0e-6)
+      << "braking tail point " << index << ", radius=" << tail_radius
+      << ", committed cap=" << committed_radius_cap;
   }
-  EXPECT_TRUE(outward_tail_rejected_by_radius)
-    << "the outward probe should remain covered by the hard compact radius guard";
 
   const Eigen::VectorXd goal = (Eigen::VectorXd(6) <<
     0.0, -0.2715944, -2.8699983, 0.0, 1.5707963267948966,
@@ -6493,6 +11463,150 @@ TEST_F(MotionReferenceTest, LocalSearchKeepsTheLastPostureAndStartsWithoutPlanni
   EXPECT_LT(scanned.task->secondary_reference.tail(5).norm(), 1e-9);
 }
 
+TEST_F(MotionReferenceTest, CameraHoldPreservesConsumedLocalSearchTime)
+{
+  auto robot_state = state(.7);
+  auto search = target(msg::TrackingTarget::SEARCH);
+  search.search_pattern = "local_then_sweep";
+  ASSERT_EQ(update(robot_state, search, nullptr, nullptr, std::nullopt,
+      kSceneRevision, 1.0).task.has_value(), true);
+  EXPECT_EQ(reference_->diagnostics().state, "SEARCH_LOCAL");
+
+  // Five seconds of local search elapse before the camera watchdog's HOLD.
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 6.0);
+  EXPECT_EQ(reference_->diagnostics().state, "SEARCH_LOCAL");
+  auto camera_hold = target(msg::TrackingTarget::HOLD);
+  // The controller publishes unavailable camera HOLD with no active target.
+  // This sentinel is availability state, not a new search request.
+  camera_hold.target_id = -1;
+  camera_hold.allow_recovery = false;
+  EXPECT_EQ(camera_hold.target_id, -1);
+  EXPECT_FALSE(camera_hold.allow_recovery);
+  EXPECT_FALSE(update(robot_state, camera_hold, nullptr, nullptr, std::nullopt,
+      kSceneRevision, 6.01).task);
+  EXPECT_EQ(reference_->diagnostics().state, "HOLD");
+
+  // Resume one second after the pause. Only one active second remained in the
+  // six-second local phase, so this call must advance to preparation.
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 20.0);
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 21.02);
+  EXPECT_EQ(reference_->diagnostics().state, "SEARCH_PLANNING");
+}
+
+TEST_F(MotionReferenceTest, RepeatedCameraHoldsPreserveSweepGoalAndDirection)
+{
+  auto robot_state = state();
+  auto search = target(msg::TrackingTarget::SEARCH);
+  search.search_pattern = "sweep";
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 113.0);
+  const Eigen::VectorXd original_goal = MotionReferenceTestPeer::searchGoal(*reference_);
+  ASSERT_EQ(original_goal.size(), 6);
+
+  auto camera_hold = target(msg::TrackingTarget::HOLD);
+  camera_hold.target_id = -1;
+  camera_hold.allow_recovery = false;
+  EXPECT_EQ(camera_hold.target_id, -1);
+  EXPECT_FALSE(camera_hold.allow_recovery);
+  EXPECT_FALSE(update(robot_state, camera_hold, nullptr, nullptr, std::nullopt,
+      kSceneRevision, 113.683).task);
+  robot_state = state(.8);
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 114.0);
+  EXPECT_TRUE(MotionReferenceTestPeer::searchGoal(*reference_).isApprox(original_goal, 0.001));
+
+  EXPECT_FALSE(update(robot_state, camera_hold, nullptr, nullptr, std::nullopt,
+      kSceneRevision, 114.333).task);
+  robot_state = state(.9);
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 120.0);
+  EXPECT_TRUE(MotionReferenceTestPeer::searchGoal(*reference_).isApprox(original_goal, 0.001));
+
+  EXPECT_FALSE(update(robot_state, camera_hold, nullptr, nullptr, std::nullopt,
+      kSceneRevision, 121.531).task);
+  robot_state = state(1.0);
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 122.0);
+  EXPECT_TRUE(MotionReferenceTestPeer::searchGoal(*reference_).isApprox(original_goal, 0.001));
+}
+
+TEST_F(MotionReferenceTest, SearchRestSearchStartsANewLocalPhase)
+{
+  auto robot_state = state(.3);
+  auto search = target(msg::TrackingTarget::SEARCH);
+  search.search_pattern = "local_then_sweep";
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 1.0);
+  (void)update(robot_state, target(msg::TrackingTarget::REST), nullptr, nullptr,
+    std::nullopt, kSceneRevision, 2.0);
+  EXPECT_EQ(reference_->diagnostics().state, "REST_PLANNING");
+
+  robot_state = state(.8);
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 3.0);
+  EXPECT_EQ(reference_->diagnostics().state, "SEARCH_LOCAL");
+  EXPECT_NEAR(MotionReferenceTestPeer::searchGoal(*reference_)[0], 1.15, 0.001);
+}
+
+TEST_F(MotionReferenceTest, SearchClockResetStartsANewSector)
+{
+  auto robot_state = state(.3);
+  auto search = target(msg::TrackingTarget::SEARCH);
+  search.search_pattern = "sweep";
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 10.0);
+  const Eigen::VectorXd old_goal = MotionReferenceTestPeer::searchGoal(*reference_);
+
+  robot_state = state(.8);
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 0.5);
+  const Eigen::VectorXd new_goal = MotionReferenceTestPeer::searchGoal(*reference_);
+  ASSERT_EQ(new_goal.size(), old_goal.size());
+  EXPECT_GT(std::abs(new_goal[0] - old_goal[0]), 0.1);
+}
+
+TEST_F(MotionReferenceTest, SearchArrivalDoesNotRequestAnotherPlanWhileSettling)
+{
+  auto robot_state = state();
+  auto search = target(msg::TrackingTarget::SEARCH);
+  search.search_pattern = "local_then_sweep";
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 1.0);
+  (void)update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 8.0);
+  EXPECT_EQ(reference_->diagnostics().state, "SEARCH_PLANNING");
+
+  Eigen::VectorXd position = MotionReferenceTestPeer::searchGoal(*reference_);
+  position[0] -= 0.03;
+  robot_state.setJointGroupPositions(group_, position);
+  robot_state.update();
+  std::vector<Eigen::VectorXd> zero_distance_path{position, position};
+  ASSERT_TRUE(MotionReferenceTestPeer::installSearchFollowerPathForTest(
+      *reference_, robot_state, zero_distance_path, 9.0));
+  const auto planner_deadline = std::chrono::steady_clock::now() + 500ms;
+  while (MotionReferenceTestPeer::plannerBusy(*reference_) &&
+    std::chrono::steady_clock::now() < planner_deadline)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_FALSE(MotionReferenceTestPeer::plannerBusy(*reference_));
+  Eigen::VectorXd velocity = Eigen::VectorXd::Zero(6);
+  velocity[0] = 0.02;
+  robot_state.setJointGroupVelocities(group_, velocity);
+  robot_state.update();
+  const auto before = reference_->diagnostics().plans_requested;
+  const auto settling = update(robot_state, search, nullptr, nullptr, std::nullopt,
+    kSceneRevision, 10.0);
+  EXPECT_TRUE(settling.task);
+  EXPECT_TRUE(settling.follows_path);
+  EXPECT_EQ(reference_->diagnostics().state, "SEARCH_SETTLING");
+  EXPECT_EQ(reference_->diagnostics().paths_completed, 1U);
+  EXPECT_EQ(reference_->diagnostics().plans_requested, before);
+}
+
 TEST_F(MotionReferenceTest, FoldedRestAcquisitionChecksEveryEdgeAndBrakeTailStep)
 {
   constexpr double kPi = 3.14159265358979323846;
@@ -6612,6 +11726,7 @@ TEST_F(MotionReferenceTest, FoldedRestAcquisitionChecksEveryEdgeAndBrakeTailStep
   ASSERT_TRUE(accepted->braking_tail.command_available());
   ASSERT_FALSE(accepted->braking_tail.points.empty());
 }
+
 
 }  // namespace
 }  // namespace face_tracking_arm::control

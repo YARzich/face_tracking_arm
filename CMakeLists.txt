@@ -139,6 +139,7 @@ add_tracking_library(collision_aware_servo_component
   src/collision_aware_servo_diagnostics.cpp
   src/collision_aware_parameters.cpp
   src/motion_reference.cpp
+  src/posture_preference.cpp
   src/idle_search.cpp
 )
 target_link_libraries(
@@ -379,6 +380,7 @@ ament_export_dependencies(
 )
 
 if(BUILD_TESTING)
+  find_package(Boost REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   find_package(ament_cmake_lint_cmake REQUIRED)
   find_package(ament_cmake_gtest REQUIRED)
@@ -576,11 +578,17 @@ if(BUILD_TESTING)
   ament_add_gtest(test_motion_reference test/test_motion_reference.cpp)
   target_compile_definitions(test_motion_reference PRIVATE
     TEST_ROBOT_URDF_FILE="${CMAKE_CURRENT_BINARY_DIR}/test_robot.urdf"
-    TEST_ROBOT_SRDF_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/moveit/xarm6.srdf")
+    TEST_ROBOT_SRDF_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/moveit/xarm6.srdf"
+    TEST_POSTURE1C_POSES_FILE="${CMAKE_CURRENT_SOURCE_DIR}/docs/reference/posture1c/poses.json"
+    TEST_POSTURE1D_FAST_TAIL_CAPTURE_FILE="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/posture1d_fast_tail_99_106.csv")
   target_link_libraries(test_motion_reference collision_aware_servo_component)
   target_include_directories(test_motion_reference PRIVATE src)
+  target_include_directories(test_motion_reference SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
   set_tests_properties(test_motion_reference PROPERTIES
-    FIXTURES_REQUIRED motion_reference_description)
+    FIXTURES_REQUIRED motion_reference_description
+    TIMEOUT 120)
+  ament_add_gtest(test_posture_preference test/test_posture_preference.cpp)
+  target_link_libraries(test_posture_preference collision_aware_servo_component Eigen3::Eigen)
   ament_add_gtest(test_compact_upright_path test/test_compact_upright_path.cpp)
   target_compile_definitions(test_compact_upright_path PRIVATE
     TEST_ROBOT_URDF_FILE="${CMAKE_CURRENT_BINARY_DIR}/test_robot.urdf"

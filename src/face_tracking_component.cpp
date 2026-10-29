@@ -232,6 +232,14 @@ public:
   {
     const double minimum_face_distance_m =
       declare_parameter<double>("minimum_face_distance_m", 0.40);
+    const double face_distance_min_m = declare_parameter<double>("face_distance_min_m", 0.37);
+    const double face_distance_max_m = declare_parameter<double>("face_distance_max_m", 0.43);
+    if (!std::isfinite(face_distance_min_m) || !std::isfinite(face_distance_max_m) ||
+      face_distance_min_m <= 0.0 || face_distance_min_m >= face_distance_max_m)
+    {
+      throw std::invalid_argument(
+              "face_distance_min_m/max_m must be finite, positive, and min < max");
+    }
     const double safe_reach_radius_m =
       declare_parameter<double>("safe_reach_radius_m", 0.42);
     const double freshness_sec =

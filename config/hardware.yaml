@@ -180,8 +180,10 @@ tracking:
   # rest — возвращаться в исходную позу; search_sweep — искать по сторонам;
   # search_local_then_sweep — сначала искать рядом с потерянным лицом, затем шире.
   idle_behavior: rest
-  minimum_face_distance_m: 0.50 # Желаемый отступ от лица, м; не гарантирует защиту от столкновения.
-  safe_reach_radius_m: 0.70     # Радиус области, куда стремится экран при слежении, м.
+  minimum_face_distance_m: 0.50 # Центр полосы в старых конфигах; столкновения проверяются отдельно.
+  face_distance_min_m: 0.47
+  face_distance_max_m: 0.53
+  safe_reach_radius_m: 0.70     # Ограничивает прежнюю расчётную цель; не физический предел обычного FACE.
   face_target_freshness_timeout_sec: 0.50 # Через сколько секунд точка лица считается устаревшей.
   face_prediction_timeout_sec: 0.80 # Максимум удержания предсказания между свежими точками.
   return_to_rest_delay_sec: 2.0 # Сколько секунд ждать после потери лица перед возвратом/поиском.
@@ -227,7 +229,7 @@ controller:
   maximum_linear_reference_mps: 0.18  # Максимальная скорость цели экрана, м/с.
   maximum_angular_reference_radps: 0.70 # Максимальная угловая скорость цели, рад/с.
   position_deadband_m: 0.03           # Не реагировать на малую ошибку позиции, м.
-  pointing_deadband_rad: 0.005        # Малая ошибка направления, рад.
+  pointing_deadband_rad: 0.01         # Тихая зона направления FACE (≈0.57°), рад.
   hard_clearance_m: 0.015            # Минимальный геометрический зазор, м.
   joint_position_margin_rad: 0.10    # Мягкий запас до границы сустава, рад.
   monitor_guard_joint_name: ''       # Пусто: не сужать диапазон отдельного сустава.

@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 import xacro
 import yaml
 
+from .face_distance_config import resolve_face_distance_band
 from .mount_collisions import allow_fixed_mount_collisions
 from .robot_profile import get_robot_profile
 from .simulation_start import resolve_simulation_start
@@ -192,7 +193,7 @@ def _controller_parameters(
 def load_simulation_config(share, *, robot_model, start_pose, initial_positions_file,
                            camera, servo_backend, smoothing_plugin, idle_behavior,
                            require_perception_status=False, controller_config_file=None,
-                           table_enabled=True):
+                           tracking_config_file=None, table_enabled=True):
     """Build a consistent model and controller configuration for either backend."""
     share = Path(share)
     if idle_behavior != 'rest' and servo_backend != 'collision_aware':
@@ -208,8 +209,13 @@ def load_simulation_config(share, *, robot_model, start_pose, initial_positions_
         share, profile['planning_group'], camera['camera_mode'],
         robot[3]['robot_description_planning']['joint_limits'], idle_behavior,
         controller_config_file)
-    tracking = _load_yaml(share / 'config/tracking.yaml')
+    tracking_path = (Path(tracking_config_file).expanduser() if tracking_config_file else
+                     share / 'config/tracking.yaml')
+    tracking = _load_yaml(tracking_path)
     tracking_parameters = tracking['face_tracking_controller']['ros__parameters']
+    band = resolve_face_distance_band(
+        tracking_parameters, controller.get('position_deadband_m', .03))
+    controller.update(face_distance_min_m=band[0], face_distance_max_m=band[1])
     tracking_parameters['require_perception_status'] = bool(require_perception_status)
     if not table_enabled:
         # A zero-sized table is the existing REMOVE representation used by the

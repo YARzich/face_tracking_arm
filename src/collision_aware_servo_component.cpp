@@ -970,34 +970,41 @@ std::optional<msg::TrackingTarget> CollisionAwareServoComponent::current_target(
   if (!snapshot.has_value()) {
     return std::nullopt;
   }
+  return target_snapshot_is_current(*snapshot, tick_time, current_time) ? snapshot :
+         std::nullopt;
+}
+
+bool CollisionAwareServoComponent::target_snapshot_is_current(
+  const msg::TrackingTarget & snapshot, const rclcpp::Time & tick_time,
+  const rclcpp::Time & current_time) const
+{
   if (!control::isInSameClockEpoch(
       tick_time.nanoseconds(), current_time.nanoseconds()))
   {
-    return std::nullopt;
+    return false;
   }
-  const rclcpp::Time stamp(
-    snapshot->header.stamp, get_clock()->get_clock_type());
-  if (stamp > current_time || current_time - stamp >=
+  const rclcpp::Time stamp(snapshot.header.stamp, get_clock()->get_clock_type());
+  if (stamp > current_time || current_time < tick_time || current_time - stamp >=
     rclcpp::Duration::from_seconds(parameters_.incoming_command_timeout_sec))
   {
-    return std::nullopt;
+    return false;
   }
-  if (snapshot->mode == msg::TrackingTarget::FACE) {
-    const rclcpp::Time face_stamp(snapshot->face_stamp, get_clock()->get_clock_type());
+  if (snapshot.mode == msg::TrackingTarget::FACE) {
+    const rclcpp::Time face_stamp(snapshot.face_stamp, get_clock()->get_clock_type());
     const rclcpp::Time prediction_expiry(
-      snapshot->face_prediction_expiry, get_clock()->get_clock_type());
+      snapshot.face_prediction_expiry, get_clock()->get_clock_type());
     const bool face_is_current = control::validFaceTargetAge(
       face_stamp.nanoseconds(), stamp.nanoseconds(), current_time.nanoseconds(),
       static_cast<std::int64_t>(std::llround(
         parameters_.face_target_freshness_timeout_sec * 1.0e9)),
-      snapshot->face_is_prediction, prediction_expiry.nanoseconds(),
+      snapshot.face_is_prediction, prediction_expiry.nanoseconds(),
       static_cast<std::int64_t>(std::llround(
         parameters_.face_prediction_timeout_sec * 1.0e9)));
     if (!face_is_current) {
-      return std::nullopt;
+      return false;
     }
   }
-  return snapshot;
+  return true;
 }
 
 }  // namespace face_tracking_arm

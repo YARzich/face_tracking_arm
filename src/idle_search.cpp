@@ -63,6 +63,8 @@ void IdleSearch::start(
   started_at_ = now;
   progress_since_ = now;
   progress_anchor_ = current[base_index_];
+  paused_at_ = 0.0;
+  paused_ = false;
   direction_ = current[base_index] >= upper_ - 0.10 ? -1 : 1;
   phase_ = local && config.local_duration_sec > 0.0 ? Phase::kLocal : Phase::kPrepare;
   goal_ = current;
@@ -84,6 +86,9 @@ void IdleSearch::update(const Eigen::VectorXd & current, const double now)
 {
   if (current.size() != goal_.size() || !current.allFinite() || !std::isfinite(now)) {
     throw std::invalid_argument("Idle search update requires a finite current position and time");
+  }
+  if (paused_) {
+    return;
   }
   if (phase_ == Phase::kLocal && now - started_at_ >= config_.local_duration_sec) {
     prepare(current);
@@ -113,6 +118,31 @@ void IdleSearch::update(const Eigen::VectorXd & current, const double now)
   const double low = phase_ == Phase::kLocal ? local_lower_ : lower_;
   const double high = phase_ == Phase::kLocal ? local_upper_ : upper_;
   goal_[base_index_] = direction_ > 0 ? high : low;
+}
+
+void IdleSearch::pause(const double now)
+{
+  if (!std::isfinite(now)) {
+    throw std::invalid_argument("Idle search pause requires a finite time");
+  }
+  if (!paused_) {
+    paused_at_ = now;
+    paused_ = true;
+  }
+}
+
+void IdleSearch::resume(const double now)
+{
+  if (!std::isfinite(now)) {
+    throw std::invalid_argument("Idle search resume requires a finite time");
+  }
+  if (!paused_) {
+    return;
+  }
+  const double paused_duration = std::max(0.0, now - paused_at_);
+  started_at_ += paused_duration;
+  progress_since_ += paused_duration;
+  paused_ = false;
 }
 
 void IdleSearch::prepared(const Eigen::VectorXd & current, const double now)
