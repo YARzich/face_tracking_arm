@@ -141,7 +141,7 @@ def test_search_scenario_reports_a_person_never_discovered():
     assert sequence.discovery_timeouts == 1
 
 
-@pytest.mark.parametrize('scenario', ['stress', 'stress_fast', 'stress_close'])
+@pytest.mark.parametrize('scenario', ['stress', 'stress_fast', 'stress_close', 'stress_reversals'])
 def test_stress_starts_without_rest_readiness_or_face_and_reports_completion(scenario):
     from builtin_interfaces.msg import Time
 
@@ -149,11 +149,13 @@ def test_stress_starts_without_rest_readiness_or_face_and_reports_completion(sce
     from face_tracking_perception.close_stress_motion import CloseStressMotion
     from face_tracking_perception.fast_stress_motion import FastStressMotion
     from face_tracking_perception.stress_motion import StressMotion
+    from face_tracking_perception.reversal_stress_motion import ReversalStressMotion
 
     profiles = {'stress': StressMotion, 'stress_fast': FastStressMotion,
-                'stress_close': CloseStressMotion}
+                'stress_close': CloseStressMotion, 'stress_reversals': ReversalStressMotion}
     motion = profiles[scenario]()
-    initial = motion.initial_poses if scenario == 'stress_fast' else [motion.initial_pose]
+    initial = (motion.initial_poses if scenario in ('stress_fast', 'stress_reversals')
+               else [motion.initial_pose])
     published, poses = [], []
     node = SimpleNamespace(
         scenario=scenario, people_count=len(initial),
@@ -162,6 +164,7 @@ def test_stress_starts_without_rest_readiness_or_face_and_reports_completion(sce
         pending=None, retry_at=0.0, pose_success_at=None, pose_failures=0,
         get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: Time())),
         publisher=SimpleNamespace(publish=published.append),
+        get_logger=lambda: SimpleNamespace(info=lambda _: None),
         client=SimpleNamespace(service_is_ready=lambda: True),
         request_poses=lambda value, action: poses.append((value, action)))
     FaceAppearances.tick_stress(node, 2.1)
@@ -181,7 +184,7 @@ def test_stress_starts_without_rest_readiness_or_face_and_reports_completion(sce
     assert poses[-1][0] == initial
 
 
-@pytest.mark.parametrize('scenario', ['stress', 'stress_fast', 'stress_close'])
+@pytest.mark.parametrize('scenario', ['stress', 'stress_fast', 'stress_close', 'stress_reversals'])
 def test_stress_does_not_queue_pose_updates_while_gazebo_request_is_pending(scenario):
     from builtin_interfaces.msg import Time
 
@@ -189,9 +192,10 @@ def test_stress_does_not_queue_pose_updates_while_gazebo_request_is_pending(scen
     from face_tracking_perception.close_stress_motion import CloseStressMotion
     from face_tracking_perception.fast_stress_motion import FastStressMotion
     from face_tracking_perception.stress_motion import StressMotion
+    from face_tracking_perception.reversal_stress_motion import ReversalStressMotion
 
     profiles = {'stress': StressMotion, 'stress_fast': FastStressMotion,
-                'stress_close': CloseStressMotion}
+                'stress_close': CloseStressMotion, 'stress_reversals': ReversalStressMotion}
     node = SimpleNamespace(
         scenario=scenario, people_count=3 if scenario == 'stress_fast' else 1,
         stress=profiles[scenario](),
@@ -199,7 +203,8 @@ def test_stress_does_not_queue_pose_updates_while_gazebo_request_is_pending(scen
         joint_stamp=10.0, tracking_stamp=10.0, cycles=0, ready=True, mode='FACE',
         pending=object(), retry_at=0.0, pose_success_at=9.0, pose_failures=0,
         get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: Time())),
-        publisher=SimpleNamespace(publish=lambda _: None))
+        publisher=SimpleNamespace(publish=lambda _: None),
+        get_logger=lambda: SimpleNamespace(info=lambda _: None))
     # There is intentionally no client/request_poses: the pending request must
     # prevent accessing transport or replacing its in-flight pose.
     FaceAppearances.tick_stress(node, 10.0)

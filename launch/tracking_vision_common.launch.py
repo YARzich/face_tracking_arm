@@ -27,6 +27,23 @@ def shutdown_after_exit(event, context):
     return [EmitEvent(event=Shutdown(reason=f'Vision process exited ({event.returncode})'))]
 
 
+def tracking_launch_arguments(value, mode, robot_model, world_path):
+    """Build launch arguments forwarded to the base simulation bringup."""
+    return {
+        'headless': value('headless'), 'test_face_scenario': 'disabled',
+        'visualize_target': 'false', 'servo_backend': 'collision_aware',
+        'require_perception_status': 'true', 'camera_mode': mode,
+        'camera_baseline': value('baseline'), 'camera_width': value('camera_width'),
+        'camera_height': value('camera_height'), 'camera_rate': value('camera_rate'),
+        'camera_horizontal_fov': value('camera_horizontal_fov'),
+        'idle_behavior': value('idle_behavior'), 'robot_model': robot_model,
+        'start_pose': value('start_pose'),
+        'initial_positions_file': value('initial_positions_file'),
+        'tracking_config_file': value('tracking_config_file'),
+        'world_file': str(world_path),
+    }
+
+
 def assemble(context):
     share = Path(get_package_share_directory('face_tracking_arm'))
     scripts = Path(get_package_prefix('face_tracking_arm')) / 'lib/face_tracking_arm'
@@ -35,6 +52,7 @@ def assemble(context):
         write_collisionless_person_model, write_vision_world)
     from face_tracking_perception.close_stress_motion import CloseStressMotion
     from face_tracking_perception.fast_stress_motion import FastStressMotion
+    from face_tracking_perception.reversal_stress_motion import ReversalStressMotion
     from face_tracking_perception.stress_motion import StressMotion
 
     def value(name):
@@ -44,10 +62,12 @@ def assemble(context):
     scenario = value('scenario')
     robot_model = value('robot_model')
     people_count = int(value('people_count'))
-    counts = {'appearances': (1, 2), 'stress': (1,), 'stress_fast': (3,), 'stress_close': (1,)}
+    counts = {'appearances': (1, 2), 'stress': (1,), 'stress_fast': (3,),
+              'stress_close': (1,), 'stress_reversals': (1,)}
     if people_count not in counts[scenario]:
         raise ValueError(
-            'Use appearances with 1–2 people, stress/stress_close with 1, or stress_fast with 3')
+            'Use appearances with 1–2 people, stress/stress_close with 1, '
+            'stress_fast with 3, or stress_reversals with 1')
     assets = Path(value('assets_dir')).expanduser()
     python = str(Path(value('python_executable')).expanduser())
     if not (assets / 'person_standing/model.sdf').is_file() or not Path(python).is_file():
@@ -60,7 +80,9 @@ def assemble(context):
     initial_pose = StressMotion().initial_pose if scenario == 'stress' else None
     if scenario == 'stress_close':
         initial_pose = CloseStressMotion().initial_pose
-    initial_poses = FastStressMotion().initial_poses if scenario == 'stress_fast' else None
+    initial_poses = (FastStressMotion().initial_poses if scenario == 'stress_fast'
+                     else ReversalStressMotion().initial_poses
+                     if scenario == 'stress_reversals' else None)
     write_vision_world(share / 'worlds/lite6_table.sdf', world_path, people_count,
                        initial_person_pose=initial_pose, initial_person_poses=initial_poses)
     world = ET.parse(world_path)
@@ -97,18 +119,8 @@ def assemble(context):
     environment = SetEnvironmentVariable('GZ_SIM_RESOURCE_PATH', resource_path)
     tracking = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(str(share / 'launch/tracking_sim.launch.py')),
-        launch_arguments={'headless': value('headless'), 'test_face_scenario': 'disabled',
-                          'visualize_target': 'false', 'servo_backend': 'collision_aware',
-                          'require_perception_status': 'true',
-                          'camera_mode': mode, 'camera_baseline': value('baseline'),
-                          'camera_width': value('camera_width'),
-                          'camera_height': value('camera_height'),
-                          'camera_rate': value('camera_rate'),
-                          'camera_horizontal_fov': value('camera_horizontal_fov'),
-                          'idle_behavior': value('idle_behavior'),
-                          'robot_model': robot_model, 'start_pose': value('start_pose'),
-                          'initial_positions_file': value('initial_positions_file'),
-                          'world_file': str(world_path)}.items())
+        launch_arguments=tracking_launch_arguments(
+            value, mode, robot_model, world_path).items())
     bridge = Node(package='ros_gz_bridge', executable='parameter_bridge',
                   name='monitor_camera_bridge', parameters=[{'use_sim_time': True,
                                                             'config_file': str(bridge_path)}])
@@ -166,7 +178,7 @@ def generate_launch_description():
             "'zero' if '", LaunchConfiguration('scenario'), "' == 'stress' else 'rest'"]),
         'idle_behavior': PythonExpression([
             "'search_local_then_sweep' if '", LaunchConfiguration('scenario'),
-            "' in ('stress', 'stress_fast', 'stress_close') else 'rest'"]),
+            "' in ('stress', 'stress_fast', 'stress_close', 'stress_reversals') else 'rest'"]),
         'people_count': PythonExpression([
             "'3' if '", LaunchConfiguration('scenario'), "' == 'stress_fast' else '1'"]),
         'detector': 'yunet', 'baseline': '0.08', 'threads': '2',
@@ -176,6 +188,7 @@ def generate_launch_description():
         'point_smoothing_beta': '32.0',
         'point_kalman_measurement_std_m': '0.02',
         'point_kalman_acceleration_std_mps2': '1.5',
+        'tracking_config_file': '',
         'camera_width': PythonExpression([
             "'640' if '", LaunchConfiguration('mode'), "' == 'stereo' else '1280'"]),
         'camera_height': PythonExpression([
@@ -187,8 +200,10 @@ def generate_launch_description():
         'rest_sec': '8.0', 'cycles': '0', 'model_dir': str(cache / 'models'),
         'assets_dir': str(cache / 'gazebo_models'),
         'python_executable': str(cache / 'perception_venv/bin/python')}
+    scenario_choices = ['appearances', 'stress', 'stress_fast', 'stress_close',
+                        'stress_reversals']
     choices = {'mode': ['mono_cpu', 'stereo', 'rgbd'], 'headless': ['true', 'false'],
-               'scenario': ['appearances', 'stress', 'stress_fast', 'stress_close'],
+               'scenario': scenario_choices,
                'robot_model': ['xarm6', 'lite6'],
                'start_pose': ['rest', 'zero', 'folded', 'joint1_limit', 'incident'],
                'show_image': ['true', 'false'],

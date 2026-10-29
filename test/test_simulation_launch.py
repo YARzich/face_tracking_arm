@@ -3,6 +3,7 @@
 
 """Check simulation configuration and startup decisions without starting processes."""
 
+import importlib.util
 import math
 from pathlib import Path
 import sys
@@ -23,6 +24,12 @@ from face_tracking_bringup.simulation_config import (  # noqa: E402, I100
 )
 from face_tracking_bringup import simulation_launch as sim  # noqa: E402, I100
 
+_VISION_LAUNCH_PATH = ROOT / 'launch/tracking_vision_common.launch.py'
+_VISION_SPEC = importlib.util.spec_from_file_location(
+    'tracking_vision_common_launch', _VISION_LAUNCH_PATH)
+vision_launch = importlib.util.module_from_spec(_VISION_SPEC)
+_VISION_SPEC.loader.exec_module(vision_launch)
+
 
 def _camera(**overrides):
     values = {'mode': 'disabled', 'baseline': '0.08', 'width': '1280', 'height': '720',
@@ -39,29 +46,14 @@ def _config(**overrides):
     return load_simulation_config(ROOT, **{**settings, **overrides})
 
 
-def test_test_world_box_only_changes_moveit_table_fixture():
-    context = LaunchContext()
-    context.launch_configurations.update({
-        'robot_model': 'xarm6', 'start_pose': 'rest', 'initial_positions_file': '',
-        'camera_mode': 'disabled', 'camera_baseline': '0.08', 'camera_width': '1280',
-        'camera_height': '720', 'camera_rate': '30', 'camera_horizontal_fov': '1.433',
-        'servo_backend': 'collision_aware',
-        'smoothing_plugin': 'online_signal_smoothing::AccelerationLimitedPlugin',
-        'idle_behavior': 'rest', 'require_perception_status': 'false',
-        'collision_aware_servo_config_file': '',
-        'table_enabled': 'true',
-    })
-    ordinary = sim._configuration(context, ROOT)
-    assert ordinary.tracking.get('table_shape') != 'box'
-    context.launch_configurations['test_world_box'] = 'true'
-    test_scene = sim._configuration(context, ROOT)
-    assert test_scene.tracking['table_shape'] == 'box'
-    assert test_scene.tracking['table_dimensions_m'] == [0.10, 0.10, 0.10]
-    assert test_scene.tracking['table_center_m'] == [0.50, 0.0, 1.15]
-    assert ordinary.tracking.get('table_shape') != 'box'
-    context.launch_configurations['table_enabled'] = 'false'
-    with pytest.raises(ValueError, match='cannot be combined'):
-        sim._configuration(context, ROOT)
+def test_vision_launch_declares_and_forwards_tracking_config_override():
+    declarations = vision_launch.generate_launch_description().entities
+    assert any(getattr(action, 'name', None) == 'tracking_config_file'
+               for action in declarations)
+    values = {'tracking_config_file': '/tmp/custom_tracking.yaml'}
+    args = vision_launch.tracking_launch_arguments(
+        lambda name: values.get(name, ''), 'mono_cpu', 'xarm6', Path('/tmp/world.sdf'))
+    assert args['tracking_config_file'] == '/tmp/custom_tracking.yaml'
 
 
 def test_disabling_table_removes_only_scene_collision_and_preserves_robot_anchor():
@@ -73,6 +65,49 @@ def test_disabling_table_removes_only_scene_collision_and_preserves_robot_anchor
     assert anchor is not None and anchor.attrib['xyz'] == '0 0 0.75'
     assert robot.findall('.//collision')
     assert robot.find("./link[@name='link_base']") is not None
+
+
+def test_tracking_config_override_resolves_band_and_reaches_controller(tmp_path):
+    source = yaml.safe_load((ROOT / 'config/tracking.yaml').read_text())
+    source['face_tracking_controller']['ros__parameters'].update(
+        face_distance_min_m=.45, face_distance_max_m=.55)
+    path = tmp_path / 'tracking.yaml'
+    path.write_text(yaml.safe_dump(source))
+    config = _config(tracking_config_file=path)
+    assert config.tracking['face_distance_min_m'] == pytest.approx(.45)
+    assert config.tracking['face_distance_max_m'] == pytest.approx(.55)
+    assert config.controller['face_distance_min_m'] == pytest.approx(.45)
+    assert config.controller['face_distance_max_m'] == pytest.approx(.55)
+
+
+def test_old_tracking_config_uses_deadband_as_half_width(tmp_path):
+    source = yaml.safe_load((ROOT / 'config/tracking.yaml').read_text())
+    params = source['face_tracking_controller']['ros__parameters']
+    params.pop('face_distance_min_m')
+    params.pop('face_distance_max_m')
+    path = tmp_path / 'legacy_tracking.yaml'
+    path.write_text(yaml.safe_dump(source))
+    config = _config(tracking_config_file=path)
+    assert config.controller['face_distance_min_m'] == pytest.approx(.37)
+    assert config.controller['face_distance_max_m'] == pytest.approx(.43)
+
+
+@pytest.mark.parametrize('bounds', [
+    {'face_distance_min_m': .45},
+    {'face_distance_min_m': .55, 'face_distance_max_m': .45},
+    {'face_distance_min_m': 0.0, 'face_distance_max_m': .55},
+    {'face_distance_min_m': float('nan'), 'face_distance_max_m': .55},
+])
+def test_tracking_config_rejects_invalid_distance_band(tmp_path, bounds):
+    source = yaml.safe_load((ROOT / 'config/tracking.yaml').read_text())
+    params = source['face_tracking_controller']['ros__parameters']
+    params.pop('face_distance_min_m')
+    params.pop('face_distance_max_m')
+    params.update(bounds)
+    path = tmp_path / 'invalid_tracking.yaml'
+    path.write_text(yaml.safe_dump(source))
+    with pytest.raises(ValueError, match='face_distance|distance band'):
+        _config(tracking_config_file=path)
 
 
 def test_table_free_world_copy_removes_gazebo_table_but_keeps_floor(tmp_path):

@@ -319,6 +319,10 @@ install(
   PATTERN "calibration" EXCLUDE
   PATTERN "*.local.yaml" EXCLUDE
 )
+install(
+  FILES tools/posture_demo.launch.py tools/posture_demo_target.py
+  DESTINATION share/${PROJECT_NAME}/launch
+)
 # Private Python modules sit beside their entry point; no overlap with rosidl's
 # generated face_tracking_arm Python package and no build-time ML dependencies.
 install(DIRECTORY python/face_tracking_perception DESTINATION lib/${PROJECT_NAME}
@@ -326,6 +330,19 @@ install(DIRECTORY python/face_tracking_perception DESTINATION lib/${PROJECT_NAME
 install(DIRECTORY python/face_tracking_bringup DESTINATION lib/${PROJECT_NAME}
   PATTERN "__pycache__" EXCLUDE)
 install(PROGRAMS tools/record_face_runtime.py DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS
+  tools/posture1d_observer.py
+  tools/analyze_posture1d_capture.py
+  tools/posture1d_metrics.py
+  tools/posture1d_sequence.py
+  tools/posture_settling_metrics.py
+  tools/run_posture1d_case.sh
+  tools/run_collision_brake_case.sh
+  DESTINATION lib/${PROJECT_NAME})
+install(FILES tools/posture1d_scenarios.json
+  tools/posture1d_far_lateral_up_return.json
+  tools/posture1d_far_lateral_up_return_slow.json
+  DESTINATION share/${PROJECT_NAME}/posture1d)
 install(PROGRAMS
   scripts/face_detection_node.py
   scripts/face_position_node.py
@@ -425,14 +442,17 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/install/*.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/install/*.hxx"
   )
-  # Exact paths are needed because ament lint hooks discover files recursively.
+  # The ament linters compare exact paths; a directory entry does not exclude its
+  # recursively discovered files, so pass generated and archived sources explicitly.
   set(_excluded_cpp_sources
     ${_archived_experiment_cpp_sources}
     ${_generated_cpp_sources}
   )
   set(ament_cmake_cpplint_ADDITIONAL_EXCLUDE ${_excluded_cpp_sources})
   set(ament_cmake_uncrustify_ADDITIONAL_EXCLUDE ${_excluded_cpp_sources})
-  # ament_lint_auto scans generated CMake files; lint this source CMakeLists directly.
+  # ament_lint_auto's cmake hook scans the whole source tree and ignores the
+  # file exclusion list. Keep the source CMakeLists check while avoiding generated
+  # CMake files under build/ and install/.
   set(AMENT_LINT_AUTO_EXCLUDE ament_cmake_lint_cmake)
   ament_lint_auto_find_test_dependencies()
   ament_lint_cmake(CMakeLists.txt)
@@ -463,10 +483,21 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_face_appearances test/test_face_appearances.py TIMEOUT 30)
   ament_add_pytest_test(test_stress_motion test/test_stress_motion.py TIMEOUT 30)
   ament_add_pytest_test(test_fast_stress_motion test/test_fast_stress_motion.py TIMEOUT 30)
+  ament_add_pytest_test(test_reversal_stress_motion
+    test/test_reversal_stress_motion.py TIMEOUT 30)
   ament_add_pytest_test(test_simulation_start test/test_simulation_start.py TIMEOUT 60)
   ament_add_pytest_test(test_simulation_launch test/test_simulation_launch.py TIMEOUT 60)
   ament_add_pytest_test(test_private_python_install
     test/test_private_python_install.py TIMEOUT 30)
+  ament_add_pytest_test(test_posture_demo_target test/test_posture_demo_target.py TIMEOUT 30)
+  ament_add_pytest_test(test_posture1d_metrics
+    test/test_posture1d_metrics.py TIMEOUT 30)
+  ament_add_pytest_test(test_posture1d_analysis
+    test/test_posture1d_analysis.py TIMEOUT 30)
+  ament_add_pytest_test(test_posture1d_sequence
+    test/test_posture1d_sequence.py TIMEOUT 30)
+  ament_add_pytest_test(test_posture_settling_metrics
+    test/test_posture_settling_metrics.py TIMEOUT 30)
   ament_add_pytest_test(test_mount_setup test/test_mount_setup.py TIMEOUT 60)
   ament_add_pytest_test(test_face_selection test/test_face_selection.py TIMEOUT 30)
   ament_add_pytest_test(test_point_filter test/test_point_filter.py TIMEOUT 30)

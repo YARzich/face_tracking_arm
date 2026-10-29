@@ -1,0 +1,363 @@
+{
+  "schema_version": 1,
+  "initial_scenarios_frozen_before_production_fix": true,
+  "post_fix_regression_matrix_defined_after_initial_post_fix_runtime": true,
+  "sequence_v3_acceptance_frozen_before_its_first_runtime": true,
+  "runtime": {
+    "workspace": "/home/yaroslav/ros2_ws",
+    "package": "face_tracking_arm",
+    "launch": "face_tracking_arm tracking_sim.launch.py",
+    "model": "xarm6 (launch default; no robot_model override)",
+    "start_pose": "rest",
+    "camera": "disabled for fixed-F cases; RGB-D enabled for vision case",
+    "recording_hz": 50,
+    "source_install_prefix": "/home/yaroslav/ros2_ws/install/face_tracking_arm"
+  },
+  "scenarios": [
+    {
+      "id": "red_fixed_far60",
+      "kind": "fixed_world_target",
+      "target_world_m": [
+        3.052973146,
+        1.907709351,
+        1.75
+      ],
+      "duration_sim_sec": 60,
+      "analysis_window_elapsed_sec": [
+        20,
+        60
+      ],
+      "expected": "FAIL",
+      "assertions": {
+        "q3_reversals_over_1deg_gt": 1,
+        "elbow_span_m_gt": 0.01,
+        "minimum_coverage_sec": 39.95,
+        "maximum_sample_gap_sec": 0.05,
+        "unique_joint_state_stamps": true,
+        "preflight_joint_age_sec_max": 0.05
+      },
+      "known_reference": {
+        "q3_peak_to_peak_deg": 31.55,
+        "elbow_link3_z_range_mm": 85.2,
+        "straight_crossings": 41,
+        "period_sec": 2.0
+      }
+    },
+    {
+      "id": "green_stationary_inband",
+      "kind": "fixed_world_target_from_live_rest_frame",
+      "target_distance_m": 0.4,
+      "duration_sim_sec": 60,
+      "analysis_window_elapsed_sec": [
+        30,
+        60
+      ],
+      "expected": "PASS",
+      "assertions": {
+        "minimum_coverage_sec": 29.95,
+        "maximum_sample_gap_sec": 0.05,
+        "maximum_target_range_m": 1e-05,
+        "maximum_full_hold_span_m": 0.01,
+        "maximum_sliding_10s_path_m": 0.01,
+        "target_used_for_reference": true,
+        "preflight_joint_age_sec_max": 0.05
+      }
+    },
+    {
+      "id": "red_rgbd_stress_fast",
+      "kind": "tracking_vision_common",
+      "mode": "rgbd",
+      "scenario": "stress_fast",
+      "cycles": 1,
+      "expected_duration_sim_sec": 126,
+      "required_stationary_tail_sec": 30,
+      "expected": "capture_complete"
+    }
+  ],
+  "post_fix_regression_matrix": [
+    {
+      "id": "static_near_mid_far_holds",
+      "cases": [
+        {
+          "id": "near_inband",
+          "target_distance_from_live_screen_normal_m": 0.4,
+          "duration_sim_sec": 60,
+          "analysis_window_elapsed_sec": [
+            30,
+            60
+          ],
+          "status": "acceptance_control"
+        },
+        {
+          "id": "mid_exploratory",
+          "fixed_world_target_m": [
+            1.0,
+            0.0,
+            1.75
+          ],
+          "duration_sim_sec": 30,
+          "status": "exploratory_no_compatibility_claim"
+        },
+        {
+          "id": "far_unreachable",
+          "fixed_world_target_m": [
+            3.052973146,
+            1.907709351,
+            1.75
+          ],
+          "duration_sim_sec": 60,
+          "analysis_window_elapsed_sec": [
+            20,
+            60
+          ],
+          "status": "acceptance_case"
+        }
+      ],
+      "checks": [
+        "near hold is GOOD and preserves P/E/W comfort: full-window span <= 0.01 m and every sliding 10 s path <= 0.01 m",
+        "mid is diagnostic only; record FACE, distance, comfort, P/E/W paths, and errors without compatibility pass/fail",
+        "far hold: FACE and target_used continuous, no solver/safety/controller-stop errors, P/E/W comfort spans and sliding 10 s paths each <= 0.01 m",
+        "P/E/W path and monitor-to-face distance are reported separately"
+      ]
+    },
+    {
+      "id": "far_fixed_unreachable",
+      "duration_sim_sec": 60,
+      "target_world_m": [
+        3.052973146,
+        1.907709351,
+        1.75
+      ],
+      "checks": [
+        "FACE remains active and target remains used",
+        "all P/E/W full-window spans <= 0.01 m",
+        "all P/E/W sliding 10 s path lengths <= 0.01 m",
+        "q3 cycle absent; unreachable range does not create an error or stop"
+      ]
+    },
+    {
+      "id": "reachable_inband_stationary",
+      "duration_sim_sec": 60,
+      "analysis_window_elapsed_sec": [
+        30,
+        60
+      ],
+      "checks": [
+        "FACE remains active and target remains used",
+        "all P/E/W full-window spans <= 0.01 m",
+        "all P/E/W sliding 10 s path lengths <= 0.01 m",
+        "distance remains in the 0.4 m comfort band"
+      ]
+    },
+    {
+      "id": "far_lateral_up_return_near",
+      "duration_sim_sec": 175,
+      "runner": "tools/run_posture1d_case.sh arm far_lateral_up_return_near sequence 175 OUTPUT tools/posture1d_far_lateral_up_return.json",
+      "waypoints_file": "tools/posture1d_far_lateral_up_return.json",
+      "phases": [
+        {
+          "name": "far_acquisition",
+          "elapsed_sec": [
+            0,
+            30
+          ],
+          "kind": "acquisition",
+          "target_world_m": [
+            3.052973146,
+            1.907709351,
+            1.75
+          ]
+        },
+        {
+          "name": "far_hold",
+          "elapsed_sec": [
+            30,
+            60
+          ],
+          "kind": "hold",
+          "target_world_m": [
+            3.052973146,
+            1.907709351,
+            1.75
+          ]
+        },
+        {
+          "name": "far_lateral_up_smoothstep",
+          "elapsed_sec": [
+            60,
+            75
+          ],
+          "kind": "moving",
+          "from_world_m": [
+            3.052973146,
+            1.907709351,
+            1.75
+          ],
+          "to_world_m": [
+            3.052973146,
+            2.407709351,
+            2.05
+          ]
+        },
+        {
+          "name": "far_lateral_up_hold",
+          "elapsed_sec": [
+            75,
+            105
+          ],
+          "kind": "hold",
+          "target_world_m": [
+            3.052973146,
+            2.407709351,
+            2.05
+          ]
+        },
+        {
+          "name": "reachable_return_smoothstep",
+          "elapsed_sec": [
+            105,
+            115
+          ],
+          "kind": "moving",
+          "to_world_m": "return target frozen at preflight"
+        },
+        {
+          "name": "reachable_recovery",
+          "elapsed_sec": [
+            115,
+            145
+          ],
+          "kind": "recovery",
+          "target_world_m": "same return target"
+        },
+        {
+          "name": "reachable_good_hold",
+          "elapsed_sec": [
+            145,
+            175
+          ],
+          "kind": "hold",
+          "target_world_m": "same return target"
+        }
+      ],
+      "assertions": {
+        "minimum_coverage_sec": 174.95,
+        "maximum_joint_gap_sec": 0.05,
+        "maximum_context_joint_skew_sec": 0.05,
+        "maximum_target_source_joint_skew_sec": 0.05,
+        "screen_normal_error_check": "last 1 s of acquisition/recovery and every sample in fixed holds; <=1 degree (0.017453292519943295)",
+        "screen_normal_error_rationale": "1 degree practical tolerance accounts for measured RGB-D feed-forward variation; errors above 1 degree fail",
+        "face_tracking_published_and_target_used": "after first valid source-stamped FACE command; acquisition may have only a counted leading absence prefix, with no later gaps",
+        "joint_positions_within_xarm6_urdf_limits": "every sampled row",
+        "q3_comfort_interval_rad": [
+          -1.955144977,
+          -0.369630908
+        ],
+        "q3_hold_tolerance_rad": 0.017453292519943295,
+        "q3_within_comfort_interval": "fixed holds within 1 degree; report raw excursions for every phase",
+        "solver_failure_delta": 0,
+        "emergency_stop_delta": 0,
+        "servo_status_codes_allowed": [
+          0,
+          4
+        ],
+        "servo_status_code_4": "Safe primary orientation command only",
+        "segment_rejection_delta": 0,
+        "feedback_motion_limit_failure_delta": 0,
+        "p_e_w_settling": "apply only to fixed hold stages; <= 0.01 m full-span and sliding path",
+        "reachable_good_hold_window_sec": [
+          145,
+          175
+        ],
+        "reachable_distance_check_window_sec": {
+          "elapsed_sec": [
+            144,
+            145
+          ],
+          "range_m": [
+            0.37,
+            0.43
+          ],
+          "tolerance_m": 0.01
+        }
+      },
+      "checks": [
+        "FACE remains active and target remains used after acquisition; acquisition allows only the counted leading prefix before first valid FACE",
+        "screen-normal pointing error <=1 degree (0.017453292519943295) in the final 1 s of acquisition/recovery and throughout fixed holds",
+        "distance is in [0.37, 0.43] m in the final 1 s of recovery [144,145] and throughout the reachable hold [145,175]",
+        "no stale-state errors, controller stops or safety faults"
+      ],
+      "source_quality_window_sec": [
+        0,
+        175
+      ]
+    },
+    {
+      "id": "far_lateral_up_return_slow",
+      "duration_sim_sec": 205,
+      "runner": "tools/run_posture1d_case.sh arm far_lateral_up_return_near sequence 205 OUTPUT tools/posture1d_far_lateral_up_return_slow.json",
+      "waypoints_file": "tools/posture1d_far_lateral_up_return_slow.json",
+      "return_transition_sec": 40,
+      "return_transition_max_target_speed_mps": 0.18,
+      "status": "acceptance_case_after_fast-return-diagnostic",
+      "checks": [
+        "keep the 175 s fast-return sequence as a separate diagnostic",
+        "freeze the reachable return target at preflight",
+        "report actual target speed, source coverage and q3 excursions",
+        "do not claim slow-return success until the full capture passes"
+      ]
+    },
+    {
+      "id": "perception_rgbd",
+      "scenarios": [
+        "stress_fast",
+        "stress_close",
+        "stress"
+      ],
+      "motion_profiles": {
+        "stress": "slow smooth route",
+        "stress_fast": "fast direction changes and near/far route",
+        "stress_close": "close-range route"
+      },
+      "capture_sim_sec": [
+        126,
+        150,
+        164
+      ],
+      "capture_origin": "observer begins after source-age/TF preflight; preserve and report launch-to-preflight startup separately because scenario may already be active",
+      "startup_window": "do not claim unobserved scenario phases; report launch start, preflight pass, first source-stamped sample and scenario phase available in recorded context",
+      "checks": [
+        "passive observer; no extra face publisher",
+        "FACE continuity and source-stamp freshness",
+        "target ID transitions and perception recovery are recorded",
+        "P/E/W motion, distance and gaze are retained where source context is valid"
+      ]
+    },
+    {
+      "id": "existing_bad_distance_controls",
+      "runner": "tools/posture_demo_target.py",
+      "scenarios": [
+        "posture_good",
+        "posture",
+        "range",
+        "boundaries",
+        "crossing",
+        "obstacle"
+      ],
+      "bad_duration_sim_sec": 60,
+      "recovery_window_elapsed_sec": [
+        0,
+        30
+      ],
+      "good_hold_window_elapsed_sec": [
+        30,
+        60
+      ],
+      "checks": [
+        "GOOD state is preserved across in-band holds",
+        "BAD start may recover during the first 30 s, then must remain GOOD for the following 30 s",
+        "boundary, straight-crossing and obstacle behavior remain safe"
+      ]
+    }
+  ]
+}

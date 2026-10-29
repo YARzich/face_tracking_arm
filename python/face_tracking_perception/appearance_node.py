@@ -21,6 +21,7 @@ from .arm_scene import person_entity_name
 from .close_stress_motion import CloseStressMotion
 from .depth_messages import status_message
 from .fast_stress_motion import FastStressMotion
+from .reversal_stress_motion import ReversalStressMotion
 from .stress_motion import StressMotion
 
 
@@ -46,14 +47,15 @@ class FaceAppearances(Node):
         self.searching = value('idle_behavior') != 'rest'
         self.people_count = value('people_count')
         self.scenario = value('scenario')
-        counts = {'appearances': (1, 2), 'stress': (1,), 'stress_fast': (3,), 'stress_close': (1,)}
+        counts = {'appearances': (1, 2), 'stress': (1,), 'stress_fast': (3,),
+                  'stress_close': (1,), 'stress_reversals': (1,)}
         if self.scenario not in counts or self.people_count not in counts[self.scenario]:
             raise ValueError(
                 'Use appearances with 1–2 people, stress/stress_close with 1, '
-                'or stress_fast with 3')
+                'stress_fast with 3, or stress_reversals with 1')
         self.cycles = value('cycles')
         profiles = {'stress': StressMotion, 'stress_fast': FastStressMotion,
-                    'stress_close': CloseStressMotion}
+                    'stress_close': CloseStressMotion, 'stress_reversals': ReversalStressMotion}
         self.stress = profiles.get(self.scenario, StressMotion)()
         self.stress_started_at = None
         self.stress_last_time = None
@@ -116,7 +118,7 @@ class FaceAppearances(Node):
 
     def tick(self):
         now = self.seconds()
-        if self.scenario in ('stress', 'stress_fast', 'stress_close'):
+        if self.scenario in ('stress', 'stress_fast', 'stress_close', 'stress_reversals'):
             self.tick_stress(now)
             return
         fresh = all(stamp is not None and 0 <= now - stamp < .5
@@ -165,7 +167,7 @@ class FaceAppearances(Node):
         self.stress_last_time = now
         elapsed = 0.0 if self.stress_started_at is None else now - self.stress_started_at
         sample = self.stress.sample(elapsed, cycles=self.cycles)
-        if self.scenario == 'stress_fast':
+        if self.scenario in ('stress_fast', 'stress_reversals'):
             poses, visible = sample.poses, True
         else:
             poses = [sample.pose if sample.visible else (0.0, 0.0, -10.0, 0.0)]
@@ -183,6 +185,10 @@ class FaceAppearances(Node):
                                        if self.pose_success_at is not None else -1.0)}
         self.publisher.publish(status_message(
             header, 'face_appearances', sample.phase, values, fresh))
+        if (self.scenario == 'stress_reversals'
+                and sample.phase != getattr(self, 'last_logged_phase', None)):
+            self.get_logger().info(f'Reversal scenario phase: {sample.phase}')
+            self.last_logged_phase = sample.phase
         if (self.pending is not None or now < self.retry_at
                 or not self.client.service_is_ready()):
             return

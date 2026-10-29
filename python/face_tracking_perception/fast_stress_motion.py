@@ -17,7 +17,7 @@ def _model_pose(x, y, height):
 
 @dataclass(frozen=True)
 class FastStressSample:
-    """Three visible model poses in world metres/radians and their schedule state."""
+    """Model poses in world metres/radians and their schedule state."""
 
     poses: tuple[tuple[float, float, float, float], ...]
     phase: str

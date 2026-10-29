@@ -16,9 +16,9 @@ import hashlib
 import json
 import math
 import os
+from pathlib import Path
 import subprocess
 import time
-from pathlib import Path
 
 from diagnostic_msgs.msg import DiagnosticArray
 
@@ -183,7 +183,6 @@ class RuntimeRecorder(Node):
         self.trajectory_publications_by_stage: dict[str, int] = {
             name: 0 for name, _ in STAGES
         }
-        self.test_world_box = False
         self.stage_offsets: list[tuple[str, float, float]] = []
         cursor = 0.0
         for name, duration in STAGES:
@@ -321,6 +320,7 @@ class RuntimeRecorder(Node):
             'cycle_duration_ns': duration_ns,
             'stage': stage,
             'stage_elapsed_sec': local_elapsed,
+            'control_time_wait': bool(getattr(message, 'control_time_wait', False)),
             'target_available': bool(message.target_available),
             'target_used_for_reference': bool(
                 message.target_used_for_reference
@@ -655,18 +655,6 @@ class RuntimeRecorder(Node):
                 'scenario': (
                     'stationary/dynamic/edge/table-approach/loss/return'
                 ),
-                'initial_test_world_box': self.test_world_box,
-                'test_world_box': (
-                    {
-                        'planning_scene_object_id': 'round_table',
-                        'shape': 'box',
-                        'dimensions_m': [0.10, 0.10, 0.10],
-                        'center_world_m': [0.50, 0.00, 1.15],
-                        'yaw_rad': 0.0,
-                    }
-                    if self.test_world_box
-                    else None
-                ),
                 'target_frame': 'world',
                 'target_rate_hz': 50,
                 'scene_world': str(scene_path),
@@ -713,11 +701,6 @@ def main() -> int:
         required=True,
         help='new output directory for raw records and summary',
     )
-    parser.add_argument(
-        '--test-world-box',
-        action='store_true',
-        help='record the initial test-only box substituted for the table',
-    )
     args = parser.parse_args()
     output = args.output.expanduser().resolve()
     if output.exists():
@@ -725,7 +708,6 @@ def main() -> int:
     output.mkdir(parents=True)
     rclpy.init()
     recorder = RuntimeRecorder(output)
-    recorder.test_world_box = args.test_world_box
     try:
         rclpy.spin(recorder)
     finally:

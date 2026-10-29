@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "status": "acceptance_plan_not_yet_executed",
+  "description": "Far acquisition and hold, lateral/up move and hold, then return to a fixed target derived once from the initial GOOD rest screen normal using a speed-limited 40 second transition.",
+  "return_target_derivation": "At preflight, compute initial monitor_control_frame origin plus 0.4 m along its local +X normal; freeze that world coordinate for the full scenario.",
+  "return_distance_m": 0.4,
+  "duration_sim_sec": 205,
+  "return_transition_max_speed_mps": 0.18,
+  "q3_comfort_interval_rad": [-1.955144977, -0.369630908],
+  "q3_hold_tolerance_rad": 0.017453292519943295,
+  "analysis_stages": [
+    {"name": "far_acquisition", "elapsed_sec": [0, 30], "kind": "acquisition", "gaze_check_last_sec": 1},
+    {"name": "far_hold", "elapsed_sec": [30, 60], "kind": "hold"},
+    {"name": "far_lateral_up_transition", "elapsed_sec": [60, 75], "kind": "moving"},
+    {"name": "far_lateral_up_hold", "elapsed_sec": [75, 105], "kind": "hold"},
+    {"name": "reachable_return_transition", "elapsed_sec": [105, 145], "kind": "moving"},
+    {"name": "reachable_recovery", "elapsed_sec": [145, 175], "kind": "recovery", "gaze_check_last_sec": 1, "distance_check_last_sec": 1},
+    {"name": "reachable_good_hold", "elapsed_sec": [175, 205], "kind": "hold", "require_distance_band": true}
+  ],
+  "waypoints": [
+    {"name": "far_hold", "elapsed_sec": 0, "target_world_m": [3.052973146, 1.907709351, 1.75], "transition_start_sec": 0, "transition_sec": 0},
+    {"name": "far_lateral_up", "elapsed_sec": 75, "target_world_m": [3.052973146, 2.407709351, 2.05], "transition_start_sec": 60, "transition_sec": 15},
+    {"name": "reachable_return", "elapsed_sec": 145, "target_world_m": null, "transition_start_sec": 105, "transition_sec": 40},
+    {"name": "reachable_hold", "elapsed_sec": 205, "target_world_m": null, "transition_start_sec": 205, "transition_sec": 0}
+  ],
+  "acceptance": {
+    "continuous_face_and_target_used": true,
+    "acquisition_leading_face_absence": "count only the initial prefix before the first valid source-stamped FACE command; require continuous fresh FACE and target use after that point through the stage end",
+    "maximum_joint_gap_sec": 0.05,
+    "maximum_context_joint_skew_sec": 0.05,
+    "maximum_target_source_joint_skew_sec": 0.05,
+    "physical_joint_limits": "every source-stamped sample, xarm6 limits from generated model",
+    "q3_comfort": "fixed holds stay within the calibrated interval with a 1 degree practical tolerance; report raw excursions and q3 extrema in every phase",
+    "solver_failure_delta": 0,
+    "emergency_event_delta": 0,
+    "segment_rejection_delta": 0,
+    "feedback_motion_limit_failure_delta": 0,
+    "lower_rank_partial_count": "report count and delta; gaze/target continuity remains the acceptance oracle",
+    "braking_event_count": "report count and delta; emergency counter must remain zero",
+    "servo_status_code_allowed": [0, 4],
+    "servo_status_code_4_message": "Safe primary orientation command only",
+    "screen_normal_error_rad": 0.017453292519943295,
+    "screen_normal_error_rationale": "1 degree practical tolerance accounts for measured RGB-D feed-forward variation; errors above 1 degree fail the gaze gate",
+    "distance_band_m": [0.37, 0.43],
+    "distance_band_tolerance_m": 0.01,
+    "p_e_w_holds": "only fixed hold phases; <=0.01m full-span and sliding 10s path"
+  }
+}

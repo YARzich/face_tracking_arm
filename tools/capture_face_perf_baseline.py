@@ -6,14 +6,14 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
+from pathlib import Path
 import platform
 import re
 import shutil
 import subprocess
-from datetime import datetime, timezone
-from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[1]
