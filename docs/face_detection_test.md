@@ -7,6 +7,9 @@
 
 Сначала выполните [подготовку](#подготовка). Затем откройте терминал:
 
+После сборки повторно подключите workspace: ament-хук добавляет путь к модулям
+perception в `PYTHONPATH`, который наследует отдельный `python_executable`.
+
 ```bash
 source /opt/ros/jazzy/setup.bash
 source ~/ros2_ws/install/setup.bash

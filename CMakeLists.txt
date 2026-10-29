@@ -11,6 +11,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 find_package(ament_cmake REQUIRED)
+ament_environment_hooks(env-hooks/face_tracking_arm_pythonpath.dsv)
 find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -379,6 +380,7 @@ ament_export_dependencies(
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  find_package(ament_cmake_lint_cmake REQUIRED)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
   find_package(joint_trajectory_controller REQUIRED)
@@ -390,6 +392,8 @@ if(BUILD_TESTING)
     CONTRIBUTING.md
     # Archived A/B experiment sources are immutable evidence, not package code.
     log/
+    build/
+    install/
   )
   file(GLOB_RECURSE _archived_experiment_cpp_sources CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/log/*.c"
@@ -401,11 +405,35 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/log/*.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/log/*.hxx"
   )
-  # The ament linters compare exact paths; a directory entry does not exclude its
-  # recursively discovered files, so pass the immutable archived sources explicitly.
-  set(ament_cmake_cpplint_ADDITIONAL_EXCLUDE ${_archived_experiment_cpp_sources})
-  set(ament_cmake_uncrustify_ADDITIONAL_EXCLUDE ${_archived_experiment_cpp_sources})
+  file(GLOB_RECURSE _generated_cpp_sources CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/*.cxx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/*.hh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/*.hxx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/install/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/install/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/install/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/install/*.cxx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/install/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/install/*.hh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/install/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/install/*.hxx"
+  )
+  # Exact paths are needed because ament lint hooks discover files recursively.
+  set(_excluded_cpp_sources
+    ${_archived_experiment_cpp_sources}
+    ${_generated_cpp_sources}
+  )
+  set(ament_cmake_cpplint_ADDITIONAL_EXCLUDE ${_excluded_cpp_sources})
+  set(ament_cmake_uncrustify_ADDITIONAL_EXCLUDE ${_excluded_cpp_sources})
+  # ament_lint_auto scans generated CMake files; lint this source CMakeLists directly.
+  set(AMENT_LINT_AUTO_EXCLUDE ament_cmake_lint_cmake)
   ament_lint_auto_find_test_dependencies()
+  ament_lint_cmake(CMakeLists.txt)
   ament_add_pytest_test(
     test_monitor_description
     test/test_monitor_description.py
@@ -433,6 +461,8 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_fast_stress_motion test/test_fast_stress_motion.py TIMEOUT 30)
   ament_add_pytest_test(test_simulation_start test/test_simulation_start.py TIMEOUT 60)
   ament_add_pytest_test(test_simulation_launch test/test_simulation_launch.py TIMEOUT 60)
+  ament_add_pytest_test(test_private_python_install
+    test/test_private_python_install.py TIMEOUT 30)
   ament_add_pytest_test(test_mount_setup test/test_mount_setup.py TIMEOUT 60)
   ament_add_pytest_test(test_face_selection test/test_face_selection.py TIMEOUT 30)
   ament_add_pytest_test(test_point_filter test/test_point_filter.py TIMEOUT 30)
