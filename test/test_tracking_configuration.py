@@ -198,7 +198,7 @@ def test_enabled_xacro_has_one_complete_gazebo_control_system(
     position_gain = control_plugin.find('./position_proportional_gain')
     assert position_gain is not None
     assert math.isclose(
-        float(position_gain.text), 0.5, rel_tol=0.0, abs_tol=ABS_TOL
+        float(position_gain.text), 1.0, rel_tol=0.0, abs_tol=ABS_TOL
     )
 
 

@@ -1,0 +1,10 @@
+# Upstream controller_manager sim-time overlay pin. Source this file from Bash.
+UPSTREAM_REPO=https://github.com/ros-controls/ros2_control.git
+UPSTREAM_TAG=4.48.1
+UPSTREAM_COMMIT=b7f1a5d420443c7a079f4c81e80d5e39759acf4c
+UPSTREAM_VERSION=4.48.1
+UPSTREAM_LICENSE=Apache-2.0
+UPSTREAM_PR=3684
+UPSTREAM_PR_STATUS=Open
+INSTALLED_DEB_VERSION=4.48.1-1noble.20261006.035021
+PATCH_SHA256=e01cef961ce5b5241bd0e1fe3700fb1c362c68bb84b2efa5490a76e908b4ab26

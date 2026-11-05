@@ -1,0 +1,17 @@
+diff --git a/controller_manager/src/controller_manager.cpp b/controller_manager/src/controller_manager.cpp
+index 790fd5f..8c7203a 100644
+--- a/controller_manager/src/controller_manager.cpp
++++ b/controller_manager/src/controller_manager.cpp
+@@ -3407,0 +3408,4 @@ controller_interface::return_type ControllerManager::update(
++  // Simulator update time can be newer than the last /clock message received by this node.
++  const bool use_time_argument = this->get_trigger_clock()->get_clock_type() == RCL_ROS_TIME &&
++                                 time != rclcpp::Time(0, 0, RCL_ROS_TIME);
++
+@@ -3442 +3446 @@ controller_interface::return_type ControllerManager::update(
+-      const rclcpp::Time current_time = get_clock()->started() ? get_trigger_clock()->now() : time;
++      const rclcpp::Time current_time = use_time_argument ? time : get_trigger_clock()->now();
+@@ -3470,2 +3474,2 @@ controller_interface::return_type ControllerManager::update(
+-          const auto trigger_result =
+-            loaded_controller.c->trigger_update(this->now(), controller_actual_period);
++          const auto trigger_result = loaded_controller.c->trigger_update(
++            use_time_argument ? time : this->now(), controller_actual_period);
