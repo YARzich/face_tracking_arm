@@ -11,8 +11,12 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
+import subprocess
 import sys
 import tarfile
+import textwrap
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +27,193 @@ sys.path.insert(0, str(ROOT / 'docker'))
 import host  # noqa: E402, I100
 import image_manifest  # noqa: E402
 import runtime  # noqa: E402
+
+
+@pytest.fixture
+def isolated_start(tmp_path):
+    """Copy start.sh beside a harmless run stub; never invoke Docker."""
+    launcher = tmp_path / 'start.sh'
+    shutil.copy2(ROOT / 'start.sh', launcher)
+    stub = tmp_path / 'run'
+    stub.write_text(textwrap.dedent('''\
+        #!/usr/bin/env python3
+        import argparse
+        import json
+        import os
+        import signal
+        import sys
+        import time
+
+        signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+        if marker := os.environ.get('STUB_CALLED'):
+            with open(marker, 'w') as output:
+                output.write('called')
+        if ready := os.environ.get('STUB_READY'):
+            with open(ready, 'w') as output:
+                output.write('ready')
+        parser = argparse.ArgumentParser()
+        parser.add_argument('operation', choices=['cpu', 'stereo', 'rgbd'])
+        parser.add_argument('--config')
+        parser.add_argument('--domain')
+        parser.add_argument('--point-filter')
+        parser.add_argument('--camera-only', action='store_true')
+        parser.add_argument('--show-image', action='store_true')
+        parser.add_argument('--mock', action='store_true')
+        args = parser.parse_args()
+        if os.environ.get('STUB_WAIT'):
+            while True:
+                time.sleep(1)
+        if path := os.environ.get('STUB_ARGS'):
+            with open(path, 'w') as output:
+                json.dump(sys.argv[1:], output)
+        sys.exit(int(os.environ.get('STUB_EXIT_CODE', '0')))
+    '''))
+    stub.chmod(0o755)
+    launcher.chmod(0o755)
+    return launcher
+
+
+def invoke_start(launcher, *args, env=None, cwd=None):
+    child_env = os.environ.copy()
+    child_env['STUB_CALLED'] = str(launcher.parent / 'stub-called')
+    if env:
+        child_env.update({key: str(value) for key, value in env.items()})
+    return subprocess.run([str(launcher), *args], cwd=cwd, env=child_env,
+                          text=True, capture_output=True, check=False)
+
+
+def test_start_defaults_to_rgbd_with_image_and_runs_sibling_from_other_cwd(
+        isolated_start, tmp_path):
+    capture = tmp_path / 'argv.json'
+    outside = tmp_path / 'caller-directory'
+    outside.mkdir()
+    result = invoke_start(isolated_start, env={'STUB_ARGS': capture}, cwd=outside)
+    assert result.returncode == 0
+    assert json.loads(capture.read_text()) == ['rgbd', '--show-image']
+    assert 'режим=rgbd; изображение=включено' in result.stdout
+
+
+@pytest.mark.parametrize(('mode', 'operation'), [
+    ('rgb', 'cpu'), ('cpu', 'cpu'), ('rgbd', 'rgbd'), ('stereo', 'stereo'),
+])
+def test_start_mode_aliases(isolated_start, tmp_path, mode, operation):
+    capture = tmp_path / 'argv.json'
+    result = invoke_start(isolated_start, mode, '--no-image',
+                          env={'STUB_ARGS': capture})
+    assert result.returncode == 0
+    assert json.loads(capture.read_text()) == [operation]
+    assert f'режим={operation}; изображение=выключено' in result.stdout
+
+
+@pytest.mark.parametrize(('flags', 'shows_image'), [
+    (['--no-image'], False),
+    (['--no-image', '--show-image'], True),
+    (['--show-image', '--no-image'], False),
+])
+def test_start_image_flags_last_one_wins(isolated_start, tmp_path, flags, shows_image):
+    capture = tmp_path / 'argv.json'
+    result = invoke_start(isolated_start, *flags, env={'STUB_ARGS': capture})
+    passed = json.loads(capture.read_text())
+    assert ('--show-image' in passed) is shows_image
+    assert result.returncode == 0
+
+
+def test_start_preserves_options_with_spaces_and_flag_like_values(isolated_start, tmp_path):
+    capture = tmp_path / 'argv.json'
+    config = 'profiles/station --no-image/--show-image config.yaml'
+    result = invoke_start(
+        isolated_start, 'stereo', '--config', config, '--domain', '71',
+        '--point-filter', 'one_euro', '--camera-only', '--mock',
+        env={'STUB_ARGS': capture},
+    )
+    assert result.returncode == 0
+    assert json.loads(capture.read_text()) == [
+        'stereo', '--config', config, '--domain', '71',
+        '--point-filter', 'one_euro', '--camera-only', '--mock', '--show-image',
+    ]
+    assert 'mock-контроллер, без реальной руки' not in result.stdout
+    assert 'только камера' in result.stdout
+
+
+@pytest.mark.parametrize('args', [
+    ('',),
+    ('invalid',),
+    ('rgbd', 'stereo'),
+    ('stereo', 'rgb'),
+])
+def test_start_rejects_unknown_or_extra_mode_before_run(isolated_start, args):
+    result = invoke_start(isolated_start, *args)
+    assert result.returncode == 2
+    assert not (isolated_start.parent / 'stub-called').exists()
+
+
+def test_start_returns_run_exit_code(isolated_start):
+    result = invoke_start(isolated_start, env={'STUB_EXIT_CODE': '23'})
+    assert result.returncode == 23
+
+
+def test_start_help_is_local_and_does_not_call_run(isolated_start, tmp_path):
+    result = invoke_start(isolated_start, '--help', cwd=tmp_path)
+    assert result.returncode == 0
+    assert 'Изображение включено по умолчанию' in result.stdout
+    assert not (isolated_start.parent / 'stub-called').exists()
+
+
+def test_start_ignores_empty_option_terminator_before_default_image_flag(
+        isolated_start, tmp_path):
+    capture = tmp_path / 'argv.json'
+    result = invoke_start(isolated_start, '--', env={'STUB_ARGS': capture})
+    assert result.returncode == 0
+    assert json.loads(capture.read_text()) == ['rgbd', '--show-image']
+
+
+def test_start_exec_forwards_termination_to_run(isolated_start):
+    ready = isolated_start.parent / 'stub-ready'
+    process = subprocess.Popen([str(isolated_start)], env={
+        **os.environ,
+        'STUB_WAIT': '1',
+        'STUB_READY': str(ready),
+        'STUB_CALLED': str(isolated_start.parent / 'stub-called'),
+    }, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), 'run stub did not report readiness in time'
+        assert process.send_signal(signal.SIGINT) is None
+        assert process.wait(timeout=5) == 130
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_public_start_path_reaches_run_and_stops_at_missing_image(tmp_path):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    docker = bin_dir / 'docker'
+    docker.write_text(textwrap.dedent('''\
+        #!/usr/bin/env bash
+        case "$*" in
+            *"context inspect"*) echo 'unix:///var/run/docker.sock' ;;
+            *" info "*) echo '{"OSType":"linux","OperatingSystem":"Ubuntu","SecurityOptions":[]}' ;;
+            *"image inspect"*) echo 'image absent' >&2; exit 1 ;;
+            *) echo "unexpected Docker command: $*" >&2; exit 90 ;;
+        esac
+    '''))
+    docker.chmod(0o755)
+    child_env = {**os.environ, 'PATH': str(bin_dir) + os.pathsep + os.environ['PATH']}
+    child_env.pop('DOCKER_HOST', None)
+    result = subprocess.run(
+        [str(ROOT / 'start.sh'), 'rgbd', '--no-image'],
+        cwd=tmp_path,
+        env=child_env,
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 1
+    assert 'режим=rgbd; изображение=выключено' in result.stdout
+    assert 'Сначала выполните ./run prepare' in result.stderr
+    assert 'unexpected Docker command' not in result.stderr
 
 
 @pytest.fixture
