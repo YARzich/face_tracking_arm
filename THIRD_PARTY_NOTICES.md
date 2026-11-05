@@ -27,6 +27,17 @@ ROS, MoveIt, OpenCV и остальные системные зависимос�
 менеджером со своими лицензиями. Список прямых зависимостей — [package.xml](package.xml),
 версии Python-библиотек — [perception_requirements.txt](config/perception_requirements.txt).
 
+В расчёте compact-траектории используются уже установленные библиотеки:
+
+| Компонент | Проверенная версия и применение | Лицензия |
+| --- | --- | --- |
+| MoveIt Core | [2.12.4](https://github.com/moveit/moveit2/tree/2.12.4/moveit_core): геометрия и временной профиль TOTG, проверка динамики и столкновений | BSD-3-Clause; лицензия установлена вместе с `ros-jazzy-moveit-core` |
+| Ruckig Community | [0.9.2](https://github.com/pantor/ruckig/tree/v0.9.2): локальный скалярный расчёт движения и выборка траектории | [MIT](https://github.com/pantor/ruckig/blob/v0.9.2/LICENSE) |
+
+Эти версии проверены в локальном Jazzy-окружении; новая зависимость или
+обновление библиотек для сглаживания не требуются. Облачный расчёт Ruckig
+с промежуточными точками не используется.
+
 ## Локальная сборка Fast DDS для симуляции
 
 [Скрипт сборки](tools/build_fastdds_shm_overlay.sh) загружает закреплённые

@@ -33,6 +33,8 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(realtime_tools REQUIRED)
 find_package(ros_gz_interfaces REQUIRED)
+find_package(ruckig REQUIRED)
+find_package(srdfdom REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(shape_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
@@ -106,6 +108,24 @@ target_link_libraries(tracking_core PUBLIC target_motion_estimator)
 
 add_tracking_library(joint_path_follower src/joint_path_follower.cpp)
 target_link_libraries(joint_path_follower PUBLIC Eigen3::Eigen)
+
+add_tracking_library(compact_joint_profile
+  src/compact_joint_profile.cpp
+  src/compact_path_timing.cpp
+  src/compact_totg_time_warp.cpp)
+target_link_libraries(
+  compact_joint_profile PUBLIC hierarchical_velocity_qp Eigen3::Eigen ruckig::ruckig
+  moveit_core::moveit_trajectory_processing)
+
+add_tracking_library(compact_path_execution src/compact_path_execution.cpp)
+target_link_libraries(compact_path_execution compact_joint_profile)
+
+add_tracking_library(compact_dynamics src/compact_dynamics.cpp)
+target_link_libraries(compact_dynamics compact_joint_profile Eigen3::Eigen)
+ament_target_dependencies(compact_dynamics moveit_core)
+
+add_tracking_library(compact_profile_worker src/compact_profile_worker.cpp)
+target_link_libraries(compact_profile_worker compact_dynamics Threads::Threads)
 
 add_tracking_library(background_path_planner
   src/background_path_planner.cpp
@@ -377,6 +397,10 @@ install(
     hardware_io_status_policy
     target_motion_estimator
     joint_path_follower
+    compact_joint_profile
+    compact_path_execution
+    compact_dynamics
+    compact_profile_worker
     background_path_planner
     emergency_brake_tail
     collision_constraints
@@ -394,7 +418,7 @@ install(
 ament_export_targets(export_face_tracking_arm HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   control_msgs Eigen3 moveit_core moveit_msgs moveit_ros_planning moveit_servo
-  osqp rclcpp rosidl_default_runtime Threads
+  osqp rclcpp rosidl_default_runtime ruckig Threads
 )
 
 if(BUILD_TESTING)
@@ -550,6 +574,23 @@ if(BUILD_TESTING)
   target_link_libraries(test_target_motion_estimator target_motion_estimator)
   ament_add_gtest(test_joint_path_follower test/test_joint_path_follower.cpp)
   ament_add_gtest(test_idle_search test/test_idle_search.cpp src/idle_search.cpp)
+  ament_add_gtest(test_compact_joint_profile test/test_compact_joint_profile.cpp)
+  target_compile_definitions(test_compact_joint_profile PRIVATE
+    FACE_TRACKING_ARM_P_PATH_R1_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/p_path/r1_projected_points.csv")
+  target_link_libraries(test_compact_joint_profile compact_joint_profile)
+  ament_add_gtest(test_compact_path_execution test/test_compact_path_execution.cpp)
+  target_link_libraries(test_compact_path_execution compact_path_execution)
+  ament_add_gtest(test_compact_dynamics test/test_compact_dynamics.cpp)
+  target_compile_definitions(test_compact_dynamics PRIVATE
+    TEST_ROBOT_URDF_FILE="${CMAKE_CURRENT_BINARY_DIR}/test_robot.urdf"
+    TEST_ROBOT_SRDF_FILE="${CMAKE_CURRENT_SOURCE_DIR}/config/moveit/xarm6.srdf")
+  target_link_libraries(test_compact_dynamics compact_dynamics compact_joint_profile Eigen3::Eigen)
+  ament_target_dependencies(test_compact_dynamics moveit_core srdfdom urdf)
+  set_tests_properties(test_compact_dynamics PROPERTIES
+    FIXTURES_REQUIRED motion_reference_description
+    TIMEOUT 120)
+  ament_add_gtest(test_compact_profile_worker test/test_compact_profile_worker.cpp)
+  target_link_libraries(test_compact_profile_worker compact_profile_worker Threads::Threads)
   target_include_directories(test_idle_search PRIVATE include)
   target_link_libraries(test_idle_search Eigen3::Eigen)
   target_link_libraries(test_joint_path_follower joint_path_follower)
