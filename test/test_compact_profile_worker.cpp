@@ -509,7 +509,7 @@ TEST(CompactProfileWorker, RequiredReturnGeometryRefusalRejectsMainProfile)
       return certificate;
     };
   work.return_final_geometry_validator = [&return_geometry_calls](
-      const CompactJointProfile & profile) {
+    const CompactJointProfile & profile) {
       CompactProfileGeometryCertificate certificate;
       return_geometry_calls.fetch_add(1U);
       certificate.status = CompactProfileGeometryStatus::kUnsafe;
@@ -539,7 +539,8 @@ TEST(CompactProfileWorker, RequiredReturnGeometryRefusalRejectsMainProfile)
   ASSERT_TRUE(result->return_geometry_certificate);
   EXPECT_EQ(result->return_geometry_certificate->status,
     CompactProfileGeometryStatus::kUnsafe);
-  EXPECT_NE(result->return_profile->failure_reason.find("return endpoint is outside the frozen region"),
+  EXPECT_NE(result->return_profile->failure_reason.find(
+        "return endpoint is outside the frozen region"),
     std::string::npos);
   EXPECT_EQ(main_geometry_calls.load(), 1U);
   EXPECT_EQ(return_geometry_calls.load(), 1U);

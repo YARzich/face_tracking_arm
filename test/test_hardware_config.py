@@ -18,6 +18,8 @@ sys.path.insert(0, str(ROOT / 'python'))
 from face_tracking_bringup.hardware_config import validate_config  # noqa: E402, I100
 from face_tracking_bringup.hardware_description import (  # noqa: E402
     control_parameters, perception_parameters, robot_parameters)
+from face_tracking_bringup.joint_torque_limits import (  # noqa: E402, I100
+    apply_joint_torque_limits)
 from face_tracking_bringup.robot_profile import get_robot_profile  # noqa: E402
 
 
@@ -231,6 +233,9 @@ def test_compact_goal_override_is_optional_and_forwarded_without_a_build(config)
 
     config['compact_maneuver'] = {
         'speed_scale': 0.6,
+        'fold_speed_scale': 0.8,
+        'turn_speed_scale': 1.2,
+        'return_speed_scale': 0.9,
         'goal_joints_rad': [0.0, -0.2715944, -2.8699983, 0.0, -1.151386, math.pi]}
     validated = validate_config(config, 'mono_cpu', mock=True)
     _, motion, _, _ = control_parameters(
@@ -239,6 +244,12 @@ def test_compact_goal_override_is_optional_and_forwarded_without_a_build(config)
     assert motion['compact_maneuver.goal_joints_rad'] == config['compact_maneuver'][
         'goal_joints_rad']
     assert motion['compact_maneuver.speed_scale'] == pytest.approx(0.6)
+    assert motion['compact_maneuver.fold_speed_scale'] == pytest.approx(0.8)
+    assert motion['compact_maneuver.turn_speed_scale'] == pytest.approx(1.2)
+    assert motion['compact_maneuver.return_speed_scale'] == pytest.approx(0.9)
+    assert motion['compact_maneuver.max_velocity_rad_s'] == pytest.approx([0.775] * 6)
+    assert motion['compact_maneuver.max_acceleration_rad_s2'] == pytest.approx([4.75] * 6)
+    assert motion['compact_maneuver.max_jerk_rad_s3'] == pytest.approx([100.0] * 6)
 
 
 def test_hardware_face_distance_band_is_validated_and_forwarded(config):
@@ -329,6 +340,36 @@ def test_compact_speed_scale_must_be_finite_and_positive(config, scale):
         validate_config(config, 'mono_cpu', mock=True)
 
 
+def test_legacy_compact_settings_default_phase_scales_and_working_caps(config):
+    config['compact_maneuver'] = {'speed_scale': .7}
+    compact = validate_config(config, 'mono_cpu', mock=True)['compact_maneuver']
+    assert compact['speed_scale'] == pytest.approx(.7)
+    assert compact['fold_speed_scale'] == 1.0
+    assert compact['turn_speed_scale'] == 1.0
+    assert compact['return_speed_scale'] == 1.0
+    assert compact['max_velocity_rad_s'] == [3.1] * 6
+    assert compact['max_acceleration_rad_s2'] == [19.0] * 6
+    assert compact['max_jerk_rad_s3'] == [400.0] * 6
+
+
+@pytest.mark.parametrize('key', ['fold_speed_scale', 'turn_speed_scale', 'return_speed_scale'])
+@pytest.mark.parametrize('scale', [0, -0.1, float('nan'), float('inf'), True])
+def test_compact_phase_scales_must_be_finite_and_positive(config, key, scale):
+    config['compact_maneuver'][key] = scale
+    with pytest.raises(ValueError, match=f'compact_maneuver.{key}'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
+@pytest.mark.parametrize('key', ['max_velocity_rad_s', 'max_acceleration_rad_s2',
+                                 'max_jerk_rad_s3'])
+@pytest.mark.parametrize('values', [[1.0] * 5, [1.0, float('nan'), 1, 1, 1, 1],
+                                    [1.0, 1, 1, 1, 1, 0]])
+def test_compact_working_limits_are_six_finite_positive_values(config, key, values):
+    config['compact_maneuver'][key] = values
+    with pytest.raises(ValueError, match=f'compact_maneuver.{key}'):
+        validate_config(config, 'mono_cpu', mock=True)
+
+
 @pytest.mark.parametrize('goal', [
     [0.0] * 5,
     [0.0, float('nan'), 0.0, 0.0, 0.0, 0.0],
@@ -354,8 +395,12 @@ def test_compact_goal_override_is_checked_against_active_reduced_bounds(config, 
     probe = {'profile': get_robot_profile('xarm6'),
              'effective_position_limits_rad': reduced}
     config['compact_maneuver'] = {'goal_joints_rad': [.5, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    config = validate_config(config, 'mono_cpu', mock=True)
     path.write_text(yaml.safe_dump(config))
-    robot_parameters(config, 'mono_cpu', share, path, True, probe_result=probe)
+    _, resolved_limits = robot_parameters(
+        config, 'mono_cpu', share, path, True, probe_result={
+            **probe, 'reduced_max_joint_speed_rad_s': 0.3})
+    assert resolved_limits['compact_maneuver']['max_velocity_rad_s'] == pytest.approx([0.3] * 6)
     config['compact_maneuver']['goal_joints_rad'][0] = 1.1
     path.write_text(yaml.safe_dump(config))
     with pytest.raises(ValueError, match='compact_maneuver.goal_joints_rad'):
@@ -631,6 +676,9 @@ def test_hardware_model_has_configured_frames_limits_and_no_gazebo(config, tmp_p
     upper = float(root.find("joint[@name='joint1']/limit").get('upper'))
     assert upper == pytest.approx(2 * 3.14159265)
     assert limits['joint_limits']['joint1']['max_velocity'] == .25
+    assert limits['compact_maneuver']['max_velocity_rad_s'] == pytest.approx([.775] * 6)
+    assert limits['compact_maneuver']['max_acceleration_rad_s2'] == pytest.approx([4.75] * 6)
+    assert limits['compact_maneuver']['max_jerk_rad_s3'] == pytest.approx([100.] * 6)
     servo, motion, _, controllers = control_parameters(config, share, limits, mode)
     assert motion['gaze_frame'] == config[mode]['left']['frame_id']
     assert motion['planning_group_name'] == 'xarm6'
@@ -704,3 +752,55 @@ def test_external_optical_tf_uses_a_separate_internal_gaze_frame(config, tmp_pat
     assert root.find("link[@name='face_camera_optical_frame']") is None
     _, motion, _, _ = control_parameters(config, share, limits)
     assert motion['gaze_frame'] == 'tracking_gaze_optical'
+
+
+def test_empty_joint_torque_override_preserves_xml_and_factory_efforts(config):
+    share = Path(get_package_share_directory('face_tracking_arm'))
+    servo_config = yaml.safe_load(
+        (ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    model, _ = robot_parameters(
+        config, 'mono_cpu', share, ROOT / 'config/hardware.yaml', True)
+    description = model[0]['robot_description']
+    assert apply_joint_torque_limits(description, servo_config) == description
+    robot = ET.fromstring(description)
+    assert [float(robot.find(f"joint[@name='joint{i}']/limit").get('effort'))
+            for i in range(1, 7)] == [50.0, 50.0, 32.0, 32.0, 32.0, 20.0]
+
+
+def test_hardware_model_applies_shared_joint_torque_override(config, tmp_path):
+    share = Path(get_package_share_directory('face_tracking_arm'))
+    servo = yaml.safe_load(
+        (ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    servo['compact_maneuver']['joint_torque_limits_nm'] = {'joint2': 40.0}
+    servo_path = tmp_path / 'collision_aware_servo.yaml'
+    servo_path.write_text(yaml.safe_dump(servo), encoding='utf-8')
+
+    model, _ = robot_parameters(
+        config, 'mono_cpu', share, ROOT / 'config/hardware.yaml', True,
+        collision_aware_servo_config_file=servo_path)
+
+    robot = ET.fromstring(model[0]['robot_description'])
+    efforts = [float(robot.find(f"joint[@name='joint{i}']/limit").get('effort'))
+               for i in range(1, 7)]
+    assert efforts == [50.0, 40.0, 32.0, 32.0, 32.0, 20.0]
+
+
+@pytest.mark.parametrize('overrides,match', [
+    ({'joint7': 1.0}, 'unknown torque-limited robot joint'),
+    ({'joint2': float('nan')}, 'joint2.*finite positive'),
+    ({'joint2': 0.0}, 'joint2.*finite positive'),
+    ({'joint2': True}, 'joint2.*finite positive'),
+    (None, 'expected a joint-name to Nm mapping'),
+])
+def test_hardware_model_rejects_invalid_shared_torque_limits(config, tmp_path, overrides, match):
+    share = Path(get_package_share_directory('face_tracking_arm'))
+    servo = yaml.safe_load(
+        (ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    servo['compact_maneuver']['joint_torque_limits_nm'] = overrides
+    servo_path = tmp_path / 'collision_aware_servo.yaml'
+    servo_path.write_text(yaml.safe_dump(servo), encoding='utf-8')
+
+    with pytest.raises(ValueError, match=match):
+        robot_parameters(
+            config, 'mono_cpu', share, ROOT / 'config/hardware.yaml', True,
+            collision_aware_servo_config_file=servo_path)

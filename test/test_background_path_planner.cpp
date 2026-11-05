@@ -220,6 +220,29 @@ protected:
     return {};
   }
 
+  CompactReturnRegion returnRegion(
+    const moveit::core::RobotState & reference, const double turn_direction) const
+  {
+    CompactReturnRegion region;
+    reference.copyJointGroupPositions(model_->getJointModelGroup("slider"),
+      region.reference_positions);
+    const auto & screen = reference.getGlobalLinkTransform("tip");
+    region.center_world = screen.translation();
+    region.outward_x_world = screen.linear().col(0);
+    region.outward_x_world.z() = 0.0;
+    region.outward_x_world.normalize();
+    region.radius_m = 0.10;
+    region.direction_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+    region.horizontal_edge_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+    region.target_joint1_rad = region.reference_positions[0] +
+      turn_direction * 2.0 * 3.14159265358979323846;
+    region.joint1_tolerance_rad = 0.025;
+    region.comfortable_joint3_lower = -0.1;
+    region.comfortable_joint3_upper = 0.1;
+    region.minimum_elbow_height_m = 0.0;
+    return region;
+  }
+
   rclcpp::Node::SharedPtr node_;
   planning_scene_monitor::PlanningSceneMonitorPtr monitor_;
   moveit::core::RobotModelConstPtr model_;
@@ -269,8 +292,20 @@ void expectCompactCertificateMatchesPath(
   double suffix_roll = result.compact_goal_metrics->maximum_roll_error_rad;
   double suffix_pitch = result.compact_goal_metrics->maximum_abs_screen_pitch_rad;
   double whole_path_radius = 0.0;
-  double whole_path_roll = 0.0;
-  double whole_path_pitch = 0.0;
+  double whole_path_roll = std::numeric_limits<double>::quiet_NaN();
+  double whole_path_pitch = std::numeric_limits<double>::quiet_NaN();
+  const auto extend_metric_maximum = [](double & current, const double candidate) {
+      if (std::isfinite(candidate)) {
+        current = std::isfinite(current) ? std::max(current, candidate) : candidate;
+      }
+    };
+  const auto expect_metric = [](const double actual, const double expected) {
+      if (std::isfinite(expected)) {
+        EXPECT_DOUBLE_EQ(actual, expected);
+      } else {
+        EXPECT_TRUE(std::isnan(actual));
+      }
+    };
   for (std::size_t reverse_index = samples.size(); reverse_index > 0U; --reverse_index) {
     const auto index = reverse_index - 1U;
     const auto & sample = samples[index];
@@ -296,50 +331,177 @@ void expectCompactCertificateMatchesPath(
     }
     EXPECT_TRUE(sample.positions.allFinite());
     EXPECT_TRUE(std::isfinite(sample.maximum_assembly_radius_m));
-    EXPECT_TRUE(std::isfinite(sample.maximum_roll_error_rad));
-    EXPECT_TRUE(std::isfinite(sample.maximum_abs_screen_pitch_rad));
     measured_state.setJointGroupPositions(group, sample.positions);
     measured_state.update(true);
     const auto measured_pose = evaluateCompactUprightPose(
       measured_state.getGlobalLinkTransform(screen_link_name).linear());
-    ASSERT_TRUE(measured_pose);
     EXPECT_NEAR(
       sample.maximum_assembly_radius_m, geometry.maximumAssemblyRadius(measured_state), 1.0e-12);
-    EXPECT_NEAR(
-      sample.maximum_roll_error_rad, std::abs(measured_pose->signed_roll_error_rad), 1.0e-12);
-    EXPECT_NEAR(
-      sample.maximum_abs_screen_pitch_rad, std::abs(measured_pose->signed_pitch_rad), 1.0e-12);
+    if (measured_pose) {
+      EXPECT_TRUE(std::isfinite(sample.maximum_roll_error_rad));
+      EXPECT_TRUE(std::isfinite(sample.maximum_abs_screen_pitch_rad));
+      EXPECT_NEAR(
+        sample.maximum_roll_error_rad, std::abs(measured_pose->signed_roll_error_rad), 1.0e-12);
+      EXPECT_NEAR(
+        sample.maximum_abs_screen_pitch_rad, std::abs(measured_pose->signed_pitch_rad), 1.0e-12);
+    } else {
+      EXPECT_TRUE(std::isnan(sample.maximum_roll_error_rad));
+      EXPECT_TRUE(std::isnan(sample.maximum_abs_screen_pitch_rad));
+    }
     suffix_radius = std::max(suffix_radius, sample.maximum_assembly_radius_m);
-    suffix_roll = std::max(suffix_roll, sample.maximum_roll_error_rad);
-    suffix_pitch = std::max(suffix_pitch, sample.maximum_abs_screen_pitch_rad);
+    extend_metric_maximum(suffix_roll, sample.maximum_roll_error_rad);
+    extend_metric_maximum(suffix_pitch, sample.maximum_abs_screen_pitch_rad);
     EXPECT_DOUBLE_EQ(sample.suffix_maximum_assembly_radius_m, suffix_radius);
-    EXPECT_DOUBLE_EQ(sample.suffix_maximum_roll_error_rad, suffix_roll);
-    EXPECT_DOUBLE_EQ(sample.suffix_maximum_abs_screen_pitch_rad, suffix_pitch);
+    expect_metric(sample.suffix_maximum_roll_error_rad, suffix_roll);
+    expect_metric(sample.suffix_maximum_abs_screen_pitch_rad, suffix_pitch);
     whole_path_radius = std::max(whole_path_radius, sample.maximum_assembly_radius_m);
-    whole_path_roll = std::max(whole_path_roll, sample.maximum_roll_error_rad);
-    whole_path_pitch = std::max(whole_path_pitch, sample.maximum_abs_screen_pitch_rad);
+    extend_metric_maximum(whole_path_roll, sample.maximum_roll_error_rad);
+    extend_metric_maximum(whole_path_pitch, sample.maximum_abs_screen_pitch_rad);
   }
   whole_path_radius = std::max(
     whole_path_radius, result.compact_goal_metrics->maximum_assembly_radius_m);
-  whole_path_roll = std::max(
-    whole_path_roll, result.compact_goal_metrics->maximum_roll_error_rad);
-  whole_path_pitch = std::max(
-    whole_path_pitch, result.compact_goal_metrics->maximum_abs_screen_pitch_rad);
+  extend_metric_maximum(whole_path_roll, result.compact_goal_metrics->maximum_roll_error_rad);
+  extend_metric_maximum(whole_path_pitch,
+        result.compact_goal_metrics->maximum_abs_screen_pitch_rad);
   EXPECT_DOUBLE_EQ(result.validation_metrics->maximum_assembly_radius_m, whole_path_radius);
-  EXPECT_DOUBLE_EQ(result.validation_metrics->maximum_roll_error_rad, whole_path_roll);
-  EXPECT_DOUBLE_EQ(result.validation_metrics->maximum_abs_screen_pitch_rad, whole_path_pitch);
+  expect_metric(result.validation_metrics->maximum_roll_error_rad, whole_path_roll);
+  expect_metric(result.validation_metrics->maximum_abs_screen_pitch_rad, whole_path_pitch);
 
   measured_state.setJointGroupPositions(group, result.goal_positions);
   measured_state.update(true);
   const auto goal_pose = evaluateCompactUprightPose(
     measured_state.getGlobalLinkTransform(screen_link_name).linear());
-  ASSERT_TRUE(goal_pose);
   EXPECT_NEAR(result.compact_goal_metrics->maximum_assembly_radius_m,
     geometry.maximumAssemblyRadius(measured_state), 1.0e-12);
-  EXPECT_NEAR(result.compact_goal_metrics->maximum_roll_error_rad,
-    std::abs(goal_pose->signed_roll_error_rad), 1.0e-12);
-  EXPECT_NEAR(result.compact_goal_metrics->maximum_abs_screen_pitch_rad,
-    std::abs(goal_pose->signed_pitch_rad), 1.0e-12);
+  if (goal_pose) {
+    EXPECT_NEAR(result.compact_goal_metrics->maximum_roll_error_rad,
+      std::abs(goal_pose->signed_roll_error_rad), 1.0e-12);
+    EXPECT_NEAR(result.compact_goal_metrics->maximum_abs_screen_pitch_rad,
+      std::abs(goal_pose->signed_pitch_rad), 1.0e-12);
+  } else {
+    EXPECT_TRUE(std::isnan(result.compact_goal_metrics->maximum_roll_error_rad));
+    EXPECT_TRUE(std::isnan(result.compact_goal_metrics->maximum_abs_screen_pitch_rad));
+  }
+}
+
+TEST(CompactReturnRegionTest, AcceptsPositiveBendWhenElbowIsBelowWrist)
+{
+  CompactReturnRegion region;
+  region.center_world = Eigen::Vector3d::Zero();
+  region.outward_x_world = Eigen::Vector3d::UnitX();
+  region.radius_m = 0.10;
+  region.direction_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+  region.horizontal_edge_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+  region.target_joint1_rad = 0.5;
+  region.joint1_tolerance_rad = 0.025;
+  region.comfortable_joint3_lower = -1.0;
+  region.comfortable_joint3_upper = 0.0;
+  region.minimum_elbow_height_m = 0.04;
+
+  const Eigen::Vector3d shoulder(0.0, 0.0, 0.0);
+  const Eigen::Vector3d elbow(0.5, 0.0, 0.6);
+  const Eigen::Vector3d wrist(1.0, 0.0, 1.0);
+  EXPECT_LT(elbow.z(), wrist.z());
+  EXPECT_TRUE(compactReturnRegionContains(
+      region, Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity(), shoulder, elbow,
+      wrist, 0.5, -0.5));
+}
+
+TEST(CompactReturnRegionTest, RejectsNegativeBendAndIncorrectBranchOrTurn)
+{
+  CompactReturnRegion region;
+  region.center_world = Eigen::Vector3d::Zero();
+  region.outward_x_world = Eigen::Vector3d::UnitX();
+  region.radius_m = 0.10;
+  region.direction_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+  region.horizontal_edge_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+  region.target_joint1_rad = 0.5;
+  region.joint1_tolerance_rad = 0.025;
+  region.comfortable_joint3_lower = -1.0;
+  region.comfortable_joint3_upper = 0.0;
+  region.minimum_elbow_height_m = 0.04;
+
+  const Eigen::Vector3d shoulder(0.0, 0.0, 0.0);
+  const Eigen::Vector3d wrist(1.0, 0.0, 1.0);
+  const Eigen::Vector3d negative_elbow(0.5, 0.0, 0.4);
+  EXPECT_FALSE(compactReturnRegionContains(
+      region, Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity(), shoulder,
+      negative_elbow, wrist, 0.5, -0.5));
+  const Eigen::Vector3d positive_elbow(0.5, 0.0, 0.6);
+  EXPECT_FALSE(compactReturnRegionContains(
+      region, Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity(), shoulder,
+      positive_elbow, wrist, 0.0, -0.5));
+  EXPECT_FALSE(compactReturnRegionContains(
+      region, Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity(), shoulder,
+      positive_elbow, wrist, 0.5, -2.0));
+}
+
+TEST(CompactReturnRegionTest, VerticalShoulderWristLineHasNoPositiveUpwardBend)
+{
+  CompactReturnRegion region;
+  region.center_world = Eigen::Vector3d::Zero();
+  region.outward_x_world = Eigen::Vector3d::UnitX();
+  region.radius_m = 0.10;
+  region.direction_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+  region.horizontal_edge_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+  region.target_joint1_rad = 0.5;
+  region.joint1_tolerance_rad = 0.025;
+  region.comfortable_joint3_lower = -1.0;
+  region.comfortable_joint3_upper = 0.0;
+  region.minimum_elbow_height_m = 0.001;
+  const Eigen::Vector3d shoulder(0.0, 0.0, 0.0);
+  const Eigen::Vector3d elbow(0.0, 0.0, 0.5);
+  const Eigen::Vector3d wrist(0.0, 0.0, 1.0);
+  EXPECT_FALSE(compactReturnRegionContains(
+      region, Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity(), shoulder,
+      elbow, wrist, 0.5, -0.5));
+}
+
+TEST(CompactReturnRegionTest, EnforcesPositionDirectionAndHorizontalScreenOrientation)
+{
+  CompactReturnRegion region;
+  region.center_world = Eigen::Vector3d::Zero();
+  region.outward_x_world = Eigen::Vector3d::UnitX();
+  region.radius_m = 0.10;
+  region.direction_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+  region.horizontal_edge_tolerance_rad = CompactReturnRegion::kDefaultAngleToleranceRad;
+  region.target_joint1_rad = 0.5;
+  region.joint1_tolerance_rad = 0.025;
+  region.comfortable_joint3_lower = -1.0;
+  region.comfortable_joint3_upper = 0.0;
+  region.minimum_elbow_height_m = 0.0;
+  const Eigen::Vector3d shoulder(0.0, 0.0, 0.0);
+  const Eigen::Vector3d elbow(0.5, 0.0, 0.6);
+  const Eigen::Vector3d wrist(1.0, 0.0, 1.0);
+  const auto accepts = [&](const Eigen::Vector3d & screen_origin,
+    const Eigen::Matrix3d & screen_rotation) {
+      return compactReturnRegionContains(
+        region, screen_origin, screen_rotation, shoulder, elbow, wrist, 0.5, -0.5);
+    };
+  const double tolerance = region.direction_tolerance_rad;
+
+  EXPECT_TRUE(accepts(
+      Eigen::Vector3d(0.10, 0.0, 0.0),
+      Eigen::AngleAxisd(tolerance, Eigen::Vector3d::UnitZ()).toRotationMatrix()));
+  EXPECT_FALSE(accepts(
+      Eigen::Vector3d(0.1001, 0.0, 0.0), Eigen::Matrix3d::Identity()));
+  EXPECT_FALSE(accepts(
+      Eigen::Vector3d::Zero(),
+      Eigen::AngleAxisd(tolerance + 0.01, Eigen::Vector3d::UnitZ()).toRotationMatrix()));
+  EXPECT_TRUE(accepts(
+      Eigen::Vector3d::Zero(),
+      Eigen::AngleAxisd(tolerance, Eigen::Vector3d::UnitX()).toRotationMatrix()));
+  EXPECT_FALSE(accepts(
+      Eigen::Vector3d::Zero(),
+      Eigen::AngleAxisd(tolerance + 0.01, Eigen::Vector3d::UnitX()).toRotationMatrix()));
+  EXPECT_FALSE(accepts(
+      Eigen::Vector3d::Zero(),
+      Eigen::AngleAxisd(0.5 * 3.14159265358979323846,
+        Eigen::Vector3d::UnitX()).toRotationMatrix()));
+  EXPECT_FALSE(accepts(
+      Eigen::Vector3d::Zero(),
+      Eigen::AngleAxisd(3.14159265358979323846,
+        Eigen::Vector3d::UnitX()).toRotationMatrix()));
 }
 
 TEST_F(BackgroundPathPlannerTest, PlansAroundWorldObstacleAndAppliesExtraFeasibility)
@@ -489,6 +651,72 @@ TEST_F(BackgroundPathPlannerTest, ReplacesPendingRequestsAndCancelDropsActiveRes
   EXPECT_NEAR(result->path.back()[0], 0.3, 0.002);
 }
 
+TEST_F(BackgroundPathPlannerTest, CancelStopsActiveOmplSolveAndDropsItsResult)
+{
+  struct Gate
+  {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered{false};
+    bool released{false};
+  };
+  const auto gate = std::make_shared<Gate>();
+  config_.planning_time_s = 2.0;
+  const auto start = Eigen::Vector2d(-0.6, 0.2);
+  const auto goal = Eigen::Vector2d(0.6, 0.2);
+  const auto infeasible_region = [gate, start, goal](
+    const planning_scene::PlanningScene &, const moveit::core::RobotState & candidate) {
+      const double x = candidate.getVariablePosition("x");
+      const double y = candidate.getVariablePosition("y");
+      const auto is_endpoint = [&](const Eigen::Vector2d & endpoint) {
+          return std::abs(x - endpoint.x()) <= 0.01 &&
+                 std::abs(y - endpoint.y()) <= 0.01;
+        };
+      if (is_endpoint(start) || is_endpoint(goal)) {
+        return true;
+      }
+      std::unique_lock<std::mutex> lock(gate->mutex);
+      gate->entered = true;
+      gate->condition.notify_all();
+      gate->condition.wait_for(lock, 5s, [gate]() {return gate->released;});
+      return false;
+    };
+  BackgroundPathPlanner planner(node_, model_, monitor_, config_, infeasible_region);
+  static_cast<void>(planner.submit(state(start.x(), start.y()), goal, 64));
+
+  bool entered = false;
+  {
+    std::unique_lock<std::mutex> lock(gate->mutex);
+    entered = gate->condition.wait_for(lock, 2s, [gate]() {return gate->entered;});
+  }
+  if (!entered) {
+    {
+      const std::lock_guard<std::mutex> lock(gate->mutex);
+      gate->released = true;
+    }
+    gate->condition.notify_all();
+    FAIL() << "State validity callback did not enter from the active OMPL solve";
+    return;
+  }
+
+  EXPECT_TRUE(planner.isBusy());
+  const auto idle_deadline = std::chrono::steady_clock::now() + 500ms;
+  planner.cancel();
+  {
+    const std::lock_guard<std::mutex> lock(gate->mutex);
+    gate->released = true;
+  }
+  gate->condition.notify_all();
+
+  while (planner.isBusy() && std::chrono::steady_clock::now() < idle_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_LT(std::chrono::steady_clock::now(), idle_deadline)
+    << "cancel blocked the control thread";
+  EXPECT_FALSE(planner.isBusy()) << "cancel left the active OMPL solve running";
+  EXPECT_FALSE(planner.takeResult()) << "cancel exposed a stale planner result";
+}
+
 TEST_F(BackgroundPathPlannerTest, PreservesTheMonitoredScenesExistingFeasibilityPredicate)
 {
   {
@@ -565,7 +793,10 @@ protected:
     return
       R"(
 <robot name="high_pitch_edge_planner">
-  <link name="base"/><link name="tip"/>
+  <link name="base"/>
+  <link name="tip">
+    <collision><geometry><sphere radius="0.01"/></geometry></collision>
+  </link>
   <joint name="pitch_joint" type="revolute">
     <parent link="base"/><child link="tip"/><axis xyz="0 1 0"/>
     <limit lower="-3.14159265359" upper="3.14159265359" effort="10" velocity="1"/>
@@ -591,7 +822,7 @@ TEST_F(BackgroundPathPlannerTest, CompactGoalValidatesUprightRadiusAndReturnsFac
   goal.bounded_positions = Eigen::Vector2d(0.4, 0.2);
   goal.path_requirements.base_link_name = "base";
   goal.path_requirements.screen_link_name = "tip";
-  goal.path_requirements.maximum_roll_error_rad = 0.05;
+  goal.path_requirements.maximum_roll_error_rad = 3.14159265358979323846;
   goal.path_requirements.maximum_assembly_radius_m = 0.70;
   goal.path_requirements.maximum_abs_screen_pitch_rad = 0.25;
   // This generic two-axis model has no joint1/joint4 pair, so the internal
@@ -606,7 +837,7 @@ TEST_F(BackgroundPathPlannerTest, CompactGoalValidatesUprightRadiusAndReturnsFac
   EXPECT_EQ(result->scene_revision, 61U);
   EXPECT_EQ(result->profile_id, "slider_compact");
   ASSERT_TRUE(result->validation_metrics);
-  EXPECT_LE(result->validation_metrics->maximum_roll_error_rad, 0.05);
+  EXPECT_LE(result->validation_metrics->maximum_roll_error_rad, 3.14159265358979323846);
   EXPECT_LE(result->validation_metrics->maximum_abs_screen_pitch_rad, 0.25);
   EXPECT_LE(result->validation_metrics->maximum_assembly_radius_m, 0.70);
   EXPECT_DOUBLE_EQ(result->validation_metrics->effective_radius_cap_m, 0.70);
@@ -614,12 +845,76 @@ TEST_F(BackgroundPathPlannerTest, CompactGoalValidatesUprightRadiusAndReturnsFac
   EXPECT_TRUE(std::isnan(result->validation_metrics->minimum_robust_clearance_m));
   EXPECT_TRUE(result->path.front().isApprox(Eigen::Vector2d(-0.6, 0.2)));
   EXPECT_LT((result->path.back() - goal.bounded_positions).lpNorm<Eigen::Infinity>(), 0.002);
+  EXPECT_FALSE(result->compact_return_path);
   expectCompactCertificateMatchesPath(*result, model_, "base", "tip");
 }
 
 TEST_F(BackgroundStagedPathPlannerTest, DirectStagedPathPreservesTheCommittedGoalAndJointBounds)
 {
   BackgroundPathPlanner planner(node_, model_, monitor_, config_);
+  CompactGoal goal;
+  goal.profile_id = "compact_turn_positive_wrist";
+  goal.bounded_positions.resize(6);
+  goal.bounded_positions << 0.0, -0.2715944, -2.8699983, 0.0, 1.5707963267948966,
+    6.28318530718 - 0.02;
+  goal.path_requirements.base_link_name = "base";
+  goal.path_requirements.screen_link_name = "tip";
+  goal.path_requirements.maximum_roll_error_rad = 3.14159265358979323846;
+  goal.path_requirements.maximum_abs_screen_pitch_rad = 0.05;
+  goal.path_requirements.maximum_assembly_radius_m = 0.5;
+  goal.path_requirements.staged_route = CompactStagedRouteRequirements{};
+
+  moveit::core::RobotState start(model_);
+  start.setToDefaultValues();
+  Eigen::VectorXd start_positions(6);
+  start_positions << 6.28318530718, 0.0, 0.0, 1.0, 0.0, 0.0;
+  start.setJointGroupPositions(model_->getJointModelGroup("slider"), start_positions);
+  start.update();
+  ASSERT_TRUE(start.satisfiesBounds(model_->getJointModelGroup("slider")));
+  goal.return_region = returnRegion(start, -1.0);
+
+  const auto generation = planner.submit(start, goal, 71);
+  const auto result = waitResult(planner);
+  ASSERT_TRUE(result);
+  ASSERT_TRUE(result->success) << result->message;
+  EXPECT_EQ(result->generation, generation);
+  EXPECT_EQ(result->scene_revision, 71U);
+  EXPECT_EQ(result->profile_id, goal.profile_id);
+  ASSERT_EQ(result->path.size(), 3U);
+  EXPECT_TRUE(result->path.front().isApprox(start_positions, 1.0e-12));
+  EXPECT_NEAR(result->path[1][0], start_positions[0] - 0.35, 1.0e-12);
+  EXPECT_DOUBLE_EQ(result->path[1][3], start_positions[3]);
+  EXPECT_TRUE(result->path.back().isApprox(goal.bounded_positions, 1.0e-12));
+  EXPECT_EQ(result->message, "Direct staged compact route validated");
+  EXPECT_TRUE(result->goal_positions.isApprox(goal.bounded_positions, 1.0e-12));
+  ASSERT_TRUE(result->validation_metrics);
+  EXPECT_LE(result->validation_metrics->maximum_assembly_radius_m, 0.40);
+  expectCompactCertificateMatchesPath(*result, model_, "base", "tip");
+  ASSERT_TRUE(result->compact_return_path);
+  const auto & return_path = *result->compact_return_path;
+  ASSERT_EQ(return_path.path.size(), 2U);
+  Eigen::VectorXd expected_return = start_positions;
+  expected_return[0] = goal.return_region->target_joint1_rad;
+  EXPECT_TRUE(return_path.path.front().isApprox(goal.bounded_positions, 1.0e-12));
+  EXPECT_TRUE(return_path.path.back().isApprox(expected_return, 1.0e-12));
+  EXPECT_TRUE(return_path.goal_positions.isApprox(expected_return, 1.0e-12));
+  EXPECT_TRUE(result->path.back().isApprox(goal.bounded_positions, 1.0e-12));
+  ASSERT_EQ(result->compact_path_samples.size(), result->validation_metrics->checked_samples);
+  EXPECT_DOUBLE_EQ(return_path.validation_metrics.effective_radius_cap_m, 0.5);
+  EXPECT_LE(return_path.validation_metrics.maximum_assembly_radius_m, 0.5);
+  EXPECT_GT(return_path.validation_metrics.checked_samples, 1U);
+}
+
+TEST_F(BackgroundStagedPathPlannerTest, UnsafeMandatoryReturnRejectsTheWholeManeuver)
+{
+  const auto reject_comfortable_return_endpoint = [](
+    const planning_scene::PlanningScene &, const moveit::core::RobotState & state) {
+      const double yaw = state.getVariablePosition("joint1");
+      const double bend = state.getVariablePosition("joint3");
+      return !(std::abs(yaw) < 0.05 && bend > -0.2 && bend < 0.2);
+    };
+  BackgroundPathPlanner planner(
+    node_, model_, monitor_, config_, reject_comfortable_return_endpoint);
   CompactGoal goal;
   goal.profile_id = "compact_turn_positive_wrist";
   goal.bounded_positions.resize(6);
@@ -639,23 +934,15 @@ TEST_F(BackgroundStagedPathPlannerTest, DirectStagedPathPreservesTheCommittedGoa
   start.setJointGroupPositions(model_->getJointModelGroup("slider"), start_positions);
   start.update();
   ASSERT_TRUE(start.satisfiesBounds(model_->getJointModelGroup("slider")));
+  goal.return_region = returnRegion(start, -1.0);
 
-  const auto generation = planner.submit(start, goal, 71);
+  static_cast<void>(planner.submit(start, goal, 73));
   const auto result = waitResult(planner);
   ASSERT_TRUE(result);
-  ASSERT_TRUE(result->success) << result->message;
-  EXPECT_EQ(result->generation, generation);
-  EXPECT_EQ(result->scene_revision, 71U);
-  EXPECT_EQ(result->profile_id, goal.profile_id);
-  ASSERT_EQ(result->path.size(), 3U);
-  EXPECT_TRUE(result->path.front().isApprox(start_positions, 1.0e-12));
-  EXPECT_NEAR(result->path[1][0], start_positions[0] - 0.35, 1.0e-12);
-  EXPECT_DOUBLE_EQ(result->path[1][3], start_positions[3]);
-  EXPECT_TRUE(result->path.back().isApprox(goal.bounded_positions, 1.0e-12));
-  EXPECT_TRUE(result->goal_positions.isApprox(goal.bounded_positions, 1.0e-12));
-  ASSERT_TRUE(result->validation_metrics);
-  EXPECT_LE(result->validation_metrics->maximum_assembly_radius_m, 0.40);
-  expectCompactCertificateMatchesPath(*result, model_, "base", "tip");
+  EXPECT_FALSE(result->success);
+  EXPECT_FALSE(result->compact_return_path);
+  EXPECT_TRUE(result->path.empty());
+  EXPECT_NE(result->message.find("Compact maneuver rejected"), std::string::npos);
 }
 
 TEST_F(BackgroundStagedPathPlannerTest, NegativeWristNamedPresetUsesTheStagedRoute)
@@ -680,6 +967,7 @@ TEST_F(BackgroundStagedPathPlannerTest, NegativeWristNamedPresetUsesTheStagedRou
   start.setJointGroupPositions(model_->getJointModelGroup("slider"), start_positions);
   start.update();
   ASSERT_TRUE(start.satisfiesBounds(model_->getJointModelGroup("slider")));
+  goal.return_region = returnRegion(start, 1.0);
 
   const auto generation = planner.submit(start, goal, 75);
   const auto result = waitResult(planner);
@@ -695,7 +983,7 @@ TEST_F(BackgroundStagedPathPlannerTest, NegativeWristNamedPresetUsesTheStagedRou
   EXPECT_TRUE(result->goal_positions.isApprox(goal.bounded_positions, 1.0e-12));
   ASSERT_TRUE(result->validation_metrics);
   EXPECT_LE(result->validation_metrics->maximum_abs_screen_pitch_rad, 0.05);
-  EXPECT_LE(result->validation_metrics->maximum_roll_error_rad, 0.05);
+  EXPECT_LE(result->validation_metrics->maximum_roll_error_rad, 3.14159265358979323846);
   expectCompactCertificateMatchesPath(*result, model_, "base", "tip");
 }
 
@@ -728,6 +1016,7 @@ TEST_F(
   start_positions << 1.0, 0.0, 0.0, 1.0, 0.0, 0.0;
   start.setJointGroupPositions(model_->getJointModelGroup("slider"), start_positions);
   start.update();
+  goal.return_region = returnRegion(start, -1.0);
 
   static_cast<void>(planner.submit(start, goal, 72));
   const auto result = waitResult(planner);
@@ -767,6 +1056,7 @@ TEST_F(BackgroundStagedPathPlannerTest, InvalidKnownPrefixDoesNotFallBackToTheFu
   start_positions << 1.0, 0.0, 0.0, 1.0, 0.0, 0.0;
   start.setJointGroupPositions(model_->getJointModelGroup("slider"), start_positions);
   start.update();
+  goal.return_region = returnRegion(start, -1.0);
 
   static_cast<void>(planner.submit(start, goal, 73));
   const auto result = waitResult(planner);
@@ -1281,6 +1571,46 @@ TEST_F(BackgroundHorizontalEdgePlannerTest, RejectsInteriorEdgeViolationWithVali
   EXPECT_FALSE(result->success);
   EXPECT_NE(result->error_code, moveit_msgs::msg::MoveItErrorCodes::SUCCESS);
   EXPECT_TRUE(result->path.empty());
+}
+
+TEST_F(BackgroundHighPitchEdgePlannerTest,
+      CompactZeroMotionCertificateAllowsUndefinedOrientationMetrics)
+{
+  BackgroundPathPlanner planner(node_, model_, monitor_, config_);
+  constexpr double kStartAngleRad{0.25};
+  moveit::core::RobotState start(model_);
+  start.setToDefaultValues();
+  start.setVariablePosition("pitch_joint", kStartAngleRad);
+  start.update();
+  const auto pose = evaluateCompactUprightPose(
+    start.getGlobalLinkTransform("tip").linear());
+  ASSERT_TRUE(pose);
+  ASSERT_LT(pose->signed_pitch_rad, 0.0);
+
+  CompactGoal goal;
+  goal.profile_id = "negative_pitch_zero_motion";
+  goal.bounded_positions = Eigen::VectorXd::Constant(1, kStartAngleRad);
+  goal.path_requirements.base_link_name = "base";
+  goal.path_requirements.screen_link_name = "tip";
+  goal.path_requirements.maximum_roll_error_rad = 0.0890117918517108;
+  goal.path_requirements.maximum_abs_screen_pitch_rad = 0.5235987755982988;
+  goal.path_requirements.maximum_assembly_radius_m = 0.40;
+
+  static_cast<void>(planner.submit(start, goal, 89));
+  const auto result = waitResult(planner);
+  ASSERT_TRUE(result);
+  ASSERT_TRUE(result->success) << result->message;
+  ASSERT_GE(result->compact_path_samples.size(), 2U);
+  EXPECT_TRUE(std::all_of(
+      result->compact_path_samples.begin(), result->compact_path_samples.end(),
+      [](const CompactPathSampleCertificate & sample) {
+        const auto nonnegative_or_undefined = [](const double value) {
+          return std::isnan(value) || (std::isfinite(value) && value >= 0.0);
+        };
+        return nonnegative_or_undefined(sample.maximum_abs_screen_pitch_rad) &&
+               nonnegative_or_undefined(sample.suffix_maximum_abs_screen_pitch_rad);
+      }));
+  expectCompactCertificateMatchesPath(*result, model_, "base", "tip");
 }
 
 TEST_F(BackgroundHighPitchEdgePlannerTest, AcceptsAValidHighPitchRestPath)

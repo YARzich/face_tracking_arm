@@ -107,6 +107,12 @@ Point walk_around_target(double elapsed)
   };
 }
 
+Point walk_around_reverse_target(double elapsed)
+{
+  const Point forward = walk_around_target(elapsed);
+  return {forward.x, -forward.y, forward.z};
+}
+
 Point approach_target(double elapsed)
 {
   const double t = std::fmod(elapsed, kApproachCycleDurationSec);
@@ -181,11 +187,15 @@ Scenario parse_scenario(std::string_view name)
   if (name == "walk_around") {
     return Scenario::kWalkAround;
   }
+  if (name == "walk_around_reverse") {
+    return Scenario::kWalkAroundReverse;
+  }
   if (name == "approach") {
     return Scenario::kApproach;
   }
   throw std::invalid_argument(
-      "scenario must be disabled, stationary, circle, people, walk_around, or approach");
+      "scenario must be disabled, stationary, circle, people, walk_around, "
+      "walk_around_reverse, or approach");
 }
 
 Sample sample(Scenario scenario, double elapsed_sec)
@@ -204,6 +214,9 @@ Sample sample(Scenario scenario, double elapsed_sec)
       return people_sample(elapsed_sec);
     case Scenario::kWalkAround:
       return {walk_around_target(elapsed_sec), "Continuous walk around, height 1.80 m"};
+    case Scenario::kWalkAroundReverse:
+      return {walk_around_reverse_target(elapsed_sec),
+        "Continuous reverse walk around, height 1.80 m"};
     case Scenario::kApproach:
       return {approach_target(elapsed_sec), "Approach and retreat, height 1.68 m"};
   }

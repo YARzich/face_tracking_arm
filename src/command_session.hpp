@@ -59,7 +59,8 @@ struct CommandSession
   [[nodiscard]] bool deferCommandDeadlineRetry() noexcept;
   [[nodiscard]] std::optional<std::uint64_t> timelineRecoveryPeriods(
     std::uint64_t observed_skipped_periods, std::int64_t current_time_ns,
-    std::int64_t target_command_lead_ns) const;
+    std::int64_t target_command_lead_ns,
+    std::optional<std::int64_t> recovery_suppression_lead_ns = std::nullopt) const;
   void completeDeferredCommandDeadlineRetry() noexcept;
   void pruneExpiredHistory(const rclcpp::Time & current_time, double retained_history_sec);
   void discardBranch(bool preserveBootstrapReset = false);

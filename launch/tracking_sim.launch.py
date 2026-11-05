@@ -36,7 +36,9 @@ def generate_launch_description() -> LaunchDescription:
     test_face_scenario_argument = DeclareLaunchArgument(
         'test_face_scenario',
         default_value='people',
-        choices=['disabled', 'stationary', 'circle', 'people', 'walk_around', 'approach'],
+        choices=[
+            'disabled', 'stationary', 'circle', 'people', 'walk_around',
+            'walk_around_reverse', 'approach'],
         description='Deterministic test source published after tracking readiness.',
     )
     visualize_target_argument = DeclareLaunchArgument(

@@ -84,7 +84,8 @@ bool CommandSession::deferCommandDeadlineRetry() noexcept
 
 std::optional<std::uint64_t> CommandSession::timelineRecoveryPeriods(
   const std::uint64_t observed_skipped_periods, const std::int64_t current_time_ns,
-  const std::int64_t target_command_lead_ns) const
+  const std::int64_t target_command_lead_ns,
+  const std::optional<std::int64_t> recovery_suppression_lead_ns) const
 {
   if (!time_grid) {
     return command_deadline_retry_pending ?
@@ -93,6 +94,13 @@ std::optional<std::uint64_t> CommandSession::timelineRecoveryPeriods(
   // Timer skips describe callback cadence, not the current command-grid lead.
   // A published-brake continuation may already have advanced that grid, so
   // using the observed count here would recover the same intervals twice.
+  if (recovery_suppression_lead_ns.has_value() && !command_deadline_retry_pending) {
+    const auto suppression_periods = time_grid->periodsUntilCommandLead(
+      current_time_ns, *recovery_suppression_lead_ns);
+    if (suppression_periods.has_value() && *suppression_periods == 0U) {
+      return 0U;
+    }
+  }
   const auto required_periods = time_grid->periodsUntilCommandLead(
     current_time_ns, target_command_lead_ns);
   if (!required_periods.has_value()) {

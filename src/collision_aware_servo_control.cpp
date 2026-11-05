@@ -20,6 +20,112 @@ constexpr double kStoppedAccelerationRadps2 = 2.0e-2;
 
 constexpr std::chrono::milliseconds kTelemetryPublishPeriod{100};
 
+bool same_numerical_policy(
+  const std::optional<control::NumericalPolicy> & first,
+  const std::optional<control::NumericalPolicy> & second) noexcept
+{
+  if (first.has_value() != second.has_value()) {
+    return false;
+  }
+  if (!first.has_value()) {
+    return true;
+  }
+  return first->position_error.value == second->position_error.value &&
+         first->velocity_error.value == second->velocity_error.value &&
+         first->acceleration_error.value == second->acceleration_error.value &&
+         first->jerk_error.value == second->jerk_error.value &&
+         first->solver_residual.value == second->solver_residual.value;
+}
+
+bool same_dynamic_limits(
+  const control::JointMotionLimits & first,
+  const control::JointMotionLimits & second) noexcept
+{
+  return first.max_velocity.size() == second.max_velocity.size() &&
+         first.max_acceleration.size() == second.max_acceleration.size() &&
+         first.max_jerk.size() == second.max_jerk.size() &&
+         (first.max_velocity.array() == second.max_velocity.array()).all() &&
+         (first.max_acceleration.array() == second.max_acceleration.array()).all() &&
+         (first.max_jerk.array() == second.max_jerk.array()).all() &&
+         same_numerical_policy(first.numerical_policy, second.numerical_policy);
+}
+
+struct VelocityConstraintViolation
+{
+  std::size_t row{0U};
+  double projected_velocity{0.0};
+  double lower_bound{0.0};
+  double upper_bound{0.0};
+};
+
+bool satisfies_velocity_constraints(
+  const Eigen::VectorXd & velocity,
+  const std::vector<control::LinearVelocityConstraint> & constraints,
+  const double tolerance,
+  const std::size_t first_constraint,
+  std::optional<VelocityConstraintViolation> * const violation = nullptr) noexcept
+{
+  if (violation != nullptr) {
+    violation->reset();
+  }
+  if (!velocity.allFinite() || !std::isfinite(tolerance) || tolerance < 0.0 ||
+    first_constraint > constraints.size())
+  {
+    return false;
+  }
+  for (std::size_t index = 0U; index < constraints.size(); ++index) {
+    const auto & constraint = constraints[index];
+    if (constraint.coefficients.size() != velocity.size() ||
+      !constraint.coefficients.allFinite() || std::isnan(constraint.lower_bound) ||
+      std::isnan(constraint.upper_bound) || constraint.lower_bound > constraint.upper_bound)
+    {
+      return false;
+    }
+    if (index < first_constraint) {
+      continue;
+    }
+    const double value = constraint.coefficients.dot(velocity);
+    if (!std::isfinite(value) || value < constraint.lower_bound - tolerance ||
+      value > constraint.upper_bound + tolerance)
+    {
+      if (violation != nullptr) {
+        *violation = VelocityConstraintViolation{
+          index, value, constraint.lower_bound, constraint.upper_bound};
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+class CompactProfilePublicationOutcome
+{
+public:
+  CompactProfilePublicationOutcome(
+    control::MotionReference * const reference, const bool attempted) noexcept
+  : reference_(attempted ? reference : nullptr) {}
+
+  ~CompactProfilePublicationOutcome()
+  {
+    if (reference_ != nullptr) {
+      reference_->recordCompactProfileCommandPublished(published_);
+    }
+  }
+
+  void markPublished(const bool published) noexcept
+  {
+    published_ = published;
+  }
+
+  CompactProfilePublicationOutcome(const CompactProfilePublicationOutcome &) = delete;
+  CompactProfilePublicationOutcome & operator=(
+    const CompactProfilePublicationOutcome &) = delete;
+
+private:
+  control::MotionReference * reference_{nullptr};
+  bool published_{false};
+};
+
 }  // namespace
 
 std::optional<control::QpResult> CollisionAwareServoComponent::reference_guard_blend(
@@ -242,34 +348,6 @@ void CollisionAwareServoComponent::update_pause_after_publication()
   pause_terminal_pending_.store(false, std::memory_order_release);
 }
 
-std::optional<control::LinearVelocityConstraint> CollisionAwareServoComponent::j1_hold_constraint(
-  const control::MotionReferenceResult & reference,
-  const control::JointMotionState & motion_state) const
-{
-  if (!reference.j1_hold_position_rad || !reference.j1_joint_index ||
-    *reference.j1_joint_index >= static_cast<std::size_t>(motion_state.position.size()))
-  {
-    return std::nullopt;
-  }
-  const auto index = static_cast<Eigen::Index>(*reference.j1_joint_index);
-  control::detail::ScalarBrakingOptions braking_options;
-  braking_options.period_sec = parameters_.control_period_sec;
-  const auto braking_step = control::detail::scalar_braking_policy::nextStep(
-    motion_state.velocity[index], motion_state.acceleration[index],
-    control::detail::ScalarBrakingLimits{
-      motion_limits_.max_velocity[index], motion_limits_.max_acceleration[index],
-      motion_limits_.max_jerk[index]}, braking_options);
-  if (!braking_step.valid) {
-    return std::nullopt;
-  }
-  control::LinearVelocityConstraint hold;
-  hold.coefficients = Eigen::VectorXd::Zero(motion_state.position.size());
-  hold.coefficients[index] = 1.0;
-  hold.lower_bound = braking_step.velocity;
-  hold.upper_bound = braking_step.velocity;
-  return hold;
-}
-
 void CollisionAwareServoComponent::control_loop()
 {
   if (!realtime_tools::configure_sched_fifo(
@@ -394,11 +472,29 @@ bool CollisionAwareServoComponent::build_and_record_collision_context(
   const planning_scene::PlanningScene & planning_scene,
   const moveit::core::RobotState & robot_state,
   const control::JointMotionState & motion_state,
+  const control::JointMotionLimits & limits,
   control::CollisionConstraintResult & result)
 {
+  if (!limits.numerical_policy.has_value()) {
+    RCLCPP_ERROR(get_logger(), "Active motion limits have no collision numerical policy");
+    enter_safety_wait("Active motion limits have no collision numerical policy");
+    return false;
+  }
+  if (!same_numerical_policy(
+      collision_constraint_config_.numerical_policy, limits.numerical_policy))
+  {
+    compact_brake_line_proof_.clear();
+    compact_brake_line_validator_.reset();
+    ++collision_config_revision_;
+    control::CollisionConstraintConfig selected_config = collision_constraint_config_;
+    selected_config.numerical_policy = limits.numerical_policy;
+    collision_constraint_builder_ =
+      std::make_unique<control::CollisionConstraintBuilder>(std::move(selected_config));
+    collision_constraint_config_.numerical_policy = limits.numerical_policy;
+  }
   const auto collision_build_start = std::chrono::steady_clock::now();
   result = collision_constraint_builder_->build(
-    planning_scene, robot_state, *joint_model_group_, motion_state, motion_limits_,
+    planning_scene, robot_state, *joint_model_group_, motion_state, limits,
     parameters_.control_period_sec);
   (void)telemetry_.collision_build_statistics.add(std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - collision_build_start).count());
@@ -488,15 +584,31 @@ bool CollisionAwareServoComponent::build_and_record_collision_context(
   return true;
 }
 
+const control::JointMotionLimits & CollisionAwareServoComponent::active_motion_limits()
+const noexcept
+{
+  return motion_reference_ ? motion_reference_->activeCommandLimits() : motion_limits_;
+}
+
 bool CollisionAwareServoComponent::recover_command_timeline(
   const rclcpp::Time & current_time, const std::uint64_t skipped_periods)
 {
-  // Recover to the epoch's initial lead, which includes one control period
-  // beyond the send-time minimum for the next computation to complete.
+  // Actual recovery retains max_expected_latency. Only an active timed compact
+  // profile gets a hysteresis trigger at send minimum plus one full calculation
+  // period; ordinary control keeps the existing recovery decision unchanged.
   const std::int64_t retry_target_lead_ns = seconds_to_nanoseconds(
     servo_parameters_.max_expected_latency);
+  std::optional<std::int64_t> recovery_suppression_lead_ns;
+  if (motion_reference_ && motion_reference_->hasActiveCompactProfile()) {
+    const std::int64_t residual_latency_ns = seconds_to_nanoseconds(
+      parameters_.residual_command_latency_sec);
+    const std::int64_t control_period_ns = seconds_to_nanoseconds(
+      parameters_.control_period_sec);
+    recovery_suppression_lead_ns = residual_latency_ns + control_period_ns + control_period_ns;
+  }
   const auto timeline_recovery_periods = commands_.timelineRecoveryPeriods(
-    skipped_periods, current_time.nanoseconds(), retry_target_lead_ns);
+    skipped_periods, current_time.nanoseconds(), retry_target_lead_ns,
+    recovery_suppression_lead_ns);
   if (!timeline_recovery_periods.has_value()) {
     enter_controlled_rearm("Deferred command deadline has no active command-grid anchor");
     return false;
@@ -877,14 +989,15 @@ void CollisionAwareServoComponent::control_tick()
   }
 
   control::CollisionConstraintResult collision_result;
+  const control::JointMotionLimits collision_context_limits = active_motion_limits();
   if (!build_and_record_collision_context(
-    *planning_scene, *robot_state, motion_state, collision_result))
+    *planning_scene, *robot_state, motion_state, collision_context_limits, collision_result))
   {
     return;
   }
 
   std::vector<control::LinearVelocityConstraint> constraints = collision_result.constraints;
-  const bool segment_validation_required =
+  bool segment_validation_required =
     collision_constraint_builder_->shouldValidateSegment(
     collision_result.diagnostics, parameters_.segment_validation_distance_m);
   // Collision evaluation can take several milliseconds while the ROS
@@ -915,6 +1028,20 @@ void CollisionAwareServoComponent::control_tick()
     *robot_state, tracking_requested ? target : std::nullopt, *planning_scene,
     current_time.seconds(), collision_scene_revision, actual_feedback,
     actual_feedback_time_sec, motion_state, active_publication, latest_publication);
+  CompactProfilePublicationOutcome compact_profile_publication(
+    motion_reference_.get(), reference.compact_profile_command);
+  bool compact_profile_candidate_accepted = false;
+  const control::JointMotionLimits & command_limits = active_motion_limits();
+  if (!same_dynamic_limits(collision_context_limits, command_limits)) {
+    if (!build_and_record_collision_context(
+        *planning_scene, *robot_state, motion_state, command_limits, collision_result))
+    {
+      return;
+    }
+    constraints = collision_result.constraints;
+    segment_validation_required = collision_constraint_builder_->shouldValidateSegment(
+      collision_result.diagnostics, parameters_.segment_validation_distance_m);
+  }
   current_tick_context_.target_used_for_reference =
     tracking_requested && reference.tracking.has_value();
   const bool ordinary_face_budget_scope = target &&
@@ -956,17 +1083,68 @@ void CollisionAwareServoComponent::control_tick()
       constraints.end(), reference.compact_pitch_constraints.begin(),
       reference.compact_pitch_constraints.end());
   }
-  const auto j1_hold = j1_hold_constraint(reference, motion_state);
-  if (j1_hold) {
-    constraints.push_back(*j1_hold);
-  }
   if (reference.tracking) {
     telemetry_.last_position_error_m = reference.tracking->position_error_m;
     telemetry_.last_screen_normal_pointing_error_rad = reference.tracking->pointing_error_rad;
     telemetry_.last_roll_error_rad = reference.tracking->roll_error_rad;
     (void)telemetry_.pointing_error_statistics.add(reference.tracking->pointing_error_rad);
   }
-  if (reference.task && !reference.motion_reference_support_unavailable) {
+  if (reference.compact_profile_command &&
+    !reference.motion_reference_support_unavailable)
+  {
+    std::string candidate_failure;
+    CandidateRejectionKind rejection_kind = CandidateRejectionKind::kOther;
+    std::optional<VelocityConstraintViolation> hard_velocity_violation;
+    if (reference.compact_profile_velocity) {
+      const double tolerance = velocity_qp_->config().solution_feasibility_tolerance;
+      // Collision rows are the conservative QP viability screen. This exact
+      // profile is still admitted only after full candidate and brake-tail validation.
+      if (satisfies_velocity_constraints(
+          *reference.compact_profile_velocity, constraints, tolerance,
+          collision_result.constraints.size(), &hard_velocity_violation))
+      {
+        accepted_command = validated_candidate(
+          robot_state, *state, motion_state, *reference.compact_profile_velocity,
+          *planning_scene, segment_validation_required, CommandAttempt::kTracking,
+          candidate_failure, collision_result.diagnostics, rejection_kind, collision_budget,
+          true);
+      } else {
+        candidate_failure = "Compact profile command violates an active hard velocity constraint";
+      }
+    } else {
+      candidate_failure = "Compact profile command has no joint velocity sample";
+    }
+    if (stop_for_expired_collision_validation_budget(collision_budget)) {
+      return;
+    }
+    if (accepted_command.has_value()) {
+      compact_profile_candidate_accepted = true;
+      accepted_qp_result.status = control::QpStatus::kSolved;
+      accepted_qp_result.joint_velocity = *reference.compact_profile_velocity;
+      controller_mode_ = ControllerMode::kTracking;
+    } else {
+      if (hard_velocity_violation) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Compact profile candidate rejected: %s; hard velocity row=%zu, "
+          "projected_qdot=%.9g rad/s, bounds=[%.9g, %.9g] rad/s",
+          candidate_failure.c_str(), hard_velocity_violation->row,
+          hard_velocity_violation->projected_velocity,
+          hard_velocity_violation->lower_bound, hard_velocity_violation->upper_bound);
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Compact profile candidate rejected: %s", candidate_failure.c_str());
+      }
+      mitigated_failure = "Compact profile candidate rejected: " + candidate_failure;
+      // Keep the already validated braking suffix when it is still eligible.
+      const auto continuation_status = tryContinuePublishedBrake(
+        current_time, target, tracking_requested, collision_scene_revision);
+      if (continuation_status != PublishedBrakeContinuationStatus::kNotEligible) {
+        return;
+      }
+    }
+  } else if (reference.task && !reference.motion_reference_support_unavailable) {
     auto task = *reference.task;
     if (stop_for_expired_collision_validation_budget(collision_budget)) {
       return;
@@ -980,11 +1158,6 @@ void CollisionAwareServoComponent::control_tick()
         CommandAttempt::kTracking, tracking_result, motion_state, constraints,
         collision_result.diagnostics);
       mitigated_failure = "Tracking QP command is unavailable";
-      if (reference.tracking) {
-        motion_reference_->recordFaceCommand(
-            *reference.tracking, tracking_result, current_time.seconds(), false,
-            reference.actual_face_alignment);
-      }
     } else {
       std::string candidate_failure;
       CandidateRejectionKind rejection_kind = CandidateRejectionKind::kOther;
@@ -1010,11 +1183,6 @@ void CollisionAwareServoComponent::control_tick()
           motion_reference_->rejectPath();
         }
         mitigated_failure = "Tracking candidate rejected: " + candidate_failure;
-        if (!retryable_reference_guard && reference.tracking) {
-          motion_reference_->recordFaceCommand(
-            *reference.tracking, tracking_result, current_time.seconds(), false,
-            reference.actual_face_alignment);
-        }
       }
     }
   }
@@ -1035,13 +1203,6 @@ void CollisionAwareServoComponent::control_tick()
         collision_result.diagnostics);
       const auto continuation_status = tryContinuePublishedBrake(
         current_time, target, tracking_requested, collision_scene_revision);
-      if (continuation_status != PublishedBrakeContinuationStatus::kContinued) {
-        if (guard_rejected_tracking_result && reference.tracking) {
-          motion_reference_->recordFaceCommand(
-            *reference.tracking, *guard_rejected_tracking_result, current_time.seconds(),
-            false, reference.actual_face_alignment);
-        }
-      }
       if (continuation_status != PublishedBrakeContinuationStatus::kNotEligible) {
         return;
       }
@@ -1062,13 +1223,6 @@ void CollisionAwareServoComponent::control_tick()
     if (!accepted_command.has_value()) {
       const auto continuation_status = tryContinuePublishedBrake(
         current_time, target, tracking_requested, collision_scene_revision);
-      if (continuation_status != PublishedBrakeContinuationStatus::kContinued) {
-        if (guard_rejected_tracking_result && reference.tracking) {
-          motion_reference_->recordFaceCommand(
-            *reference.tracking, *guard_rejected_tracking_result, current_time.seconds(),
-            false, reference.actual_face_alignment);
-        }
-      }
       if (continuation_status != PublishedBrakeContinuationStatus::kNotEligible) {
         return;
       }
@@ -1118,22 +1272,12 @@ void CollisionAwareServoComponent::control_tick()
         }
         if (!reference_guard_recovery_accepted) {
           motion_reference_->rejectPath();
-          if (reference.tracking) {
-            motion_reference_->recordFaceCommand(
-              *reference.tracking, *guard_rejected_tracking_result, current_time.seconds(),
-              false, reference.actual_face_alignment);
-          }
         }
       }
     }
   }
 
   if (!commands_.startup_warmup_complete || !commands_.epoch_active) {
-    if (reference.tracking) {
-      motion_reference_->recordFaceCommand(
-        *reference.tracking, accepted_qp_result, current_time.seconds(), false,
-        reference.actual_face_alignment);
-    }
     process_startup_cycle(*state, *robot_state, *planning_scene);
     return;
   }
@@ -1158,11 +1302,6 @@ void CollisionAwareServoComponent::control_tick()
     return;
   }
   if (publication_status != CommandPublicationStatus::kSuccess) {
-    if (reference.tracking) {
-      motion_reference_->recordFaceCommand(
-        *reference.tracking, accepted_qp_result, current_time.seconds(), false,
-        reference.actual_face_alignment);
-    }
     if (publication_status == CommandPublicationStatus::kRecoverableCommandDeadline ||
       publication_status == CommandPublicationStatus::kRecoverableTimingFailure)
     {
@@ -1190,14 +1329,11 @@ void CollisionAwareServoComponent::control_tick()
     }
     return;
   }
+  compact_profile_publication.markPublished(compact_profile_candidate_accepted);
   telemetry_.observeCommandTransition(
     motion_state, commands_.queue.back(), parameters_.control_period_sec);
   commands_.recordHealthyPublication();
   if (reference.tracking) {
-    motion_reference_->recordFaceCommand(
-      *reference.tracking, accepted_qp_result, current_time.seconds(),
-      controller_mode_ == ControllerMode::kTracking && !reference_guard_recovery_accepted,
-      reference.actual_face_alignment);
     current_tick_context_.face_tracking_published =
       controller_mode_ == ControllerMode::kTracking && !reference_guard_recovery_accepted;
   }
@@ -1309,7 +1445,7 @@ control::QpResult CollisionAwareServoComponent::solve_with_telemetry(
 {
   const auto start = std::chrono::steady_clock::now();
   control::QpResult result = velocity_qp_->solve(
-    task, state, motion_limits_, constraints);
+    task, state, active_motion_limits(), constraints);
   telemetry_.recordQpResult(start, result);
   control::QpResult handoff;
   handoff.primary_snapshot_disposition = result.primary_snapshot_disposition;
@@ -1343,7 +1479,8 @@ control::QpResult CollisionAwareServoComponent::brake_with_telemetry(
   const std::vector<control::LinearVelocityConstraint> & constraints)
 {
   const auto start = std::chrono::steady_clock::now();
-  control::QpResult result = velocity_qp_->brake(state, motion_limits_, constraints);
+  control::QpResult result = velocity_qp_->brake(
+    state, active_motion_limits(), constraints);
   telemetry_.recordQpResult(start, result);
   control::QpResult handoff;
   handoff.primary_snapshot_disposition = result.primary_snapshot_disposition;

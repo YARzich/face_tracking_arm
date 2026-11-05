@@ -1,6 +1,8 @@
 // Copyright 2026 YARzich
 // SPDX-License-Identifier: MIT
 
+#include <rcl/time.h>
+
 #include <Eigen/Geometry>
 #include <Eigen/LU>
 #include <geometric_shapes/shapes.h>
@@ -36,14 +38,17 @@
 #include "collision_aware_servo_component.hpp"
 #include "collision_stopping.hpp"
 #include "face_tracking_arm/face_tracking_policy.hpp"
+#include "face_tracking_arm/compact_maneuver.hpp"
 #include "face_tracking_arm/motion_reference.hpp"
 #include "face_tracking_arm/pointing_geometry.hpp"
 #include "face_tracking_arm/compact_upright.hpp"
+#include "face_tracking_arm/compact_joint_profile.hpp"
 #include "face_tracking_arm/emergency_brake_tail.hpp"
 #include "face_tracking_arm/horizontal_edge_upright.hpp"
 #include "face_tracking_arm/qp_failure_snapshot_io.hpp"
 #include "face_tracking_arm/tracking_velocity_task.hpp"
 #include "face_tracking_arm/posture_preference.hpp"
+#include "face_tracking_arm/snapshot_timing.hpp"
 #include "face_tracking_arm/detail/scalar_braking_policy.hpp"
 
 namespace face_tracking_arm::control
@@ -56,6 +61,94 @@ namespace face_tracking_arm::control
 class MotionReferenceTestPeer final
 {
 public:
+  [[nodiscard]] static bool freshActualStateForTest(
+    const MotionReference & reference, const double tick_time_sec,
+    const std::optional<double> & feedback_time_sec)
+  {
+    const double timeout_sec = reference.parameters_.state_feedback_timeout_sec;
+    if (!feedback_time_sec || !std::isfinite(tick_time_sec) ||
+      !std::isfinite(*feedback_time_sec) || !std::isfinite(timeout_sec) || timeout_sec < 0.0)
+    {
+      return false;
+    }
+    if (reference.clock_ && reference.clock_->get_clock_type() == RCL_ROS_TIME &&
+      reference.clock_->ros_time_is_active())
+    {
+      const auto to_nanoseconds = [](const double time_sec) {
+          if (!std::isfinite(time_sec) || time_sec < 0.0 ||
+            time_sec > static_cast<double>(std::numeric_limits<std::int64_t>::max()) * 1.0e-9)
+          {
+            return std::int64_t{0};
+          }
+          return static_cast<std::int64_t>(std::llround(time_sec * 1.0e9));
+        };
+      return isFreshSnapshotTimestamp(
+        to_nanoseconds(*feedback_time_sec), to_nanoseconds(tick_time_sec),
+        to_nanoseconds(timeout_sec), kSimTimeFeedbackFutureToleranceNs);
+    }
+    return tick_time_sec >= *feedback_time_sec &&
+           tick_time_sec - *feedback_time_sec <= timeout_sec;
+  }
+
+  static void applyRequestedFaceRollGuardDisarmForTest(MotionReference & reference)
+  {
+    if (reference.compact_maneuver_->takeFaceRollGuardDisarmRequest()) {
+      reference.upright_roll_guard_armed_ = false;
+      reference.diagnostics_.upright_roll_guard_armed = false;
+    }
+  }
+
+  [[nodiscard]] static MotionReferenceResult applyCompactOutcomeForTest(
+    MotionReference & reference, const CompactManeuverContext & context,
+    CompactManeuverOutcome outcome)
+  {
+    const bool disarm_requested =
+      reference.compact_maneuver_->takeFaceRollGuardDisarmRequest();
+    const bool disarm_face_roll_guard = outcome.disarm_face_roll_guard || disarm_requested;
+    if (disarm_face_roll_guard) {
+      reference.upright_roll_guard_armed_ = false;
+      reference.diagnostics_.upright_roll_guard_armed = false;
+    }
+    if (outcome.handled) {
+      const bool has_face = context.target &&
+        context.target->mode == msg::TrackingTarget::FACE;
+      if ((outcome.face_directive == CompactFaceDirective::kBuildFace ||
+        outcome.face_directive == CompactFaceDirective::kBuildFaceAndGuard) && has_face)
+      {
+        outcome.result.task = reference.faceTask(
+          context.state, *context.target, context.target_motion,
+          outcome.result, has_face);
+      }
+      if (outcome.face_directive == CompactFaceDirective::kGuardOnly ||
+        outcome.face_directive == CompactFaceDirective::kBuildFaceAndGuard)
+      {
+        static_cast<void>(reference.appendFaceRollGuardConstraints(
+            context.state, context.command_queue_state, outcome.result));
+      }
+    }
+    return std::move(outcome.result);
+  }
+
+  static CompactManeuverContext contextForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const planning_scene::PlanningScene & scene,
+    const std::optional<msg::TrackingTarget> & target,
+    const TargetMotionEstimate & target_motion, const double time_sec,
+    const std::uint64_t scene_revision, const Eigen::VectorXd & position,
+    const bool settled, const bool fresh_actual_state,
+    const std::optional<JointMotionState> & actual_feedback,
+    const std::optional<double> & actual_feedback_time_sec,
+    const std::optional<JointMotionState> & command_queue_state,
+    const PublishedTrajectoryRecord * active_publication,
+    const PublishedTrajectoryRecord * latest_publication)
+  {
+    return CompactManeuverContext{
+      state, scene, target, target_motion, reference.j1_boundary_assessment_,
+      time_sec, scene_revision, position, settled, fresh_actual_state,
+      actual_feedback, actual_feedback_time_sec, command_queue_state,
+      active_publication, latest_publication, reference.upright_roll_guard_armed_};
+  }
+
   static void setFaceRollGuardArmedForTest(MotionReference & reference)
   {
     reference.upright_roll_guard_armed_ = true;
@@ -64,81 +157,543 @@ public:
 
   [[nodiscard]] static bool hasPreparation(const MotionReference & reference)
   {
-    return reference.compact_preparation_.has_value();
+    return reference.compact_maneuver_->compact_preparation_.has_value();
   }
 
-  [[nodiscard]] static PairYawResourceAssessment pairYawAssessment(
+  static bool submitPreparationForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const double time_sec, const std::uint64_t scene_revision,
+    const JointMotionState & actual_feedback,
+    const JointMotionState & command_queue_state,
+    const PublishedTrajectoryRecord * active_publication,
+    const PublishedTrajectoryRecord * latest_publication)
+  {
+    planning_scene::PlanningScene scene(reference.robot_model_);
+    const std::optional<msg::TrackingTarget> target;
+    const TargetMotionEstimate target_motion;
+    const std::optional<JointMotionState> actual{actual_feedback};
+    const std::optional<double> actual_stamp{time_sec};
+    const std::optional<JointMotionState> queue{command_queue_state};
+    const auto context = contextForTest(
+      reference, state, scene, target, target_motion, time_sec, scene_revision,
+      actual_feedback.position,
+      reference.compact_maneuver_->motionSettled(actual_feedback, queue),
+      freshActualStateForTest(reference, time_sec, actual_stamp),
+      actual, actual_stamp, queue, active_publication, latest_publication);
+    const auto outcome = reference.compact_maneuver_->submitCompactPreparationPlan(context);
+    return outcome == CompactManeuver::CompactPreparationSubmitOutcome::kSubmitted;
+  }
+
+  [[nodiscard]] static Eigen::VectorXd submittedStartForTest(
     const MotionReference & reference)
   {
-    return reference.pair_yaw_assessment_;
+    return reference.compact_maneuver_->compact_preparation_ ?
+           reference.compact_maneuver_->compact_preparation_->submitted_start_positions :
+           Eigen::VectorXd{};
+  }
+
+  [[nodiscard]] static Eigen::VectorXd exhaustedStartForTest(
+    const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_preparation_ ?
+           reference.compact_maneuver_->compact_preparation_->exhausted_start_positions :
+           Eigen::VectorXd{};
+  }
+
+  static void keepOnlyFirstCandidateForTest(MotionReference & reference)
+  {
+    if (reference.compact_maneuver_->compact_preparation_) {
+      reference.compact_maneuver_->compact_preparation_->candidates.resize(1U);
+      reference.compact_maneuver_->compact_preparation_->candidate_index = 0U;
+    }
+  }
+
+  /// These lifecycle fixtures start after a compact trigger has been accepted;
+  /// they do not inject a kinematic reason or an alternate joint resource.
+  static void qualifyCompactPhaseForIsolatedPreparationTest(MotionReference & reference)
+  {
+    reference.upright_roll_guard_armed_ = true;
+    reference.diagnostics_.upright_roll_guard_armed = true;
+    static_cast<void>(reference.compact_maneuver_->face_policy_.update(FaceTrackingPolicyInput{true,
+      false}));
+  }
+
+  static J1BoundaryAssessment updateJ1BoundaryForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const std::optional<msg::TrackingTarget> & target,
+    const bool fresh_actual_state,
+    const std::optional<JointMotionState> & actual_feedback,
+    const std::optional<JointMotionState> & command_queue_state)
+  {
+    reference.updateJ1BoundaryAndLimitHold(
+      state, target, TargetMotionEstimate{}, 1.0, fresh_actual_state,
+      actual_feedback, command_queue_state);
+    return reference.j1_boundary_assessment_;
+  }
+
+  static std::optional<CompactJointProfile> installAcceptedProfileForTest(
+    MotionReference & reference, const JointMotionState & start,
+    const Eigen::VectorXd & goal, const std::size_t cursor = 0U)
+  {
+    const std::vector<Eigen::VectorXd> path{start.position, goal};
+    auto profile = buildCompactJointProfile(
+      path, start, reference.compact_maneuver_->compact_limits_,
+        reference.parameters_.control_period_sec,
+      reference.compact_maneuver_->compact_speed_scale_, {1.0});
+    if (profile) {
+      reference.compact_maneuver_->compact_path_execution_.install(*profile,
+          reference.compact_maneuver_->compact_limits_);
+      for (std::size_t index = 0U;
+        index < std::min(cursor, profile->samples.size() - 1U); ++index)
+      {
+        reference.compact_maneuver_->compact_path_execution_.recordCommandPublished(true);
+      }
+      reference.compact_maneuver_->compact_commit_initialized_ = true;
+      reference.compact_maneuver_->compact_path_adopted_ = true;
+      static_cast<void>(reference.compact_maneuver_->face_policy_.update({true, false}));
+    }
+    return profile;
+  }
+
+  static bool activatePreparedReturnProfileForTest(MotionReference & reference)
+  {
+    if (!reference.compact_maneuver_->compact_prepared_return_profile_ ||
+      reference.compact_maneuver_->compact_prepared_return_profile_->samples.size() < 2U)
+    {
+      return false;
+    }
+    reference.compact_maneuver_->compact_path_execution_.install(
+      std::move(*reference.compact_maneuver_->compact_prepared_return_profile_),
+        reference.compact_maneuver_->compact_limits_);
+    reference.compact_maneuver_->compact_prepared_return_profile_.reset();
+    reference.compact_maneuver_->compact_return_endpoint_ =
+      reference.compact_maneuver_->compact_path_execution_.profile()->samples.back().position;
+    reference.compact_maneuver_->compact_return_profile_active_ = true;
+    reference.compact_maneuver_->compact_return_path_pending_ = true;
+    reference.compact_maneuver_->compact_goal_reached_ = true;
+    reference.compact_maneuver_->compact_path_endpoint_reached_ = false;
+    reference.compact_maneuver_->compact_path_adopted_ = true;
+    return true;
+  }
+
+  static bool installFrozenReturnStageForTest(
+    MotionReference & reference, const moveit::core::RobotState & working_state)
+  {
+    if (!reference.group_ || !reference.command_link_ || !reference.base_link_ ||
+      !reference.posture_task_builder_)
+    {
+      return false;
+    }
+    const auto & names = reference.group_->getVariableNames();
+    const auto joint1 = std::find(names.begin(), names.end(), "joint1");
+    if (joint1 == names.end()) {
+      return false;
+    }
+    const Eigen::Index joint1_index = static_cast<Eigen::Index>(
+      std::distance(names.begin(), joint1));
+    CompactReturnRegion region;
+    Eigen::VectorXd reference_positions;
+    working_state.copyJointGroupPositions(reference.group_, reference_positions);
+    region.reference_positions = reference_positions;
+    const auto & screen_pose = working_state.getGlobalLinkTransform(reference.command_link_);
+    region.center_world = screen_pose.translation();
+    region.outward_x_world = region.center_world -
+      working_state.getGlobalLinkTransform(reference.base_link_).translation();
+    region.outward_x_world.z() = 0.0;
+    if (!region.center_world.allFinite() || !region.outward_x_world.allFinite() ||
+      region.outward_x_world.head<2>().norm() <= 1.0e-6)
+    {
+      return false;
+    }
+    region.outward_x_world.normalize();
+    region.radius_m = 0.10;
+    region.direction_tolerance_rad = 15.0 * 3.14159265358979323846 / 180.0;
+    region.horizontal_edge_tolerance_rad = 15.0 * 3.14159265358979323846 / 180.0;
+    region.target_joint1_rad = reference_positions[joint1_index] -
+      2.0 * 3.14159265358979323846;
+    region.joint1_tolerance_rad = 0.025;
+    region.comfortable_joint3_lower =
+      reference.posture_task_builder_->comfortableJoint3Lower();
+    region.comfortable_joint3_upper =
+      reference.posture_task_builder_->comfortableJoint3Upper();
+    region.minimum_elbow_height_m = reference.parameters_.maximum_linear_reference_mps *
+      reference.parameters_.control_period_sec;
+    Eigen::VectorXd endpoint = reference_positions;
+    endpoint[joint1_index] = region.target_joint1_rad;
+    if (!reference.compact_maneuver_->validateCompactReturnRegion(
+        working_state, endpoint, region))
+    {
+      return false;
+    }
+
+    reference.compact_maneuver_->compact_goal_.return_region = region;
+    reference.compact_maneuver_->compact_commit_initialized_ = true;
+    static_cast<void>(reference.compact_maneuver_->face_policy_.update({true, false}));
+    if (reference.compact_maneuver_->compact_geometry_validator_) {
+      reference.compact_maneuver_->compact_goal_.path_requirements.maximum_assembly_radius_m =
+        reference.compact_maneuver_->compact_geometry_validator_->maximumAssemblyRadius(
+          working_state) + 0.01;
+    }
+    reference.compact_maneuver_->compact_return_endpoint_ = std::move(endpoint);
+    reference.compact_maneuver_->compact_return_profile_active_ = true;
+    reference.compact_maneuver_->compact_return_path_pending_ = true;
+    reference.compact_maneuver_->compact_path_endpoint_reached_ = false;
+    reference.diagnostics_.compact_phase = "RETURN_PATH";
+    reference.diagnostics_.state = "COMPACT_RETURN_PATH";
+    return true;
+  }
+
+  [[nodiscard]] static Eigen::VectorXd returnEndpointForTest(
+    const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_return_endpoint_;
+  }
+
+  static void activateRadiusOnlyCompactForTest(
+    MotionReference & reference, const moveit::core::RobotState & start,
+    const double radius_cap_m)
+  {
+    reference.compact_maneuver_->face_policy_.clearForStop();
+    static_cast<void>(reference.compact_maneuver_->face_policy_.update({true, false}));
+    reference.compact_maneuver_->compact_commit_initialized_ = true;
+    reference.compact_maneuver_->compact_goal_.profile_id = "radius_only_test_fixture";
+    start.copyJointGroupPositions(reference.group_,
+        reference.compact_maneuver_->compact_goal_.bounded_positions);
+    reference.compact_maneuver_->compact_goal_.path_requirements.maximum_assembly_radius_m =
+      radius_cap_m;
+    reference.compact_maneuver_->compact_radius_floor_latched_ = false;
+    reference.compact_maneuver_->compact_return_path_pending_ = false;
+    reference.diagnostics_.compact_phase = "PATH";
+  }
+
+  static MotionReferenceResult finishReturnStageForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const JointMotionState & actual_feedback, const JointMotionState & command_queue_state,
+    const bool endpoint_reached, const double time_sec)
+  {
+    reference.compact_maneuver_->compact_path_endpoint_reached_ = endpoint_reached;
+    MotionReferenceResult result;
+    planning_scene::PlanningScene scene(reference.robot_model_);
+    const std::optional<msg::TrackingTarget> target;
+    const TargetMotionEstimate target_motion;
+    const std::optional<JointMotionState> actual{actual_feedback};
+    const std::optional<double> actual_stamp{time_sec};
+    const std::optional<JointMotionState> queue{command_queue_state};
+    Eigen::VectorXd position;
+    state.copyJointGroupPositions(reference.group_, position);
+    const auto context = contextForTest(
+      reference, state, scene, target, target_motion, time_sec,
+      reference.compact_maneuver_->active_scene_revision_.value_or(0U), position,
+      reference.compact_maneuver_->motionSettled(actual_feedback, queue),
+      freshActualStateForTest(reference, time_sec, actual_stamp),
+      actual, actual_stamp, queue, nullptr, nullptr);
+    reference.compact_maneuver_->finishCompactReturnProfileStage(context, result);
+    return result;
+  }
+
+  static void installPendingPrefixForTest(
+    MotionReference & reference, const JointMotionState & endpoint)
+  {
+    CompactJointProfile prefix;
+    prefix.samples.push_back(endpoint);
+    reference.compact_maneuver_->compact_path_execution_.install(prefix,
+        reference.compact_maneuver_->compact_limits_);
+    reference.compact_maneuver_->compact_path_adopted_ = true;
+    reference.compact_maneuver_->compact_commit_initialized_ = true;
+    reference.compact_maneuver_->active_scene_revision_ = 12U;
+    static_cast<void>(reference.compact_maneuver_->face_policy_.update({true, false}));
+    CompactManeuver::PendingCompactProfileWork pending;
+    pending.request_id = 5U;
+    pending.generation = reference.diagnostics_.compact_generation;
+    pending.scene_revision = 12U;
+    pending.fixed_prefix = prefix.samples;
+    pending.prefix_endpoint_sample_index = 0U;
+    reference.compact_maneuver_->pending_compact_profile_work_ = std::move(pending);
+  }
+
+  static void installPendingFailurePrefixForTest(
+    MotionReference & reference, const JointMotionState & start)
+  {
+    JointMotionState endpoint = start;
+    endpoint.position[0] += 0.001;
+    endpoint.velocity.setZero();
+    endpoint.acceleration.setZero();
+    CompactJointProfile prefix;
+    prefix.samples = {start, endpoint};
+    prefix.prefix_endpoint_sample_index = 1U;
+    reference.compact_maneuver_->compact_path_execution_.install(prefix,
+        reference.compact_maneuver_->compact_limits_);
+    reference.compact_maneuver_->compact_path_adopted_ = true;
+    reference.compact_maneuver_->compact_commit_initialized_ = true;
+    reference.compact_maneuver_->active_scene_revision_ = 12U;
+    static_cast<void>(reference.compact_maneuver_->face_policy_.update({true, false}));
+    CompactProfileWorkRequest request;
+    request.generation = reference.diagnostics_.compact_generation;
+    request.scene_revision = 12U;
+    request.limits = reference.compact_maneuver_->compact_limits_;
+    request.control_period_sec = reference.parameters_.control_period_sec;
+    request.profile = CompactJointProfile{};
+    CompactManeuver::PendingCompactProfileWork pending;
+    pending.request_id =
+      reference.compact_maneuver_->compact_profile_worker_->submit(std::move(request));
+    pending.generation = reference.diagnostics_.compact_generation;
+    pending.scene_revision = 12U;
+    pending.kind = CompactManeuver::CompactProfileWorkKind::kReadoption;
+    pending.fixed_prefix = prefix.samples;
+    pending.prefix_endpoint_sample_index = 1U;
+    reference.compact_maneuver_->pending_compact_profile_work_ = std::move(pending);
+  }
+
+  static void consumeTorqueResultForTest(
+    MotionReference & reference, const double time_sec, const std::uint64_t scene_revision)
+  {
+    reference.compact_maneuver_->consumeCompactProfileWorkResult(time_sec, scene_revision);
+  }
+
+  static void runCompactTaskForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const JointMotionState & queue, const double time_sec, MotionReferenceResult & result)
+  {
+    planning_scene::PlanningScene scene(reference.robot_model_);
+    const std::optional<msg::TrackingTarget> target;
+    const TargetMotionEstimate target_motion;
+    const std::optional<JointMotionState> actual;
+    const std::optional<double> actual_stamp;
+    const std::optional<JointMotionState> queue_state{queue};
+    const auto context = contextForTest(
+      reference, state, scene, target, target_motion, time_sec, 12U,
+      queue.position, false, false, actual, actual_stamp, queue_state, nullptr, nullptr);
+    static_cast<void>(reference.compact_maneuver_->compactTask(context, result));
+  }
+
+  [[nodiscard]] static bool pendingPrefixIsHeld(
+    const MotionReference & reference, const std::size_t expected_samples = 1U)
+  {
+    return !reference.compact_maneuver_->compact_path_endpoint_reached_ &&
+           reference.compact_maneuver_->compact_path_execution_.active() &&
+           reference.compact_maneuver_->compact_path_execution_.profile()->samples.size() ==
+           expected_samples &&
+           reference.compact_maneuver_->pending_compact_profile_work_.has_value();
+  }
+
+  [[nodiscard]] static bool profileWorkPending(const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->pending_compact_profile_work_.has_value();
+  }
+
+  static bool finishTorqueProfileWorkForTest(
+    MotionReference & reference, const double time_sec, const std::uint64_t scene_revision)
+  {
+    if (reference.compact_maneuver_->pending_compact_profile_work_ &&
+      reference.compact_maneuver_->compact_path_execution_.active() &&
+      reference.compact_maneuver_->compact_path_execution_.cursor() <
+      reference.compact_maneuver_->pending_compact_profile_work_->prefix_endpoint_sample_index)
+    {
+      return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (reference.compact_maneuver_->pending_compact_profile_work_ &&
+      std::chrono::steady_clock::now() < deadline)
+    {
+      reference.compact_maneuver_->consumeCompactProfileWorkResult(time_sec, scene_revision);
+      if (reference.compact_maneuver_->pending_compact_profile_work_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    return !reference.compact_maneuver_->pending_compact_profile_work_;
+  }
+
+  [[nodiscard]] static std::optional<CompactJointProfile> profileSnapshotForTest(
+    const MotionReference & reference)
+  {
+    if (!reference.compact_maneuver_->compact_path_execution_.profile()) {
+      return std::nullopt;
+    }
+    return *reference.compact_maneuver_->compact_path_execution_.profile();
+  }
+
+  [[nodiscard]] static std::optional<CompactJointProfile> preparedReturnProfileForTest(
+    const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_prepared_return_profile_;
+  }
+
+  [[nodiscard]] static std::optional<CompactReturnRegion> returnRegionForTest(
+    const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_goal_.return_region;
+  }
+
+  static bool validateReturnEndpointForTest(
+    const MotionReference & reference, const Eigen::VectorXd & endpoint,
+    const CompactReturnRegion & region)
+  {
+    moveit::core::RobotState state(reference.robot_model_);
+    state.setToDefaultValues();
+    state.update(true);
+    return reference.compact_maneuver_->validateCompactReturnRegion(state, endpoint, region);
+  }
+
+  [[nodiscard]] static bool returnProfileActiveForTest(const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_return_profile_active_;
+  }
+
+  [[nodiscard]] static const JointMotionLimits & compactLimitsForTest(
+    const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_limits_;
+  }
+
+  [[nodiscard]] static const JointMotionLimits & returnLimitsForTest(
+    const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_return_limits_;
+  }
+
+  [[nodiscard]] static double compactSpeedScaleForTest(const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_speed_scale_;
+  }
+
+  [[nodiscard]] static std::size_t profileCursorForTest(const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_path_execution_.cursor();
+  }
+
+  static void setProfileCursorForTest(
+    MotionReference & reference, const std::size_t cursor)
+  {
+    if (reference.compact_maneuver_->compact_path_execution_.active()) {
+      const auto * profile = reference.compact_maneuver_->compact_path_execution_.profile();
+      for (std::size_t index = reference.compact_maneuver_->compact_path_execution_.cursor();
+        index < std::min(cursor, profile->samples.size() - 1U); ++index)
+      {
+        reference.compact_maneuver_->compact_path_execution_.recordCommandPublished(true);
+      }
+    }
+  }
+
+  static void setActiveSceneRevisionForTest(
+    MotionReference & reference, const std::uint64_t revision)
+  {
+    reference.compact_maneuver_->active_scene_revision_ = revision;
+  }
+
+  static void invalidateCompactMotionLimitsForTest(MotionReference & reference)
+  {
+    reference.compact_maneuver_->compact_limits_.max_jerk.setZero();
+  }
+
+  static bool appendUprightConstraintsForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const JointMotionState & motion_state, MotionReferenceResult & result)
+  {
+    return reference.appendUprightConstraints(state, motion_state, result);
+  }
+
+  static bool appendCompactPathConstraintsForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const JointMotionState & motion_state, MotionReferenceResult & result)
+  {
+    return reference.compact_maneuver_->appendCompactPathConstraints(
+      state, motion_state, result);
+  }
+
+  static double compactAccelerationLimitForTest(
+    const MotionReference & reference, const Eigen::Index joint_index)
+  {
+    return reference.compact_maneuver_->compact_limits_.max_acceleration[joint_index];
+  }
+
+  static double compactVelocityLimitForTest(
+    const MotionReference & reference, const Eigen::Index joint_index)
+  {
+    return reference.compact_maneuver_->compact_limits_.max_velocity[joint_index];
+  }
+
+  [[nodiscard]] static JointMotionLimits compactMotionLimitsForTest(
+    const MotionReference & reference)
+  {
+    return reference.compact_maneuver_->compact_limits_;
   }
 
   [[nodiscard]] static std::size_t candidateIndex(const MotionReference & reference)
   {
-    return reference.compact_preparation_ ?
-           reference.compact_preparation_->candidate_index : 0U;
+    return reference.compact_maneuver_->compact_preparation_ ?
+           reference.compact_maneuver_->compact_preparation_->candidate_index : 0U;
   }
 
   [[nodiscard]] static std::size_t candidateCount(const MotionReference & reference)
   {
-    return reference.compact_preparation_ ?
-           reference.compact_preparation_->candidates.size() : 0U;
+    return reference.compact_maneuver_->compact_preparation_ ?
+           reference.compact_maneuver_->compact_preparation_->candidates.size() : 0U;
   }
 
   [[nodiscard]] static double comfortableJoint3Lower(const MotionReference & reference)
   {
-    return reference.posture_preference_config_.comfortable_joint3_lower;
+    return reference.posture_task_builder_->comfortableJoint3Lower();
   }
 
   [[nodiscard]] static double comfortableJoint3Upper(const MotionReference & reference)
   {
-    return reference.posture_preference_config_.comfortable_joint3_upper;
+    return reference.posture_task_builder_->comfortableJoint3Upper();
   }
 
   [[nodiscard]] static CompactGoal candidate(
     const MotionReference & reference, const std::size_t index)
   {
-    if (!reference.compact_preparation_ ||
-      index >= reference.compact_preparation_->candidates.size())
+    if (!reference.compact_maneuver_->compact_preparation_ ||
+      index >= reference.compact_maneuver_->compact_preparation_->candidates.size())
     {
       return {};
     }
-    return reference.compact_preparation_->candidates[index];
+    return reference.compact_maneuver_->compact_preparation_->candidates[index];
   }
 
   [[nodiscard]] static bool preparationExhausted(const MotionReference & reference)
   {
-    return reference.compact_preparation_ && reference.compact_preparation_->exhausted;
+    return reference.compact_maneuver_->compact_preparation_ &&
+           reference.compact_maneuver_->compact_preparation_->exhausted;
   }
 
   [[nodiscard]] static std::optional<std::uint64_t> pendingGeneration(
     const MotionReference & reference)
   {
-    return reference.pending_generation_;
+    return reference.compact_maneuver_->pending_generation_;
   }
 
   static void clearDefaultCandidatesForTest(MotionReference & reference)
   {
-    reference.default_compact_goals_.clear();
+    reference.compact_maneuver_->default_compact_goals_.clear();
   }
 
   static void activateResultGeneration(
     MotionReference & reference, const std::uint64_t generation)
   {
-    if (!reference.compact_preparation_ || reference.compact_preparation_->exhausted ||
-      reference.compact_preparation_->candidate_index >=
-      reference.compact_preparation_->candidates.size())
+    if (!reference.compact_maneuver_->compact_preparation_ ||
+      reference.compact_maneuver_->compact_preparation_->exhausted ||
+      reference.compact_maneuver_->compact_preparation_->candidate_index >=
+      reference.compact_maneuver_->compact_preparation_->candidates.size())
     {
       return;
     }
-    reference.compact_preparation_->generation = generation;
-    reference.pending_generation_ = generation;
-    reference.active_scene_revision_ = reference.compact_preparation_->scene_revision;
+    reference.compact_maneuver_->compact_preparation_->generation = generation;
+    reference.compact_maneuver_->pending_generation_ = generation;
+    reference.compact_maneuver_->active_scene_revision_ =
+      reference.compact_maneuver_->compact_preparation_->scene_revision;
   }
 
   static void cancelPlannerForTest(MotionReference & reference)
   {
     reference.planner_->cancel();
+  }
+
+  static void clearPendingPlannerForSubmissionTest(MotionReference & reference)
+  {
+    reference.planner_->cancel();
+    reference.compact_maneuver_->pending_generation_.reset();
+    reference.compact_maneuver_->compact_plan_pending_ = false;
   }
 
   static bool installRestFollowerPathForTest(
@@ -188,7 +743,16 @@ public:
   static double assemblyRadiusForTest(
     const MotionReference & reference, const moveit::core::RobotState & state)
   {
-    return reference.compact_geometry_validator_->maximumAssemblyRadius(state);
+    return reference.compact_maneuver_->compact_geometry_validator_->maximumAssemblyRadius(state);
+  }
+
+  static CompactProfileFinalGeometryValidator finalGeometryValidatorForTest(
+    const MotionReference & reference, const planning_scene::PlanningScene & scene,
+    const moveit::core::RobotState & state, const std::uint64_t scene_revision,
+    const double radius_cap_m)
+  {
+    return reference.compact_maneuver_->makeCompactProfileFinalGeometryValidator(
+      scene, state, scene_revision, radius_cap_m);
   }
 
   static void beginPreparation(
@@ -200,14 +764,27 @@ public:
     const PublishedTrajectoryRecord * active_publication,
     const PublishedTrajectoryRecord * latest_publication)
   {
-    reference.requestCompactManeuver(
-      state, time_sec, scene, scene_revision, "test_preparation",
-      actual_feedback, command_queue_state, active_publication, latest_publication);
+    const std::optional<msg::TrackingTarget> target;
+    const TargetMotionEstimate target_motion;
+    Eigen::VectorXd position = actual_feedback ? actual_feedback->position :
+      reference.groupPosition(state);
+    const bool settled = actual_feedback && command_queue_state &&
+      reference.compact_maneuver_->motionSettled(
+      *actual_feedback, command_queue_state);
+    const std::optional<double> actual_stamp = actual_feedback ?
+      std::optional<double>{time_sec} : std::nullopt;
+    const auto context = contextForTest(
+      reference, state, scene, target, target_motion, time_sec, scene_revision,
+      position, settled,
+      freshActualStateForTest(reference, time_sec, actual_stamp), actual_feedback, actual_stamp,
+      command_queue_state, active_publication, latest_publication);
+    reference.compact_maneuver_->requestCompactManeuver(context, "test_preparation");
+    applyRequestedFaceRollGuardDisarmForTest(reference);
   }
 
 
-  /// Exercise preparation admission after a synthetic qualified pair resource
-  /// assessment; public update gate behavior has separate real-FK tests.
+  /// Exercise preparation admission after the trigger has already been accepted;
+  /// public update gate behavior has separate real-FK tests.
   static MotionReferenceResult handleQualifiedPreparationForTest(
     MotionReference & reference, const moveit::core::RobotState & state,
     const msg::TrackingTarget & target, const planning_scene::PlanningScene & scene,
@@ -216,37 +793,26 @@ public:
     const std::optional<JointMotionState> & command_queue_state,
     const bool preserve_existing_roll_guard = false)
   {
+    qualifyCompactPhaseForIsolatedPreparationTest(reference);
     const bool roll_guard_was_armed = reference.upright_roll_guard_armed_;
-    qualifyPairYawForIsolatedAdmissionTest(reference);
     reference.upright_roll_guard_armed_ = preserve_existing_roll_guard && roll_guard_was_armed;
     reference.diagnostics_.upright_roll_guard_armed = reference.upright_roll_guard_armed_;
-    Eigen::VectorXd position;
-    state.copyJointGroupPositions(reference.group_, position);
-    MotionReferenceResult result;
-    static_cast<void>(reference.handleCompactPreparation(
-        state, target, TargetMotionEstimate{}, scene, time_sec, scene_revision,
-        position, true, actual_feedback, time_sec, command_queue_state,
-        nullptr, nullptr, result));
-    return result;
-  }
-
-  static MotionReferenceResult handlePreparationWithAssessmentForTest(
-    MotionReference & reference, const moveit::core::RobotState & state,
-    const msg::TrackingTarget & target, const planning_scene::PlanningScene & scene,
-    const double time_sec, const std::uint64_t scene_revision,
-    const JointMotionState & actual_feedback,
-    const std::optional<JointMotionState> & command_queue_state,
-    const PairYawResourceAssessment & assessment)
-  {
-    reference.pair_yaw_assessment_ = assessment;
-    Eigen::VectorXd position;
-    state.copyJointGroupPositions(reference.group_, position);
-    MotionReferenceResult result;
-    static_cast<void>(reference.handleCompactPreparation(
-        state, target, TargetMotionEstimate{}, scene, time_sec, scene_revision,
-        position, true, actual_feedback, time_sec, command_queue_state,
-        nullptr, nullptr, result));
-    return result;
+    const std::optional<msg::TrackingTarget> optional_target{target};
+    const TargetMotionEstimate target_motion;
+    const std::optional<JointMotionState> actual{actual_feedback};
+    const std::optional<double> actual_stamp{time_sec};
+    const Eigen::VectorXd position = actual_feedback.position;
+    const bool settled = reference.compact_maneuver_->motionSettled(
+      actual_feedback, command_queue_state);
+    const auto context = contextForTest(
+      reference, state, scene, optional_target, target_motion, time_sec,
+      scene_revision, position, settled,
+      freshActualStateForTest(reference, time_sec, actual_stamp), actual, actual_stamp,
+      command_queue_state, nullptr, nullptr);
+    CompactManeuverOutcome outcome;
+    outcome.handled = reference.compact_maneuver_->handleCompactPreparation(
+      context, outcome);
+    return applyCompactOutcomeForTest(reference, context, std::move(outcome));
   }
 
   static bool armFaceUprightRollGuardFromFeedbackForTest(
@@ -258,54 +824,184 @@ public:
       state, time_sec, actual_feedback, time_sec, command_queue_state, nullptr, nullptr);
   }
 
-  /// Isolated planner/admission fixtures begin after the production pair gate.
-  /// Real FK and public update gating are covered by dedicated tests below;
-  /// this injected certificate keeps these cases focused on path admission.
-  static void qualifyPairYawForIsolatedAdmissionTest(MotionReference & reference)
+  static bool armFaceUprightRollGuardAtFeedbackStampForTest(
+    MotionReference & reference, const moveit::core::RobotState & state,
+    const double time_sec, const double feedback_time_sec,
+    const JointMotionState & actual_feedback, const JointMotionState & command_queue_state)
   {
-    PairYawResourceInput input;
-    input.target_bearing_rate_radps = 0.4;
-    input.target_rate_deadband_radps = 0.01;
-    input.j1 = PairYawJointResourceInput{
-      -1.0, 1.9, 1.9, -2.0, 2.0, 0.10, BaseJointDirection::kNone};
-    input.j4 = PairYawJointResourceInput{
-      -1.0, 1.9, 1.9, -2.0, 2.0, 0.10, BaseJointDirection::kNone};
-    reference.pair_yaw_assessment_ = assessPairYawResource(input);
-    auto & assessment = reference.pair_yaw_assessment_;
-    assessment.probe_valid = true;
-    assessment.actual_probe_solved = true;
-    assessment.relaxed_probe_solved = true;
-    assessment.actual_available_yaw_rad = 0.0;
-    assessment.pair_relaxed_available_yaw_rad = kPairYawProbeDisplacementRad;
-    assessment.actual_roll_residual_rad = 0.0;
-    assessment.relaxed_roll_residual_rad = 0.0;
-    assessment.actual_elevation_residual_rad = 0.0;
-    assessment.relaxed_elevation_residual_rad = 0.0;
-    assessment.pair_bound_cause = pairYawProbeShowsPairBoundCause(assessment);
-    assessment.exhausted = assessment.pair_bound_cause;
-    reference.upright_roll_guard_armed_ = true;
-    static_cast<void>(reference.face_policy_.update({true, false}));
+    return reference.maybeArmFaceUprightRollGuard(
+      state, time_sec, actual_feedback, feedback_time_sec, command_queue_state, nullptr, nullptr);
+  }
+
+  static void setExplicitSystemClockForTest(MotionReference & reference)
+  {
+    reference.clock_ = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
+  }
+
+  static void setClockForTest(
+    MotionReference & reference, const rclcpp::Clock::SharedPtr & clock)
+  {
+    reference.clock_ = clock;
   }
 
   static void removeCompactProfileForTest(MotionReference & reference)
   {
-    reference.compact_goal_.profile_id.clear();
-    reference.compact_geometry_validator_.reset();
-    reference.default_compact_goals_.clear();
+    reference.compact_maneuver_->compact_goal_.profile_id.clear();
+    reference.compact_maneuver_->compact_geometry_validator_.reset();
+    reference.compact_maneuver_->default_compact_goals_.clear();
+  }
+
+  static bool installValidWorkingReturnRegionForTest(MotionReference & reference)
+  {
+    if (!reference.robot_model_ || !reference.group_ || !reference.command_link_ ||
+      !reference.base_link_ || !reference.posture_task_builder_ ||
+      !reference.compact_maneuver_->compact_preparation_)
+    {
+      return false;
+    }
+    auto & preparation = *reference.compact_maneuver_->compact_preparation_;
+    if (preparation.exhausted || preparation.candidate_index >= preparation.candidates.size()) {
+      return false;
+    }
+    const auto & names = reference.group_->getVariableNames();
+    const auto joint1 = std::find(names.begin(), names.end(), "joint1");
+    if (joint1 == names.end()) {
+      return false;
+    }
+    const auto joint1_index = static_cast<Eigen::Index>(
+      std::distance(names.begin(), joint1));
+    const auto & candidate = preparation.candidates[preparation.candidate_index];
+    const auto * existing_region = preparation.return_region ?
+      &*preparation.return_region :
+      (candidate.return_region ? &*candidate.return_region : nullptr);
+    const auto expected_dof = static_cast<Eigen::Index>(reference.group_->getVariableCount());
+    if (preparation.submitted_start_positions.size() != expected_dof ||
+      candidate.bounded_positions.size() != expected_dof ||
+      (existing_region && existing_region->reference_positions.size() != expected_dof))
+    {
+      return false;
+    }
+
+    const double reference_joint1 = existing_region ?
+      existing_region->reference_positions[joint1_index] :
+      preparation.submitted_start_positions[joint1_index];
+    CompactReturnRegion region = existing_region ? *existing_region : CompactReturnRegion{};
+    region.reference_positions = existing_region ? existing_region->reference_positions :
+      preparation.submitted_start_positions;
+    const double turn_delta = candidate.bounded_positions[joint1_index] -
+      preparation.submitted_start_positions[joint1_index];
+    const double turn_direction = std::abs(turn_delta) > 1.0e-3 ? turn_delta :
+      (reference.j1_boundary_assessment_.edge_direction == BaseJointDirection::kNegative ?
+      -1.0 : 1.0);
+    if (!existing_region) {
+      region.target_joint1_rad = reference_joint1 +
+        std::copysign(2.0 * std::acos(-1.0), turn_direction);
+      region.joint1_tolerance_rad = 0.025;
+    } else {
+      if (std::abs(std::abs(region.target_joint1_rad - reference_joint1) -
+        2.0 * std::acos(-1.0)) > 1.0e-6)
+      {
+        return false;
+      }
+    }
+
+    if (existing_region) {
+      moveit::core::RobotState existing_state(reference.robot_model_);
+      existing_state.setToDefaultValues();
+      existing_state.setJointGroupPositions(reference.group_, existing_region->reference_positions);
+      existing_state.update(true);
+      Eigen::VectorXd endpoint = existing_region->reference_positions;
+      endpoint[joint1_index] = existing_region->target_joint1_rad;
+      if (reference.compact_maneuver_->validateCompactReturnRegion(
+          existing_state, endpoint, *existing_region))
+      {
+        preparation.return_region = *existing_region;
+        for (auto & candidate : preparation.candidates) {
+          candidate.return_region = *existing_region;
+        }
+        return true;
+      }
+    }
+
+    region.radius_m = 0.10;
+    region.direction_tolerance_rad = 15.0 * std::acos(-1.0) / 180.0;
+    region.horizontal_edge_tolerance_rad = 15.0 * std::acos(-1.0) / 180.0;
+    region.comfortable_joint3_lower =
+      reference.posture_task_builder_->comfortableJoint3Lower();
+    region.comfortable_joint3_upper =
+      reference.posture_task_builder_->comfortableJoint3Upper();
+    region.minimum_elbow_height_m = reference.parameters_.maximum_linear_reference_mps *
+      reference.parameters_.control_period_sec;
+
+    const auto try_pose = [&reference, &preparation, &region, joint1_index](
+      moveit::core::RobotState working_state) {
+        working_state.setVariablePosition("joint1", region.reference_positions[joint1_index]);
+        working_state.setJointGroupVelocities(
+          reference.group_, Eigen::VectorXd::Zero(reference.group_->getVariableCount()));
+        working_state.setJointGroupAccelerations(
+          reference.group_, Eigen::VectorXd::Zero(reference.group_->getVariableCount()));
+        working_state.update(true);
+        working_state.copyJointGroupPositions(reference.group_, region.reference_positions);
+        const auto & screen_pose = working_state.getGlobalLinkTransform(reference.command_link_);
+        region.center_world = screen_pose.translation();
+        region.outward_x_world = region.center_world -
+          working_state.getGlobalLinkTransform(reference.base_link_).translation();
+        region.outward_x_world.z() = 0.0;
+        if (!region.center_world.allFinite() || !region.outward_x_world.allFinite() ||
+          region.outward_x_world.head<2>().norm() <= 1.0e-6)
+        {
+          return false;
+        }
+        region.outward_x_world.normalize();
+        Eigen::VectorXd endpoint = region.reference_positions;
+        endpoint[joint1_index] = region.target_joint1_rad;
+        if (!reference.compact_maneuver_->validateCompactReturnRegion(
+            working_state, endpoint, region))
+        {
+          return false;
+        }
+        preparation.return_region = region;
+        for (auto & candidate : preparation.candidates) {
+          candidate.return_region = region;
+        }
+        return true;
+      };
+
+    moveit::core::RobotState submitted_state(reference.robot_model_);
+    submitted_state.setToDefaultValues();
+    submitted_state.setJointGroupPositions(reference.group_, preparation.submitted_start_positions);
+    submitted_state.update(true);
+    if (try_pose(std::move(submitted_state))) {
+      return true;
+    }
+    moveit::core::RobotState working_state(reference.robot_model_);
+    working_state.setToDefaultValues();
+    if (!working_state.setToDefaultValues(reference.group_, "rest")) {
+      return false;
+    }
+    // Deterministic comfortable compact workspace fixture. The endpoint has
+    // positive elbow height and remains within the initial 0.40 m radius cap.
+    working_state.setVariablePosition("joint2", -0.66);
+    working_state.setVariablePosition("joint3", -0.3696309078954824);
+    working_state.setVariablePosition("joint4", 0.0);
+    working_state.setVariablePosition("joint5", -0.5411654188994143);
+    working_state.setVariablePosition("joint6", 0.0);
+    return try_pose(std::move(working_state));
   }
 
   [[nodiscard]] static BackgroundPathResult resultForCurrentCandidate(
     const MotionReference & reference, const bool success,
-    const double terminal_joint6_offset_rad = 0.0)
+    const double terminal_joint6_offset_rad = 0.0,
+    const bool include_return_path = true)
   {
     BackgroundPathResult result;
-    if (!reference.compact_preparation_ ||
-      reference.compact_preparation_->candidate_index >=
-      reference.compact_preparation_->candidates.size())
+    if (!reference.compact_maneuver_->compact_preparation_ ||
+      reference.compact_maneuver_->compact_preparation_->candidate_index >=
+      reference.compact_maneuver_->compact_preparation_->candidates.size())
     {
       return result;
     }
-    const auto & preparation = *reference.compact_preparation_;
+    const auto & preparation = *reference.compact_maneuver_->compact_preparation_;
     const auto & candidate = preparation.candidates[preparation.candidate_index];
     result.generation = preparation.generation;
     result.scene_revision = preparation.scene_revision;
@@ -325,9 +1021,73 @@ public:
       metrics.maximum_assembly_radius_m =
         candidate.path_requirements.maximum_assembly_radius_m;
       metrics.maximum_roll_error_rad = candidate.path_requirements.maximum_roll_error_rad;
-      metrics.maximum_abs_screen_pitch_rad =
-        candidate.path_requirements.maximum_abs_screen_pitch_rad.value_or(0.0);
       result.validation_metrics = metrics;
+      if (include_return_path && preparation.return_region) {
+        CompactReturnPath return_path;
+        return_path.goal_positions = preparation.return_region->reference_positions;
+        const auto & names = reference.group_->getVariableNames();
+        const auto joint1 = std::find(names.begin(), names.end(), "joint1");
+        if (joint1 != names.end()) {
+          const auto joint1_index = static_cast<Eigen::Index>(
+            std::distance(names.begin(), joint1));
+          const double frozen_joint1_target =
+            preparation.return_region->target_joint1_rad;
+          const auto & compact_limits = reference.compact_maneuver_->compact_limits_;
+          constexpr double kEndpointBoundaryInsetRad{0.01};
+          double endpoint_joint1 = frozen_joint1_target;
+          if (endpoint_joint1 - compact_limits.lower_position[joint1_index] <
+            kEndpointBoundaryInsetRad)
+          {
+            endpoint_joint1 = compact_limits.lower_position[joint1_index] +
+              kEndpointBoundaryInsetRad;
+          } else {
+            if (compact_limits.upper_position[joint1_index] - endpoint_joint1 <
+              kEndpointBoundaryInsetRad)
+            {
+              endpoint_joint1 = compact_limits.upper_position[joint1_index] -
+                kEndpointBoundaryInsetRad;
+            }
+          }
+          return_path.goal_positions[joint1_index] = endpoint_joint1;
+
+          moveit::core::RobotState return_reference_state(reference.robot_model_);
+          return_reference_state.setToDefaultValues();
+          return_reference_state.setJointGroupPositions(
+            reference.group_, preparation.return_region->reference_positions);
+          return_reference_state.update(true);
+          if (!reference.compact_maneuver_->validateCompactReturnRegion(
+              return_reference_state, return_path.goal_positions,
+              *preparation.return_region))
+          {
+            return result;
+          }
+
+          Eigen::VectorXd turn_pose = candidate.bounded_positions;
+          turn_pose[joint1_index] = endpoint_joint1;
+          return_path.path = {candidate.bounded_positions, turn_pose};
+          if (candidate.profile_id == "compact_turn_negative_wrist") {
+            const auto joint2 = std::find(names.begin(), names.end(), "joint2");
+            if (joint2 != names.end()) {
+              Eigen::VectorXd tucked_pose = turn_pose;
+              const auto joint2_index = static_cast<Eigen::Index>(
+                std::distance(names.begin(), joint2));
+              tucked_pose[joint2_index] = -0.423;
+              return_path.path.push_back(std::move(tucked_pose));
+            }
+          }
+          return_path.path.push_back(return_path.goal_positions);
+        }
+        return_path.validation_metrics.maximum_assembly_radius_m =
+          preparation.entry_radius_cap_m;
+        return_path.validation_metrics.maximum_roll_error_rad =
+          candidate.path_requirements.maximum_roll_error_rad;
+        return_path.validation_metrics.effective_radius_cap_m =
+          preparation.entry_radius_cap_m;
+        return_path.validation_metrics.checked_samples = return_path.path.size();
+        if (return_path.path.size() >= 2U) {
+          result.compact_return_path = std::move(return_path);
+        }
+      }
     }
     return result;
   }
@@ -342,10 +1102,24 @@ public:
     const PublishedTrajectoryRecord * active_publication,
     const PublishedTrajectoryRecord * latest_publication)
   {
-    reference.consumeCompactPreparationResult(
-      plan, state, time_sec, scene, scene_revision, actual_feedback,
-      actual_feedback_time_sec, command_queue_state, active_publication,
-      latest_publication);
+    const std::optional<msg::TrackingTarget> target;
+    const TargetMotionEstimate target_motion;
+    Eigen::VectorXd position;
+    if (actual_feedback) {
+      position = actual_feedback->position;
+    } else {
+      state.copyJointGroupPositions(reference.group_, position);
+    }
+    const bool fresh = actual_feedback.has_value() &&
+      freshActualStateForTest(reference, time_sec, actual_feedback_time_sec);
+    const bool settled = actual_feedback && command_queue_state &&
+      reference.compact_maneuver_->motionSettled(*actual_feedback, command_queue_state);
+    const auto context = contextForTest(
+      reference, state, scene, target, target_motion, time_sec, scene_revision,
+      position, settled, fresh, actual_feedback, actual_feedback_time_sec,
+      command_queue_state, active_publication, latest_publication);
+    reference.compact_maneuver_->consumeCompactPreparationResult(plan, context);
+    applyRequestedFaceRollGuardDisarmForTest(reference);
   }
 
   static CollisionSegmentValidationResult validatePose(
@@ -357,46 +1131,6 @@ public:
       Eigen::VectorXd::Zero(position.size())};
     return reference.collision_validator_.validatePose(
       scene, state, *reference.group_, stationary);
-  }
-
-  [[nodiscard]] static PairYawResourceAssessment evaluatePairYawResource(
-    const MotionReference & reference, const moveit::core::RobotState & state,
-    const msg::TrackingTarget & target)
-  {
-    Eigen::VectorXd position;
-    Eigen::VectorXd velocity;
-    Eigen::VectorXd acceleration;
-    state.copyJointGroupPositions(reference.group_, position);
-    state.copyJointGroupVelocities(reference.group_, velocity);
-    state.copyJointGroupAccelerations(reference.group_, acceleration);
-    const JointMotionState feedback{position, velocity, acceleration};
-    return reference.evaluatePairYawResource(
-      state, target, TargetMotionEstimate{}, feedback, feedback);
-  }
-
-  [[nodiscard]] static std::optional<Eigen::Vector2d> pairYawProbeEdgeDeltaInterval(
-    const double initial_edge_sine)
-  {
-    return MotionReference::pairYawProbeEdgeDeltaInterval(initial_edge_sine);
-  }
-
-  static void holdBaseJointForTest(
-    MotionReference & reference, const double position,
-    const BaseJointDirection direction)
-  {
-    BaseJointHandoffInput input;
-    input.working_edge_reached = true;
-    input.actual_base_position_rad = position;
-    input.predicted_hold_position_rad = position;
-    input.edge_direction = direction;
-    input.tracking_yaw_direction = direction;
-    static_cast<void>(reference.base_handoff_policy_.update(input));
-  }
-
-  [[nodiscard]] static bool hasAvailablePairYawResource(
-    const PairYawResourceAssessment & assessment)
-  {
-    return MotionReference::hasAvailablePairYawResource(assessment);
   }
 
   static JointPathUpdate updateFollower(
@@ -576,6 +1310,78 @@ public:
     state.speed_scaling_factor = 1.0;
     std::lock_guard<std::mutex> lock(component.controller_state_mutex_);
     component.latest_controller_state_ = std::move(state);
+  }
+
+  static bool setRosTimeForTest(
+    CollisionAwareServoComponent & component, const std::int64_t time_ns)
+  {
+    auto * clock = component.get_clock()->get_clock_handle();
+    return rcl_enable_ros_time_override(clock) == RCL_RET_OK &&
+           rcl_set_ros_time_override(clock, time_ns) == RCL_RET_OK;
+  }
+
+  static bool disableRosTimeForTest(CollisionAwareServoComponent & component)
+  {
+    return rcl_disable_ros_time_override(component.get_clock()->get_clock_handle()) == RCL_RET_OK;
+  }
+
+  static void setStateFeedbackTimeoutForTest(
+    CollisionAwareServoComponent & component, const double timeout_sec)
+  {
+    component.parameters_.state_feedback_timeout_sec = timeout_sec;
+  }
+
+  static void setControllerStateStampForTest(
+    CollisionAwareServoComponent & component, const rclcpp::Time & stamp)
+  {
+    const auto nanoseconds = stamp.nanoseconds();
+    std::lock_guard<std::mutex> lock(component.controller_state_mutex_);
+    ASSERT_TRUE(component.latest_controller_state_.has_value());
+    component.latest_controller_state_->header.stamp.sec =
+      static_cast<std::int32_t>(nanoseconds / 1000000000LL);
+    component.latest_controller_state_->header.stamp.nanosec =
+      static_cast<std::uint32_t>(nanoseconds % 1000000000LL);
+  }
+
+  static void makeControllerStateIncompleteForTest(
+    CollisionAwareServoComponent & component)
+  {
+    std::lock_guard<std::mutex> lock(component.controller_state_mutex_);
+    ASSERT_TRUE(component.latest_controller_state_.has_value());
+    component.latest_controller_state_->feedback.velocities.pop_back();
+  }
+
+  static void makeControllerStateNonfiniteForTest(
+    CollisionAwareServoComponent & component)
+  {
+    std::lock_guard<std::mutex> lock(component.controller_state_mutex_);
+    ASSERT_TRUE(component.latest_controller_state_.has_value());
+    component.latest_controller_state_->feedback.positions.front() =
+      std::numeric_limits<double>::quiet_NaN();
+  }
+
+  static bool currentControllerStateAvailableForTest(
+    CollisionAwareServoComponent & component)
+  {
+    return component.current_controller_state().has_value();
+  }
+
+  static std::string currentControllerStateFailureForTest(
+    CollisionAwareServoComponent & component)
+  {
+    std::string reason;
+    (void)component.current_controller_state(&reason);
+    return reason;
+  }
+
+  static std::optional<std::int64_t> currentControllerStateStampForTest(
+    CollisionAwareServoComponent & component)
+  {
+    const auto state = component.current_controller_state();
+    if (!state) {
+      return std::nullopt;
+    }
+    return rclcpp::Time(state->header.stamp, component.get_clock()->get_clock_type()).nanoseconds();
   }
 
   static bool setControllerTerminalTimeline(
@@ -1276,10 +2082,12 @@ public:
 
   static std::optional<moveit_servo::KinematicState> predict(
     CollisionAwareServoComponent & component, std::string & reason,
-    bool & requires_latched_halt)
+    bool & requires_latched_halt,
+    std::optional<rclcpp::Time> * actual_feedback_stamp = nullptr)
   {
+    std::optional<control::JointMotionState> actual_feedback;
     return component.predicted_or_measured_state(
-      component.now(), reason, requires_latched_halt, nullptr, nullptr);
+      component.now(), reason, requires_latched_halt, &actual_feedback, actual_feedback_stamp);
   }
 
   static std::optional<Eigen::VectorXd> provenHold(
@@ -1555,171 +2363,13 @@ std::optional<std::size_t> triggeredAttachmentSampleIndex(
   }
 }
 
-TEST(CompactPathReferenceSpeed, ScalingChangesCompactPathVelocityReference)
+std::string compactEventSummary(const std::vector<CompactEvent> & events)
 {
-  const Eigen::VectorXd current = Eigen::VectorXd::Zero(6);
-  const Eigen::VectorXd distant_waypoint = Eigen::VectorXd::Constant(6, 1.0);
-  for (const auto & [scale, expected_speed] : {
-        std::pair<double, double>{0.5, 0.35}, {1.0, 0.70}, {1.5, 1.05}})
-  {
-    const auto settings = scaleCompactPathReference(6.0, 0.70, scale);
-    const auto task = makeJointPathVelocityTask(
-      current, distant_waypoint, settings.gain, settings.maximum_velocity_radps);
-    ASSERT_TRUE(task);
-    EXPECT_NEAR(
-      task->primary_reference.lpNorm<Eigen::Infinity>(), expected_speed, 1.0e-12);
+  std::ostringstream summary;
+  for (const auto & event : events) {
+    summary << event.event << "[" << event.reason << "]:" << event.details_json << "; ";
   }
-
-  const Eigen::VectorXd nearby_waypoint = Eigen::VectorXd::Constant(6, 0.01);
-  double previous_reference_norm = 0.0;
-  for (const auto & [scale, expected_norm] : {
-        std::pair<double, double>{0.5, 0.5}, {1.0, 1.0}, {1.5, 1.5}})
-  {
-    const auto settings = scaleCompactPathReference(6.0, 0.70, scale);
-    const auto task = makeJointPathVelocityTask(
-      current, nearby_waypoint, settings.gain, settings.maximum_velocity_radps);
-    ASSERT_TRUE(task);
-    const double reference_norm = task->primary_reference.norm();
-    EXPECT_NEAR(reference_norm, expected_norm * 0.06 * std::sqrt(6.0), 1.0e-12);
-    EXPECT_GT(reference_norm, previous_reference_norm);
-    previous_reference_norm = reference_norm;
-  }
-}
-
-TEST(CompactPathReferenceSpeed, ScaleOneMatchesExistingPathTaskGeometry)
-{
-  struct Case
-  {
-    Eigen::VectorXd current;
-    Eigen::VectorXd projected;
-    Eigen::VectorXd lookahead;
-    double remaining;
-    bool crosses_corner;
-  };
-  const std::vector<Case> cases{
-    {Eigen::Vector2d{0.0, 0.0}, Eigen::Vector2d{0.0, 0.0},
-      Eigen::Vector2d{0.1, 0.0}, 0.4, false},
-    {Eigen::Vector2d{0.0, 0.02}, Eigen::Vector2d{0.0, 0.0},
-      Eigen::Vector2d{0.1, 0.0}, 0.4, false},
-    {Eigen::Vector2d{0.01, 0.03}, Eigen::Vector2d{0.01, 0.0},
-      Eigen::Vector2d{0.08, 0.03}, 0.4, true},
-    {Eigen::Vector2d{0.0, 0.0}, Eigen::Vector2d{0.0, 0.0},
-      Eigen::Vector2d{0.05, 0.0}, 0.05, false}};
-
-  for (const auto & test_case : cases) {
-    JointPathUpdate path;
-    path.status = JointPathStatus::kTracking;
-    path.projected_position = test_case.projected;
-    path.reference_position = test_case.lookahead;
-    path.remaining_distance_rad = test_case.remaining;
-    path.lookahead_crosses_corner = test_case.crosses_corner;
-    const auto velocity = makeCompactPathVelocityReference(
-      test_case.current, path, 0.10, 1.0);
-    ASSERT_TRUE(velocity);
-
-    const auto old_task = makeJointPathVelocityTask(
-      test_case.current, test_case.lookahead, 6.0, 0.70);
-    const auto new_task = makeJointPathVelocityTask(
-      test_case.current, test_case.current + *velocity / 6.0, 6.0, 0.70);
-    ASSERT_TRUE(old_task);
-    ASSERT_TRUE(new_task);
-    EXPECT_TRUE(new_task->primary_reference.isApprox(old_task->primary_reference, 1.0e-12));
-  }
-}
-
-TEST(CompactPathReferenceSpeed, CruiseScaleDoesNotScaleCrossTrackAndCornersLimitCruise)
-{
-  JointPathUpdate path;
-  path.status = JointPathStatus::kTracking;
-  path.projected_position = Eigen::Vector2d{0.0, 0.0};
-  path.reference_position = Eigen::Vector2d{0.1, 0.0};
-  path.remaining_distance_rad = 1.0;
-  const Eigen::Vector2d off_path_position{0.0, 0.02};
-
-  auto velocity = makeCompactPathVelocityReference(off_path_position, path, 0.10, 1.5);
-  ASSERT_TRUE(velocity);
-  EXPECT_TRUE(velocity->isApprox(Eigen::Vector2d{0.9, -0.12}, 1.0e-12));
-
-  path.lookahead_crosses_corner = true;
-  velocity = makeCompactPathVelocityReference(off_path_position, path, 0.10, 1.5);
-  ASSERT_TRUE(velocity);
-  EXPECT_TRUE(velocity->isApprox(Eigen::Vector2d{0.6, -0.12}, 1.0e-12));
-}
-
-TEST(CompactPathReferenceSpeed, TerminalFeedforwardCapIsContinuousAndLimitsEndpointSpeed)
-{
-  JointPathUpdate path;
-  path.status = JointPathStatus::kTracking;
-  path.projected_position = Eigen::Vector2d{0.0, 0.0};
-  path.reference_position = Eigen::Vector2d{0.05, 0.0};
-  path.remaining_distance_rad = 0.05;
-  const Eigen::Vector2d current{0.0, 0.0};
-  const auto velocity = makeCompactPathVelocityReference(current, path, 0.10, 1.5);
-  ASSERT_TRUE(velocity);
-  EXPECT_NEAR(velocity->norm(), 6.0 * path.remaining_distance_rad, 1.0e-12);
-
-  path.reference_position = Eigen::Vector2d{0.10, 0.0};
-  path.remaining_distance_rad = 0.100001;
-  const auto before = makeCompactPathVelocityReference(current, path, 0.10, 1.5);
-  path.remaining_distance_rad = 0.099999;
-  const auto after = makeCompactPathVelocityReference(current, path, 0.10, 1.5);
-  ASSERT_TRUE(before);
-  ASSERT_TRUE(after);
-  EXPECT_NEAR((*before - *after).norm(), 1.2e-5, 1.0e-10);
-}
-
-TEST(CompactPathReferenceSpeed, DirectionPreservingVelocityCapBoundsTheReference)
-{
-  JointPathUpdate path;
-  path.status = JointPathStatus::kTracking;
-  path.projected_position = Eigen::Vector2d{0.0, 0.0};
-  path.reference_position = Eigen::Vector2d{0.2, 0.0};
-  path.remaining_distance_rad = 1.0;
-  const Eigen::Vector2d current{0.0, 0.0};
-  const auto velocity = makeCompactPathVelocityReference(current, path, 0.10, 1.5);
-  ASSERT_TRUE(velocity);
-  const auto task = makeJointPathVelocityTask(
-    current, current + *velocity / 6.0, 6.0, 0.70 * 1.5);
-  ASSERT_TRUE(task);
-  EXPECT_NEAR(task->primary_reference.lpNorm<Eigen::Infinity>(), 0.70 * 1.5, 1.0e-12);
-  EXPECT_TRUE(task->primary_reference.normalized().isApprox(velocity->normalized(), 1.0e-12));
-}
-
-TEST(CompactPathReferenceSpeed, RejectsMalformedFollowerOutput)
-{
-  JointPathUpdate path;
-  path.status = JointPathStatus::kTracking;
-  path.projected_position = Eigen::Vector2d{0.0, 0.0};
-  path.reference_position = Eigen::Vector2d{0.1, 0.0};
-  path.remaining_distance_rad = 0.2;
-  const Eigen::Vector2d current{0.0, 0.0};
-  const auto valid = [&]() {
-      return makeCompactPathVelocityReference(current, path, 0.10, 1.0);
-    };
-  EXPECT_TRUE(valid());
-  path.status = JointPathStatus::kInvalid;
-  EXPECT_FALSE(valid());
-  path.status = JointPathStatus::kTracking;
-  path.projected_position.resize(3);
-  EXPECT_FALSE(valid());
-  path.projected_position = Eigen::Vector2d{0.0, 0.0};
-  path.remaining_distance_rad = -0.1;
-  EXPECT_FALSE(valid());
-  path.remaining_distance_rad = 0.2;
-  EXPECT_FALSE(makeCompactPathVelocityReference(current, path, 0.0, 1.0));
-  EXPECT_FALSE(makeCompactPathVelocityReference(
-      current, path, 0.10, std::numeric_limits<double>::quiet_NaN()));
-  path.reference_position[0] = std::numeric_limits<double>::infinity();
-  EXPECT_FALSE(valid());
-}
-
-TEST(CompactPathReferenceSpeed, RejectsNonPositiveOrNonFiniteScale)
-{
-  for (const double scale : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
-      std::numeric_limits<double>::infinity(), std::numeric_limits<double>::max()})
-  {
-    EXPECT_THROW((void)scaleCompactPathReference(6.0, 0.70, scale), std::invalid_argument);
-  }
+  return summary.str();
 }
 
 std::optional<Eigen::VectorXd> goalVectorFromDetails(const std::string & details)
@@ -1821,6 +2471,15 @@ double independentElbowFaceSide(
   return e.dot(f) - (e.dot(w) * f.dot(w)) / w.squaredNorm();
 }
 
+double independentUpwardBend(
+  const Eigen::Vector3d & shoulder, const Eigen::Vector3d & elbow,
+  const Eigen::Vector3d & wrist)
+{
+  const Eigen::Vector3d line = wrist - shoulder;
+  const Eigen::Vector3d offset = elbow - shoulder;
+  return (offset - line * (offset.dot(line) / line.squaredNorm())).z();
+}
+
 /// The real xArm6 description is expanded by CMake, never by a running test.
 /// No controller, sensor, simulator or robot command publisher is started here.
 class MotionReferenceTest : public ::testing::Test
@@ -1891,6 +2550,8 @@ protected:
           rclcpp::Parameter("search_enabled", searchEnabled()),
           rclcpp::Parameter("recovery.mode", recoveryMode()),
           rclcpp::Parameter("search_speed_rad_s", searchEnabled() ? 0.30 : -1.0),
+          rclcpp::Parameter(
+        "compact_maneuver.return_speed_scale", compactReturnSpeedScale()),
           rclcpp::Parameter("compact_maneuver.goal_joints_rad", compactGoalOverride()),
     });
     node_ = std::make_shared<rclcpp::Node>("motion_reference_test", options);
@@ -1957,29 +2618,20 @@ protected:
   virtual bool searchEnabled() const {return true;}
   virtual std::string recoveryMode() const {return "compact";}
   virtual bool compactProfileEnabled() const {return true;}
+  virtual double compactReturnSpeedScale() const {return 1.0;}
   virtual std::vector<double> compactGoalOverride() const {return {};}
 
-  void recordQualifyingFaceShortfall(const moveit::core::RobotState & robot_state)
+  void primeFaceTracking(const moveit::core::RobotState & robot_state)
   {
-    auto selected = update(robot_state, target(msg::TrackingTarget::FACE));
+    const auto selected = update(robot_state, target(msg::TrackingTarget::FACE));
     ASSERT_TRUE(selected.tracking);
-    auto tracking = *selected.tracking;
-    tracking.has_face_primary_roll = true;
-    tracking.signed_face_primary_error_rad = Eigen::Vector3d(0.06, 0.0, 0.0);
-    tracking.face_primary_feedforward_radps.setZero();
-    QpResult qp;
-    qp.status = QpStatus::kSolved;
-    qp.achieved_primary_velocity = Eigen::Vector3d(-0.20, 0.0, 0.0);
-    for (int tick = 0; tick <= 8; ++tick) {
-      reference_->recordFaceCommand(
-        tracking, qp, 1.0 + 0.02 * static_cast<double>(tick), true);
-    }
+    ASSERT_TRUE(selected.task);
   }
 
   std::vector<CompactEvent> commitCompactWithLifecycleFixturePath(
     const moveit::core::RobotState & robot_state)
   {
-    recordQualifyingFaceShortfall(robot_state);
+    primeFaceTracking(robot_state);
     beginPreparationForResultTest(robot_state);
     if (MotionReferenceTestPeer::hasPreparation(*reference_)) {
       const auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
@@ -1994,8 +2646,11 @@ protected:
     const PublishedTrajectoryRecord * active_publication = nullptr,
     const PublishedTrajectoryRecord * latest_publication = nullptr,
     const std::uint64_t scene_revision = kSceneRevision,
-    const std::optional<JointMotionState> & actual_feedback_override = std::nullopt)
+    const std::optional<JointMotionState> & actual_feedback_override = std::nullopt,
+    const bool include_return_path = true)
   {
+    // Isolated admission fixtures exercise an already accepted compact phase.
+    MotionReferenceTestPeer::qualifyCompactPhaseForIsolatedPreparationTest(*reference_);
     if (!MotionReferenceTestPeer::hasPreparation(*reference_)) {
       beginPreparationForResultTest(
         robot_state, command_queue_state, active_publication,
@@ -2007,7 +2662,10 @@ protected:
     MotionReferenceTestPeer::cancelPlannerForTest(*reference_);
     MotionReferenceTestPeer::activateResultGeneration(
       *reference_, reference_->diagnostics().compact_generation + 100U);
-    const auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
+    static_cast<void>(
+      MotionReferenceTestPeer::installValidWorkingReturnRegionForTest(*reference_));
+    const auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(
+      *reference_, true, 0.0, include_return_path);
     consumePreparationResult(
       robot_state, plan, command_queue_state, active_publication,
       latest_publication, scene_revision, actual_feedback_override);
@@ -2111,42 +2769,7 @@ protected:
       effective_command_queue_state, active_publication, latest_publication);
   }
 
-  PairYawResourceAssessment pairYawAssessment(
-    const moveit::core::RobotState & robot_state,
-    const msg::TrackingTarget & command) const
-  {
-    return MotionReferenceTestPeer::evaluatePairYawResource(
-      *reference_, robot_state, command);
-  }
-
-  msg::TrackingTarget targetWithYawOffset(
-    const moveit::core::RobotState & robot_state, const double yaw_offset_rad) const
-  {
-    auto command = faceAlongLookDirection(robot_state);
-    const auto * tracking_link = parameters_.gaze_frame.empty() ?
-      model_->getLinkModel(parameters_.command_frame) :
-      model_->getLinkModel(parameters_.gaze_frame);
-    if (!tracking_link) {
-      throw std::runtime_error("The pair-yaw test needs a valid tracking link");
-    }
-    Eigen::Isometry3d tracking_pose = robot_state.getGlobalLinkTransform(tracking_link);
-    if (!parameters_.gaze_frame.empty()) {
-      tracking_pose.linear() *= face_tracking_arm::opticalToPointingRotation();
-    }
-    const Eigen::Isometry3d base_pose = robot_state.getGlobalLinkTransform("link_base");
-    const Eigen::Vector3d face(command.face.x, command.face.y, command.face.z);
-    Eigen::Vector3d ray_base = base_pose.linear().transpose() *
-      (face - tracking_pose.translation());
-    ray_base = Eigen::AngleAxisd(yaw_offset_rad, Eigen::Vector3d::UnitZ()) * ray_base;
-    const Eigen::Vector3d offset_face = tracking_pose.translation() +
-      base_pose.linear() * ray_base;
-    command.face.x = offset_face.x();
-    command.face.y = offset_face.y();
-    command.face.z = offset_face.z();
-    return command;
-  }
-
-  std::pair<moveit::core::RobotState, msg::TrackingTarget> criticalPairExhaustedCase() const
+  std::pair<moveit::core::RobotState, msg::TrackingTarget> j1WorkingEdgeFaceCase() const
   {
     auto robot_state = state();
     constexpr std::array<double, 6> kJointAnglesRad{
@@ -2188,6 +2811,8 @@ protected:
       *reference_, plan, robot_state, now, *planning_scene, scene_revision,
       actual_feedback, now, effective_command_queue_state,
       active_publication, latest_publication);
+    static_cast<void>(MotionReferenceTestPeer::finishTorqueProfileWorkForTest(
+        *reference_, now, scene_revision));
   }
 
   void beginPreparationForResultTest(
@@ -2197,7 +2822,7 @@ protected:
     const PublishedTrajectoryRecord * latest_publication = nullptr,
     const std::uint64_t scene_revision = kSceneRevision)
   {
-    MotionReferenceTestPeer::qualifyPairYawForIsolatedAdmissionTest(*reference_);
+    MotionReferenceTestPeer::qualifyCompactPhaseForIsolatedPreparationTest(*reference_);
     planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
     const planning_scene::PlanningSceneConstPtr planning_scene = scene;
     const double now = std::chrono::duration<double>(
@@ -2214,6 +2839,8 @@ protected:
       *reference_, robot_state, now, *planning_scene, scene_revision,
       actual_feedback, effective_command_queue_state,
       active_publication, latest_publication);
+    static_cast<void>(
+      MotionReferenceTestPeer::installValidWorkingReturnRegionForTest(*reference_));
     MotionReferenceTestPeer::activateResultGeneration(
       *reference_, reference_->diagnostics().compact_generation + 100U);
   }
@@ -2287,6 +2914,52 @@ protected:
   std::string gazeFrame() const override {return "test_camera_optical";}
 };
 
+TEST_F(MotionReferenceTest, PendingTorqueProfileKeepsPublishedPrefixWithoutCompletingPath)
+{
+  const auto robot_state = state();
+  JointMotionState queue;
+  queue.position.resize(6);
+  robot_state.copyJointGroupPositions(group_, queue.position);
+  queue.velocity = Eigen::VectorXd::Zero(6);
+  queue.acceleration = Eigen::VectorXd::Zero(6);
+  MotionReferenceTestPeer::installPendingPrefixForTest(*reference_, queue);
+
+  MotionReferenceResult selected;
+  MotionReferenceTestPeer::runCompactTaskForTest(
+    *reference_, robot_state, queue, 1.0, selected);
+
+  EXPECT_FALSE(selected.compact_profile_command);
+  EXPECT_EQ(reference_->diagnostics().paths_completed, 0U);
+  EXPECT_FALSE(reference_->diagnostics().compact_goal_reached > 0.0);
+  EXPECT_TRUE(MotionReferenceTestPeer::pendingPrefixIsHeld(*reference_));
+}
+
+TEST_F(MotionReferenceTest, FailedTorqueResultWaitsUntilImmutablePrefixIsConsumed)
+{
+  const auto robot_state = state();
+  JointMotionState queue;
+  robot_state.copyJointGroupPositions(group_, queue.position);
+  queue.velocity = Eigen::VectorXd::Zero(6);
+  queue.acceleration = Eigen::VectorXd::Zero(6);
+  MotionReferenceTestPeer::installPendingFailurePrefixForTest(*reference_, queue);
+
+  MotionReferenceTestPeer::consumeTorqueResultForTest(*reference_, 1.0, 12U);
+  EXPECT_TRUE(MotionReferenceTestPeer::pendingPrefixIsHeld(*reference_, 2U));
+  EXPECT_EQ(reference_->diagnostics().paths_abandoned, 0U);
+
+  reference_->recordCompactProfileCommandPublished(true);
+  ASSERT_TRUE(MotionReferenceTestPeer::finishTorqueProfileWorkForTest(
+      *reference_, 1.01, 12U));
+  EXPECT_FALSE(MotionReferenceTestPeer::pendingPrefixIsHeld(*reference_));
+  EXPECT_EQ(reference_->diagnostics().paths_abandoned, 1U);
+}
+
+class MotionReferenceCameraReturnScaleTest : public MotionReferenceCameraTest
+{
+protected:
+  double compactReturnSpeedScale() const override {return 0.5;}
+};
+
 class MotionReferenceSearchDisabledTest : public MotionReferenceTest
 {
 protected:
@@ -2327,79 +3000,6 @@ protected:
   std::string commandFrame() const override {return "test_camera_optical";}
 };
 
-TEST_F(MotionReferenceTest, PairYawGateHasValidJacobianAtAlignedFeasiblePose)
-{
-  const auto robot_state = state();
-  const auto aligned = faceAlongLookDirection(robot_state);
-  const auto assessment = pairYawAssessment(robot_state, aligned);
-
-  ASSERT_TRUE(assessment.valid);
-  EXPECT_FALSE(assessment.demand_present);
-
-  auto pure_vertical_error = aligned;
-  pure_vertical_error.face.z += 0.20;
-  const auto vertical_assessment = pairYawAssessment(robot_state, pure_vertical_error);
-  ASSERT_TRUE(vertical_assessment.valid);
-  EXPECT_FALSE(vertical_assessment.demand_present);
-  EXPECT_FALSE(vertical_assessment.exhausted);
-}
-
-TEST_F(MotionReferenceTest, PairYawProbeRollIntervalClipsBothEdgeSignsOnlyNearCap)
-{
-  constexpr double kPi = 3.14159265358979323846;
-  const double cap = std::sin(5.1 * kPi / 180.0);
-  const double local_allowance = std::sin(kPi / 180.0);
-  const double near_edge = 0.0858;
-
-  const auto negative_edge = MotionReferenceTestPeer::pairYawProbeEdgeDeltaInterval(-near_edge);
-  ASSERT_TRUE(negative_edge);
-  EXPECT_NEAR((*negative_edge)[0], -cap + near_edge, 1.0e-15);
-  EXPECT_DOUBLE_EQ((*negative_edge)[1], local_allowance);
-
-  const auto positive_edge = MotionReferenceTestPeer::pairYawProbeEdgeDeltaInterval(near_edge);
-  ASSERT_TRUE(positive_edge);
-  EXPECT_DOUBLE_EQ((*positive_edge)[0], -local_allowance);
-  EXPECT_NEAR((*positive_edge)[1], cap - near_edge, 1.0e-15);
-
-  const auto interior = MotionReferenceTestPeer::pairYawProbeEdgeDeltaInterval(0.0);
-  ASSERT_TRUE(interior);
-  EXPECT_DOUBLE_EQ((*interior)[0], -local_allowance);
-  EXPECT_DOUBLE_EQ((*interior)[1], local_allowance);
-  EXPECT_FALSE(MotionReferenceTestPeer::pairYawProbeEdgeDeltaInterval(cap + 1.0e-6));
-  EXPECT_FALSE(MotionReferenceTestPeer::pairYawProbeEdgeDeltaInterval(
-      std::numeric_limits<double>::quiet_NaN()));
-}
-
-TEST_F(MotionReferenceTest, PairYawProbeNearNegativeCapKeepsOnlyCapValidResource)
-{
-  auto robot_state = state();
-  Eigen::VectorXd captured_q(6);
-  captured_q << 6.2088163036370609, 0.2772025522914156, -1.6536501053918486,
-    -0.087558368682742596, -0.83288051421121145, 6.2831839078553147;
-  robot_state.setJointGroupPositions(group_, captured_q);
-  robot_state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
-  robot_state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
-  robot_state.update(true);
-  auto command = target(msg::TrackingTarget::FACE);
-  command.face.x = 0.8405535239328289;
-  command.face.y = 0.1263715688123846;
-  command.face.z = 1.6757422070843495;
-  MotionReferenceTestPeer::holdBaseJointForTest(
-    *reference_, captured_q[0], BaseJointDirection::kPositive);
-
-  const auto assessment = pairYawAssessment(robot_state, command);
-
-  ASSERT_TRUE(assessment.pair_bound_candidate);
-  ASSERT_TRUE(assessment.actual_probe_solved);
-  ASSERT_TRUE(assessment.relaxed_probe_solved);
-  EXPECT_LT(assessment.actual_available_yaw_rad, 0.80 * kPairYawProbeDisplacementRad);
-  EXPECT_GE(assessment.pair_relaxed_available_yaw_rad, 0.80 * kPairYawProbeDisplacementRad);
-  EXPECT_LE(assessment.actual_roll_residual_rad,
-    std::asin(std::sin(5.1 * 3.14159265358979323846 / 180.0)) -
-    std::asin(0.08580283244921869) + 1.0e-6);
-  EXPECT_LE(assessment.relaxed_roll_residual_rad, 1.0 * 3.14159265358979323846 / 180.0 + 1.0e-4);
-}
-
 TEST_F(MotionReferenceTest, StaleInitialReadEpochWaitsUntilFreshActiveProvenance)
 {
   auto component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
@@ -2437,6 +3037,509 @@ TEST_F(MotionReferenceTest, StaleInitialReadEpochWaitsUntilFreshActiveProvenance
   CollisionAwareServoComponentTestPeer::controlTick(*component);
   EXPECT_TRUE(CollisionAwareServoComponentTestPeer::hardwareInhibitPending(*component));
   EXPECT_FALSE(CollisionAwareServoComponentTestPeer::hasPublishedCommand(*component));
+}
+
+TEST_F(MotionReferenceTest, SimTimeControllerFeedbackKeepsAgeAndValidityGuards)
+{
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("use_sim_time", true)});
+  auto component = std::make_shared<CollisionAwareServoComponent>(options);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *component, 10'000'000'000LL));
+
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*component);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(*component, 0.030);
+  Eigen::VectorXd q(6);
+  state().copyJointGroupPositions(group_, q);
+  const rclcpp::Time now(10'000'000'000LL, RCL_ROS_TIME);
+  const auto available_at = [&](const std::int64_t offset_ns) {
+      CollisionAwareServoComponentTestPeer::setControllerState(*component, q);
+      CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+        *component, now + rclcpp::Duration::from_nanoseconds(offset_ns));
+      return CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+        *component);
+    };
+
+  EXPECT_TRUE(available_at(0));
+  EXPECT_TRUE(available_at(-29'000'000LL));
+  EXPECT_TRUE(available_at(-30'000'000LL));
+  EXPECT_FALSE(available_at(-30'000'001LL));
+  EXPECT_FALSE(available_at(-31'000'000LL));
+  EXPECT_FALSE(available_at(-37'000'000LL));
+  // These are the intended sim-time RED cases: a small clock lag must not
+  // reject an otherwise fresh controller sample.
+  EXPECT_TRUE(available_at(1'000'000LL));
+  EXPECT_TRUE(available_at(2'000'000LL));
+  EXPECT_TRUE(available_at(3'000'000LL));
+  EXPECT_FALSE(available_at(3'000'001LL));
+  EXPECT_TRUE(available_at(2'000'000LL));
+  const auto expected_future_stamp = now.nanoseconds() + 2'000'000LL;
+  const auto preserved_stamp =
+    CollisionAwareServoComponentTestPeer::currentControllerStateStampForTest(*component);
+  EXPECT_TRUE(preserved_stamp.has_value());
+  if (preserved_stamp) {
+    EXPECT_EQ(*preserved_stamp, expected_future_stamp);
+  }
+
+  EXPECT_FALSE(available_at(-10'000'000'000LL));
+  CollisionAwareServoComponentTestPeer::setControllerState(*component, q);
+  CollisionAwareServoComponentTestPeer::makeControllerStateIncompleteForTest(*component);
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *component));
+  CollisionAwareServoComponentTestPeer::setControllerState(*component, q);
+  CollisionAwareServoComponentTestPeer::makeControllerStateNonfiniteForTest(*component);
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *component));
+
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *component, 20'000'000'000LL));
+  CollisionAwareServoComponentTestPeer::setControllerState(*component, q);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *component));
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *component, 10'000'000'000LL));
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *component));
+
+  auto system_time_component =
+    std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  CollisionAwareServoComponentTestPeer::configure(
+    *system_time_component, monitor_, group_, parameters_.joint_names, limits_,
+    collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*system_time_component);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(
+    *system_time_component, 0.030);
+  CollisionAwareServoComponentTestPeer::setControllerState(*system_time_component, q);
+  const auto system_now = system_time_component->now();
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *system_time_component, system_now + rclcpp::Duration::from_nanoseconds(100'000'000LL));
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *system_time_component));
+
+  auto hardware_component =
+    std::make_shared<CollisionAwareServoComponent>(options);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *hardware_component, 10'000'000'000LL));
+  CollisionAwareServoComponentTestPeer::configure(
+    *hardware_component, monitor_, group_, parameters_.joint_names, limits_,
+    collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(
+    *hardware_component, 0.030);
+  CollisionAwareServoComponentTestPeer::setControllerState(*hardware_component, q);
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *hardware_component, now + rclcpp::Duration::from_nanoseconds(1'000'000LL));
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *hardware_component));
+  const std::string hardware_reason =
+    CollisionAwareServoComponentTestPeer::currentControllerStateFailureForTest(
+    *hardware_component);
+  EXPECT_NE(hardware_reason.find("stamp_ns=10001000000"), std::string::npos);
+  EXPECT_NE(hardware_reason.find("validation_ns=10000000000"), std::string::npos);
+  EXPECT_NE(hardware_reason.find("epsilon_ns=0"), std::string::npos);
+  EXPECT_NE(hardware_reason.find("reason=future timestamp exceeds configured epsilon"),
+    std::string::npos);
+
+  rclcpp::NodeOptions explicit_system_clock_options;
+  explicit_system_clock_options.clock_type(RCL_SYSTEM_TIME);
+  auto explicit_system_clock_component =
+    std::make_shared<CollisionAwareServoComponent>(explicit_system_clock_options);
+  CollisionAwareServoComponentTestPeer::configure(
+    *explicit_system_clock_component, monitor_, group_, parameters_.joint_names, limits_,
+    collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*explicit_system_clock_component);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(
+    *explicit_system_clock_component, 0.030);
+  CollisionAwareServoComponentTestPeer::setControllerState(*explicit_system_clock_component, q);
+  const auto explicit_system_now = explicit_system_clock_component->now();
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *explicit_system_clock_component,
+    explicit_system_now + rclcpp::Duration::from_nanoseconds(100'000'000LL));
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *explicit_system_clock_component));
+  const std::string explicit_system_reason =
+    CollisionAwareServoComponentTestPeer::currentControllerStateFailureForTest(
+    *explicit_system_clock_component);
+  EXPECT_NE(explicit_system_reason.find("epsilon_ns=0"), std::string::npos);
+}
+
+TEST_F(MotionReferenceTest, JtcFutureToleranceRequiresActiveSimClock)
+{
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("use_sim_time", true)});
+  auto component = std::make_shared<CollisionAwareServoComponent>(options);
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*component);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(*component, 0.030);
+  Eigen::VectorXd q(6);
+  state().copyJointGroupPositions(group_, q);
+
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::disableRosTimeForTest(*component));
+  ASSERT_FALSE(component->get_clock()->ros_time_is_active());
+  CollisionAwareServoComponentTestPeer::setControllerState(*component, q);
+  const auto inactive_now = component->now();
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *component, inactive_now + rclcpp::Duration::from_nanoseconds(3'000'000LL));
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *component));
+  const std::string inactive_reason =
+    CollisionAwareServoComponentTestPeer::currentControllerStateFailureForTest(*component);
+  EXPECT_NE(inactive_reason.find("epsilon_ns=0"), std::string::npos);
+
+  auto active_component = std::make_shared<CollisionAwareServoComponent>(options);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *active_component, 10'000'000'000LL));
+  ASSERT_TRUE(active_component->get_clock()->ros_time_is_active());
+  CollisionAwareServoComponentTestPeer::configure(
+    *active_component, monitor_, group_, parameters_.joint_names, limits_,
+    collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*active_component);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(*active_component, 0.030);
+  CollisionAwareServoComponentTestPeer::setControllerState(*active_component, q);
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *active_component, rclcpp::Time(10'003'000'000LL, RCL_ROS_TIME));
+  EXPECT_TRUE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *active_component));
+
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *active_component, rclcpp::Time(10'003'000'001LL, RCL_ROS_TIME));
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *active_component));
+  const std::string active_reason =
+    CollisionAwareServoComponentTestPeer::currentControllerStateFailureForTest(*active_component);
+  EXPECT_NE(active_reason.find("epsilon_ns=3000000"), std::string::npos);
+}
+
+TEST_F(MotionReferenceTest, SimTimePlanningSceneFeedbackAllowsSmallFutureStamps)
+{
+  monitor_->startStateMonitor("/joint_states");
+  auto joint_state_publisher = node_->create_publisher<sensor_msgs::msg::JointState>(
+    "/joint_states", rclcpp::QoS(10).reliable());
+  const auto hold = state();
+  Eigen::VectorXd positions;
+  hold.copyJointGroupPositions(group_, positions);
+
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("use_sim_time", true)});
+  auto component = std::make_shared<CollisionAwareServoComponent>(options);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *component, 10'000'000'000LL));
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*component);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(*component, 0.030);
+
+  auto state_monitor = monitor_->getStateMonitor();
+  ASSERT_TRUE(state_monitor);
+  for (const std::int64_t ahead_ns : {
+        1'000'000LL, 2'000'000LL, 3'000'000LL, 3'000'001LL})
+  {
+    const std::int64_t state_stamp_ns = 10'000'000'000LL + ahead_ns;
+    sensor_msgs::msg::JointState message;
+    message.header.stamp.sec = static_cast<std::int32_t>(state_stamp_ns / 1000000000LL);
+    message.header.stamp.nanosec = static_cast<std::uint32_t>(state_stamp_ns % 1000000000LL);
+    message.name = parameters_.joint_names;
+    message.position.assign(positions.data(), positions.data() + positions.size());
+    message.velocity.assign(positions.size(), 0.0);
+    bool received = false;
+    for (std::size_t attempt = 0U; attempt < 100U && !received; ++attempt) {
+      joint_state_publisher->publish(message);
+      rclcpp::spin_some(node_);
+      const auto snapshot = state_monitor->getCurrentStateAndTime();
+      received = snapshot.first && snapshot.second.nanoseconds() == state_stamp_ns;
+      if (!received) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    ASSERT_TRUE(received) << "state_stamp_ns=" << state_stamp_ns;
+
+    CollisionAwareServoComponentTestPeer::setControllerState(*component, positions);
+    CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+      *component, rclcpp::Time(state_stamp_ns, RCL_ROS_TIME));
+    std::string reason;
+    bool requires_latched_halt = false;
+    std::optional<rclcpp::Time> actual_feedback_stamp;
+    const auto prediction = CollisionAwareServoComponentTestPeer::predict(
+      *component, reason, requires_latched_halt, &actual_feedback_stamp);
+    if (ahead_ns <= 3'000'000LL) {
+      EXPECT_TRUE(prediction) << "ahead_ns=" << ahead_ns << ", reason=" << reason;
+      EXPECT_TRUE(actual_feedback_stamp.has_value()) << "ahead_ns=" << ahead_ns;
+      if (actual_feedback_stamp) {
+        EXPECT_EQ(actual_feedback_stamp->nanoseconds(), state_stamp_ns)
+          << "ahead_ns=" << ahead_ns << ", reason=" << reason;
+      }
+      EXPECT_FALSE(requires_latched_halt);
+    } else {
+      EXPECT_FALSE(prediction);
+      EXPECT_NE(reason.find("Robot state timestamp is ahead of sampled ROS time"),
+        std::string::npos) << "ahead_ns=" << ahead_ns << ", reason=" << reason;
+    }
+  }
+
+  (void)joint_state_publisher;
+}
+
+TEST_F(MotionReferenceTest, SimTimeStartupAcceptsFutureStateWithoutStartingTrackingWork)
+{
+  monitor_->startStateMonitor("/joint_states");
+  auto joint_state_publisher = node_->create_publisher<sensor_msgs::msg::JointState>(
+    "/joint_states", rclcpp::QoS(10).reliable());
+  auto command_subscriber = node_->create_subscription<trajectory_msgs::msg::JointTrajectory>(
+    "/test/command", rclcpp::QoS(1), [](trajectory_msgs::msg::JointTrajectory::ConstSharedPtr) {});
+  const auto hold = state();
+  Eigen::VectorXd positions;
+  hold.copyJointGroupPositions(group_, positions);
+
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("use_sim_time", true)});
+  auto component = std::make_shared<CollisionAwareServoComponent>(options);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *component, 10'000'000'000LL));
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*component);
+  CollisionAwareServoComponentTestPeer::installMotionReference(
+    *component, std::move(reference_));
+  HierarchicalVelocityQpConfig qp_config;
+  qp_config.period_sec = parameters_.control_period_sec;
+  CollisionAwareServoComponentTestPeer::installVelocityQp(*component, qp_config);
+  CollisionAwareServoComponentTestPeer::installStatusPublisher(*component);
+  CollisionAwareServoComponentTestPeer::installTrajectoryPublisher(*component);
+  CollisionAwareServoComponentTestPeer::prepareStartupControlTick(*component, false);
+
+  bool subscriber_ready = false;
+  for (std::size_t attempt = 0U; attempt < 100U && !subscriber_ready; ++attempt) {
+    rclcpp::spin_some(node_);
+    subscriber_ready =
+      CollisionAwareServoComponentTestPeer::trajectorySubscriberCount(*component) > 0U;
+    if (!subscriber_ready) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  ASSERT_TRUE(subscriber_ready);
+
+  const std::int64_t state_stamp_ns = 10'002'000'000LL;
+  sensor_msgs::msg::JointState message;
+  message.header.stamp.sec = static_cast<std::int32_t>(state_stamp_ns / 1000000000LL);
+  message.header.stamp.nanosec = static_cast<std::uint32_t>(state_stamp_ns % 1000000000LL);
+  message.name = parameters_.joint_names;
+  message.position.assign(positions.data(), positions.data() + positions.size());
+  message.velocity.assign(positions.size(), 0.0);
+  auto state_monitor = monitor_->getStateMonitor();
+  ASSERT_TRUE(state_monitor);
+  bool received = false;
+  for (std::size_t attempt = 0U; attempt < 100U && !received; ++attempt) {
+    joint_state_publisher->publish(message);
+    rclcpp::spin_some(node_);
+    const auto snapshot = state_monitor->getCurrentStateAndTime();
+    received = snapshot.first && snapshot.second.nanoseconds() == state_stamp_ns;
+    if (!received) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  ASSERT_TRUE(received);
+  CollisionAwareServoComponentTestPeer::setControllerState(*component, positions);
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *component, rclcpp::Time(state_stamp_ns, RCL_ROS_TIME));
+  auto face = faceAlongLookDirection(hold);
+  const auto now = component->now();
+  face.header.stamp = now;
+  face.face_stamp = now;
+  CollisionAwareServoComponentTestPeer::setContinuationTarget(*component, face);
+
+  const auto validations_before =
+    CollisionAwareServoComponentTestPeer::actualStateValidationCount(*component);
+  CollisionAwareServoComponentTestPeer::controlTick(*component);
+  EXPECT_EQ(CollisionAwareServoComponentTestPeer::actualStateValidationCount(*component),
+    validations_before + 1U);
+  EXPECT_FALSE(CollisionAwareServoComponentTestPeer::hasPublishedCommand(*component));
+  (void)joint_state_publisher;
+  (void)command_subscriber;
+}
+
+TEST_F(MotionReferenceTest, SimTimeFeedbackSourcesStayIndependentAndRequireEveryJoint)
+{
+  monitor_->startStateMonitor("/joint_states");
+  auto joint_state_publisher = node_->create_publisher<sensor_msgs::msg::JointState>(
+    "/joint_states", rclcpp::QoS(10).reliable());
+  const auto hold = state();
+  Eigen::VectorXd positions;
+  hold.copyJointGroupPositions(group_, positions);
+
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("use_sim_time", true)});
+  auto component = std::make_shared<CollisionAwareServoComponent>(options);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *component, 10'000'000'000LL));
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*component);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(*component, 0.030);
+  auto state_monitor = monitor_->getStateMonitor();
+  ASSERT_TRUE(state_monitor);
+
+  const auto publish_and_wait = [&](const std::int64_t stamp_ns,
+    const std::vector<std::string> & names) {
+      sensor_msgs::msg::JointState message;
+      message.header.stamp.sec = static_cast<std::int32_t>(stamp_ns / 1000000000LL);
+      message.header.stamp.nanosec = static_cast<std::uint32_t>(stamp_ns % 1000000000LL);
+      message.name = names;
+      for (const auto & name : names) {
+        const auto index = std::find(parameters_.joint_names.begin(),
+            parameters_.joint_names.end(), name) - parameters_.joint_names.begin();
+        if (index >= parameters_.joint_names.size()) {
+          return false;
+        }
+        message.position.push_back(positions[static_cast<Eigen::Index>(index)]);
+        message.velocity.push_back(0.0);
+      }
+      for (std::size_t attempt = 0U; attempt < 100U; ++attempt) {
+        joint_state_publisher->publish(message);
+        rclcpp::spin_some(node_);
+        const auto snapshot = state_monitor->getCurrentStateAndTime();
+        if (snapshot.first && snapshot.second.nanoseconds() == stamp_ns) {
+          return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      return false;
+    };
+  const auto expect_predict_failure = [&](const std::string & expected_reason) {
+      std::string reason;
+      bool requires_latched_halt = false;
+      const auto prediction = CollisionAwareServoComponentTestPeer::predict(
+        *component, reason, requires_latched_halt);
+      EXPECT_FALSE(prediction);
+      EXPECT_NE(reason.find(expected_reason), std::string::npos) << "reason=" << reason;
+    };
+
+  // One old joint remains incomplete even after the other five are refreshed.
+  ASSERT_TRUE(publish_and_wait(9'960'000'000LL, parameters_.joint_names));
+  auto all_but_first_joint = parameters_.joint_names;
+  all_but_first_joint.erase(all_but_first_joint.begin());
+  ASSERT_TRUE(publish_and_wait(10'000'000'000LL, all_but_first_joint));
+  CollisionAwareServoComponentTestPeer::setControllerState(*component, positions);
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *component, rclcpp::Time(10'000'000'000LL, RCL_ROS_TIME));
+  expect_predict_failure("incomplete joint state at cutoff");
+
+  // With all CSM joints fresh, a separately stale JTC sample is still rejected.
+  ASSERT_TRUE(publish_and_wait(10'010'000'000LL, parameters_.joint_names));
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *component, 10'010'000'000LL));
+  CollisionAwareServoComponentTestPeer::setControllerState(*component, positions);
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *component, rclcpp::Time(9'978'999'999LL, RCL_ROS_TIME));
+  expect_predict_failure("Fresh finite trajectory controller state is unavailable");
+
+  // A fresh JTC sample does not hide the 40 ms old CSM state.
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *component, 10'050'000'000LL));
+  CollisionAwareServoComponentTestPeer::setControllerState(*component, positions);
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *component, rclcpp::Time(10'050'000'000LL, RCL_ROS_TIME));
+  expect_predict_failure("Robot state snapshot is stale");
+  (void)joint_state_publisher;
+}
+
+TEST_F(MotionReferenceTest, SimTimeSafeRearmCompletesWithFreshFutureSamples)
+{
+  monitor_->startStateMonitor("/joint_states");
+  auto joint_state_publisher = node_->create_publisher<sensor_msgs::msg::JointState>(
+    "/joint_states", rclcpp::QoS(10).reliable());
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("use_sim_time", true)});
+  auto component = std::make_shared<CollisionAwareServoComponent>(options);
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*component);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(*component, 0.030);
+  Eigen::VectorXd positions(6);
+  state().copyJointGroupPositions(group_, positions);
+  auto state_monitor = monitor_->getStateMonitor();
+  ASSERT_TRUE(state_monitor);
+
+  for (std::int64_t sample_index = 0; sample_index < 3; ++sample_index) {
+    const std::int64_t validation_ns = 10'000'000'000LL + sample_index * 1'000'000LL;
+    const std::int64_t state_stamp_ns = validation_ns + 2'000'000LL;
+    ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+        *component, validation_ns));
+    sensor_msgs::msg::JointState message;
+    message.header.stamp.sec = static_cast<std::int32_t>(state_stamp_ns / 1000000000LL);
+    message.header.stamp.nanosec = static_cast<std::uint32_t>(state_stamp_ns % 1000000000LL);
+    message.name = parameters_.joint_names;
+    message.position.assign(positions.data(), positions.data() + positions.size());
+    message.velocity.assign(positions.size(), 0.0);
+    bool received = false;
+    for (std::size_t attempt = 0U; attempt < 100U && !received; ++attempt) {
+      joint_state_publisher->publish(message);
+      rclcpp::spin_some(node_);
+      const auto snapshot = state_monitor->getCurrentStateAndTime();
+      received = snapshot.first && snapshot.second.nanoseconds() == state_stamp_ns;
+      if (!received) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    ASSERT_TRUE(received) << "state_stamp_ns=" << state_stamp_ns;
+
+    CollisionAwareServoComponentTestPeer::setControllerState(*component, positions);
+    CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+      *component, rclcpp::Time(state_stamp_ns, RCL_ROS_TIME));
+    std::string reason;
+    const auto readiness = CollisionAwareServoComponentTestPeer::checkRearm(*component, reason);
+    if (sample_index < 2) {
+      EXPECT_EQ(readiness, RearmReadiness::kWaiting) << "reason=" << reason;
+      EXPECT_NE(reason.find("confirming a settled hold"), std::string::npos)
+        << "reason=" << reason;
+    } else {
+      EXPECT_EQ(readiness, RearmReadiness::kReady) << "reason=" << reason;
+    }
+  }
+  (void)joint_state_publisher;
 }
 
 TEST_F(MotionReferenceTest, InactiveWarmEpochSkipsTrackingWorkAndKeepsBootstrapGuards)
@@ -3477,101 +4580,174 @@ TEST_F(MotionReferenceTest, ComponentAdmissionKeepsInclusiveQvAndSaturatedAjEndp
   EXPECT_FALSE(outside_jerk.has_value());
 }
 
-TEST_F(MotionReferenceTest, JointThreeLimitExamplesDoNotExhaustJ1J4YawResource)
+TEST_F(MotionReferenceTest, DirectStateAdmissionUsesCommittedCompactVelocityEnvelope)
 {
-  constexpr double kDegreesToRadians = 3.14159265358979323846 / 180.0;
-  const std::array<std::array<double, 6>, 2> joint_angles_deg{{
-    {{15.0, -9.0, -70.0, -16.0, -56.0, 23.0}},
-    {{183.0, 82.0, -222.9, 26.5, 9.0, -25.0}}}};
-
-  for (const auto & angles_deg : joint_angles_deg) {
-    auto robot_state = state();
-    for (std::size_t index = 0; index < angles_deg.size(); ++index) {
-      robot_state.setVariablePosition(
-        parameters_.joint_names[index], angles_deg[index] * kDegreesToRadians);
-    }
-    robot_state.update(true);
-    const auto yaw_demand = targetWithYawOffset(robot_state, 0.30);
-    const auto assessment = pairYawAssessment(robot_state, yaw_demand);
-
-    ASSERT_TRUE(assessment.valid);
-    ASSERT_TRUE(assessment.demand_present);
-    EXPECT_FALSE(assessment.pair_bound_candidate);
-    EXPECT_FALSE(assessment.exhausted);
+  std::vector<PositionBoundSet> bounds;
+  bounds.reserve(parameters_.joint_names.size());
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
   }
+
+  auto robot_state = state();
+  Eigen::VectorXd positions(6);
+  robot_state.copyJointGroupPositions(group_, positions);
+  Eigen::VectorXd actual_velocity = Eigen::VectorXd::Zero(6);
+  actual_velocity[0] = 1.5;
+  robot_state.setJointGroupVelocities(group_, actual_velocity);
+  robot_state.update();
+
+  moveit_servo::KinematicState current_state(6);
+  current_state.joint_names = parameters_.joint_names;
+  current_state.positions = positions;
+  current_state.velocities = actual_velocity;
+  current_state.accelerations = Eigen::VectorXd::Zero(6);
+  const Eigen::VectorXd command_velocity = actual_velocity;
+  std::string reason;
+
+  auto ordinary_component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  CollisionAwareServoComponentTestPeer::configure(
+    *ordinary_component, monitor_, group_, parameters_.joint_names, limits_,
+    collision_config_, bounds);
+  const auto ordinary_result = CollisionAwareServoComponentTestPeer::nextState(
+    *ordinary_component, std::make_shared<moveit::core::RobotState>(robot_state),
+    current_state, command_velocity, reason);
+  EXPECT_FALSE(ordinary_result.has_value());
+  EXPECT_NE(reason.find("active q/v/a/j command policy"), std::string::npos) << reason;
+
+  auto compact_component = std::make_shared<CollisionAwareServoComponent>(rclcpp::NodeOptions{});
+  CollisionAwareServoComponentTestPeer::configure(
+    *compact_component, monitor_, group_, parameters_.joint_names, limits_,
+    collision_config_, bounds);
+  auto compact_reference = std::make_unique<MotionReference>(
+    node_, monitor_, parameters_, limits_, collision_config_);
+  Eigen::VectorXd compact_goal = positions;
+  compact_goal[0] += 0.05;
+  const JointMotionState compact_profile_start{
+    positions, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const auto accepted_profile = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *compact_reference, compact_profile_start, compact_goal);
+  ASSERT_TRUE(accepted_profile) << reference_->diagnostics().last_plan_message;
+  ASSERT_TRUE(compact_reference->compactManeuverActive());
+  ASSERT_GT(compact_reference->activeCommandLimits().max_velocity[0], 1.5);
+  CollisionAwareServoComponentTestPeer::installMotionReference(
+    *compact_component, std::move(compact_reference));
+
+  const auto compact_result = CollisionAwareServoComponentTestPeer::nextState(
+    *compact_component, std::make_shared<moveit::core::RobotState>(robot_state),
+    current_state, command_velocity, reason);
+  ASSERT_TRUE(compact_result.has_value()) << reason;
+  EXPECT_DOUBLE_EQ(compact_result->velocities[0], 1.5);
+  EXPECT_DOUBLE_EQ(compact_result->accelerations[0], 0.0);
 }
 
-TEST_F(MotionReferenceTest, PublicUpdateDoesNotCompactFromShortfallOrOtherJointLimits)
+TEST_F(MotionReferenceTest, PublicUpdateDoesNotCompactFromInteriorJ1OrJ4Boundary)
 {
-  constexpr double kDegreesToRadians = 3.14159265358979323846 / 180.0;
-  const std::array<std::array<double, 6>, 2> joint_angles_deg{{
-    {{15.0, -9.0, -70.0, -16.0, -56.0, 23.0}},
-    {{183.0, 82.0, -222.9, 26.5, 9.0, -25.0}}}};
-
-  for (const auto & angles_deg : joint_angles_deg) {
-    auto robot_state = state();
-    for (std::size_t index = 0; index < angles_deg.size(); ++index) {
-      robot_state.setVariablePosition(
-        parameters_.joint_names[index], angles_deg[index] * kDegreesToRadians);
-    }
-    robot_state.update(true);
-    const auto yaw_demand = targetWithYawOffset(robot_state, 0.30);
-    const auto selected = update(robot_state, yaw_demand);
-    ASSERT_TRUE(selected.tracking);
-
-    auto shortfall = *selected.tracking;
-    shortfall.has_face_primary_roll = true;
-    shortfall.signed_face_primary_error_rad = Eigen::Vector3d(0.06, 0.0, 0.0);
-    shortfall.face_primary_feedforward_radps.setZero();
-    QpResult shortfall_qp;
-    shortfall_qp.status = QpStatus::kSolved;
-    shortfall_qp.achieved_primary_velocity = Eigen::Vector3d(-0.20, 0.0, 0.0);
-    for (int tick = 0; tick < 9; ++tick) {
-      reference_->recordFaceCommand(shortfall, shortfall_qp, 1.0 + 0.02 * tick, true);
-    }
-
-    EXPECT_FALSE(reference_->compactManeuverActive());
-    EXPECT_EQ(reference_->diagnostics().compact_generation, 0U);
-    EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
-    const auto events = reference_->drainCompactEvents();
-    EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
-        return event.event == "pair_resource_exhausted";
-    }));
-  }
-}
-
-TEST_F(MotionReferenceTest, PublicUpdateTriggersForDirectionallyExhaustedJ1J4Pair)
-{
-  const auto [robot_state, yaw_demand] = criticalPairExhaustedCase();
-  const auto assessment = pairYawAssessment(robot_state, yaw_demand);
-  ASSERT_TRUE(assessment.valid);
-  ASSERT_TRUE(assessment.demand_present);
-  ASSERT_TRUE(assessment.pair_bound_candidate);
-  ASSERT_TRUE(assessment.probe_valid);
-  EXPECT_TRUE(assessment.actual_probe_solved);
-  EXPECT_FALSE(assessment.actual_probe_infeasible);
-  EXPECT_DOUBLE_EQ(assessment.probe_horizon_sec, kPairYawProbeHorizonSec);
-  EXPECT_TRUE(assessment.pair_bound_cause);
-  EXPECT_TRUE(assessment.exhausted);
-  EXPECT_LT(assessment.actual_available_yaw_rad, 0.80 * kPairYawProbeDisplacementRad);
-  EXPECT_GE(assessment.pair_relaxed_available_yaw_rad, 0.80 * kPairYawProbeDisplacementRad);
-  EXPECT_LE(assessment.relaxed_roll_residual_rad, 1.0 * 3.14159265358979323846 / 180.0 + 1.0e-4);
-  EXPECT_LE(assessment.relaxed_elevation_residual_rad,
-        1.0 * 3.14159265358979323846 / 180.0 + 1.0e-4);
-  const auto selected = update(robot_state, yaw_demand);
+  auto robot_state = state();
+  robot_state.setVariablePosition("joint1", 0.4);
+  robot_state.setVariablePosition("joint4", limits_.upper_position[3] - limits_.position_margin[3]);
+  robot_state.update(true);
+  const auto selected = update(robot_state, faceAlongLookDirection(robot_state));
 
   ASSERT_TRUE(selected.tracking);
-  EXPECT_EQ(reference_->diagnostics().state, "FACE_PAIR_YAW_RESOURCE_EXHAUSTED");
-  EXPECT_EQ(reference_->diagnostics().compact_reason, "pair_yaw_resource_exhausted");
-  const auto events = reference_->drainCompactEvents();
-  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
-      return event.event == "pair_resource_exhausted";
-  }));
+  EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().compact_generation, 0U);
+  EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
+
+  for (const double face_y : {-0.2, 0.2, -0.2}) {
+    auto reversed_bearing = target(msg::TrackingTarget::FACE);
+    reversed_bearing.face.y = face_y;
+    const auto tracking = update(robot_state, reversed_bearing);
+    EXPECT_TRUE(tracking.tracking);
+    EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
+    EXPECT_FALSE(reference_->compactManeuverActive());
+  }
+  auto ordinary_j4_tracking = target(msg::TrackingTarget::FACE);
+  ordinary_j4_tracking.face.x = 0.425;
+  ordinary_j4_tracking.face.y = -0.736;
+  ordinary_j4_tracking.face.z = 1.680;
+  const auto j4_task = update(robot_state, ordinary_j4_tracking);
+  EXPECT_TRUE(j4_task.tracking);
+  EXPECT_FALSE(reference_->compactManeuverActive());
+}
+
+TEST_F(MotionReferenceTest, StationaryAlignedFaceAtEitherJ1WorkingEdgeStartsCompactWithFreeJ4)
+{
+  for (const double side : {-1.0, 1.0}) {
+    reference_->reset(false);
+    auto robot_state = state();
+    const double working_edge = side > 0.0 ?
+      limits_.upper_position[0] - limits_.position_margin[0] :
+      limits_.lower_position[0] + limits_.position_margin[0];
+    robot_state.setVariablePosition("joint1", working_edge);
+    robot_state.setVariablePosition("joint4", 0.0);
+    robot_state.update(true);
+    ASSERT_TRUE(robot_state.satisfiesBounds(group_));
+    const auto stationary_aligned_face = faceAlongLookDirection(robot_state);
+
+    const auto selected = update(robot_state, stationary_aligned_face);
+
+    EXPECT_TRUE(selected.tracking);
+    EXPECT_FALSE(reference_->compactManeuverActive()) << side;
+    EXPECT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_)) << side;
+    EXPECT_EQ(reference_->diagnostics().compact_generation, 1U) << side;
+    EXPECT_EQ(reference_->diagnostics().state, "FACE_COMPACT_PREPARING") << side;
+    EXPECT_EQ(reference_->diagnostics().compact_reason, "j1_working_boundary") << side;
+    auto events = reference_->drainCompactEvents();
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const CompactEvent & event) {
+        return event.event == "j1_boundary_reached";
+    }), 1) << side;
+
+    auto next_face = stationary_aligned_face;
+    next_face.header.stamp = rclcpp::Time(1, 0, RCL_ROS_TIME);
+    next_face.face_stamp = next_face.header.stamp;
+    const auto preparation = update(robot_state, next_face);
+    EXPECT_TRUE(preparation.tracking) << side;
+    EXPECT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_)) << side;
+    EXPECT_EQ(reference_->diagnostics().compact_generation, 1U) << side;
+    events = reference_->drainCompactEvents();
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const CompactEvent & event) {
+        return event.event == "j1_boundary_reached";
+    })) << side;
+    EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
+        return event.event == "preparation_cancelled" || event.event == "cancelled";
+    })) << side;
+  }
+}
+
+TEST_F(MotionReferenceTest, FreshJ1BrakeEnvelopeCanReachWorkingBoundaryBeforeMeasuredPosition)
+{
+  auto robot_state = state();
+  const double working_upper =
+    limits_.upper_position[0] - limits_.position_margin[0];
+  robot_state.setVariablePosition("joint1", working_upper - 0.005);
+  robot_state.update(true);
+  Eigen::VectorXd position;
+  robot_state.copyJointGroupPositions(group_, position);
+  const JointMotionState actual{
+    position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  JointMotionState queue = actual;
+  queue.velocity[0] = 0.10 * limits_.max_velocity[0];
+  const auto aligned_face = faceAlongLookDirection(robot_state);
+
+  const auto stale = MotionReferenceTestPeer::updateJ1BoundaryForTest(
+    *reference_, robot_state, aligned_face, false, actual, queue);
+  EXPECT_FALSE(stale.valid);
+
+  const auto fresh = MotionReferenceTestPeer::updateJ1BoundaryForTest(
+    *reference_, robot_state, aligned_face, true, actual, queue);
+  ASSERT_TRUE(fresh.valid);
+  EXPECT_LT(fresh.actual_position_rad, fresh.working_upper_rad);
+  EXPECT_GE(fresh.brake_max_position_rad, fresh.working_upper_rad);
+  EXPECT_EQ(fresh.edge_direction, BaseJointDirection::kPositive);
 }
 
 TEST_F(MotionReferenceRecoveryDisabledTest, ExhaustionBrakesAndLatchesAcrossLossPredictionAndReset)
 {
-  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+  const auto [robot_state, exhausted_target] = j1WorkingEdgeFaceCase();
   auto observed_target = exhausted_target;
   observed_target.header.stamp = rclcpp::Time(0, 1'000'000, RCL_ROS_TIME);
   observed_target.face_stamp = observed_target.header.stamp;
@@ -3615,7 +4791,7 @@ TEST_F(MotionReferenceRecoveryDisabledTest, ExhaustionBrakesAndLatchesAcrossLoss
 
 TEST_F(MotionReferenceRecoveryDisabledTest, OnlyNewRealAccessibleFaceReleasesLimitHold)
 {
-  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+  const auto [robot_state, exhausted_target] = j1WorkingEdgeFaceCase();
   auto blocked = exhausted_target;
   blocked.header.stamp = rclcpp::Time(0, 1'000'000, RCL_ROS_TIME);
   blocked.face_stamp = blocked.header.stamp;
@@ -3651,7 +4827,7 @@ TEST_F(MotionReferenceRecoveryDisabledTest, OnlyNewRealAccessibleFaceReleasesLim
 
 TEST_F(MotionReferenceRecoveryDisabledTest, PredictionStampCannotReleaseLimitHold)
 {
-  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+  const auto [robot_state, exhausted_target] = j1WorkingEdgeFaceCase();
   auto prediction = exhausted_target;
   prediction.face_is_prediction = true;
   prediction.header.stamp = rclcpp::Time(0, 2'000'000, RCL_ROS_TIME);
@@ -3674,7 +4850,7 @@ TEST_F(MotionReferenceRecoveryDisabledTest, PredictionStampCannotReleaseLimitHol
 
 TEST_F(MotionReferenceRecoveryDisabledTest, FreshFeedbackOnFaceLossCanLatchExhaustion)
 {
-  const auto [critical_state, critical_face] = criticalPairExhaustedCase();
+  const auto [critical_state, critical_face] = j1WorkingEdgeFaceCase();
   auto last_face = critical_face;
   last_face.header.stamp = rclcpp::Time(3, 0, RCL_ROS_TIME);
   last_face.face_stamp = last_face.header.stamp;
@@ -3700,26 +4876,9 @@ TEST_F(MotionReferenceRecoveryDisabledTest, FreshFeedbackOnFaceLossCanLatchExhau
   EXPECT_TRUE(reference_->diagnostics().disabled_limit_hold_latched);
 }
 
-TEST_F(MotionReferenceTest, FailedPairYawProbeCannotProveResourceAvailable)
-{
-  PairYawResourceAssessment assessment;
-  assessment.valid = true;
-  assessment.demand_present = true;
-  assessment.pair_bound_candidate = true;
-  assessment.probe_valid = false;
-  assessment.exhausted = false;
-
-  EXPECT_FALSE(MotionReferenceTestPeer::hasAvailablePairYawResource(assessment));
-
-  assessment.probe_valid = true;
-  assessment.actual_probe_solved = true;
-  assessment.actual_available_yaw_rad = kPairYawProbeDisplacementRad;
-  EXPECT_TRUE(MotionReferenceTestPeer::hasAvailablePairYawResource(assessment));
-}
-
 TEST_F(MotionReferenceRecoveryDisabledTest, ClockRewindKeepsHoldUntilFreshFaceInNewEpoch)
 {
-  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+  const auto [robot_state, exhausted_target] = j1WorkingEdgeFaceCase();
   auto exhausted = exhausted_target;
   exhausted.header.stamp = rclcpp::Time(9, 500'000'000, RCL_ROS_TIME);
   exhausted.face_stamp = exhausted.header.stamp;
@@ -3748,7 +4907,7 @@ TEST_F(MotionReferenceRecoveryDisabledTest, ClockRewindKeepsHoldUntilFreshFaceIn
 TEST_F(MotionReferenceRecoveryDisabledTest, MissingCompactProfileDoesNotBlockDisabledMode)
 {
   MotionReferenceTestPeer::removeCompactProfileForTest(*reference_);
-  const auto [robot_state, exhausted_target] = criticalPairExhaustedCase();
+  const auto [robot_state, exhausted_target] = j1WorkingEdgeFaceCase();
 
   const auto result = update(robot_state, exhausted_target);
 
@@ -3760,7 +4919,7 @@ TEST_F(MotionReferenceRecoveryDisabledTest, MissingCompactProfileDoesNotBlockDis
 
 TEST_F(MotionReferenceRecoveryDisabledNoCompactProfileTest, StartsWithoutCompactProfile)
 {
-  const auto [robot_state, face] = criticalPairExhaustedCase();
+  const auto [robot_state, face] = j1WorkingEdgeFaceCase();
   const auto result = update(robot_state, face);
 
   EXPECT_FALSE(result.task);
@@ -3784,11 +4943,11 @@ TEST_F(MotionReferenceRecoveryDisabledTest, OrdinaryRestAndSearchRemainAvailable
   EXPECT_FALSE(reference_->compactManeuverActive());
 }
 
-TEST_F(MotionReferenceRecoveryDisabledTest, AvailablePairKeepsNormalFaceTracking)
+TEST_F(MotionReferenceRecoveryDisabledTest, InteriorJ1KeepsNormalFaceTracking)
 {
   auto robot_state = state();
   constexpr std::array<double, 6> kJointAnglesRad{
-    6.233, -0.784, -1.010, 1.311, -1.097, 4.632};
+    6.0, -0.784, -1.010, 1.311, -1.097, 4.632};
   for (std::size_t index = 0; index < kJointAnglesRad.size(); ++index) {
     robot_state.setVariablePosition(parameters_.joint_names[index], kJointAnglesRad[index]);
   }
@@ -3806,225 +4965,43 @@ TEST_F(MotionReferenceRecoveryDisabledTest, AvailablePairKeepsNormalFaceTracking
   EXPECT_EQ(reference_->diagnostics().state, "FACE");
 }
 
-TEST_F(MotionReferenceTest, PairYawProbeDoesNotBlameJ4WhenTheOtherSwivelCanContinue)
+TEST_F(MotionReferenceTest, FreeJ4AndFaceDirectionReversalDoNotCancelJ1Preparation)
 {
-  auto robot_state = state();
-  constexpr std::array<double, 6> kJointAnglesRad{
-    6.233, -0.784, -1.010, 1.311, -1.097, 4.632};
-  for (std::size_t index = 0; index < kJointAnglesRad.size(); ++index) {
-    robot_state.setVariablePosition(parameters_.joint_names[index], kJointAnglesRad[index]);
-  }
-  robot_state.update(true);
-  auto command = target(msg::TrackingTarget::FACE);
-  command.face.x = 0.425;
-  command.face.y = -0.736;
-  command.face.z = 1.680;
+  const auto [robot_state, outward_face] = j1WorkingEdgeFaceCase();
+  auto first = outward_face;
+  first.target_id = 17;
+  first.header.stamp = rclcpp::Time(1, 0, RCL_ROS_TIME);
+  first.face_stamp = first.header.stamp;
+  const auto boundary = update(robot_state, first);
 
-  const auto assessment = pairYawAssessment(robot_state, command);
-
-  ASSERT_TRUE(assessment.valid);
-  ASSERT_TRUE(assessment.demand_present);
-  EXPECT_TRUE(assessment.probe_valid);
-  EXPECT_FALSE(assessment.exhausted);
-  EXPECT_GE(assessment.actual_available_yaw_rad, 0.80 * kPairYawProbeDisplacementRad);
-}
-
-TEST_F(MotionReferenceTest, PublicYawReversalReleasesTheLatchedJ1Hold)
-{
-  auto robot_state = state();
-  robot_state.setVariablePosition("joint1", 6.20);
-  robot_state.setVariablePosition("joint2", 0.233);
-  robot_state.setVariablePosition("joint3", -1.71);
-  robot_state.setVariablePosition("joint4", 0.0168);
-  robot_state.setVariablePosition("joint5", -0.8338);
-  robot_state.setVariablePosition("joint6", 6.27);
-  robot_state.update(true);
-  Eigen::VectorXd position;
-  robot_state.copyJointGroupPositions(group_, position);
-  const JointMotionState settled{
-    position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
-
-  const auto edge_update = update(
-    robot_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, settled);
-  ASSERT_TRUE(edge_update.j1_hold_position_rad);
-  const auto held_direction = static_cast<BaseJointDirection>(
-    reference_->diagnostics().j1_hold_direction);
-  ASSERT_NE(held_direction, BaseJointDirection::kNone);
-
-  std::optional<msg::TrackingTarget> reversed_target;
-  for (const double offset : {0.30, -0.30}) {
-    auto candidate = targetWithYawOffset(robot_state, offset);
-    const auto assessment = pairYawAssessment(robot_state, candidate);
-    if (assessment.valid && assessment.demand_present &&
-      assessment.j1.required_direction != BaseJointDirection::kNone &&
-      assessment.j1.required_direction != held_direction)
-    {
-      reversed_target = std::move(candidate);
-      break;
-    }
-  }
-  ASSERT_TRUE(reversed_target);
-
-  const auto reversed_update = update(
-    robot_state, reversed_target, nullptr, nullptr, settled);
-
-  EXPECT_FALSE(reversed_update.j1_hold_position_rad);
-  EXPECT_EQ(reference_->diagnostics().j1_hold_direction, 0);
-  EXPECT_DOUBLE_EQ(reference_->diagnostics().j1_hold_q, 0.0);
-
-  auto bad_state = state();
-  bad_state.setVariablePosition("joint1", 6.20);
-  bad_state.setVariablePosition("joint2", 0.233);
-  bad_state.setVariablePosition("joint3", -2.30);
-  bad_state.setVariablePosition("joint4", 0.0168);
-  bad_state.setVariablePosition("joint5", -0.8338);
-  bad_state.setVariablePosition("joint6", 6.27);
-  bad_state.update(true);
-  ASSERT_TRUE(bad_state.satisfiesBounds(group_));
-  Eigen::VectorXd bad_position;
-  bad_state.copyJointGroupPositions(group_, bad_position);
-  const JointMotionState bad_settled{
-    bad_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
-  reference_ = std::make_unique<MotionReference>(
-    node_, monitor_, parameters_, limits_, collision_config_);
-  const auto bad_edge = update(
-    bad_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, bad_settled);
-  ASSERT_TRUE(bad_edge.task);
-  ASSERT_TRUE(bad_edge.j1_hold_position_rad);
-  ASSERT_EQ(reference_->diagnostics().posture_mode, "recover");
-  const auto bad_held_direction = static_cast<BaseJointDirection>(
-    reference_->diagnostics().j1_hold_direction);
-  std::optional<msg::TrackingTarget> bad_reversed_target;
-  for (const double offset : {0.30, -0.30}) {
-    auto candidate = targetWithYawOffset(bad_state, offset);
-    const auto assessment = pairYawAssessment(bad_state, candidate);
-    if (assessment.valid && assessment.demand_present &&
-      assessment.j1.required_direction != BaseJointDirection::kNone &&
-      assessment.j1.required_direction != bad_held_direction)
-    {
-      bad_reversed_target = std::move(candidate);
-      break;
-    }
-  }
-  ASSERT_TRUE(bad_reversed_target);
-  const auto bad_reversed = update(
-    bad_state, bad_reversed_target, nullptr, nullptr, bad_settled);
-  ASSERT_TRUE(bad_reversed.task);
-  EXPECT_FALSE(bad_reversed.j1_hold_position_rad);
-  EXPECT_EQ(reference_->diagnostics().j1_hold_direction, 0);
-  EXPECT_EQ(reference_->diagnostics().posture_mode, "recover");
-
-  HierarchicalVelocityQpConfig qp_config;
-  qp_config.period_sec = parameters_.control_period_sec;
-  qp_config.residual_command_latency_sec = 0.0;
-  qp_config.velocity_regularization = parameters_.velocity_regularization_weight;
-  qp_config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
-  qp_config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
-  qp_config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
-  qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
-  qp_config.solver_max_iterations = parameters_.solver_max_iterations;
-  const HierarchicalVelocityQp solver(qp_config);
-  CollisionConstraintBuilder collision_builder(collision_config_);
-  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
-  ASSERT_TRUE(locked_scene);
-  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
-  const auto collision = collision_builder.build(
-    *scene, bad_state, *group_, bad_settled, limits_, parameters_.control_period_sec);
-  auto constraints = collision.constraints;
-  constraints.insert(
-    constraints.end(), bad_reversed.compact_roll_constraints.begin(),
-    bad_reversed.compact_roll_constraints.end());
-  const auto bad_qp = solver.solve(
-    *bad_reversed.task, bad_settled, limits_, constraints);
-  ASSERT_TRUE(bad_qp.command_available());
-}
-
-TEST_F(MotionReferenceTest, FreshPairAvailabilityCancelsPreparationBeforeCommit)
-{
-  const auto robot_state = state();
-  const auto aligned_target = faceAlongLookDirection(robot_state);
-  beginPreparationForResultTest(robot_state);
+  ASSERT_TRUE(boundary.tracking);
+  ASSERT_FALSE(reference_->compactManeuverActive());
   ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
-  MotionReferenceTestPeer::cancelPlannerForTest(*reference_);
-  MotionReferenceTestPeer::activateResultGeneration(
-    *reference_, reference_->diagnostics().compact_generation + 100U);
-  const auto result = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
-
-  const auto refreshed = update(robot_state, aligned_target);
-
-  EXPECT_TRUE(refreshed.tracking);
-  EXPECT_FALSE(reference_->compactManeuverActive());
-  EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "PREPARATION_CANCELLED");
-  consumePreparationResult(robot_state, result);
-  EXPECT_FALSE(reference_->compactManeuverActive());
-  const auto events = reference_->drainCompactEvents();
-  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
-      return event.event == "preparation_cancelled";
-  }));
-}
-
-TEST_F(MotionReferenceTest, UnknownPairProbePreservesPreparationGeneration)
-{
-  const auto robot_state = state();
-  beginPreparationForResultTest(robot_state);
+  ASSERT_EQ(reference_->diagnostics().state, "FACE_COMPACT_PREPARING");
+  first.header.stamp = rclcpp::Time(2, 0, RCL_ROS_TIME);
+  first.face_stamp = first.header.stamp;
+  const auto started = update(robot_state, first);
+  ASSERT_TRUE(started.tracking);
   ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
-  const auto generation = MotionReferenceTestPeer::pendingGeneration(*reference_);
-  ASSERT_TRUE(generation);
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  ASSERT_EQ(reference_->diagnostics().compact_reason, "j1_working_boundary");
 
-  PairYawResourceAssessment unknown;
-  unknown.valid = true;
-  unknown.demand_present = true;
-  unknown.pair_bound_candidate = true;
-  unknown.actual_probe_solved = false;
-  planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
-  const planning_scene::PlanningSceneConstPtr planning_scene = scene;
-  const double now = std::chrono::duration<double>(
-    std::chrono::steady_clock::now() - clock_origin_).count();
-  Eigen::VectorXd position;
-  Eigen::VectorXd velocity;
-  robot_state.copyJointGroupPositions(group_, position);
-  robot_state.copyJointGroupVelocities(group_, velocity);
-  const JointMotionState feedback{
-    position, velocity, Eigen::VectorXd::Zero(position.size())};
+  auto reversed = first;
+  reversed.face.x = 0.85;
+  reversed.face.y = -0.20;
+  reversed.header.stamp = rclcpp::Time(3, 0, RCL_ROS_TIME);
+  reversed.face_stamp = reversed.header.stamp;
+  const auto continued = update(robot_state, reversed);
 
-  const auto result = MotionReferenceTestPeer::handlePreparationWithAssessmentForTest(
-    *reference_, robot_state, faceAlongLookDirection(robot_state), *planning_scene,
-    now, kSceneRevision, feedback, feedback, unknown);
-
-  EXPECT_TRUE(result.tracking);
+  EXPECT_TRUE(continued.tracking);
   EXPECT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
-  EXPECT_EQ(MotionReferenceTestPeer::pendingGeneration(*reference_), generation);
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "PREPARING");
-  MotionReferenceTestPeer::qualifyPairYawForIsolatedAdmissionTest(*reference_);
-  const auto exhausted = MotionReferenceTestPeer::pairYawAssessment(*reference_);
-  ASSERT_EQ(pairYawResourceState(exhausted), PairYawResourceState::kExhausted);
-  static_cast<void>(MotionReferenceTestPeer::handlePreparationWithAssessmentForTest(
-      *reference_, robot_state, faceAlongLookDirection(robot_state), *planning_scene,
-      now + parameters_.control_period_sec, kSceneRevision, feedback, feedback, exhausted));
-
-  EXPECT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
-  EXPECT_EQ(MotionReferenceTestPeer::pendingGeneration(*reference_), generation);
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().compact_generation, 1U);
+  EXPECT_NE(reference_->diagnostics().compact_phase, "PREPARATION_CANCELLED");
   const auto events = reference_->drainCompactEvents();
   EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
-      return event.event == "preparation_cancelled";
+      return event.event == "preparation_cancelled" || event.event == "cancelled";
   }));
-
-  const auto lost_target = target(msg::TrackingTarget::HOLD);
-  static_cast<void>(MotionReferenceTestPeer::handlePreparationWithAssessmentForTest(
-      *reference_, robot_state, lost_target, *planning_scene,
-      now + 2.0 * parameters_.control_period_sec, kSceneRevision,
-      feedback, feedback, unknown));
-  EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
-
-  beginPreparationForResultTest(robot_state);
-  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
-  static_cast<void>(MotionReferenceTestPeer::handlePreparationWithAssessmentForTest(
-      *reference_, robot_state, faceAlongLookDirection(robot_state), *planning_scene,
-      now + 3.0 * parameters_.control_period_sec, kSceneRevision + 1U,
-      feedback, feedback, unknown));
-  EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
-  EXPECT_FALSE(MotionReferenceTestPeer::pendingGeneration(*reference_));
 }
 
 TEST_F(MotionReferenceTest, DefaultCompactGoalUsesNearestValidatedBoundedWristBranch)
@@ -4055,8 +5032,17 @@ TEST_F(MotionReferenceTest, DefaultCompactGoalUsesNearestValidatedBoundedWristBr
       events.begin(), events.end(), [](const CompactEvent & event) {
         return event.event == "triggered";
       });
-    ASSERT_NE(triggered, events.end()) << cases[index].second;
-    ASSERT_TRUE(reference_->compactManeuverActive()) << cases[index].second;
+    ASSERT_NE(triggered, events.end()) << cases[index].second
+                                       << "; phase=" << reference_->diagnostics().compact_phase
+                                       << "; last_plan=" <<
+      reference_->diagnostics().last_plan_message
+                                       << "; events=" << compactEventSummary(events);
+    ASSERT_TRUE(reference_->compactManeuverActive()) << cases[index].second
+                                                     << "; phase=" <<
+      reference_->diagnostics().compact_phase
+                                                     << "; last_plan=" <<
+      reference_->diagnostics().last_plan_message
+                                                     << "; events=" << compactEventSummary(events);
     const auto goal = goalVectorFromDetails(triggered->details_json);
     ASSERT_TRUE(goal) << triggered->details_json;
     if (cases[index].second == "negative_pi") {
@@ -4103,26 +5089,23 @@ TEST_F(MotionReferenceTest, DefaultCompactGoalUsesNearestValidatedBoundedWristBr
 
 TEST_F(MotionReferenceTest, PreparationFailureKeepsFaceActiveWithoutTriggeredEvent)
 {
-  const auto [start, initial_target] = criticalPairExhaustedCase();
+  const auto [start, initial_target] = j1WorkingEdgeFaceCase();
   auto face_target = initial_target;
   Eigen::VectorXd position;
   start.copyJointGroupPositions(group_, position);
   const JointMotionState settled{
     position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
 
-  // First FACE update qualifies the pair-resource transition. Preparation is
-  // entered on the following update, after the policy transition is visible.
+  // The boundary trigger and preparation request are visible on the first
+  // FACE update; the next fresh target keeps that same preparation live.
   const auto face = update(start, face_target, nullptr, nullptr, settled);
   ASSERT_TRUE(face.task);
   ASSERT_TRUE(face.tracking);
-  EXPECT_FALSE(face.actual_face_alignment);
-  EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  EXPECT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
   face_target.face_stamp = rclcpp::Time(1, 20'000'000, RCL_ROS_TIME);
   const auto preparation = update(start, face_target, nullptr, nullptr, settled);
   ASSERT_TRUE(preparation.task);
   ASSERT_TRUE(preparation.tracking);
-  ASSERT_TRUE(preparation.actual_face_alignment);
-  EXPECT_TRUE(std::isfinite(preparation.actual_face_alignment->pointing_error_rad));
   ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
   EXPECT_EQ(reference_->diagnostics().tracking_phase, "FACE");
   EXPECT_FALSE(reference_->compactManeuverActive());
@@ -4145,21 +5128,40 @@ TEST_F(MotionReferenceTest, PreparationFailureKeepsFaceActiveWithoutTriggeredEve
     [](const CompactEvent & event) {return event.event == "triggered";}));
 }
 
-TEST_F(MotionReferenceTest, FailedDefaultCandidateAdvancesToDistinctBoundedGoal)
+TEST_F(MotionReferenceTest, MissingMandatoryReturnRejectsCandidateBeforeCommit)
 {
-  const auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  const auto start = state(6.0);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
+  Eigen::VectorXd start_positions;
+  Eigen::VectorXd start_velocities;
+  start.copyJointGroupPositions(group_, start_positions);
+  start.copyJointGroupVelocities(group_, start_velocities);
+  const JointMotionState stationary{
+    start_positions, start_velocities, Eigen::VectorXd::Zero(start_positions.size())};
+  MotionReferenceTestPeer::clearPendingPlannerForSubmissionTest(*reference_);
+  const double submit_time = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count();
+  ASSERT_TRUE(MotionReferenceTestPeer::submitPreparationForTest(
+      *reference_, start, submit_time, kSceneRevision, stationary, stationary,
+      nullptr, nullptr)) << reference_->diagnostics().last_plan_message;
+  MotionReferenceTestPeer::cancelPlannerForTest(*reference_);
+  MotionReferenceTestPeer::activateResultGeneration(*reference_, 1001U);
   const std::size_t count = MotionReferenceTestPeer::candidateCount(*reference_);
   ASSERT_GE(count, 2U);
   const CompactGoal first = MotionReferenceTestPeer::candidate(*reference_, 0U);
   ASSERT_EQ(MotionReferenceTestPeer::candidateIndex(*reference_), 0U);
 
-  const auto first_failure = MotionReferenceTestPeer::resultForCurrentCandidate(
-    *reference_, false);
-  consumePreparationResult(start, first_failure);
+  const auto missing_return = MotionReferenceTestPeer::resultForCurrentCandidate(
+    *reference_, true, 0.0, false);
+  consumePreparationResult(start, missing_return);
   ASSERT_EQ(MotionReferenceTestPeer::candidateIndex(*reference_), 1U);
   EXPECT_FALSE(reference_->compactManeuverActive());
+  EXPECT_NE(reference_->diagnostics().last_plan_message.find(
+      "checked endpoint in its frozen return region"), std::string::npos);
+  const auto rejected_events = reference_->drainCompactEvents();
+  EXPECT_FALSE(std::any_of(rejected_events.begin(), rejected_events.end(),
+    [](const CompactEvent & event) {return event.event == "triggered";}));
   const CompactGoal second = MotionReferenceTestPeer::candidate(*reference_, 1U);
   EXPECT_NE(first.profile_id, second.profile_id);
   ASSERT_EQ(first.bounded_positions.size(), limits_.lower_position.size());
@@ -4172,11 +5174,27 @@ TEST_F(MotionReferenceTest, FailedDefaultCandidateAdvancesToDistinctBoundedGoal)
   EXPECT_TRUE((second.bounded_positions.array() >= limits_.lower_position.array()).all());
   EXPECT_TRUE((second.bounded_positions.array() <= limits_.upper_position.array()).all());
 
+  const auto planner_idle_deadline = std::chrono::steady_clock::now() + 1s;
+  while (MotionReferenceTestPeer::plannerBusy(*reference_) &&
+    std::chrono::steady_clock::now() < planner_idle_deadline)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_FALSE(MotionReferenceTestPeer::plannerBusy(*reference_));
+  MotionReferenceTestPeer::clearPendingPlannerForSubmissionTest(*reference_);
+  const double second_submit_time = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count();
+  ASSERT_TRUE(MotionReferenceTestPeer::submitPreparationForTest(
+      *reference_, start, second_submit_time, kSceneRevision, stationary, stationary,
+      nullptr, nullptr)) << reference_->diagnostics().last_plan_message;
+  static_cast<void>(
+    MotionReferenceTestPeer::installValidWorkingReturnRegionForTest(*reference_));
+  MotionReferenceTestPeer::cancelPlannerForTest(*reference_);
   MotionReferenceTestPeer::activateResultGeneration(*reference_, 1002U);
   const auto second_success = MotionReferenceTestPeer::resultForCurrentCandidate(
     *reference_, true);
   consumePreparationResult(start, second_success);
-  EXPECT_TRUE(reference_->compactManeuverActive());
+  EXPECT_TRUE(reference_->compactManeuverActive()) << reference_->diagnostics().last_plan_message;
   const auto events = reference_->drainCompactEvents();
   const auto triggered = std::find_if(events.begin(), events.end(),
       [](const CompactEvent & event) {return event.event == "triggered";});
@@ -4188,7 +5206,7 @@ TEST_F(MotionReferenceTest, FailedDefaultCandidateAdvancesToDistinctBoundedGoal)
 TEST_F(MotionReferenceTest, AllPreparationCandidatesExhaustOnceForUnchangedStateAndScene)
 {
   const auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   const std::size_t candidate_count = MotionReferenceTestPeer::candidateCount(*reference_);
   ASSERT_GT(candidate_count, 0U);
@@ -4249,7 +5267,7 @@ TEST_F(MotionReferenceTest, EmptyDefaultCandidateSetExhaustsUntilStateOrSceneCha
 
   const auto changed_state = compactGoalState(0.06);
   const auto scene_retry_generation = reference_->diagnostics().compact_generation;
-  recordQualifyingFaceShortfall(changed_state);
+  primeFaceTracking(changed_state);
   beginPreparationForResultTest(
     changed_state, std::nullopt, nullptr, nullptr, kChangedSceneRevision);
   EXPECT_EQ(reference_->diagnostics().compact_generation, scene_retry_generation + 1U);
@@ -4260,7 +5278,7 @@ TEST_F(MotionReferenceTest, EmptyDefaultCandidateSetExhaustsUntilStateOrSceneCha
 TEST_F(MotionReferenceTest, StalePreparationResultsCannotCommit)
 {
   const auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
 
@@ -4287,7 +5305,7 @@ TEST_F(MotionReferenceTest, StalePreparationResultsCannotCommit)
 TEST_F(MotionReferenceTest, PreparationResultWithStaleStartRejectsCandidate)
 {
   const auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   ASSERT_GE(MotionReferenceTestPeer::candidateCount(*reference_), 2U);
   auto stale_start = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
@@ -4303,10 +5321,10 @@ TEST_F(MotionReferenceTest, PreparationResultWithStaleStartRejectsCandidate)
   }));
 }
 
-TEST_F(MotionReferenceTest, AlignedFaceAndLegacyShortfallNeverAdmitCompact)
+TEST_F(MotionReferenceTest, AlignedInteriorFaceAndLegacyShortfallNeverAdmitCompact)
 {
   const auto start = state();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   const auto face = faceAlongLookDirection(start);
   for (int tick = 0; tick < 16; ++tick) {
     const auto measured = update(start, face);
@@ -4322,14 +5340,14 @@ TEST_F(MotionReferenceTest, AlignedFaceAndLegacyShortfallNeverAdmitCompact)
   EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
   const auto events = reference_->drainCompactEvents();
   EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
-      return event.event == "pair_resource_exhausted" || event.event == "triggered";
+      return event.event == "triggered";
   }));
 }
 
 TEST_F(MotionReferenceTest, NearbyAdmissionRejectsCollisionWithinAttachDistance)
 {
   const auto submitted_start = compactGoalState();
-  recordQualifyingFaceShortfall(submitted_start);
+  primeFaceTracking(submitted_start);
   beginPreparationForResultTest(submitted_start);
   ASSERT_GE(MotionReferenceTestPeer::candidateCount(*reference_), 2U);
   const auto worker_result = MotionReferenceTestPeer::resultForCurrentCandidate(
@@ -4369,8 +5387,9 @@ TEST_F(MotionReferenceTest, NearbyAdmissionRejectsCollisionWithinAttachDistance)
   consumePreparationResult(nearby_actual, worker_result, nearby_queue);
   EXPECT_FALSE(reference_->compactManeuverActive());
   EXPECT_GT(reference_->diagnostics().plans_rejected, 0U);
-  EXPECT_NE(reference_->diagnostics().last_plan_message.find("attachment bridge"),
-    std::string::npos);
+  EXPECT_NE(reference_->diagnostics().last_plan_message.find(
+      "attachment collision validation failed"), std::string::npos)
+    << reference_->diagnostics().last_plan_message;
   EXPECT_NE(MotionReferenceTestPeer::candidateIndex(*reference_), 0U);
   const auto events = reference_->drainCompactEvents();
   EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
@@ -4381,15 +5400,16 @@ TEST_F(MotionReferenceTest, NearbyAdmissionRejectsCollisionWithinAttachDistance)
 TEST_F(MotionReferenceTest, CertifiedSafeSuffixRebasesPathAndFollowerDoesNotReplayPrefix)
 {
   const auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
   Eigen::VectorXd first_waypoint = plan.start_positions;
   first_waypoint[0] += 0.15;
-  Eigen::VectorXd detour_waypoint = first_waypoint;
-  detour_waypoint[1] += 0.50;
-  plan.path = {
-    plan.start_positions, first_waypoint, detour_waypoint, plan.goal_positions};
+  // Keep the synthetic source physically close to the committed route. Its
+  // certificate still marks the first half as unsafe, while the selected
+  // queue-nearest suffix is the safe endpoint; a large arbitrary J2 detour
+  // would make the final, real geometry validator reject this fixture.
+  plan.path = {plan.start_positions, first_waypoint, plan.goal_positions};
   installSyntheticCompactCertificate(
     plan, [](const std::size_t segment, const double fraction) {
       // A submitted-path prefix exceeds the current cap; the selected suffix is safe.
@@ -4408,13 +5428,27 @@ TEST_F(MotionReferenceTest, CertifiedSafeSuffixRebasesPathAndFollowerDoesNotRepl
   const JointMotionState queue_feedback{
     queue_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
   const auto selected_index = [&]() {
-      double nearest_distance = std::numeric_limits<double>::infinity();
+      double nearest_queue_distance = std::numeric_limits<double>::infinity();
+      double nearest_actual_distance = std::numeric_limits<double>::infinity();
       std::size_t nearest = 0U;
       for (std::size_t index = 0U; index < plan.compact_path_samples.size(); ++index) {
-        const double distance =
+        const auto & sample = plan.compact_path_samples[index];
+        const double queue_distance =
+          (queue_position - sample.positions).norm();
+        const double actual_distance =
           (actual_position - plan.compact_path_samples[index].positions).norm();
-        if (distance < nearest_distance) {
-          nearest_distance = distance;
+        if (sample.original_segment_index >= 4U || queue_distance > 0.20 + 1.0e-9 ||
+          sample.suffix_maximum_assembly_radius_m >
+          reference_->diagnostics().compact_entry_radius_cap_m + 1.0e-6)
+        {
+          continue;
+        }
+        if (queue_distance < nearest_queue_distance - 1.0e-12 ||
+          (std::abs(queue_distance - nearest_queue_distance) <= 1.0e-12 &&
+          actual_distance < nearest_actual_distance - 1.0e-12))
+        {
+          nearest_queue_distance = queue_distance;
+          nearest_actual_distance = actual_distance;
           nearest = index;
         }
       }
@@ -4425,7 +5459,7 @@ TEST_F(MotionReferenceTest, CertifiedSafeSuffixRebasesPathAndFollowerDoesNotRepl
   ASSERT_LE(
     (actual_position - plan.compact_path_samples[selected_index].positions).norm(), 0.20);
   EXPECT_NEAR(
-    (queue_position - plan.compact_path_samples[selected_index].positions).norm(), 0.20,
+    (queue_position - plan.compact_path_samples[selected_index].positions).norm(), 0.15,
     1.0e-9);
   consumePreparationResult(start, plan, queue_feedback, nullptr, nullptr,
     kSceneRevision, actual_feedback);
@@ -4447,22 +5481,79 @@ TEST_F(MotionReferenceTest, CertifiedSafeSuffixRebasesPathAndFollowerDoesNotRepl
   EXPECT_NE(triggered->details_json.find("\"follower_seed_positions_rad\":"),
     std::string::npos);
 
+  // Validate the actual queue-to-selected-suffix source geometry with the same
+  // final validator used by the worker, before any time-warped samples exist.
+  std::vector<Eigen::VectorXd> source_route{queue_position};
+  source_route.push_back(plan.compact_path_samples[selected_index].positions);
+  for (std::size_t index = selected_index + 1U;
+    index < plan.compact_path_samples.size(); ++index)
+  {
+    if ((plan.compact_path_samples[index].positions - source_route.back()).norm() > 1.0e-12) {
+      source_route.push_back(plan.compact_path_samples[index].positions);
+    }
+  }
+  CompactGeometryValidator physical_geometry(model_, "link_base");
+  double source_radius_cap = 0.40;
+  const auto include_source_pose = [&](const Eigen::VectorXd & position) {
+      auto pose_state = start;
+      pose_state.setJointGroupPositions(group_, position);
+      pose_state.update(true);
+      source_radius_cap = std::max(
+        source_radius_cap, physical_geometry.maximumAssemblyRadius(pose_state));
+    };
+  include_source_pose(actual_position);
+  include_source_pose(queue_position);
+  include_source_pose(plan.goal_positions);
+  CompactProfileFinalGeometryValidator source_validator;
+  {
+    planning_scene_monitor::LockedPlanningSceneRO scene_lock(monitor_);
+    const planning_scene::PlanningSceneConstPtr scene = scene_lock;
+    source_validator = MotionReferenceTestPeer::finalGeometryValidatorForTest(
+      *reference_, *scene, start, kSceneRevision, source_radius_cap);
+  }
+  CompactJointProfile source_geometry;
+  for (std::size_t segment = 0U; segment + 1U < source_route.size(); ++segment) {
+    const Eigen::VectorXd delta = source_route[segment + 1U] - source_route[segment];
+    const std::size_t steps = static_cast<std::size_t>(std::max(1.0, std::ceil(
+        delta.lpNorm<Eigen::Infinity>() / 0.02)));
+    for (std::size_t step = 0U; step <= steps; ++step) {
+      if (segment > 0U && step == 0U) {
+        continue;
+      }
+      const double fraction = static_cast<double>(step) / static_cast<double>(steps);
+      const Eigen::VectorXd position = source_route[segment] + fraction * delta;
+      source_geometry.samples.push_back(JointMotionState{
+            position, Eigen::VectorXd::Zero(position.size()),
+            Eigen::VectorXd::Zero(position.size())});
+    }
+  }
+  const auto source_certificate = source_validator(source_geometry);
+  ASSERT_EQ(source_certificate.status, CompactProfileGeometryStatus::kPass)
+    << source_certificate.failure_reason;
+
   const double now = std::chrono::duration<double>(
     std::chrono::steady_clock::now() - clock_origin_).count();
-  const auto follower = MotionReferenceTestPeer::updateFollower(
-    *reference_, queue_position, now + 0.01);
-  ASSERT_EQ(follower.status, JointPathStatus::kTracking);
-  EXPECT_NEAR(follower.distance_from_path_rad, 0.0, 1.0e-9);
-  EXPECT_DOUBLE_EQ(follower.progress_rad, 0.0);
-  const auto & attachment = plan.compact_path_samples[selected_index].positions;
-  EXPECT_GE(follower.reference_position[0], attachment[0] - 1.0e-9);
-  EXPECT_GT((follower.reference_position - plan.path.front()).norm(), 0.05);
+  const auto accepted_profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(accepted_profile) << reference_->diagnostics().last_plan_message;
+  ASSERT_FALSE(accepted_profile->samples.empty());
+  EXPECT_NEAR((accepted_profile->samples.front().position - queue_position).norm(), 0.0, 1.0e-9);
+  const JointMotionState queue_state{
+    queue_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const auto next_command = update(
+    start, target(msg::TrackingTarget::FACE), nullptr, nullptr, queue_state,
+    kSceneRevision, now + 0.01);
+  ASSERT_TRUE(next_command.compact_profile_command);
+  ASSERT_TRUE(next_command.compact_profile_velocity);
+  ASSERT_GE(accepted_profile->samples.size(), 2U);
+  EXPECT_TRUE(next_command.compact_profile_velocity->isApprox(
+    accepted_profile->samples[1U].velocity, 1.0e-12));
+  EXPECT_GT((accepted_profile->samples[1U].position - plan.path.front()).norm(), 0.05);
 }
 
 TEST_F(MotionReferenceTest, CompactAdmissionRejectsCertificateGapOrMappingMismatch)
 {
   const auto make_plan = [this](const moveit::core::RobotState & start) {
-      recordQualifyingFaceShortfall(start);
+      primeFaceTracking(start);
       beginPreparationForResultTest(start);
       auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
       Eigen::VectorXd waypoint = plan.start_positions;
@@ -4509,7 +5600,7 @@ TEST_F(MotionReferenceTest, CompactAdmissionRejectsCertificateGapOrMappingMismat
 TEST_F(MotionReferenceTest, CompactAdmissionRejectsUnsafeRemainingSuffix)
 {
   const auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
   Eigen::VectorXd waypoint = plan.start_positions;
@@ -4537,7 +5628,7 @@ TEST_F(MotionReferenceTest, CompactAdmissionRejectsUnsafeRemainingSuffix)
 TEST_F(MotionReferenceTest, CompactCertificateAdmissionEnforcesWindowAndFirstFourSegments)
 {
   auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   auto queue_plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
   Eigen::VectorXd queue_waypoint = queue_plan.start_positions;
@@ -4559,7 +5650,7 @@ TEST_F(MotionReferenceTest, CompactCertificateAdmissionEnforcesWindowAndFirstFou
 
   reference_->reset(false);
   start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
   Eigen::VectorXd actual_position = plan.start_positions;
@@ -4589,7 +5680,7 @@ TEST_F(MotionReferenceTest, CompactCertificateAdmissionEnforcesWindowAndFirstFou
 TEST_F(MotionReferenceTest, CompactCertificateAdmissionChoosesEarliestTiedSample)
 {
   const auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
   Eigen::VectorXd first_waypoint = plan.start_positions;
@@ -4618,7 +5709,7 @@ TEST_F(MotionReferenceTest, CompactCertificateAdmissionChoosesEarliestTiedSample
 TEST_F(MotionReferenceTest, WorkerEndpointWithinGoalToleranceIsAdmitted)
 {
   const auto start = compactGoalState(0.05);
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   const auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(
     *reference_, true, 0.005);
@@ -4635,7 +5726,7 @@ TEST_F(MotionReferenceTest, WorkerEndpointWithinGoalToleranceIsAdmitted)
 TEST_F(MotionReferenceTest, WorkerEndpointOutsideGoalToleranceIsRejected)
 {
   const auto start = compactGoalState(0.05);
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   const auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(
     *reference_, true, 0.1);
@@ -4652,51 +5743,54 @@ TEST_F(MotionReferenceTest, WorkerEndpointOutsideGoalToleranceIsRejected)
     std::string::npos);
 }
 
-TEST_F(MotionReferenceTest, TargetLossOrChangeCancelsOnlyUncommittedPreparation)
+TEST_F(MotionReferenceTest, HealthyRecoveryPreservesPreparationButExplicitHoldCancels)
 {
-  auto [start, first_target] = criticalPairExhaustedCase();
+  auto [start, first_target] = j1WorkingEdgeFaceCase();
   first_target.target_id = 17;
   (void)update(start, first_target);
   first_target.face_stamp = rclcpp::Time(1, 20'000'000, RCL_ROS_TIME);
   (void)update(start, first_target);
   ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  const auto old_generation = reference_->diagnostics().compact_generation;
   auto changed_target = first_target;
   changed_target.target_id = 18;
-  (void)update(start, changed_target);
-  EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
-  EXPECT_FALSE(reference_->compactManeuverActive());
-
-  reference_->reset(false);
-  auto healthy_case = criticalPairExhaustedCase();
-  start = std::move(healthy_case.first);
-  first_target = std::move(healthy_case.second);
-  first_target.target_id = 17;
-  (void)update(start, first_target);
-  first_target.face_stamp = rclcpp::Time(1, 20'000'000, RCL_ROS_TIME);
-  (void)update(start, first_target);
+  const auto changed = update(start, changed_target);
+  EXPECT_TRUE(changed.tracking);
   ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  const auto new_generation = reference_->diagnostics().compact_generation;
+  EXPECT_EQ(new_generation, old_generation);
+
+  changed_target.header.stamp = rclcpp::Time(1, 40'000'000, RCL_ROS_TIME);
+  changed_target.face_stamp = changed_target.header.stamp;
+  (void)update(start, changed_target);
+  EXPECT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  EXPECT_EQ(reference_->diagnostics().compact_generation, new_generation);
   auto healthy_loss = target(msg::TrackingTarget::HOLD);
   healthy_loss.allow_recovery = true;
   (void)update(start, healthy_loss);
-  EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  EXPECT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
   EXPECT_FALSE(reference_->compactManeuverActive());
 
   reference_->reset(false);
-  start = compactGoalState(0.05);
-  recordQualifyingFaceShortfall(start);
-  admitCurrentPreparationWithLifecycleFixturePath(start);
-  ASSERT_TRUE(reference_->compactManeuverActive());
-  (void)update(start, healthy_loss);
-  EXPECT_TRUE(reference_->compactManeuverActive());
-  changed_target.target_id = 19;
-  (void)update(start, changed_target);
-  EXPECT_TRUE(reference_->compactManeuverActive());
+  auto explicit_hold_case = j1WorkingEdgeFaceCase();
+  start = std::move(explicit_hold_case.first);
+  first_target = std::move(explicit_hold_case.second);
+  first_target.target_id = 17;
+  (void)update(start, first_target);
+  first_target.face_stamp = rclcpp::Time(1, 20'000'000, RCL_ROS_TIME);
+  (void)update(start, first_target);
+  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  const auto explicit_hold = target(msg::TrackingTarget::HOLD);
+  (void)update(start, explicit_hold);
+  EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  EXPECT_FALSE(reference_->compactManeuverActive());
 }
 
 TEST_F(MotionReferenceCustomCompactGoalTest, ExplicitCompactGoalIsNotBranchSelectedOrStaged)
 {
   const auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   beginPreparationForResultTest(start);
   ASSERT_EQ(MotionReferenceTestPeer::candidateCount(*reference_), 1U);
   const auto configured_candidate = MotionReferenceTestPeer::candidate(*reference_, 0U);
@@ -4722,7 +5816,7 @@ TEST_F(MotionReferenceCustomCompactGoalTest, ExplicitCompactGoalIsNotBranchSelec
   EXPECT_DOUBLE_EQ((*goal)[5], 0.7);
 }
 
-TEST_F(MotionReferenceInvalidCompactMountTest, DefaultCandidatesRejectInvalidScreenMount)
+TEST_F(MotionReferenceInvalidCompactMountTest, InvalidScreenMountCannotCommitWithoutValidReturn)
 {
   auto safe_mount_state = nearScreenPoleState();
   safe_mount_state.setVariablePosition(
@@ -4734,8 +5828,14 @@ TEST_F(MotionReferenceInvalidCompactMountTest, DefaultCandidatesRejectInvalidScr
   ASSERT_LE(std::abs(safe_mount_pose->signed_roll_error_rad), kCompactRollCapTestRad);
   const auto events = commitCompactWithLifecycleFixturePath(safe_mount_state);
   EXPECT_FALSE(reference_->compactManeuverActive());
-  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
-      return event.event == "cancelled";
+  const auto rejected = std::find_if(events.begin(), events.end(), [](const CompactEvent & event) {
+        return event.event == "candidate_rejected" &&
+               event.reason.find("checked endpoint in its frozen return region") !=
+               std::string::npos;
+    });
+  ASSERT_NE(rejected, events.end());
+  EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
+      return event.event == "triggered";
   }));
 }
 
@@ -4875,7 +5975,7 @@ TEST_F(MotionReferenceTest, ReferenceGuardBlendUsesValidatedBrakeFallback)
 
       auto reference = std::make_unique<MotionReference>(
         node_, monitor_, parameters_, limits_, collision_config_);
-      MotionReferenceTestPeer::qualifyPairYawForIsolatedAdmissionTest(*reference);
+      MotionReferenceTestPeer::qualifyCompactPhaseForIsolatedPreparationTest(*reference);
       auto component = make_component();
       CollisionAwareServoComponentTestPeer::installMotionReference(
         *component, std::move(reference));
@@ -4997,7 +6097,7 @@ TEST_F(MotionReferenceTest, ReferenceGuardBlendUsesValidatedBrakeFallback)
   current.time_stamp = rclcpp::Time(1, 0, RCL_ROS_TIME);
   auto reference = std::make_unique<MotionReference>(
     node_, monitor_, parameters_, limits_, collision_config_);
-  MotionReferenceTestPeer::qualifyPairYawForIsolatedAdmissionTest(*reference);
+  MotionReferenceTestPeer::qualifyCompactPhaseForIsolatedPreparationTest(*reference);
   auto component = make_component();
   CollisionAwareServoComponentTestPeer::installMotionReference(
     *component, std::move(reference));
@@ -5481,6 +6581,7 @@ TEST_F(MotionReferenceTest, FaceUsesExactUprightTrackingWithoutJointPathGuidance
   EXPECT_TRUE(result.tracking->has_face_primary_roll);
   EXPECT_FALSE(result.follows_path);
   EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
+  EXPECT_EQ(reference_->diagnostics().posture_unavailable_reason, "none");
 }
 
 TEST_F(MotionReferenceTest, FaceRollGuardArmsOnlyWithSettledOrCompleteStopEvidence)
@@ -5748,10 +6849,6 @@ TEST_F(MotionReferenceCameraTest, GazeFaceKeepsPhysicalScreenRollPrimary)
   EXPECT_TRUE(result.task->primary_matrix.row(2).isApprox(
       edge_task->task.primary_matrix.row(0), 1.0e-12));
 
-  const auto pair_resource = pairYawAssessment(robot_state, face);
-  ASSERT_TRUE(pair_resource.valid);
-  EXPECT_FALSE(pair_resource.demand_present);
-  EXPECT_FALSE(pair_resource.exhausted);
   EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(*reference_));
   EXPECT_FALSE(reference_->compactManeuverActive());
   EXPECT_EQ(reference_->diagnostics().tracking_phase, "FACE");
@@ -5923,7 +7020,6 @@ TEST_F(MotionReferenceTest, Posture1CApprovedFixturesUseWorldBaseOrigin)
       robot_state.getGlobalLinkTransform("link3").translation();
     const Eigen::Vector3d wrist =
       robot_state.getGlobalLinkTransform("link4").translation();
-    const Eigen::MatrixXd base_jacobian = Eigen::MatrixXd::Zero(3, 6);
     const auto world_linear_jacobian = [this, &robot_state](
       const std::string & link_name, Eigen::MatrixXd & output) {
         Eigen::MatrixXd full;
@@ -5940,8 +7036,10 @@ TEST_F(MotionReferenceTest, Posture1CApprovedFixturesUseWorldBaseOrigin)
         }
         return output.allFinite();
       };
+    Eigen::MatrixXd shoulder_jacobian;
     Eigen::MatrixXd elbow_jacobian;
     Eigen::MatrixXd wrist_jacobian;
+    ASSERT_TRUE(world_linear_jacobian("link2", shoulder_jacobian));
     ASSERT_TRUE(world_linear_jacobian("link3", elbow_jacobian));
     ASSERT_TRUE(world_linear_jacobian("link4", wrist_jacobian));
     EXPECT_TRUE(shoulder.isApprox(fixture.shoulder, 2.0e-6));
@@ -5951,8 +7049,8 @@ TEST_F(MotionReferenceTest, Posture1CApprovedFixturesUseWorldBaseOrigin)
     EXPECT_NEAR(base.y(), 0.0, 1.0e-9);
     EXPECT_NEAR(base.z(), 0.75, 1.0e-9);
 
-    // The approved labels are an independent oracle. This scalar is evaluated
-    // directly from the fixture FK points, without calling the production helper.
+    // Keep the old face-side measurements as fixture history. Current geometry
+    // preference is checked independently below using the shoulder-wrist line.
     const double base_side = independentElbowFaceSide(
       base, fixture.elbow, fixture.wrist, fixture.face);
     const double shoulder_side = independentElbowFaceSide(
@@ -5991,9 +7089,14 @@ TEST_F(MotionReferenceTest, Posture1CApprovedFixturesUseWorldBaseOrigin)
     config.position_margin_j5_rad = 0.0;
     config.position_margin_j6_rad = 0.0;
     const auto production = makePosturePreferenceObjective(
-      base, elbow, wrist, fixture.face, base_jacobian, elbow_jacobian,
+      shoulder, elbow, wrist, shoulder_jacobian, elbow_jacobian,
       wrist_jacobian, q, config);
     ASSERT_TRUE(production.valid);
+    const double upward_bend = independentUpwardBend(shoulder, elbow, wrist);
+    EXPECT_EQ(upward_bend > 0.0, fixture.good)
+      << "S/E/W upward bend h=" << upward_bend;
+    EXPECT_EQ(production.geometry_comfortable, fixture.good)
+      << "production geometry classification disagrees with fixture label";
     const bool bend_classifies_good = q[2] >= calibration.joint3_lower &&
       q[2] <= calibration.joint3_upper;
     EXPECT_EQ(bend_classifies_good, fixture.good)
@@ -6004,40 +7107,33 @@ TEST_F(MotionReferenceTest, Posture1CApprovedFixturesUseWorldBaseOrigin)
       << "Production branch classification disagrees with approved label; independent "
       << "C(link_base)=" << base_side << " C(link2)=" << shoulder_side;
     if (!fixture.good) {
-      ASSERT_GT(production.matrix.rows(), 0);
-      EXPECT_GT(production.reference[0], 0.0)
+      ASSERT_GT(production.joint3_correction.matrix.rows(), 0);
+      EXPECT_GT(production.joint3_correction.reference[0], 0.0)
         << "Outside the comfort branch, the soft objective must progress toward it";
     }
-    // The branch label is anatomical and must survive polar J1 rotation and
-    // an arbitrary change of F. Rotate the known FK geometry about link_base,
-    // then try face points on both sides and near the gaze-axis pole.
+    // The bend criterion is anatomical and survives polar J1 rotation. The
+    // target face is no longer an input to the posture objective.
     for (const double polar_delta : {-1.1, 0.7}) {
       const Eigen::Matrix3d polar = Eigen::AngleAxisd(polar_delta,
         Eigen::Vector3d::UnitZ()).toRotationMatrix();
       Eigen::VectorXd polar_q = q;
       polar_q[0] += polar_delta;
+      const Eigen::Vector3d polar_shoulder = base + polar * (shoulder - base);
       const Eigen::Vector3d polar_elbow = base + polar * (elbow - base);
       const Eigen::Vector3d polar_wrist = base + polar * (wrist - base);
-      const Eigen::Vector3d polar_face = base + polar * (fixture.face - base);
-      const std::array<Eigen::Vector3d, 3> face_variants{
-        polar_face,
-        base + polar * Eigen::Vector3d(0.35, 0.22, 0.08),
-        base + polar * Eigen::Vector3d(0.35, -0.22, -0.08)};
-      for (std::size_t variant = 0; variant < face_variants.size(); ++variant) {
-        const auto stable = makePosturePreferenceObjective(
-          base, polar_elbow, polar_wrist, face_variants[variant], base_jacobian,
-          elbow_jacobian, wrist_jacobian, polar_q, config);
-        ASSERT_TRUE(stable.valid);
-        EXPECT_EQ(stable.branch_comfortable, fixture.good)
-          << "label changed under polar delta=" << polar_delta << " F variant=" << variant;
-      }
+      const auto stable = makePosturePreferenceObjective(
+        polar_shoulder, polar_elbow, polar_wrist, shoulder_jacobian,
+        elbow_jacobian, wrist_jacobian, polar_q, config);
+      ASSERT_TRUE(stable.valid);
+      EXPECT_EQ(stable.branch_comfortable, fixture.good)
+        << "label changed under polar delta=" << polar_delta;
     }
   }
 
   EXPECT_EQ(base_matches, 10)
-    << "All approved poses classify only when link_base's world transform is used";
+    << "Historical base-origin face-side classifications for the approved labels";
   EXPECT_EQ(shoulder_matches, 6)
-    << "The link2-origin counterexample proves the shoulder substitution changes approved labels";
+    << "Historical shoulder-origin face-side classifications for the approved labels";
   EXPECT_EQ(bend_matches, 10)
     << "Named-pose calibrated anatomical bend must reproduce all ten approved labels";
 }
@@ -9204,322 +10300,6 @@ TEST_F(MotionReferenceTest, Posture1DBadStartRecoversAcrossNearBandAndFarTargets
   std::cout << "POSTURE-1D BAD-start distance witnesses\n" << summary.str();
 }
 
-TEST_F(MotionReferenceTest, FaceRelativeElbowSideUsesActualModelAndPreservesTracking)
-{
-  const auto signed_clearance = [](const moveit::core::RobotState & robot_state,
-    const Eigen::Vector3d & face_point) {
-      const Eigen::Vector3d base =
-        robot_state.getGlobalLinkTransform("link_base").translation();
-      const Eigen::Vector3d e =
-        robot_state.getGlobalLinkTransform("link3").translation() - base;
-      const Eigen::Vector3d w =
-        robot_state.getGlobalLinkTransform("link4").translation() - base;
-      const Eigen::Vector3d f = face_point - base;
-      const Eigen::Vector3d e_perp = e - w * (e.dot(w) / w.squaredNorm());
-      const Eigen::Vector3d f_perp = f - w * (f.dot(w) / w.squaredNorm());
-      const double c = e_perp.dot(f_perp);
-      return std::pair<double, double>{-c / f_perp.norm(), c};
-    };
-  const auto make_face_target = [this](const moveit::core::RobotState & robot_state) {
-      auto face = faceAlongLookDirection(robot_state);
-      const auto * look_link = parameters_.gaze_frame.empty() ? nullptr :
-        model_->getLinkModel(parameters_.gaze_frame);
-      Eigen::Isometry3d look_pose = look_link ?
-        robot_state.getGlobalLinkTransform(look_link) :
-        robot_state.getGlobalLinkTransform("monitor_control_frame");
-      if (look_link) {
-        look_pose.linear() *= face_tracking_arm::opticalToPointingRotation();
-      }
-      const Eigen::Vector3d face_point = look_pose.translation() +
-        0.40 * look_pose.linear().col(0);
-      face.face.x = face_point.x();
-      face.face.y = face_point.y();
-      face.face.z = face_point.z();
-      return face;
-    };
-
-  const auto configure_qp = [this]() {
-      HierarchicalVelocityQpConfig config;
-      config.period_sec = parameters_.control_period_sec;
-      config.residual_command_latency_sec = 0.0;
-      config.velocity_regularization = parameters_.velocity_regularization_weight;
-      config.primary_preservation_tolerance = parameters_.primary_orientation_tolerance_radps;
-      config.solver_absolute_tolerance = parameters_.solver_absolute_tolerance;
-      config.solver_relative_tolerance = parameters_.solver_relative_tolerance;
-      config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
-      config.solver_max_iterations = parameters_.solver_max_iterations;
-      return config;
-    };
-  const auto qp_config = configure_qp();
-  const HierarchicalVelocityQp solver(qp_config);
-
-  const double side_reserve = parameters_.maximum_linear_reference_mps *
-    parameters_.control_period_sec;
-  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
-  ASSERT_TRUE(locked_scene);
-  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
-  CollisionConstraintBuilder collision_builder(collision_config_);
-  moveit::core::RobotState bad_pose(model_);
-  ASSERT_TRUE(bad_pose.setToDefaultValues(group_, "rest"));
-  // Keep this pose inside the FK-calibrated rest/search bend interval so the
-  // face-side preference is active as a secondary preference. Search a small,
-  // deterministic set of named joint values for a genuine negative F-side
-  // case under the model FK and the actual look-ray target.
-  constexpr std::array<double, 3> kJoint1Candidates{0.0, 1.0, -1.0};
-  constexpr std::array<double, 5> kJoint2Candidates{-1.5, -1.0, -0.5, 0.0, 0.5};
-  constexpr std::array<double, 5> kJoint4Candidates{-1.0, -0.5, 0.0, 0.5, 1.0};
-  constexpr std::array<double, 5> kJoint5Candidates{-1.5, -0.75, 0.0, 0.75, 1.5};
-  constexpr std::array<double, 7> kJoint6Candidates{-3.0, -1.5, 0.0, 1.5, 3.0, 4.5, 6.0};
-  const TrackingVelocityTaskConfig tracking_config;
-  Eigen::VectorXd seed_q;
-  bool found_negative_face_seed = false;
-  for (const double q1 : kJoint1Candidates) {
-    for (const double q2 : kJoint2Candidates) {
-      for (const double q4 : kJoint4Candidates) {
-        for (const double q5 : kJoint5Candidates) {
-          for (const double q6 : kJoint6Candidates) {
-            moveit::core::RobotState candidate(model_);
-            ASSERT_TRUE(candidate.setToDefaultValues(group_, "rest"));
-            candidate.setVariablePosition("joint1", q1);
-            candidate.setVariablePosition("joint2", q2);
-            candidate.setVariablePosition("joint3", -0.9);
-            candidate.setVariablePosition("joint4", q4);
-            candidate.setVariablePosition("joint5", q5);
-            candidate.setVariablePosition("joint6", q6);
-            candidate.update();
-            if (!candidate.satisfiesBounds(group_)) {
-              continue;
-            }
-            const auto candidate_face = make_face_target(candidate);
-            const Eigen::Vector3d candidate_target(
-              candidate_face.face.x, candidate_face.face.y, candidate_face.face.z);
-            const auto * look_link = parameters_.gaze_frame.empty() ? nullptr :
-              model_->getLinkModel(parameters_.gaze_frame);
-            Eigen::Isometry3d look_pose = look_link ?
-              candidate.getGlobalLinkTransform(look_link) :
-              candidate.getGlobalLinkTransform("monitor_control_frame");
-            if (look_link) {
-              look_pose.linear() *= face_tracking_arm::opticalToPointingRotation();
-            }
-            const Eigen::Vector3d candidate_ray = candidate_target - look_pose.translation();
-            const double candidate_pointing_error = std::acos(std::clamp(
-                look_pose.linear().col(0).dot(candidate_ray.normalized()), -1.0, 1.0));
-            const auto candidate_edge_task = makeHorizontalEdgePathTask(
-              candidate.getGlobalLinkTransform("monitor_control_frame"),
-              Eigen::MatrixXd::Identity(6, 6), Eigen::VectorXd::Zero(6), tracking_config);
-            const double candidate_clearance =
-              signed_clearance(candidate, candidate_target).first;
-            const double candidate_distance = (
-              candidate.getGlobalLinkTransform("monitor_control_frame").translation() -
-              candidate_target).norm();
-            if (candidate_clearance >= -side_reserve ||
-              candidate_pointing_error > parameters_.pointing_deadband_rad ||
-              !candidate_edge_task ||
-              std::abs(candidate_edge_task->edge_tilt_error_rad) >
-              tracking_config.roll_deadband_rad ||
-              candidate_distance < parameters_.face_distance_min_m ||
-              candidate_distance > parameters_.face_distance_max_m ||
-              scene->isStateColliding(candidate, group_->getName()))
-            {
-              continue;
-            }
-            seed_q.resize(6);
-            candidate.copyJointGroupPositions(group_, seed_q);
-            found_negative_face_seed = true;
-            break;
-          }
-          if (found_negative_face_seed) {break;}
-        }
-        if (found_negative_face_seed) {break;}
-      }
-      if (found_negative_face_seed) {break;}
-    }
-    if (found_negative_face_seed) {break;}
-  }
-  ASSERT_TRUE(found_negative_face_seed)
-    << "No collision-free in-band face target with negative F-side clearance was found";
-  for (Eigen::Index index = 0; index < seed_q.size(); ++index) {
-    bad_pose.setVariablePosition("joint" + std::to_string(index + 1), seed_q[index]);
-  }
-  bad_pose.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(seed_q.size()));
-  bad_pose.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(seed_q.size()));
-  bad_pose.update();
-  ASSERT_TRUE(bad_pose.satisfiesBounds(group_));
-  EXPECT_FALSE(scene->isStateColliding(bad_pose, group_->getName()));
-  Eigen::VectorXd q;
-  bad_pose.copyJointGroupPositions(group_, q);
-  const JointMotionState motion{q, Eigen::VectorXd::Zero(q.size()),
-    Eigen::VectorXd::Zero(q.size())};
-  const auto bad_actual = collision_builder.validateActualState(*scene, bad_pose, *group_);
-  ASSERT_TRUE(bad_actual.input_valid) << bad_actual.failure_reason;
-  ASSERT_FALSE(bad_actual.unsafe) << bad_actual.failure_reason;
-  const auto bad_pose_validation = collision_builder.validatePose(*scene, bad_pose, *group_,
-        motion);
-  ASSERT_TRUE(bad_pose_validation.input_valid) << bad_pose_validation.failure_reason;
-  ASSERT_FALSE(bad_pose_validation.unsafe) << bad_pose_validation.failure_reason;
-  const auto bad_face = make_face_target(bad_pose);
-  const Eigen::Vector3d fixed_face(bad_face.face.x, bad_face.face.y, bad_face.face.z);
-  const double initial_clearance = signed_clearance(bad_pose, fixed_face).first;
-  const double initial_c = signed_clearance(bad_pose, fixed_face).second;
-  ASSERT_LT(initial_clearance, -side_reserve);
-  const auto result = update(bad_pose, bad_face);
-  ASSERT_TRUE(result.tracking) << reference_->diagnostics().state;
-  EXPECT_LE(result.tracking->pointing_error_rad, parameters_.pointing_deadband_rad);
-  EXPECT_LE(result.tracking->roll_error_rad, tracking_config.roll_deadband_rad);
-  ASSERT_TRUE(result.task);
-  ASSERT_FALSE(result.tracking->face_distance_outside_band);
-  ASSERT_TRUE(result.tracking->face_distance_interval);
-  EXPECT_EQ(result.task->distance_matrix.rows(), 0)
-    << "Distance inside its allowed band must not hold the current radius";
-  EXPECT_EQ(result.task->secondary_matrix.rows(), 0)
-    << "The in-branch main-bend objective is empty";
-  ASSERT_GT(result.task->tertiary_matrix.rows(), 0)
-    << "Elbow-side preference is below the main bend";
-  ASSERT_EQ(result.task->preferred_primary_constraints.size(), 1U)
-    << "Only the GOOD J3 braking-aware preservation row is preferred by primary";
-  EXPECT_EQ((result.task->preferred_primary_constraints.front().coefficients.array() !=
-    0.0).count(), 1);
-  EXPECT_DOUBLE_EQ(result.task->preferred_primary_constraints.front().coefficients[2], 1.0);
-  const double active_distance = (fixed_face -
-    bad_pose.getGlobalLinkTransform("monitor_control_frame").translation()).norm();
-  EXPECT_NEAR(result.tracking->face_distance_interval->lower_bound,
-    parameters_.position_gain * (parameters_.face_distance_min_m - active_distance), 1.0e-8);
-  EXPECT_NEAR(result.tracking->face_distance_interval->upper_bound,
-    parameters_.position_gain * (parameters_.face_distance_max_m - active_distance), 1.0e-8);
-
-  auto full_task = *result.task;
-  const auto collision = collision_builder.build(
-    *scene, bad_pose, *group_, motion, limits_, parameters_.control_period_sec);
-  full_task.secondary_constraints.insert(
-    full_task.secondary_constraints.end(),
-    collision.constraints.begin(), collision.constraints.end());
-  const QpResult comfort_qp = solver.solve(full_task, motion, limits_);
-  ASSERT_TRUE(comfort_qp.command_available()) << static_cast<int>(comfort_qp.status);
-  EXPECT_GT(full_task.tertiary_matrix.row(0).dot(comfort_qp.joint_velocity), 0.0)
-    << "q=" << q.transpose() << " s=" << initial_clearance
-    << " qdot=" << comfort_qp.joint_velocity.transpose()
-    << " comfort_ref=" << result.task->secondary_reference.transpose();
-  auto next_pose = bad_pose;
-  next_pose.setJointGroupPositions(
-    group_, q + parameters_.control_period_sec * comfort_qp.joint_velocity);
-  next_pose.update(true);
-  const double next_clearance = signed_clearance(next_pose, fixed_face).first;
-  EXPECT_GT(next_clearance, initial_clearance);
-  EXPECT_GT(initial_c, 0.0);
-
-  const double feasibility_tolerance = qp_config.solution_feasibility_tolerance +
-    4.0 * qp_config.solver_absolute_tolerance;
-  const auto & posture_bound = full_task.preferred_primary_constraints.front();
-  const double joint3_rate = posture_bound.coefficients.dot(comfort_qp.joint_velocity);
-  EXPECT_GE(joint3_rate, posture_bound.lower_bound - feasibility_tolerance);
-  EXPECT_LE(joint3_rate, posture_bound.upper_bound + feasibility_tolerance);
-  ASSERT_EQ(comfort_qp.achieved_primary_velocity.size(),
-    result.task->primary_matrix.rows());
-  EXPECT_LE((full_task.primary_matrix * comfort_qp.joint_velocity -
-    comfort_qp.achieved_primary_velocity).norm(),
-    qp_config.primary_preservation_tolerance + feasibility_tolerance);
-
-  auto perturbed_face = bad_face;
-  perturbed_face.face.y += 0.005;
-  const auto blocked_result = update(bad_pose, perturbed_face);
-  ASSERT_TRUE(blocked_result.tracking);
-  ASSERT_TRUE(blocked_result.task);
-  ASSERT_FALSE(blocked_result.tracking->face_distance_outside_band);
-  ASSERT_GT(blocked_result.task->primary_reference.norm(), 1.0e-5);
-  auto blocked_task = *blocked_result.task;
-  blocked_task.secondary_constraints.insert(
-    blocked_task.secondary_constraints.end(),
-    collision.constraints.begin(), collision.constraints.end());
-  const QpResult blocked_qp = solver.solve(blocked_task, motion, limits_);
-  ASSERT_TRUE(blocked_qp.command_available()) << static_cast<int>(blocked_qp.status);
-  EXPECT_TRUE(blocked_qp.fully_solved() || blocked_qp.status == QpStatus::kPrimaryOnly ||
-    blocked_qp.status == QpStatus::kPartial);
-  EXPECT_GT(blocked_qp.achieved_primary_velocity.norm(), 1.0e-5);
-  EXPECT_LE((blocked_task.primary_matrix * blocked_qp.joint_velocity -
-    blocked_qp.achieved_primary_velocity).norm(),
-    qp_config.primary_preservation_tolerance + feasibility_tolerance);
-
-  moveit::core::RobotState good_pose(model_);
-  ASSERT_TRUE(good_pose.setToDefaultValues(group_, "rest"));
-  good_pose.setVariablePosition("joint1", 0.0);
-  good_pose.setVariablePosition("joint2", -1.178097245096172);
-  good_pose.setVariablePosition("joint3", -0.9);
-  good_pose.setVariablePosition("joint4", 0.0);
-  good_pose.setVariablePosition("joint5", 0.0);
-  good_pose.setVariablePosition("joint6", 0.0);
-  good_pose.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
-  good_pose.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
-  good_pose.update();
-  ASSERT_TRUE(good_pose.satisfiesBounds(group_));
-  EXPECT_FALSE(scene->isStateColliding(good_pose, group_->getName()));
-  Eigen::VectorXd good_q;
-  good_pose.copyJointGroupPositions(group_, good_q);
-  const JointMotionState good_motion{
-    good_q, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
-  const auto good_actual = collision_builder.validateActualState(*scene, good_pose, *group_);
-  ASSERT_TRUE(good_actual.input_valid) << good_actual.failure_reason;
-  ASSERT_FALSE(good_actual.unsafe) << good_actual.failure_reason;
-  const auto good_pose_validation = collision_builder.validatePose(
-    *scene, good_pose, *group_, good_motion);
-  ASSERT_TRUE(good_pose_validation.input_valid) << good_pose_validation.failure_reason;
-  ASSERT_FALSE(good_pose_validation.unsafe) << good_pose_validation.failure_reason;
-  const auto good_face = make_face_target(good_pose);
-  const Eigen::Vector3d good_target(good_face.face.x, good_face.face.y, good_face.face.z);
-  ASSERT_GT(signed_clearance(good_pose, good_target).first, side_reserve);
-  // Use a fresh reference so this one stationary face sample has zero radial
-  // feed-forward when checking the idle-only allowed envelope.
-  reference_.reset();
-  reference_ = std::make_unique<MotionReference>(
-    node_, monitor_, parameters_, limits_, collision_config_);
-  const auto good_result = update(good_pose, good_face);
-  ASSERT_TRUE(good_result.tracking);
-  ASSERT_TRUE(good_result.task);
-  ASSERT_FALSE(good_result.tracking->face_distance_outside_band);
-  ASSERT_EQ(good_result.task->preferred_primary_constraints.size(), 1U)
-    << "A GOOD J3 pose keeps its braking-aware comfort bound at every distance";
-  EXPECT_EQ(good_result.task->distance_matrix.rows(), 0)
-    << "Inside the band the final distance level is empty, not a radial hold";
-  EXPECT_EQ(good_result.task->secondary_matrix.rows(), 0);
-  EXPECT_EQ(good_result.task->tertiary_matrix.rows(), 0);
-  EXPECT_DOUBLE_EQ(good_result.task->preferred_primary_constraints.front().coefficients[2], 1.0);
-  EXPECT_GE(good_result.task->preferred_primary_constraints.front().lower_bound,
-        -limits_.max_velocity[2]);
-  EXPECT_LE(good_result.task->preferred_primary_constraints.front().upper_bound,
-        limits_.max_velocity[2]);
-  JointMotionState different_queue_state = good_motion;
-  different_queue_state.velocity[2] = 0.2;
-  different_queue_state.acceleration[2] = 0.1;
-  const auto same_control_state = update(
-    good_pose, good_face, nullptr, nullptr, different_queue_state);
-  ASSERT_TRUE(same_control_state.task);
-  ASSERT_EQ(same_control_state.task->preferred_primary_constraints.size(), 1U);
-  EXPECT_DOUBLE_EQ(
-    same_control_state.task->preferred_primary_constraints.front().lower_bound,
-    good_result.task->preferred_primary_constraints.front().lower_bound);
-  EXPECT_DOUBLE_EQ(
-    same_control_state.task->preferred_primary_constraints.front().upper_bound,
-    good_result.task->preferred_primary_constraints.front().upper_bound)
-    << "Comfort bounds use the state shared with QP linearization, not a separate queue sample";
-  moveit::core::RobotState position_only(model_);
-  ASSERT_TRUE(position_only.setToDefaultValues(group_, "rest"));
-  position_only.update();
-  ASSERT_FALSE(position_only.hasVelocities());
-  ASSERT_FALSE(position_only.hasAccelerations());
-  const auto position_only_result = update(position_only, good_face);
-  ASSERT_TRUE(position_only_result.task);
-  EXPECT_TRUE(position_only_result.task->preferred_primary_constraints.empty())
-    << "A position-only RobotState must not fabricate braking bounds from absent motion data";
-  auto full_good_task = *good_result.task;
-  const auto good_collision = collision_builder.build(
-    *scene, good_pose, *group_, good_motion, limits_, parameters_.control_period_sec);
-  full_good_task.secondary_constraints.insert(
-    full_good_task.secondary_constraints.end(),
-    good_collision.constraints.begin(), good_collision.constraints.end());
-  const QpResult settled_qp = solver.solve(full_good_task, good_motion, limits_);
-  ASSERT_TRUE(settled_qp.command_available()) << static_cast<int>(settled_qp.status);
-  EXPECT_LT(settled_qp.joint_velocity.norm(), 1.0e-5);
-}
-
 TEST_F(MotionReferenceCameraTest, GazeFaceRemainsFiniteNearScreenUprightPole)
 {
   const auto robot_state = nearScreenPoleState();
@@ -9540,7 +10320,7 @@ TEST_F(MotionReferenceCameraTest, GazeFaceRemainsFiniteNearScreenUprightPole)
 
 TEST_F(MotionReferenceCompactDisabledTest, MissingCompactProfileReportsOnceWithoutBreakingFace)
 {
-  const auto [robot_state, face_target] = criticalPairExhaustedCase();
+  const auto [robot_state, face_target] = j1WorkingEdgeFaceCase();
   const auto transition = update(robot_state, face_target);
   ASSERT_TRUE(transition.tracking);
   auto preparation_target = face_target;
@@ -9553,7 +10333,7 @@ TEST_F(MotionReferenceCompactDisabledTest, MissingCompactProfileReportsOnceWitho
   EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
       return event.event == "compact_unavailable";
   }));
-  recordQualifyingFaceShortfall(robot_state);
+  primeFaceTracking(robot_state);
   events = reference_->drainCompactEvents();
   EXPECT_TRUE(events.empty());
 }
@@ -9565,37 +10345,82 @@ TEST_F(MotionReferenceTest, ExplicitHoldPausesButHealthyHoldContinuesCommittedCo
     robot_state.getGlobalLinkTransform("monitor_control_frame").linear());
   ASSERT_TRUE(upright);
   ASSERT_LE(std::abs(upright->signed_roll_error_rad), kCompactRollCapTestRad);
-  JointMotionState moving_queue;
-  robot_state.copyJointGroupPositions(group_, moving_queue.position);
-  moving_queue.velocity = Eigen::VectorXd::Zero(6);
-  moving_queue.acceleration = Eigen::VectorXd::Zero(6);
-  moving_queue.velocity[0] = 0.02;
-  recordQualifyingFaceShortfall(robot_state);
-  admitCurrentPreparationWithLifecycleFixturePath(robot_state, moving_queue);
-  const auto committed = update(
-    robot_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, moving_queue);
+  JointMotionState stationary_queue;
+  robot_state.copyJointGroupPositions(group_, stationary_queue.position);
+  stationary_queue.velocity = Eigen::VectorXd::Zero(6);
+  stationary_queue.acceleration = Eigen::VectorXd::Zero(6);
+  MotionReferenceTestPeer::qualifyCompactPhaseForIsolatedPreparationTest(*reference_);
+  Eigen::VectorXd small_face_safe_goal = stationary_queue.position;
+  small_face_safe_goal[0] += 0.01;
+  const auto prepared_profile = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *reference_, stationary_queue, small_face_safe_goal);
+  ASSERT_TRUE(prepared_profile);
+  ASSERT_GT(prepared_profile->samples.size(), 2U);
+  auto face_target = target(msg::TrackingTarget::FACE);
+  face_target.target_id = 17;
+  auto committed = update(
+    robot_state, face_target, nullptr, nullptr, stationary_queue);
+  if (!committed.compact_profile_command &&
+    MotionReferenceTestPeer::profileWorkPending(*reference_))
+  {
+    ASSERT_TRUE(MotionReferenceTestPeer::finishTorqueProfileWorkForTest(
+        *reference_, 0.0, kSceneRevision)) << reference_->diagnostics().last_plan_message;
+    committed = update(
+      robot_state, face_target, nullptr, nullptr, stationary_queue);
+  }
+  ASSERT_TRUE(committed.compact_profile_command) << reference_->diagnostics().last_plan_message;
+  ASSERT_TRUE(committed.compact_profile_velocity);
   ASSERT_TRUE(reference_->compactManeuverActive());
   ASSERT_TRUE(reference_->diagnostics().upright_roll_guard_armed);
   EXPECT_EQ(reference_->diagnostics().compact_phase, "PATH");
+  const auto committed_profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(committed_profile);
+  const std::size_t initial_cursor =
+    MotionReferenceTestPeer::profileCursorForTest(*reference_);
+  ASSERT_LT(initial_cursor + 1U, committed_profile->samples.size());
+  EXPECT_TRUE(committed.compact_profile_velocity->isApprox(
+      committed_profile->samples[initial_cursor + 1U].velocity, 1.0e-12));
 
   auto explicit_hold = target(msg::TrackingTarget::HOLD);
   const auto paused = update(
-    robot_state, explicit_hold, nullptr, nullptr, moving_queue);
+    robot_state, explicit_hold, nullptr, nullptr, stationary_queue);
   EXPECT_FALSE(paused.task);
+  EXPECT_FALSE(paused.compact_profile_command);
   EXPECT_EQ(reference_->diagnostics().state, "COMPACT_COMMITTED_WAITING_FOR_HEALTHY_COMMAND");
   EXPECT_TRUE(reference_->compactManeuverActive());
   EXPECT_TRUE(reference_->diagnostics().upright_roll_guard_armed);
+  EXPECT_EQ(MotionReferenceTestPeer::profileCursorForTest(*reference_), initial_cursor);
 
   auto healthy_hold = explicit_hold;
   healthy_hold.allow_recovery = true;
   const auto continued = update(
-    robot_state, healthy_hold, nullptr, nullptr, moving_queue);
-  EXPECT_TRUE(continued.task);
+    robot_state, healthy_hold, nullptr, nullptr, stationary_queue);
+  ASSERT_TRUE(continued.compact_profile_command);
+  ASSERT_TRUE(continued.compact_profile_velocity);
+  EXPECT_TRUE(continued.compact_profile_velocity->isApprox(
+      committed_profile->samples[initial_cursor + 1U].velocity, 1.0e-12));
   EXPECT_EQ(reference_->diagnostics().compact_phase, "PATH");
   EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
   EXPECT_NE(reference_->diagnostics().state, "COMPACT_COMMITTED_WAITING_FOR_HEALTHY_COMMAND");
   EXPECT_TRUE(reference_->compactManeuverActive());
   EXPECT_TRUE(reference_->diagnostics().upright_roll_guard_armed);
+
+  auto changed_face_target = face_target;
+  changed_face_target.target_id = 18;
+  const auto after_target_change = update(
+    robot_state, changed_face_target, nullptr, nullptr, stationary_queue);
+  ASSERT_TRUE(after_target_change.compact_profile_command);
+  ASSERT_TRUE(after_target_change.compact_profile_velocity);
+  EXPECT_TRUE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "PATH");
+  EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
+  const auto profile_after_target_change =
+    MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(profile_after_target_change);
+  EXPECT_EQ(profile_after_target_change->samples.size(), committed_profile->samples.size());
+  ASSERT_FALSE(profile_after_target_change->samples.empty());
+  EXPECT_TRUE(profile_after_target_change->samples.back().position.isApprox(
+      committed_profile->samples.back().position, 1.0e-12));
 }
 
 TEST_F(MotionReferenceTest, CompactEntryCapCoversMeasuredCommandAndPublishedStopEnvelope)
@@ -9641,26 +10466,7 @@ TEST_F(MotionReferenceTest, CompactEntryCapCoversMeasuredCommandAndPublishedStop
     }
   }
   ASSERT_GT(published_stop_radius, start_radius + 1.0e-5);
-  const auto absolute_pitch = [this, &geometry_state](const Eigen::VectorXd & position) {
-      geometry_state.setJointGroupPositions(group_, position);
-      geometry_state.update(true);
-      const auto pose = evaluateCompactUprightPose(
-        geometry_state.getGlobalLinkTransform("monitor_control_frame").linear());
-      return pose ? std::optional<double>{std::abs(pose->signed_pitch_rad)} : std::nullopt;
-    };
-  const auto start_pitch = absolute_pitch(start_position);
-  const auto published_stop_pitch = absolute_pitch(published_stop_position);
-  Eigen::VectorXd goal_position;
-  const auto compact_goal_state = compactGoalState();
-  compact_goal_state.copyJointGroupPositions(group_, goal_position);
-  const auto goal_pitch = absolute_pitch(goal_position);
-  ASSERT_TRUE(start_pitch);
-  ASSERT_TRUE(published_stop_pitch);
-  ASSERT_TRUE(goal_pitch);
-  const double expected_pitch_cap = std::max({
-        0.5235987755982988, *start_pitch, *published_stop_pitch, *goal_pitch});
-
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   const double now = std::chrono::duration<double>(
     std::chrono::steady_clock::now() - clock_origin_).count();
   PublishedTrajectoryRecord publication;
@@ -9700,17 +10506,17 @@ TEST_F(MotionReferenceTest, CompactEntryCapCoversMeasuredCommandAndPublishedStop
   const double expected_cap = std::max({0.40, start_radius,
         published_stop_radius});
   EXPECT_NEAR(reference_->diagnostics().compact_entry_radius_cap_m, expected_cap, 1.0e-9);
-  EXPECT_NEAR(reference_->diagnostics().compact_pitch_cap_rad, expected_pitch_cap, 1.0e-9);
+  EXPECT_TRUE(std::isnan(reference_->diagnostics().compact_pitch_cap_rad));
   EXPECT_TRUE(std::isfinite(reference_->diagnostics().planned_path_max_radius_m));
 
   reference_->reset(true);
   (void)update(start, target(msg::TrackingTarget::FACE), &publication, &publication);
   EXPECT_TRUE(reference_->compactManeuverActive());
   EXPECT_NEAR(reference_->diagnostics().compact_entry_radius_cap_m, expected_cap, 1.0e-9);
-  EXPECT_NEAR(reference_->diagnostics().compact_pitch_cap_rad, expected_pitch_cap, 1.0e-9);
+  EXPECT_TRUE(std::isnan(reference_->diagnostics().compact_pitch_cap_rad));
 }
 
-TEST_F(MotionReferenceTest, CompactPitchCapIncludesFreshActualAndSurvivesRearm)
+TEST_F(MotionReferenceTest, CompactPitchCapRemainsUnboundedWithFreshActualAndSurvivesRearm)
 {
   auto command_state = compactGoalState(0.05);
   command_state.setVariablePosition("joint5", -0.8);
@@ -9727,18 +10533,14 @@ TEST_F(MotionReferenceTest, CompactPitchCapIncludesFreshActualAndSurvivesRearm)
     measured_state.getGlobalLinkTransform("monitor_control_frame").linear());
   const auto command_pose = evaluateCompactUprightPose(
     command_state.getGlobalLinkTransform("monitor_control_frame").linear());
-  const auto goal_state = compactGoalState();
-  const auto goal_pose = evaluateCompactUprightPose(
-    goal_state.getGlobalLinkTransform("monitor_control_frame").linear());
   ASSERT_TRUE(measured_pose);
   ASSERT_TRUE(command_pose);
-  ASSERT_TRUE(goal_pose);
   const double measured_abs_pitch = std::abs(measured_pose->signed_pitch_rad);
   ASSERT_GT(measured_abs_pitch, 0.5235987755982988);
   ASSERT_LT(measured_abs_pitch, 1.3962634015954636);
   ASSERT_GT(std::abs(measured_abs_pitch - std::abs(command_pose->signed_pitch_rad)), 0.05);
 
-  recordQualifyingFaceShortfall(command_state);
+  primeFaceTracking(command_state);
   const double now = std::chrono::duration<double>(
     std::chrono::steady_clock::now() - clock_origin_).count();
   const auto sample = [this, &command_position](const double seconds) {
@@ -9773,11 +10575,7 @@ TEST_F(MotionReferenceTest, CompactPitchCapIncludesFreshActualAndSurvivesRearm)
     command_state, queued, &publication, &latest_publication, kSceneRevision, actual);
   ASSERT_TRUE(reference_->compactManeuverActive());
 
-  const double expected_cap = std::max({
-        0.5235987755982988, measured_abs_pitch,
-        std::abs(command_pose->signed_pitch_rad),
-        std::abs(goal_pose->signed_pitch_rad)});
-  EXPECT_NEAR(reference_->diagnostics().compact_pitch_cap_rad, expected_cap, 1.0e-9);
+  EXPECT_TRUE(std::isnan(reference_->diagnostics().compact_pitch_cap_rad));
 
   reference_->reset(true);
   const double rearm_time = now + 0.02;
@@ -9785,14 +10583,13 @@ TEST_F(MotionReferenceTest, CompactPitchCapIncludesFreshActualAndSurvivesRearm)
     command_state, target(msg::TrackingTarget::FACE), *planning_scene, rearm_time,
     kSceneRevision, actual, rearm_time, queued, &publication, &latest_publication);
   EXPECT_TRUE(reference_->compactManeuverActive());
-  EXPECT_DOUBLE_EQ(reference_->diagnostics().compact_pitch_cap_rad, expected_cap);
+  EXPECT_TRUE(std::isnan(reference_->diagnostics().compact_pitch_cap_rad));
 }
 
-TEST_F(MotionReferenceTest, CompactCandidateValidationRejectsPitchBeyondCommittedCap)
+TEST_F(MotionReferenceTest, IntermediateCompactPitchAndRollAreNotHardGuards)
 {
-  // Keep the known folded wrist (J4=0, J6=pi) upright while varying only J5.
-  // Interpolating toward nearScreenPoleState() also changes screen roll and makes
-  // an unrelated hard-roll guard mask this pitch-envelope regression.
+  // Change pitch through J5, then independently move screen roll through J6.
+  // Both poses remain inside the committed assembly-radius envelope.
   auto entry = compactGoalState();
   entry.setVariablePosition("joint5", -0.8);
   entry.update(true);
@@ -9801,6 +10598,7 @@ TEST_F(MotionReferenceTest, CompactCandidateValidationRejectsPitchBeyondCommitte
   candidate.update(true);
   Eigen::VectorXd entry_position;
   Eigen::VectorXd candidate_position;
+  Eigen::VectorXd rolled_position;
   entry.copyJointGroupPositions(group_, entry_position);
   candidate.copyJointGroupPositions(group_, candidate_position);
   const auto entry_pose = evaluateCompactUprightPose(
@@ -9809,40 +10607,166 @@ TEST_F(MotionReferenceTest, CompactCandidateValidationRejectsPitchBeyondCommitte
     candidate.getGlobalLinkTransform("monitor_control_frame").linear());
   ASSERT_TRUE(entry_pose);
   ASSERT_TRUE(candidate_pose);
-  ASSERT_LE(std::abs(entry_pose->signed_roll_error_rad), kCompactRollCapTestRad);
-  ASSERT_LE(std::abs(candidate_pose->signed_roll_error_rad), kCompactRollCapTestRad);
   ASSERT_GT(
     std::abs(candidate_pose->signed_pitch_rad),
     std::abs(entry_pose->signed_pitch_rad) + kCompactPitchValidationToleranceRad);
-  ASSERT_LT(std::abs(candidate_pose->signed_pitch_rad), 1.3962634015954636);
 
-  recordQualifyingFaceShortfall(entry);
-  const double now = std::chrono::duration<double>(
-    std::chrono::steady_clock::now() - clock_origin_).count();
-  const JointMotionState actual{
-    entry_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
-  const JointMotionState queued = actual;
-  planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
-  const planning_scene::PlanningSceneConstPtr planning_scene = scene;
-  (void)reference_->update(
-    entry, target(msg::TrackingTarget::FACE), *planning_scene, now,
-    kSceneRevision, actual, now, queued);
-  admitCurrentPreparationWithLifecycleFixturePath(entry, queued);
-  ASSERT_TRUE(reference_->compactManeuverActive());
+  auto roll_probe = entry;
+  roll_probe.setVariablePosition("joint6", roll_probe.getVariablePosition("joint6") + 1.0e-4);
+  roll_probe.update(true);
+  const auto probe_pose = evaluateCompactUprightPose(
+    roll_probe.getGlobalLinkTransform("monitor_control_frame").linear());
+  ASSERT_TRUE(probe_pose);
+  const double roll_direction =
+    std::abs(probe_pose->signed_roll_error_rad) >
+    std::abs(entry_pose->signed_roll_error_rad) ? 1.0 : -1.0;
+  auto rolled = entry;
+  rolled.setVariablePosition("joint6", rolled.getVariablePosition("joint6") +
+    roll_direction * 0.15);
+  rolled.update(true);
+  rolled.copyJointGroupPositions(group_, rolled_position);
+  const auto rolled_pose = evaluateCompactUprightPose(
+    rolled.getGlobalLinkTransform("monitor_control_frame").linear());
+  ASSERT_TRUE(rolled_pose);
+  ASSERT_GT(std::abs(rolled_pose->signed_roll_error_rad), kCompactRollCapTestRad);
+
   CompactGeometryValidator geometry(model_, "link_base");
-  EXPECT_LE(
-    geometry.maximumAssemblyRadius(candidate),
-    reference_->diagnostics().compact_entry_radius_cap_m + 1.0e-6);
-  ASSERT_GT(
-    std::abs(candidate_pose->signed_pitch_rad),
-    reference_->diagnostics().compact_pitch_cap_rad + kCompactPitchValidationToleranceRad);
+  const double radius_cap = std::max({geometry.maximumAssemblyRadius(entry),
+        geometry.maximumAssemblyRadius(candidate), geometry.maximumAssemblyRadius(rolled)}) +
+    1.0e-6;
+  MotionReferenceTestPeer::activateRadiusOnlyCompactForTest(
+    *reference_, entry, radius_cap);
+  ASSERT_TRUE(reference_->compactManeuverActive());
+  EXPECT_LE(geometry.maximumAssemblyRadius(candidate), radius_cap);
+  EXPECT_LE(geometry.maximumAssemblyRadius(rolled), radius_cap);
 
   std::string violation;
   EXPECT_TRUE(reference_->validateCompactPathPosition(entry, entry_position, &violation));
   EXPECT_TRUE(violation.empty());
-  EXPECT_FALSE(reference_->validateCompactPathPosition(
-      entry, candidate_position, &violation));
-  EXPECT_EQ(violation, "screen pitch");
+  EXPECT_TRUE(reference_->validateCompactPathPosition(
+      entry, candidate_position, &violation)) << violation;
+  EXPECT_TRUE(reference_->validateCompactPathPosition(
+      entry, rolled_position, &violation)) << violation;
+}
+
+TEST_F(MotionReferenceTest, CompactReturnStoppedShortDoesNotComplete)
+{
+  const auto working_pose = state(6.0);
+  ASSERT_TRUE(MotionReferenceTestPeer::installFrozenReturnStageForTest(
+      *reference_, working_pose));
+  Eigen::VectorXd short_position = MotionReferenceTestPeer::returnEndpointForTest(*reference_);
+  short_position[1] += 0.04;
+  const JointMotionState stopped_short{
+    short_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  MotionReferenceTestPeer::finishReturnStageForTest(
+    *reference_, working_pose, stopped_short, stopped_short, false, 2.0);
+
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_BRAKING");
+  const auto events = reference_->drainCompactEvents();
+  EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
+      return event.event == "return_workspace_reached";
+  }));
+}
+
+TEST_F(MotionReferenceTest, CompactReturnCompletesAtSettledRegionThenHandsOffToFace)
+{
+  const auto working_pose = state(6.0);
+  ASSERT_TRUE(MotionReferenceTestPeer::installFrozenReturnStageForTest(
+      *reference_, working_pose));
+  const double now = 3.0;
+  const Eigen::VectorXd endpoint = MotionReferenceTestPeer::returnEndpointForTest(*reference_);
+  Eigen::VectorXd actual_outside_position = endpoint;
+  Eigen::VectorXd queue_inside_position = endpoint;
+  actual_outside_position[0] += 0.026;
+  queue_inside_position[0] += 0.024;
+  const JointMotionState actual_outside{
+    actual_outside_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const JointMotionState queue_inside{
+    queue_inside_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+
+  const auto rejected_actual = MotionReferenceTestPeer::finishReturnStageForTest(
+    *reference_, working_pose, actual_outside, queue_inside, true, now);
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_PATH_REPLANNING");
+  EXPECT_FALSE(rejected_actual.task);
+  EXPECT_TRUE(reference_->compactManeuverActive());
+  auto events = reference_->drainCompactEvents();
+  EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
+      return event.event == "return_workspace_reached" || event.event == "completed";
+  }));
+
+  ASSERT_TRUE(MotionReferenceTestPeer::installFrozenReturnStageForTest(
+      *reference_, working_pose));
+  const auto moving_endpoint = MotionReferenceTestPeer::returnEndpointForTest(*reference_);
+  JointMotionState moving{
+    moving_endpoint, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  moving.velocity[1] = 0.1;
+  const auto unsettled = MotionReferenceTestPeer::finishReturnStageForTest(
+    *reference_, working_pose, moving, moving, true, now + 0.015);
+  EXPECT_FALSE(unsettled.task);
+  EXPECT_TRUE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_SETTLING");
+  events = reference_->drainCompactEvents();
+  EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
+      return event.event == "return_workspace_reached" || event.event == "completed";
+  }));
+
+  ASSERT_TRUE(MotionReferenceTestPeer::installFrozenReturnStageForTest(
+      *reference_, working_pose));
+  const auto endpoint_after_reset = MotionReferenceTestPeer::returnEndpointForTest(*reference_);
+  Eigen::VectorXd actual_inside_position = endpoint_after_reset;
+  Eigen::VectorXd queue_outside_position = endpoint_after_reset;
+  actual_inside_position[0] += 0.024;
+  queue_outside_position[0] += 0.026;
+  const JointMotionState actual_inside{
+    actual_inside_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const JointMotionState queue_outside{
+    queue_outside_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const auto rejected_queue = MotionReferenceTestPeer::finishReturnStageForTest(
+    *reference_, working_pose, actual_inside, queue_outside, true, now + 0.01);
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_PATH_REPLANNING");
+  EXPECT_FALSE(rejected_queue.task);
+  EXPECT_TRUE(reference_->compactManeuverActive());
+  events = reference_->drainCompactEvents();
+  EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
+      return event.event == "return_workspace_reached" || event.event == "completed";
+  }));
+
+  ASSERT_TRUE(MotionReferenceTestPeer::installFrozenReturnStageForTest(
+      *reference_, working_pose));
+  const auto in_region_not_exact_goal = MotionReferenceTestPeer::returnEndpointForTest(*reference_);
+  Eigen::VectorXd accepted_position = in_region_not_exact_goal;
+  accepted_position[1] += 0.04;
+  accepted_position[5] = 0.17;
+  ASSERT_GT((accepted_position - in_region_not_exact_goal).lpNorm<Eigen::Infinity>(), 0.025);
+  const JointMotionState accepted{
+    accepted_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const auto completion = MotionReferenceTestPeer::finishReturnStageForTest(
+    *reference_, working_pose, accepted, accepted, true, now + 0.02);
+  EXPECT_FALSE(completion.task);
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "COMPLETE");
+  EXPECT_EQ(reference_->diagnostics().state, "COMPACT_COMPLETE");
+  EXPECT_FALSE(reference_->diagnostics().upright_roll_guard_armed);
+  events = reference_->drainCompactEvents();
+  const auto reached = std::find_if(events.begin(), events.end(), [](const CompactEvent & event) {
+        return event.event == "return_workspace_reached";
+    });
+  const auto completed = std::find_if(events.begin(), events.end(), [](const CompactEvent & event) {
+        return event.event == "completed";
+    });
+  ASSERT_NE(reached, events.end());
+  ASSERT_NE(completed, events.end());
+  EXPECT_LT(std::distance(events.begin(), reached), std::distance(events.begin(), completed));
+
+  auto returned_state = working_pose;
+  returned_state.setJointGroupPositions(group_, accepted_position);
+  returned_state.update(true);
+  const auto face = update(returned_state, target(msg::TrackingTarget::FACE));
+  ASSERT_TRUE(face.task);
+  ASSERT_TRUE(face.tracking);
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().state, "FACE");
+  EXPECT_EQ(face.task->primary_matrix.rows(), 3);
 }
 
 TEST_F(MotionReferenceTest, CompactRadiusFloorLatchesOnlyAfterPublishedEnvelopeEnters)
@@ -9907,8 +10831,8 @@ TEST_F(MotionReferenceTest, CompactRadiusFloorLatchesOnlyAfterPublishedEnvelopeE
         kSceneRevision, actual, now, queued, &active, &latest);
     };
 
-  recordQualifyingFaceShortfall(outside);
-  double now = now_seconds();
+  primeFaceTracking(outside);
+  const double now = now_seconds();
   auto active = make_publication(1U, outside_position, now);
   auto latest = make_publication(2U, outside_position, now);
   (void)update_with(outside, outside_position, outside_position, active, latest, now);
@@ -9920,12 +10844,10 @@ TEST_F(MotionReferenceTest, CompactRadiusFloorLatchesOnlyAfterPublishedEnvelopeE
   ASSERT_GT(reference_->diagnostics().compact_entry_radius_cap_m, 0.40);
   const double entry_cap = reference_->diagnostics().compact_entry_radius_cap_m;
 
-  now = now_seconds();
   (void)update_with(inside, inside_position, inside_position, active, latest, now);
   EXPECT_TRUE(reference_->validateCompactPathPosition(inside, outside_position));
   EXPECT_DOUBLE_EQ(reference_->diagnostics().compact_entry_radius_cap_m, entry_cap);
 
-  now = now_seconds();
   active = make_publication(3U, inside_position, now);
   latest = make_publication(4U, inside_position, now);
   (void)update_with(inside, inside_position, inside_position, active, latest, now);
@@ -9954,32 +10876,36 @@ TEST_F(MotionReferenceTest, CompactRadiusRowsDeflectOutwardCommandNearEntryCap)
   const auto edge_face = update(
     start, target(msg::TrackingTarget::FACE), nullptr, nullptr, settled);
   ASSERT_TRUE(edge_face.tracking);
-  ASSERT_TRUE(edge_face.j1_hold_position_rad);
-  EXPECT_NE(reference_->diagnostics().j1_hold_direction, 0);
+  ASSERT_FALSE(reference_->compactManeuverActive());
+  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  EXPECT_EQ(reference_->diagnostics().state, "FACE_COMPACT_PREPARING");
+  EXPECT_EQ(reference_->diagnostics().compact_reason, "j1_working_boundary");
+  EXPECT_EQ(reference_->diagnostics().compact_generation, 1U);
 
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   admitCurrentPreparationWithLifecycleFixturePath(start);
 
-  const auto reference = update(
-    start, target(msg::TrackingTarget::FACE), nullptr, nullptr, settled);
+  (void)update(start, target(msg::TrackingTarget::FACE), nullptr, nullptr, settled);
   ASSERT_TRUE(reference_->compactManeuverActive());
-  EXPECT_FALSE(reference.j1_hold_position_rad);
-  EXPECT_EQ(reference_->diagnostics().j1_hold_direction, 0);
-  EXPECT_DOUBLE_EQ(reference_->diagnostics().j1_hold_q, 0.0);
-  ASSERT_GT(reference.compact_radius_constraints.size(), 0U);
+  EXPECT_EQ(reference_->diagnostics().compact_generation, 1U);
+  EXPECT_EQ(reference_->diagnostics().compact_reason, "j1_working_boundary");
+  MotionReferenceResult compact_rows;
+  ASSERT_TRUE(MotionReferenceTestPeer::appendCompactPathConstraintsForTest(
+      *reference_, start, settled, compact_rows));
+  ASSERT_GT(compact_rows.compact_radius_constraints.size(), 0U);
   CompactGeometryValidator geometry(model_, "link_base");
   EXPECT_NEAR(
     reference_->diagnostics().compact_entry_radius_cap_m,
     geometry.maximumAssemblyRadius(start), 1.0e-6);
 
   const auto restrictive_row = std::max_element(
-    reference.compact_radius_constraints.begin(),
-    reference.compact_radius_constraints.end(), [](const auto & left, const auto & right) {
+    compact_rows.compact_radius_constraints.begin(),
+    compact_rows.compact_radius_constraints.end(), [](const auto & left, const auto & right) {
       const double left_rate = left.upper_bound / left.coefficients.norm();
       const double right_rate = right.upper_bound / right.coefficients.norm();
       return left_rate > right_rate;
     });
-  ASSERT_NE(restrictive_row, reference.compact_radius_constraints.end());
+  ASSERT_NE(restrictive_row, compact_rows.compact_radius_constraints.end());
   ASSERT_GT(restrictive_row->coefficients.norm(), 1.0e-8);
 
   HierarchicalVelocityTask hold_task;
@@ -9994,10 +10920,10 @@ TEST_F(MotionReferenceTest, CompactRadiusRowsDeflectOutwardCommandNearEntryCap)
   qp_config.residual_command_latency_sec = parameters_.residual_command_latency_sec;
   const HierarchicalVelocityQp solver(qp_config);
   const QpResult stationary_hold = solver.solve(
-    hold_task, settled, limits_, reference.compact_radius_constraints);
+    hold_task, settled, reference_->activeCommandLimits(), compact_rows.compact_radius_constraints);
   ASSERT_TRUE(stationary_hold.command_available());
   EXPECT_NEAR(stationary_hold.joint_velocity.norm(), 0.0, 1.0e-5);
-  for (const auto & row : reference.compact_radius_constraints) {
+  for (const auto & row : compact_rows.compact_radius_constraints) {
     EXPECT_GE(row.upper_bound, -1.0e-8);
   }
 
@@ -10008,9 +10934,9 @@ TEST_F(MotionReferenceTest, CompactRadiusRowsDeflectOutwardCommandNearEntryCap)
   task.secondary_matrix = Eigen::MatrixXd(0, 6);
   task.secondary_reference = Eigen::VectorXd(0);
   task.secondary_weights = Eigen::VectorXd(0);
-  const QpResult unguarded = solver.solve(task, settled, limits_);
+  const QpResult unguarded = solver.solve(task, settled, reference_->activeCommandLimits());
   const QpResult guarded = solver.solve(
-    task, settled, limits_, reference.compact_radius_constraints);
+    task, settled, reference_->activeCommandLimits(), compact_rows.compact_radius_constraints);
   ASSERT_TRUE(unguarded.command_available());
   ASSERT_TRUE(guarded.command_available());
   EXPECT_GT(
@@ -10024,7 +10950,7 @@ TEST_F(MotionReferenceTest, CompactRadiusRowsDeflectOutwardCommandNearEntryCap)
 TEST_F(MotionReferenceTest, CompactRadiusRowsDoNotBindFarInsideFloorCap)
 {
   const auto start = compactGoalState();
-  recordQualifyingFaceShortfall(start);
+  primeFaceTracking(start);
   admitCurrentPreparationWithLifecycleFixturePath(start);
   Eigen::VectorXd position;
   start.copyJointGroupPositions(group_, position);
@@ -10032,15 +10958,21 @@ TEST_F(MotionReferenceTest, CompactRadiusRowsDoNotBindFarInsideFloorCap)
     position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
   const auto reference = update(
     start, target(msg::TrackingTarget::FACE), nullptr, nullptr, settled);
-  ASSERT_TRUE(reference_->compactManeuverActive());
-  ASSERT_GT(reference.compact_radius_constraints.size(), 0U);
+  ASSERT_TRUE(reference_->compactManeuverActive())
+    << "phase=" << reference_->diagnostics().compact_phase
+    << "; last_plan=" << reference_->diagnostics().last_plan_message
+    << "; events=" << compactEventSummary(reference_->drainCompactEvents());
+  MotionReferenceResult compact_rows;
+  ASSERT_TRUE(MotionReferenceTestPeer::appendCompactPathConstraintsForTest(
+      *reference_, start, settled, compact_rows));
+  ASSERT_GT(compact_rows.compact_radius_constraints.size(), 0U);
 
   const auto strongest_row = std::max_element(
-    reference.compact_radius_constraints.begin(),
-    reference.compact_radius_constraints.end(), [](const auto & left, const auto & right) {
+    compact_rows.compact_radius_constraints.begin(),
+    compact_rows.compact_radius_constraints.end(), [](const auto & left, const auto & right) {
       return left.coefficients.norm() < right.coefficients.norm();
     });
-  ASSERT_NE(strongest_row, reference.compact_radius_constraints.end());
+  ASSERT_NE(strongest_row, compact_rows.compact_radius_constraints.end());
   ASSERT_GT(strongest_row->coefficients.norm(), 1.0e-8);
 
   HierarchicalVelocityTask task;
@@ -10054,214 +10986,320 @@ TEST_F(MotionReferenceTest, CompactRadiusRowsDoNotBindFarInsideFloorCap)
   qp_config.period_sec = parameters_.control_period_sec;
   qp_config.residual_command_latency_sec = parameters_.residual_command_latency_sec;
   const HierarchicalVelocityQp solver(qp_config);
-  const QpResult unguarded = solver.solve(task, settled, limits_);
+  const QpResult unguarded = solver.solve(task, settled, reference_->activeCommandLimits());
   const QpResult guarded = solver.solve(
-    task, settled, limits_, reference.compact_radius_constraints);
+    task, settled, reference_->activeCommandLimits(), compact_rows.compact_radius_constraints);
   ASSERT_TRUE(unguarded.command_available());
   ASSERT_TRUE(guarded.command_available());
   EXPECT_NEAR((guarded.joint_velocity - unguarded.joint_velocity).norm(), 0.0, 1.0e-5);
 }
 
-TEST_F(MotionReferenceTest, CompactPitchRowsHoldAtCapDeflectOutwardAndAllowInwardMotion)
+TEST_F(MotionReferenceTest, CommittedCompactPathUsesRadiusRowsWithCompactAccelerationEnvelope)
+{
+  const auto start = compactGoalState(0.05);
+  Eigen::VectorXd position;
+  start.copyJointGroupPositions(group_, position);
+  JointMotionState queue_state{
+    position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  queue_state.acceleration[0] = 3.0;
+  ASSERT_GT(queue_state.acceleration[0], limits_.max_acceleration[0]);
+  ASSERT_LT(queue_state.acceleration[0],
+    MotionReferenceTestPeer::compactAccelerationLimitForTest(*reference_, 0));
+
+  MotionReferenceResult ordinary_face_rows;
+  EXPECT_FALSE(MotionReferenceTestPeer::appendUprightConstraintsForTest(
+      *reference_, start, queue_state, ordinary_face_rows));
+
+  Eigen::VectorXd profile_goal = position;
+  profile_goal[1] += 0.01;
+  const auto profile = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *reference_, JointMotionState{
+        position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)}, profile_goal);
+  ASSERT_TRUE(profile);
+  ASSERT_TRUE(reference_->compactManeuverActive());
+
+  MotionReferenceResult compact_rows;
+  ASSERT_TRUE(MotionReferenceTestPeer::appendCompactPathConstraintsForTest(
+      *reference_, start, queue_state, compact_rows));
+  EXPECT_FALSE(compact_rows.compact_radius_constraints.empty());
+  EXPECT_TRUE(compact_rows.compact_roll_constraints.empty());
+  EXPECT_TRUE(compact_rows.compact_pitch_constraints.empty());
+  EXPECT_FALSE(compact_rows.motion_reference_support_unavailable);
+}
+
+TEST_F(MotionReferenceTest, CompactPathRowsAllowFreePitchAndRollWithinRadiusCap)
 {
   auto start = compactGoalState();
   start.setVariablePosition("joint5", -0.8);
   start.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
   start.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
   start.update(true);
-  Eigen::VectorXd start_position;
-  start.copyJointGroupPositions(group_, start_position);
+
+  auto pitched = start;
+  pitched.setVariablePosition("joint5", -0.7);
+  pitched.update(true);
   const auto start_pose = evaluateCompactUprightPose(
     start.getGlobalLinkTransform("monitor_control_frame").linear());
+  const auto pitched_pose = evaluateCompactUprightPose(
+    pitched.getGlobalLinkTransform("monitor_control_frame").linear());
   ASSERT_TRUE(start_pose);
-  ASSERT_LE(std::abs(start_pose->signed_roll_error_rad), kCompactRollCapTestRad);
+  ASSERT_TRUE(pitched_pose);
   ASSERT_GT(std::abs(start_pose->signed_pitch_rad), 0.5235987755982988);
-  ASSERT_LT(std::abs(start_pose->signed_pitch_rad), 1.3962634015954636);
+  ASSERT_GT(std::abs(pitched_pose->signed_pitch_rad),
+    std::abs(start_pose->signed_pitch_rad) + kCompactPitchValidationToleranceRad);
 
-  recordQualifyingFaceShortfall(start);
-  admitCurrentPreparationWithLifecycleFixturePath(start);
-  const JointMotionState settled{
-    start_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
-  const auto reference = update(
-    start, target(msg::TrackingTarget::FACE), nullptr, nullptr, settled);
+  auto roll_probe = start;
+  roll_probe.setVariablePosition(
+    "joint6", roll_probe.getVariablePosition("joint6") + 1.0e-4);
+  roll_probe.update(true);
+  const auto probe_pose = evaluateCompactUprightPose(
+    roll_probe.getGlobalLinkTransform("monitor_control_frame").linear());
+  ASSERT_TRUE(probe_pose);
+  const double roll_direction =
+    std::abs(probe_pose->signed_roll_error_rad) >
+    std::abs(start_pose->signed_roll_error_rad) ? 1.0 : -1.0;
+  auto rolled = start;
+  rolled.setVariablePosition("joint6", rolled.getVariablePosition("joint6") +
+    roll_direction * 0.15);
+  rolled.update(true);
+  const auto rolled_pose = evaluateCompactUprightPose(
+    rolled.getGlobalLinkTransform("monitor_control_frame").linear());
+  ASSERT_TRUE(rolled_pose);
+  ASSERT_GT(std::abs(rolled_pose->signed_roll_error_rad), kCompactRollCapTestRad);
+
+  constexpr double radius_cap{0.40};
+  CompactGeometryValidator geometry(model_, "link_base");
+  ASSERT_LT(geometry.maximumAssemblyRadius(start), radius_cap);
+  ASSERT_LT(geometry.maximumAssemblyRadius(pitched), radius_cap);
+  ASSERT_LT(geometry.maximumAssemblyRadius(rolled), radius_cap);
+  MotionReferenceTestPeer::activateRadiusOnlyCompactForTest(
+    *reference_, start, radius_cap);
   ASSERT_TRUE(reference_->compactManeuverActive());
-  ASSERT_EQ(reference.compact_pitch_constraints.size(), 2U);
-  ASSERT_EQ(reference.compact_roll_constraints.size(), 2U);
-  const auto boundary_row = std::min_element(
-    reference.compact_pitch_constraints.begin(), reference.compact_pitch_constraints.end(),
-    [](const auto & left, const auto & right) {return left.upper_bound < right.upper_bound;});
-  ASSERT_NE(boundary_row, reference.compact_pitch_constraints.end());
-  EXPECT_NEAR(boundary_row->upper_bound, 0.0, 1.0e-8);
-  auto compact_constraints = reference.compact_radius_constraints;
-  compact_constraints.insert(
-    compact_constraints.end(), reference.compact_roll_constraints.begin(),
-    reference.compact_roll_constraints.end());
-  compact_constraints.insert(
-    compact_constraints.end(), reference.compact_pitch_constraints.begin(),
-    reference.compact_pitch_constraints.end());
 
-  HierarchicalVelocityTask hold_task;
-  hold_task.primary_matrix = Eigen::MatrixXd::Identity(6, 6);
-  hold_task.primary_reference = Eigen::VectorXd::Zero(6);
-  hold_task.primary_weights = Eigen::VectorXd::Ones(6);
-  hold_task.secondary_matrix = Eigen::MatrixXd(0, 6);
-  hold_task.secondary_reference = Eigen::VectorXd(0);
-  hold_task.secondary_weights = Eigen::VectorXd(0);
-  HierarchicalVelocityQpConfig qp_config;
-  qp_config.period_sec = parameters_.control_period_sec;
-  qp_config.residual_command_latency_sec = parameters_.residual_command_latency_sec;
-  const HierarchicalVelocityQp solver(qp_config);
-  const QpResult stationary_hold = solver.solve(
-    hold_task, settled, limits_, compact_constraints);
-  ASSERT_TRUE(stationary_hold.command_available());
-  EXPECT_NEAR(stationary_hold.joint_velocity.norm(), 0.0, 1.0e-5);
-
-  HierarchicalVelocityTask outward_task = hold_task;
-  outward_task.primary_reference = 0.2 * boundary_row->coefficients.normalized();
-  const QpResult unguarded_outward = solver.solve(outward_task, settled, limits_);
-  const QpResult guarded_outward = solver.solve(
-    outward_task, settled, limits_, compact_constraints);
-  ASSERT_TRUE(unguarded_outward.command_available());
-  ASSERT_TRUE(guarded_outward.command_available());
-  EXPECT_GT(
-    boundary_row->coefficients.dot(unguarded_outward.joint_velocity),
-    boundary_row->upper_bound + 1.0e-6);
-  EXPECT_LE(
-    boundary_row->coefficients.dot(guarded_outward.joint_velocity),
-    boundary_row->upper_bound + 2.0e-5);
-
-  HierarchicalVelocityTask inward_task = hold_task;
-  inward_task.primary_reference = -0.1 * boundary_row->coefficients.normalized();
-  const QpResult guarded_inward = solver.solve(
-    inward_task, settled, limits_, compact_constraints);
-  ASSERT_TRUE(guarded_inward.command_available());
-  EXPECT_LT(boundary_row->coefficients.dot(guarded_inward.joint_velocity), -1.0e-5);
-
-  const Eigen::VectorXd outward_velocity =
-    0.02 * boundary_row->coefficients.normalized();
-  const JointMotionState moving_queue{
-    start_position, outward_velocity, Eigen::VectorXd::Zero(6)};
-  const auto moving_reference = update(
-    start, target(msg::TrackingTarget::FACE), nullptr, nullptr, moving_queue);
-  ASSERT_EQ(moving_reference.compact_pitch_constraints.size(), 2U);
-  ASSERT_EQ(moving_reference.compact_roll_constraints.size(), 2U);
-  const auto moving_boundary_row = std::find_if(
-    moving_reference.compact_pitch_constraints.begin(),
-    moving_reference.compact_pitch_constraints.end(),
-    [&boundary_row](const auto & row) {
-      return row.coefficients.isApprox(boundary_row->coefficients, 1.0e-12);
-    });
-  ASSERT_NE(moving_boundary_row, moving_reference.compact_pitch_constraints.end());
-  const double current_outward_speed =
-    boundary_row->coefficients.dot(moving_queue.velocity);
-  EXPECT_LE(moving_boundary_row->upper_bound, current_outward_speed + 1.0e-6);
-
-  const QpResult unguarded_moving = solver.solve(outward_task, moving_queue, limits_);
-  auto moving_constraints = moving_reference.compact_radius_constraints;
-  moving_constraints.insert(
-    moving_constraints.end(), moving_reference.compact_roll_constraints.begin(),
-    moving_reference.compact_roll_constraints.end());
-  moving_constraints.insert(
-    moving_constraints.end(), moving_reference.compact_pitch_constraints.begin(),
-    moving_reference.compact_pitch_constraints.end());
-  const QpResult guarded_moving = solver.solve(
-    outward_task, moving_queue, limits_, moving_constraints);
-  ASSERT_TRUE(unguarded_moving.command_available());
-  ASSERT_TRUE(guarded_moving.command_available());
-  EXPECT_GT(
-    moving_boundary_row->coefficients.dot(unguarded_moving.joint_velocity),
-    moving_boundary_row->upper_bound + 1.0e-6);
-  EXPECT_LE(
-    moving_boundary_row->coefficients.dot(guarded_moving.joint_velocity),
-    moving_boundary_row->upper_bound + 2.0e-5);
+  const auto check_radius_only_rows = [this, &start](
+    const moveit::core::RobotState & pose) {
+      Eigen::VectorXd position;
+      pose.copyJointGroupPositions(group_, position);
+      const JointMotionState stationary{
+        position, Eigen::VectorXd::Zero(position.size()),
+        Eigen::VectorXd::Zero(position.size())};
+      std::string violation;
+      EXPECT_TRUE(reference_->validateCompactPathPosition(start, position, &violation)) <<
+        violation;
+      MotionReferenceResult rows;
+      ASSERT_TRUE(MotionReferenceTestPeer::appendCompactPathConstraintsForTest(
+          *reference_, pose, stationary, rows));
+      EXPECT_FALSE(rows.compact_radius_constraints.empty());
+      EXPECT_TRUE(rows.compact_roll_constraints.empty());
+      EXPECT_TRUE(rows.compact_pitch_constraints.empty());
+    };
+  check_radius_only_rows(start);
+  check_radius_only_rows(pitched);
+  check_radius_only_rows(rolled);
 }
 
-TEST_F(MotionReferenceTest, CompactOrientationViableMotionHasCertifiedBrakingTail)
+TEST_F(MotionReferenceTest, CompactOrientationMotionRetainsRadiusAndBrakingLimits)
 {
   const auto start = compactGoalState(0.05);
-  const auto start_pose = evaluateCompactUprightPose(
-    start.getGlobalLinkTransform("monitor_control_frame").linear());
-  ASSERT_TRUE(start_pose);
-  recordQualifyingFaceShortfall(start);
-  admitCurrentPreparationWithLifecycleFixturePath(start);
-  const auto stationary_reference = update(
-    start, target(msg::TrackingTarget::FACE));
-  ASSERT_TRUE(reference_->compactManeuverActive());
-  ASSERT_TRUE(std::isfinite(reference_->diagnostics().compact_pitch_cap_rad));
-  ASSERT_GT(
-    reference_->diagnostics().compact_pitch_cap_rad -
-    std::abs(start_pose->signed_pitch_rad), 0.02);
-  ASSERT_GT(kCompactRollCapTestRad - std::abs(start_pose->signed_roll_error_rad), 0.02);
-  CompactGeometryValidator geometry(model_, "link_base");
-  EXPECT_GT(
-    reference_->diagnostics().compact_entry_radius_cap_m -
-    geometry.maximumAssemblyRadius(start), 0.01);
-  ASSERT_EQ(stationary_reference.compact_pitch_constraints.size(), 2U);
-  ASSERT_EQ(stationary_reference.compact_roll_constraints.size(), 2U);
-  const auto outward_row = std::min_element(
-    stationary_reference.compact_pitch_constraints.begin(),
-    stationary_reference.compact_pitch_constraints.end(),
-    [](const auto & left, const auto & right) {return left.upper_bound < right.upper_bound;});
-  ASSERT_NE(outward_row, stationary_reference.compact_pitch_constraints.end());
-
   Eigen::VectorXd position;
   start.copyJointGroupPositions(group_, position);
-  const auto roll_outward_row = std::min_element(
-    stationary_reference.compact_roll_constraints.begin(),
-    stationary_reference.compact_roll_constraints.end(),
-    [](const auto & left, const auto & right) {return left.upper_bound < right.upper_bound;});
-  ASSERT_NE(roll_outward_row, stationary_reference.compact_roll_constraints.end());
-  const Eigen::VectorXd velocity = 0.03 * outward_row->coefficients.normalized() +
-    0.03 * roll_outward_row->coefficients.normalized();
-  const JointMotionState moving{position, velocity, Eigen::VectorXd::Zero(6)};
-  const auto moving_reference = update(
-    start, target(msg::TrackingTarget::FACE), nullptr, nullptr, moving);
-  ASSERT_EQ(moving_reference.compact_pitch_constraints.size(), 2U);
-  ASSERT_EQ(moving_reference.compact_roll_constraints.size(), 2U);
+  CompactGeometryValidator geometry(model_, "link_base");
+  constexpr double radius_cap{0.40};
+  const double start_radius = geometry.maximumAssemblyRadius(start);
+  ASSERT_LT(start_radius, radius_cap);
+  ASSERT_GT(radius_cap - start_radius, 0.005);
+  MotionReferenceTestPeer::activateRadiusOnlyCompactForTest(
+    *reference_, start, radius_cap);
+  ASSERT_TRUE(reference_->compactManeuverActive());
 
-  HierarchicalVelocityTask outward_task;
-  outward_task.primary_matrix = Eigen::MatrixXd::Identity(6, 6);
-  outward_task.primary_reference = 0.2 * outward_row->coefficients.normalized() +
-    0.2 * roll_outward_row->coefficients.normalized();
-  outward_task.primary_weights = Eigen::VectorXd::Ones(6);
-  outward_task.secondary_matrix = Eigen::MatrixXd(0, 6);
-  outward_task.secondary_reference = Eigen::VectorXd(0);
-  outward_task.secondary_weights = Eigen::VectorXd(0);
+  const JointMotionState stationary{
+    position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  MotionReferenceResult radius_rows;
+  ASSERT_TRUE(MotionReferenceTestPeer::appendCompactPathConstraintsForTest(
+      *reference_, start, stationary, radius_rows));
+  ASSERT_FALSE(radius_rows.compact_radius_constraints.empty());
+  EXPECT_TRUE(radius_rows.compact_roll_constraints.empty());
+  EXPECT_TRUE(radius_rows.compact_pitch_constraints.empty());
+
+  HierarchicalVelocityTask orientation_task;
+  orientation_task.primary_matrix = Eigen::MatrixXd::Identity(6, 6);
+  orientation_task.primary_reference = Eigen::VectorXd::Zero(6);
+  orientation_task.primary_reference[4] = 0.02;
+  orientation_task.primary_reference[5] = 0.02;
+  orientation_task.primary_weights = Eigen::VectorXd::Ones(6);
+  orientation_task.secondary_matrix = Eigen::MatrixXd(0, 6);
+  orientation_task.secondary_reference = Eigen::VectorXd(0);
+  orientation_task.secondary_weights = Eigen::VectorXd(0);
+
   HierarchicalVelocityQpConfig qp_config;
   qp_config.period_sec = parameters_.control_period_sec;
   qp_config.residual_command_latency_sec = parameters_.residual_command_latency_sec;
   const HierarchicalVelocityQp solver(qp_config);
-  auto constraints = moving_reference.compact_radius_constraints;
-  constraints.insert(
-    constraints.end(), moving_reference.compact_roll_constraints.begin(),
-    moving_reference.compact_roll_constraints.end());
-  constraints.insert(
-    constraints.end(), moving_reference.compact_pitch_constraints.begin(),
-    moving_reference.compact_pitch_constraints.end());
-  const QpResult command = solver.solve(outward_task, moving, limits_, constraints);
+  const auto & compact_limits = reference_->activeCommandLimits();
+  const QpResult command = solver.solve(
+    orientation_task, stationary, compact_limits, radius_rows.compact_radius_constraints);
   ASSERT_TRUE(command.command_available());
+  EXPECT_GT(std::abs(command.joint_velocity[4]), 1.0e-6);
+  EXPECT_GT(std::abs(command.joint_velocity[5]), 1.0e-6);
 
   const Eigen::VectorXd next_position = position +
     parameters_.control_period_sec * command.joint_velocity;
-  const Eigen::VectorXd next_acceleration =
-    (command.joint_velocity - velocity) / parameters_.control_period_sec;
-  const JointMotionState branch{next_position, command.joint_velocity, next_acceleration};
+  const Eigen::VectorXd next_acceleration = command.joint_velocity /
+    parameters_.control_period_sec;
+  const JointMotionState branch{
+    next_position, command.joint_velocity, next_acceleration};
   EmergencyBrakeTailConfig tail_config;
   tail_config.period_sec = parameters_.control_period_sec;
   const EmergencyBrakeTail tail = EmergencyBrakeTailGenerator(tail_config).generate(
-    branch, limits_);
+    branch, compact_limits);
   ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
   ASSERT_GT(tail.first_stationary_point, 0U);
 
   for (std::size_t index = 0U; index < tail.points.size(); ++index) {
+    const auto & point = tail.points[index];
     std::string violation;
     EXPECT_TRUE(reference_->validateCompactPathPosition(
-        start, tail.points[index].position, &violation)) <<
+        start, point.position, &violation)) <<
       "braking tail point " << index << " violates " << violation;
+    moveit::core::RobotState tail_state(start);
+    tail_state.setJointGroupPositions(group_, point.position);
+    tail_state.update(true);
+    EXPECT_LE(geometry.maximumAssemblyRadius(tail_state), radius_cap + 1.0e-6);
+    EXPECT_TRUE((point.position.array() >= compact_limits.lower_position.array()).all());
+    EXPECT_TRUE((point.position.array() <= compact_limits.upper_position.array()).all());
   }
 }
 
-TEST_F(MotionReferenceTest, CompactQueueTailRowsAllowDumpedStateAndCertifyEmergencyBrake)
+TEST_F(MotionReferenceTest, WorkerGeometryValidatorRejectsSampleOutsideCommittedRadiusCap)
+{
+  const auto reference_state = state();
+  const double radius = MotionReferenceTestPeer::assemblyRadiusForTest(
+    *reference_, reference_state);
+  ASSERT_TRUE(std::isfinite(radius));
+  const double radius_cap = radius - 1.0e-4;
+  planning_scene_monitor::LockedPlanningSceneRO locked_scene(monitor_);
+  const planning_scene::PlanningSceneConstPtr scene = locked_scene;
+  const auto validator = MotionReferenceTestPeer::finalGeometryValidatorForTest(
+    *reference_, *scene, reference_state, kSceneRevision, radius_cap);
+  ASSERT_TRUE(validator);
+
+  Eigen::VectorXd position;
+  reference_state.copyJointGroupPositions(group_, position);
+  CompactJointProfile profile;
+  profile.samples = {
+    JointMotionState{
+      position, Eigen::VectorXd::Zero(position.size()), Eigen::VectorXd::Zero(position.size())},
+    JointMotionState{
+      position, Eigen::VectorXd::Zero(position.size()), Eigen::VectorXd::Zero(position.size())}};
+  const auto certificate = validator(profile);
+  EXPECT_EQ(certificate.status, CompactProfileGeometryStatus::kUnsafe);
+  EXPECT_EQ(certificate.scene_revision, kSceneRevision);
+  EXPECT_EQ(certificate.checked_samples, 2U);
+  EXPECT_EQ(certificate.checked_intervals, 1U);
+  EXPECT_NE(certificate.failure_reason.find("radius"), std::string::npos);
+}
+
+TEST_F(MotionReferenceTest, CapturedCompactProfileBranchAndBrakeTailStayInsideRadiusCap)
+{
+  constexpr double kCapturedRadiusCapM{0.61033327791429515};
+  const JointMotionState branch{
+    (Eigen::Matrix<double, 6, 1>() <<
+      6.2418605804725233, 0.25159550819037518, -1.6709122977632367,
+      -0.052773120449907104, -0.79406880858610729, 6.2711020099804218).finished(),
+    (Eigen::Matrix<double, 6, 1>() <<
+      -0.017380774607104733, -0.025375125514615956, -0.060020754338774976,
+      0.40952806843059625, 0.12804544867979567, -0.28532167760342592).finished(),
+    (Eigen::Matrix<double, 6, 1>() <<
+      -0.23950992341167202, -0.34967338947499493, -0.82709583431997691,
+      5.643363919157407, 1.7644872740007103, -3.9317794917236912).finished()};
+  const Eigen::VectorXd captured_tail_position = (Eigen::Matrix<double, 6, 1>() <<
+    6.2417239423649056, 0.25130126069671982, -1.6726175141876756,
+    0.024287858233941962, -0.78657193811312054, 6.2332235258931528).finished();
+  const auto radius_at = [this](const Eigen::VectorXd & q) {
+      CompactGeometryValidator geometry(model_, "link_base");
+      auto sample_state = state();
+      sample_state.setJointGroupPositions(group_, q);
+      sample_state.update(true);
+      return geometry.maximumAssemblyRadius(sample_state);
+    };
+  const double branch_radius = radius_at(branch.position);
+  ASSERT_LE(branch_radius, kCapturedRadiusCapM + 1.0e-9);
+
+  auto limits = MotionReferenceTestPeer::compactMotionLimitsForTest(*reference_);
+  limits.max_velocity.setConstant(2.8);
+  limits.max_acceleration.setConstant(8.0);
+  limits.max_jerk.setConstant(80.0);
+  ASSERT_TRUE(limits.numerical_policy);
+  const auto captured_policy = NumericalPolicy::fromDiscreteMotionLimits(
+    PositionInterval{limits.lower_position.minCoeff(), limits.upper_position.maxCoeff()},
+    limits.max_velocity.maxCoeff(), limits.max_acceleration.maxCoeff(),
+    limits.max_jerk.maxCoeff(), parameters_.control_period_sec,
+    limits.numerical_policy->solver_residual);
+  ASSERT_TRUE(captured_policy);
+  limits.numerical_policy = *captured_policy;
+  const EmergencyBrakeTail tail = EmergencyBrakeTailGenerator(
+    EmergencyBrakeTailConfig{parameters_.control_period_sec}).generate(branch, limits);
+  ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
+  ASSERT_GT(tail.points.size(), 16U);
+  EXPECT_TRUE(tail.points[16U].position.isApprox(captured_tail_position, 1.0e-9));
+  const double generated_tail_radius = radius_at(tail.points[16U].position);
+  double generic_tail_max_radius = 0.0;
+  std::size_t generic_tail_max_index = 0U;
+  for (std::size_t index = 0U; index < tail.points.size(); ++index) {
+    const double radius = radius_at(tail.points[index].position);
+    if (radius > generic_tail_max_radius) {
+      generic_tail_max_radius = radius;
+      generic_tail_max_index = index;
+    }
+  }
+  EXPECT_GT(generated_tail_radius, kCapturedRadiusCapM)
+    << "captured generic tail index 16 radius=" << std::setprecision(17)
+    << generated_tail_radius << " m, cap=" << kCapturedRadiusCapM << " m";
+  std::cout << std::setprecision(17)
+            << "captured generic brake first violation radius=" << generated_tail_radius
+            << " m at tail index 16; full tail maximum=" << generic_tail_max_radius
+            << " m at index " << generic_tail_max_index
+            << ", cap=" << kCapturedRadiusCapM << " m\n";
+
+  const EmergencyBrakeTail profile_tail = generateCompactProfileBrakeTail(
+    branch, branch.velocity.normalized(), limits,
+    EmergencyBrakeTailConfig{parameters_.control_period_sec});
+  ASSERT_TRUE(profile_tail.command_available()) << profile_tail.failure_reason;
+  ASSERT_GT(profile_tail.first_stationary_point, 0U);
+  JointMotionState previous = branch;
+  for (std::size_t index = 0U; index < profile_tail.points.size(); ++index) {
+    const auto & sample = profile_tail.points[index];
+    ASSERT_EQ(sample.position.size(), 6);
+    ASSERT_EQ(sample.velocity.size(), 6);
+    ASSERT_EQ(sample.acceleration.size(), 6);
+    EXPECT_LE((sample.position - limits.upper_position).maxCoeff(), 1.0e-9)
+      << "profile brake sample " << index;
+    EXPECT_LE((limits.lower_position - sample.position).maxCoeff(), 1.0e-9)
+      << "profile brake sample " << index;
+    EXPECT_LE((sample.velocity.cwiseAbs() - limits.max_velocity).maxCoeff(), 1.0e-6)
+      << "profile brake sample " << index;
+    EXPECT_LE((sample.acceleration.cwiseAbs() - limits.max_acceleration).maxCoeff(), 1.0e-6)
+      << "profile brake sample " << index;
+    EXPECT_LE(radius_at(sample.position), kCapturedRadiusCapM + 1.0e-9)
+      << "profile brake sample " << index;
+    if (index == 0U) {
+      continue;
+    }
+    EXPECT_LE((sample.position - previous.position -
+      sample.velocity * parameters_.control_period_sec).norm(), 1.0e-9)
+      << "profile brake sample " << index << " q integration";
+    EXPECT_LE((sample.acceleration -
+      (sample.velocity - previous.velocity) / parameters_.control_period_sec).norm(), 1.0e-8)
+      << "profile brake sample " << index << " a derivative";
+    EXPECT_LE(((sample.acceleration - previous.acceleration) /
+      parameters_.control_period_sec).cwiseAbs().maxCoeff(),
+      limits.max_jerk.maxCoeff() + 1.0e-5)
+      << "profile brake sample " << index << " jerk";
+    previous = sample;
+  }
+}
+
+TEST_F(MotionReferenceTest, CompactQueueTailRadiusRowsStayAdvisoryAndExactGuardRejectsFoldProposal)
 {
   auto start = state();
   const Eigen::VectorXd position = (Eigen::VectorXd(6) <<
@@ -10282,23 +11320,8 @@ TEST_F(MotionReferenceTest, CompactQueueTailRowsAllowDumpedStateAndCertifyEmerge
   const EmergencyBrakeTail prior_tail = EmergencyBrakeTailGenerator(
     prior_tail_config).generate(queue_tail, limits_);
   ASSERT_TRUE(prior_tail.command_available()) << prior_tail.failure_reason;
-  const double evidence_start = std::chrono::duration<double>(
-    std::chrono::steady_clock::now() - clock_origin_).count();
-  const auto selected = update(start, target(msg::TrackingTarget::FACE));
-  ASSERT_TRUE(selected.tracking);
-  auto shortfall = *selected.tracking;
-  shortfall.has_face_primary_roll = true;
-  shortfall.signed_face_primary_error_rad = Eigen::Vector3d(0.06, 0.0, 0.0);
-  shortfall.face_primary_feedforward_radps.setZero();
-  QpResult accepted_shortfall;
-  accepted_shortfall.status = QpStatus::kSolved;
-  accepted_shortfall.achieved_primary_velocity = Eigen::Vector3d(-0.20, 0.0, 0.0);
-  for (int tick = 0; tick <= 8; ++tick) {
-    reference_->recordFaceCommand(
-      shortfall, accepted_shortfall,
-      evidence_start + 0.02 * static_cast<double>(tick + 1), true);
-  }
-  const double update_time = evidence_start + 0.18;
+  const double update_time = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count() + 0.18;
   PublishedTrajectoryRecord publication;
   publication.id = 1U;
   for (std::size_t index = 0U; index < prior_tail.points.size(); ++index) {
@@ -10333,10 +11356,157 @@ TEST_F(MotionReferenceTest, CompactQueueTailRowsAllowDumpedStateAndCertifyEmerge
       start, target(msg::TrackingTarget::FACE), *planning_scene, update_time,
       kSceneRevision, queue_tail, update_time, queue_tail, &publication, &publication);
   }
-  ASSERT_TRUE(reference_->compactManeuverActive());
-  ASSERT_EQ(compact_reference.compact_radius_constraints.size(), 6U);
-  ASSERT_EQ(compact_reference.compact_pitch_constraints.size(), 2U);
-  ASSERT_EQ(compact_reference.compact_roll_constraints.size(), 2U);
+  ASSERT_TRUE(reference_->compactManeuverActive())
+    << "phase=" << reference_->diagnostics().compact_phase
+    << "; last_plan=" << reference_->diagnostics().last_plan_message
+    << "; events=" << compactEventSummary(reference_->drainCompactEvents());
+  ASSERT_TRUE(compact_reference.compact_profile_command);
+  ASSERT_TRUE(compact_reference.compact_profile_velocity);
+  auto accepted_profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(accepted_profile);
+  ASSERT_GE(accepted_profile->samples.size(), 2U);
+  EXPECT_TRUE(compact_reference.compact_profile_velocity->isApprox(
+      accepted_profile->samples[1U].velocity, 1.0e-12));
+  ASSERT_EQ(accepted_profile->samples.size(), publication.execution_queue.size());
+  EXPECT_TRUE(MotionReferenceTestPeer::profileWorkPending(*reference_));
+  ASSERT_EQ(
+    accepted_profile->prefix_endpoint_sample_index, publication.execution_queue.size() - 1U);
+  for (std::size_t sample_index = 0U;
+    sample_index < publication.execution_queue.size(); ++sample_index)
+  {
+    const auto & published = publication.execution_queue[sample_index];
+    const auto & profiled = accepted_profile->samples[sample_index];
+    EXPECT_TRUE(profiled.position.isApprox(published.positions, 0.0))
+      << "published prefix q mismatch at sample " << sample_index;
+    EXPECT_TRUE(profiled.velocity.isApprox(published.velocities, 0.0))
+      << "published prefix v mismatch at sample " << sample_index;
+    EXPECT_TRUE(profiled.acceleration.isApprox(published.accelerations, 0.0))
+      << "published prefix a mismatch at sample " << sample_index;
+  }
+
+  EmergencyBrakeTailConfig profile_tail_config;
+  profile_tail_config.period_sec = parameters_.control_period_sec;
+  const auto check_profile_tail_contract = [this](
+    const EmergencyBrakeTail & tail, const JointMotionLimits & active_limits,
+    const std::string & label) {
+      ASSERT_TRUE(tail.command_available()) << label << ": " << tail.failure_reason;
+      ASSERT_GT(tail.points.size(), 1U) << label;
+      ASSERT_LT(tail.first_stationary_point, tail.points.size()) << label;
+      for (std::size_t index = 0U; index < tail.points.size(); ++index) {
+        const auto & sample = tail.points[index];
+        EXPECT_LE((sample.position - active_limits.upper_position).maxCoeff(), 1.0e-9)
+          << label << " sample=" << index << " q upper";
+        EXPECT_LE((active_limits.lower_position - sample.position).maxCoeff(), 1.0e-9)
+          << label << " sample=" << index << " q lower";
+        EXPECT_LE((sample.velocity.cwiseAbs() - active_limits.max_velocity).maxCoeff(), 1.0e-6)
+          << label << " sample=" << index << " velocity";
+        EXPECT_LE((sample.acceleration.cwiseAbs() - active_limits.max_acceleration).maxCoeff(),
+          1.0e-6) << label << " sample=" << index << " acceleration";
+        if (index == 0U) {
+          continue;
+        }
+        const auto & previous = tail.points[index - 1U];
+        EXPECT_LE((sample.position - previous.position -
+          sample.velocity * parameters_.control_period_sec).norm(), 1.0e-9)
+          << label << " sample=" << index << " q integration";
+        EXPECT_LE((sample.acceleration - (sample.velocity - previous.velocity) /
+          parameters_.control_period_sec).norm(), 1.0e-8)
+          << label << " sample=" << index << " acceleration derivative";
+        EXPECT_LE(((sample.acceleration - previous.acceleration) /
+          parameters_.control_period_sec).cwiseAbs().maxCoeff(),
+          active_limits.max_jerk.maxCoeff() + 1.0e-5)
+          << label << " sample=" << index << " jerk";
+      }
+    };
+  const JointMotionState next_prefix_candidate = accepted_profile->samples[1U];
+  const EmergencyBrakeTail exact_prefix_tail = reference_->compactProfileBrakingTail(
+    next_prefix_candidate, profile_tail_config);
+  ASSERT_TRUE(exact_prefix_tail.command_available()) << exact_prefix_tail.failure_reason;
+  const std::size_t exact_prefix_count =
+    accepted_profile->prefix_endpoint_sample_index - 1U + 1U;
+  ASSERT_EQ(exact_prefix_tail.first_stationary_point, exact_prefix_count - 1U);
+  ASSERT_EQ(exact_prefix_tail.points.size(),
+    exact_prefix_count + profile_tail_config.terminal_hold_points);
+  for (std::size_t index = 0U; index < exact_prefix_count; ++index) {
+    const auto & actual = exact_prefix_tail.points[index];
+    const auto & expected = accepted_profile->samples[index + 1U];
+    EXPECT_TRUE(actual.position.isApprox(expected.position, 0.0));
+    EXPECT_TRUE(actual.velocity.isApprox(expected.velocity, 0.0));
+    EXPECT_TRUE(actual.acceleration.isApprox(expected.acceleration, 0.0));
+  }
+  const auto prefix_limits = reference_->activeCommandLimits();
+  check_profile_tail_contract(exact_prefix_tail, prefix_limits, "copied prefix brake");
+
+  for (std::size_t published = 0U;
+    published < accepted_profile->prefix_endpoint_sample_index - 1U; ++published)
+  {
+    reference_->recordCompactProfileCommandPublished(true);
+  }
+  const JointMotionState endpoint_candidate =
+    accepted_profile->samples[accepted_profile->prefix_endpoint_sample_index];
+  const EmergencyBrakeTail endpoint_tail = reference_->compactProfileBrakingTail(
+    endpoint_candidate, profile_tail_config);
+  ASSERT_TRUE(endpoint_tail.command_available()) << endpoint_tail.failure_reason;
+  EXPECT_EQ(endpoint_tail.first_stationary_point, 0U);
+  EXPECT_TRUE(endpoint_tail.points.front().position.isApprox(endpoint_candidate.position, 0.0));
+  EXPECT_TRUE(endpoint_tail.points.front().velocity.isApprox(endpoint_candidate.velocity, 0.0));
+  EXPECT_TRUE(endpoint_tail.points.front().acceleration.isApprox(endpoint_candidate.acceleration,
+        0.0));
+  EXPECT_TRUE(endpoint_tail.points.back().velocity.isZero(0.0));
+  EXPECT_TRUE(endpoint_tail.points.back().acceleration.isZero(0.0));
+  check_profile_tail_contract(endpoint_tail, reference_->activeCommandLimits(), "prefix endpoint");
+
+  reference_->recordCompactProfileCommandPublished(true);
+  ASSERT_TRUE(MotionReferenceTestPeer::finishTorqueProfileWorkForTest(
+      *reference_, update_time, kSceneRevision));
+  accepted_profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(accepted_profile);
+  ASSERT_GT(
+    accepted_profile->samples.size(), accepted_profile->prefix_endpoint_sample_index + 1U);
+  const JointMotionState first_scalar_candidate =
+    accepted_profile->samples[accepted_profile->prefix_endpoint_sample_index + 1U];
+  const EmergencyBrakeTail scalar_profile_tail = reference_->compactProfileBrakingTail(
+    first_scalar_candidate, profile_tail_config);
+  ASSERT_TRUE(scalar_profile_tail.command_available()) << scalar_profile_tail.failure_reason;
+  ASSERT_GT(scalar_profile_tail.first_stationary_point, 0U);
+  EXPECT_TRUE(scalar_profile_tail.points.front().position.isApprox(
+      first_scalar_candidate.position, 0.0));
+  EXPECT_TRUE(scalar_profile_tail.points.front().velocity.isApprox(
+      first_scalar_candidate.velocity, 0.0));
+  EXPECT_TRUE(scalar_profile_tail.points.front().acceleration.isApprox(
+      first_scalar_candidate.acceleration, 0.0));
+  check_profile_tail_contract(
+    scalar_profile_tail, reference_->activeCommandLimits(), "first scalar profile step");
+  for (std::size_t index = 0U; index < scalar_profile_tail.points.size(); ++index) {
+    std::string violation;
+    EXPECT_TRUE(reference_->validateCompactPathPosition(
+        start, scalar_profile_tail.points[index].position, &violation))
+      << "first scalar brake sample " << index << " violates " << violation;
+  }
+
+  EXPECT_TRUE(accepted_profile->samples[
+      accepted_profile->prefix_endpoint_sample_index].velocity.isZero(1.0e-12));
+  EXPECT_TRUE(accepted_profile->samples[
+      accepted_profile->prefix_endpoint_sample_index].acceleration.isZero(1.0e-12));
+  double compact_continuation_max_velocity = 0.0;
+  for (std::size_t sample_index = publication.execution_queue.size();
+    sample_index < accepted_profile->samples.size(); ++sample_index)
+  {
+    const auto & sample_velocity = accepted_profile->samples[sample_index].velocity;
+    compact_continuation_max_velocity = std::max(
+      compact_continuation_max_velocity, sample_velocity.cwiseAbs().maxCoeff());
+    for (Eigen::Index joint = 0; joint < sample_velocity.size(); ++joint) {
+      EXPECT_LE(std::abs(sample_velocity[joint]),
+        MotionReferenceTestPeer::compactVelocityLimitForTest(*reference_, joint) + 1.0e-6);
+    }
+  }
+  EXPECT_GT(compact_continuation_max_velocity, limits_.max_velocity.maxCoeff());
+  MotionReferenceResult compact_rows;
+  ASSERT_TRUE(MotionReferenceTestPeer::appendCompactPathConstraintsForTest(
+      *reference_, start, queue_tail, compact_rows));
+  ASSERT_EQ(compact_rows.compact_radius_constraints.size(), 6U);
+  EXPECT_TRUE(compact_rows.compact_pitch_constraints.empty());
+  EXPECT_TRUE(compact_rows.compact_roll_constraints.empty());
   CompactGeometryValidator geometry(model_, "link_base");
   for (const auto & point : prior_tail.points) {
     auto queued_state = start;
@@ -10347,14 +11517,30 @@ TEST_F(MotionReferenceTest, CompactQueueTailRowsAllowDumpedStateAndCertifyEmerge
       reference_->diagnostics().compact_entry_radius_cap_m + 1.0e-6);
   }
 
+  for (std::size_t segment = 1U; segment < accepted_profile->samples.size(); ++segment) {
+    const auto & previous = accepted_profile->samples[segment - 1U];
+    const auto & next = accepted_profile->samples[segment];
+    const double span = (next.position - previous.position).lpNorm<Eigen::Infinity>();
+    const std::size_t substeps = std::max<std::size_t>(
+      1U, static_cast<std::size_t>(std::ceil(span / 0.02)));
+    EXPECT_LE(span / static_cast<double>(substeps), 0.02 + 1.0e-12);
+    for (std::size_t substep = 1U; substep <= substeps; ++substep) {
+      const double fraction = static_cast<double>(substep) / static_cast<double>(substeps);
+      const Eigen::VectorXd sample_position = previous.position +
+        fraction * (next.position - previous.position);
+      std::string violation;
+      EXPECT_TRUE(reference_->validateCompactPathPosition(
+          start, sample_position, &violation))
+        << "profile segment=" << segment << ", substep=" << substep
+        << " violates " << violation;
+    }
+  }
+
   HierarchicalVelocityTask outward_task;
   outward_task.primary_matrix = Eigen::MatrixXd::Identity(6, 6);
   outward_task.primary_reference = Eigen::VectorXd::Zero(6);
-  const auto & radius_boundary_row = compact_reference.compact_radius_constraints[5];
-  const auto & pitch_boundary_row = compact_reference.compact_pitch_constraints[0];
-  outward_task.primary_reference +=
-    0.2 * radius_boundary_row.coefficients.normalized() +
-    0.2 * pitch_boundary_row.coefficients.normalized();
+  const auto & radius_boundary_row = compact_rows.compact_radius_constraints[5];
+  outward_task.primary_reference += 0.2 * radius_boundary_row.coefficients.normalized();
   outward_task.primary_weights = Eigen::VectorXd::Ones(6);
   outward_task.secondary_matrix = Eigen::MatrixXd(0, 6);
   outward_task.secondary_reference = Eigen::VectorXd(0);
@@ -10371,21 +11557,13 @@ TEST_F(MotionReferenceTest, CompactQueueTailRowsAllowDumpedStateAndCertifyEmerge
   qp_config.solver_time_limit_sec = parameters_.solver_time_limit_sec;
   qp_config.solver_max_iterations = parameters_.solver_max_iterations;
   const HierarchicalVelocityQp solver(qp_config);
-  auto constraints = compact_reference.compact_radius_constraints;
-  constraints.insert(
-    constraints.end(), compact_reference.compact_roll_constraints.begin(),
-    compact_reference.compact_roll_constraints.end());
-  constraints.insert(
-    constraints.end(), compact_reference.compact_pitch_constraints.begin(),
-    compact_reference.compact_pitch_constraints.end());
-  const QpResult command = solver.solve(outward_task, queue_tail, limits_, constraints);
+  auto constraints = compact_rows.compact_radius_constraints;
+  const QpResult command = solver.solve(
+    outward_task, queue_tail, reference_->activeCommandLimits(), constraints);
   ASSERT_TRUE(command.command_available()) << static_cast<int>(command.status);
   EXPECT_LE(
     radius_boundary_row.coefficients.dot(command.joint_velocity),
     radius_boundary_row.upper_bound + 2.0e-5);
-  EXPECT_LE(
-    pitch_boundary_row.coefficients.dot(command.joint_velocity),
-    pitch_boundary_row.upper_bound + 2.0e-5);
 
   const Eigen::VectorXd branch_position =
     position + parameters_.control_period_sec * command.joint_velocity;
@@ -10394,7 +11572,8 @@ TEST_F(MotionReferenceTest, CompactQueueTailRowsAllowDumpedStateAndCertifyEmerge
   const EmergencyBrakeTailGenerator tail_generator(
     EmergencyBrakeTailConfig{parameters_.control_period_sec});
   const EmergencyBrakeTail tail = tail_generator.generate(
-    JointMotionState{branch_position, command.joint_velocity, branch_acceleration}, limits_);
+    JointMotionState{branch_position, command.joint_velocity, branch_acceleration},
+    reference_->activeCommandLimits());
   ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
   const double committed_radius_cap =
     reference_->diagnostics().compact_entry_radius_cap_m;
@@ -10421,7 +11600,7 @@ TEST_F(MotionReferenceTest, CompactQueueTailRowsAllowDumpedStateAndCertifyEmerge
   const auto planned_fold_task = makeJointPathVelocityTask(position, prefix, 6.0, 0.70);
   ASSERT_TRUE(planned_fold_task);
   const QpResult planned_fold_command = solver.solve(
-    *planned_fold_task, queue_tail, limits_, constraints);
+    *planned_fold_task, queue_tail, reference_->activeCommandLimits(), constraints);
   ASSERT_TRUE(planned_fold_command.command_available()) <<
     static_cast<int>(planned_fold_command.status);
   const Eigen::VectorXd fold_branch_position = position +
@@ -10431,19 +11610,25 @@ TEST_F(MotionReferenceTest, CompactQueueTailRowsAllowDumpedStateAndCertifyEmerge
   const EmergencyBrakeTail fold_tail = tail_generator.generate(
     JointMotionState{
         fold_branch_position, planned_fold_command.joint_velocity, fold_branch_acceleration},
-    limits_);
+    reference_->activeCommandLimits());
   ASSERT_TRUE(fold_tail.command_available()) << fold_tail.failure_reason;
-  for (std::size_t index = 0U; index < fold_tail.points.size(); ++index) {
-    std::string violation;
-    EXPECT_TRUE(reference_->validateCompactPathPosition(
-      start, fold_tail.points[index].position, &violation)) <<
-      "planned fold tail point " << index << " violates " << violation;
-  }
+  ASSERT_GT(fold_tail.points.size(), 1U);
+  // The QP rows may propose a pitched fold sample. Exact compact admission
+  // checks the radius envelope; pitch remains a path metric, not a hard cap.
+  std::string fold_branch_violation;
+  EXPECT_TRUE(reference_->validateCompactPathPosition(
+      start, fold_tail.points.front().position, &fold_branch_violation));
+  EXPECT_TRUE(fold_branch_violation.empty());
+  std::string production_transition_violation;
+  EXPECT_TRUE(reference_->validateCommandTransition(
+      start, fold_tail.points.front().position, fold_tail.points[1U].position,
+      &production_transition_violation)) << production_transition_violation;
+  EXPECT_TRUE(production_transition_violation.empty());
 }
 
 TEST_F(MotionReferenceTest, CompactCommitAdoptsCheckedPathAndPreservesGoalAcrossRearm)
 {
-  const auto [start, face_target] = criticalPairExhaustedCase();
+  const auto [start, face_target] = j1WorkingEdgeFaceCase();
   const auto start_upright = evaluateCompactUprightPose(
     start.getGlobalLinkTransform("monitor_control_frame").linear());
   ASSERT_TRUE(start_upright);
@@ -10477,7 +11662,7 @@ TEST_F(MotionReferenceTest, CompactCommitAdoptsCheckedPathAndPreservesGoalAcross
   do {
     planned = update(
       start, preparation_target, nullptr, nullptr, settled_queue);
-    if (reference_->diagnostics().plans_accepted > 0U) {
+    if (reference_->diagnostics().plans_accepted > 0U && planned.follows_path) {
       break;
     }
     std::this_thread::sleep_for(2ms);
@@ -10485,13 +11670,18 @@ TEST_F(MotionReferenceTest, CompactCommitAdoptsCheckedPathAndPreservesGoalAcross
   ASSERT_EQ(reference_->diagnostics().plans_accepted, 1U)
     << reference_->diagnostics().last_plan_message;
   EXPECT_TRUE(planned.follows_path);
-  ASSERT_TRUE(planned.task);
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "PATH");
+  ASSERT_TRUE(planned.task || planned.compact_profile_command)
+    << reference_->diagnostics().last_plan_message;
+  if (planned.compact_profile_command) {
+    ASSERT_TRUE(planned.compact_profile_velocity);
+  }
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "PATH")
+    << reference_->diagnostics().last_plan_message;
   EXPECT_TRUE(std::isfinite(reference_->diagnostics().compact_entry_radius_cap_m));
   EXPECT_DOUBLE_EQ(
     reference_->diagnostics().compact_effective_radius_cap_m,
     reference_->diagnostics().compact_entry_radius_cap_m);
-  EXPECT_TRUE(std::isfinite(reference_->diagnostics().compact_pitch_cap_rad));
+  EXPECT_TRUE(std::isnan(reference_->diagnostics().compact_pitch_cap_rad));
 
   const auto events = reference_->drainCompactEvents();
   const auto triggered = std::find_if(
@@ -10534,7 +11724,642 @@ TEST_F(MotionReferenceTest, CompactCommitAdoptsCheckedPathAndPreservesGoalAcross
       }));
 }
 
-TEST_F(MotionReferenceTest, CompactPlanningKeepsUprightCorrectionOutsideRollAdmission)
+TEST_F(MotionReferenceTest, InvalidCandidateProfileLeavesAcceptedProfileUntouched)
+{
+  const auto start_state = j1WorkingEdgeFaceCase().first;
+  beginPreparationForResultTest(start_state);
+  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+
+  JointMotionState start;
+  start_state.copyJointGroupPositions(group_, start.position);
+  start_state.copyJointGroupVelocities(group_, start.velocity);
+  start_state.copyJointGroupAccelerations(group_, start.acceleration);
+  Eigen::VectorXd accepted_goal = start.position;
+  accepted_goal[1] += 0.01;
+  const auto accepted = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *reference_, start, accepted_goal, 1U);
+  ASSERT_TRUE(accepted);
+  ASSERT_GT(accepted->samples.size(), 2U);
+  const auto accepted_snapshot = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(accepted_snapshot);
+  const auto accepted_cursor = MotionReferenceTestPeer::profileCursorForTest(*reference_);
+  ASSERT_GT(accepted_cursor, 0U);
+
+  // A valid worker path reaches candidate timing, where an invalid compact
+  // limit set makes profile preparation fail. The existing accepted samples
+  // must remain available until a replacement profile is admitted.
+  MotionReferenceTestPeer::invalidateCompactMotionLimitsForTest(*reference_);
+  const auto rejected_before = reference_->diagnostics().plans_rejected;
+  const auto candidate = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
+  consumePreparationResult(start_state, candidate);
+
+  EXPECT_EQ(reference_->diagnostics().plans_rejected, rejected_before + 1U);
+  EXPECT_NE(reference_->diagnostics().last_plan_message.find("could not be timed"),
+    std::string::npos);
+  const auto after = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(after);
+  EXPECT_EQ(MotionReferenceTestPeer::profileCursorForTest(*reference_), accepted_cursor);
+  ASSERT_EQ(after->samples.size(), accepted_snapshot->samples.size());
+  EXPECT_DOUBLE_EQ(after->duration_sec, accepted_snapshot->duration_sec);
+  for (std::size_t index = 0U; index < after->samples.size(); ++index) {
+    EXPECT_TRUE(after->samples[index].position.isApprox(
+        accepted_snapshot->samples[index].position, 0.0));
+    EXPECT_TRUE(after->samples[index].velocity.isApprox(
+        accepted_snapshot->samples[index].velocity, 0.0));
+    EXPECT_TRUE(after->samples[index].acceleration.isApprox(
+        accepted_snapshot->samples[index].acceleration, 0.0));
+  }
+}
+
+TEST_F(MotionReferenceTest, TinyQueueMotionUsesOnePrefixBeforeRepeatedTerminalHolds)
+{
+  const auto start_state = j1WorkingEdgeFaceCase().first;
+  JointMotionState stationary_queue;
+  start_state.copyJointGroupPositions(group_, stationary_queue.position);
+  stationary_queue.velocity = Eigen::VectorXd::Zero(6);
+  stationary_queue.acceleration = Eigen::VectorXd::Zero(6);
+  beginPreparationForResultTest(start_state, stationary_queue);
+  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+
+  const CompactGoal candidate = MotionReferenceTestPeer::candidate(*reference_, 0U);
+  ASSERT_EQ(candidate.bounded_positions.size(), stationary_queue.position.size());
+  const Eigen::VectorXd path_direction =
+    (candidate.bounded_positions - stationary_queue.position).normalized();
+  ASSERT_TRUE(path_direction.allFinite());
+  JointMotionState near_stationary_queue = stationary_queue;
+  near_stationary_queue.velocity = 0.5e-12 * path_direction;
+  near_stationary_queue.acceleration = 0.5e-12 * path_direction;
+
+  const double elapsed_sec = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count();
+  const rclcpp::Time publication_start(
+    static_cast<std::int64_t>(std::llround((elapsed_sec + 0.5) * 1.0e9)), RCL_ROS_TIME);
+  PublishedTrajectoryRecord publication;
+  publication.id = 1U;
+  for (std::size_t index = 0U; index < 4U; ++index) {
+    moveit_servo::KinematicState sample(static_cast<int>(group_->getVariableCount()));
+    sample.joint_names = parameters_.joint_names;
+    sample.positions = near_stationary_queue.position;
+    sample.velocities = Eigen::VectorXd::Zero(6);
+    sample.accelerations = Eigen::VectorXd::Zero(6);
+    sample.time_stamp = publication_start + rclcpp::Duration::from_nanoseconds(
+      static_cast<std::int64_t>(index) *
+      static_cast<std::int64_t>(parameters_.control_period_sec * 1.0e9));
+    publication.execution_queue.push_back(std::move(sample));
+  }
+  publication.stationary_time = publication.execution_queue.back().time_stamp;
+
+  const auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
+  const auto rejected_before = reference_->diagnostics().plans_rejected;
+  consumePreparationResult(
+    start_state, plan, near_stationary_queue, &publication, &publication);
+
+  EXPECT_EQ(reference_->diagnostics().plans_rejected, rejected_before);
+  EXPECT_EQ(reference_->diagnostics().last_plan_message.find("matches multiple samples"),
+    std::string::npos);
+  const auto profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(profile) << reference_->diagnostics().last_plan_message;
+  ASSERT_FALSE(profile->samples.empty());
+  EXPECT_TRUE(profile->samples.front().position.isApprox(near_stationary_queue.position, 0.0));
+  EXPECT_TRUE(profile->samples.front().velocity.isApprox(near_stationary_queue.velocity, 0.0));
+  EXPECT_TRUE(profile->samples.front().acceleration.isApprox(
+      near_stationary_queue.acceleration, 0.0));
+}
+
+TEST_F(MotionReferenceTest, MovingQueueStillRequiresPublishedPrefix)
+{
+  const auto start_state = j1WorkingEdgeFaceCase().first;
+  JointMotionState stationary_queue;
+  start_state.copyJointGroupPositions(group_, stationary_queue.position);
+  stationary_queue.velocity = Eigen::VectorXd::Zero(6);
+  stationary_queue.acceleration = Eigen::VectorXd::Zero(6);
+  beginPreparationForResultTest(start_state, stationary_queue);
+  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+
+  const CompactGoal candidate = MotionReferenceTestPeer::candidate(*reference_, 0U);
+  ASSERT_EQ(candidate.bounded_positions.size(), stationary_queue.position.size());
+  const Eigen::VectorXd path_direction =
+    (candidate.bounded_positions - stationary_queue.position).normalized();
+  ASSERT_TRUE(path_direction.allFinite());
+  JointMotionState moving_queue = stationary_queue;
+  moving_queue.velocity = 0.1 * path_direction;
+  const auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
+  const auto rejected_before = reference_->diagnostics().plans_rejected;
+  consumePreparationResult(start_state, plan, moving_queue);
+
+  EXPECT_EQ(reference_->diagnostics().plans_rejected, rejected_before + 1U);
+  EXPECT_NE(reference_->diagnostics().last_plan_message.find(
+      "moving queue state has no exact future match"), std::string::npos);
+  EXPECT_FALSE(MotionReferenceTestPeer::profileSnapshotForTest(*reference_));
+}
+
+TEST_F(MotionReferenceTest, ProfileCursorAdvancesOnlyAfterPublishedCommand)
+{
+  const auto start_state = state();
+  JointMotionState start;
+  start_state.copyJointGroupPositions(group_, start.position);
+  start_state.copyJointGroupVelocities(group_, start.velocity);
+  start_state.copyJointGroupAccelerations(group_, start.acceleration);
+  Eigen::VectorXd goal = start.position;
+  goal[1] += 0.01;
+  const auto profile = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *reference_, start, goal);
+  ASSERT_TRUE(profile);
+  ASSERT_GT(profile->samples.size(), 3U);
+
+  const auto initial_cursor = MotionReferenceTestPeer::profileCursorForTest(*reference_);
+  EXPECT_EQ(initial_cursor, 0U);
+  const auto face_target = target(msg::TrackingTarget::FACE);
+  const auto first = update(start_state, face_target, nullptr, nullptr, start);
+  ASSERT_TRUE(first.compact_profile_command);
+  ASSERT_TRUE(first.compact_profile_velocity);
+  EXPECT_TRUE(first.compact_profile_velocity->isApprox(profile->samples[1].velocity, 1.0e-12));
+
+  reference_->recordCompactProfileCommandPublished(false);
+  EXPECT_EQ(MotionReferenceTestPeer::profileCursorForTest(*reference_), initial_cursor);
+  const auto retry = update(start_state, face_target, nullptr, nullptr, start);
+  ASSERT_TRUE(retry.compact_profile_command);
+  ASSERT_TRUE(retry.compact_profile_velocity);
+  EXPECT_TRUE(retry.compact_profile_velocity->isApprox(
+      *first.compact_profile_velocity, 1.0e-12));
+
+  reference_->recordCompactProfileCommandPublished(true);
+  EXPECT_EQ(MotionReferenceTestPeer::profileCursorForTest(*reference_), initial_cursor + 1U);
+  const auto & published_state = profile->samples[1];
+  auto advanced_state = start_state;
+  advanced_state.setJointGroupPositions(group_, published_state.position);
+  advanced_state.setJointGroupVelocities(group_, published_state.velocity);
+  advanced_state.setJointGroupAccelerations(group_, published_state.acceleration);
+  advanced_state.update(true);
+  const auto next = update(advanced_state, face_target, nullptr, nullptr, published_state);
+  ASSERT_TRUE(next.compact_profile_command);
+  ASSERT_TRUE(next.compact_profile_velocity);
+  EXPECT_TRUE(next.compact_profile_velocity->isApprox(profile->samples[2].velocity, 1.0e-12));
+}
+
+TEST_F(MotionReferenceTest, ScalarBrakeQueuePointRetimesTheCurrentCheckedLeg)
+{
+  const auto start_state = compactGoalState(-0.5);
+  JointMotionState start;
+  start_state.copyJointGroupPositions(group_, start.position);
+  start_state.copyJointGroupVelocities(group_, start.velocity);
+  start_state.copyJointGroupAccelerations(group_, start.acceleration);
+  admitCurrentPreparationWithLifecycleFixturePath(start_state);
+  ASSERT_TRUE(reference_->compactManeuverActive())
+    << reference_->diagnostics().last_plan_message;
+  auto profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(profile);
+  const auto prepared_return =
+    MotionReferenceTestPeer::preparedReturnProfileForTest(*reference_);
+  ASSERT_TRUE(prepared_return)
+    << "lifecycle fixture must provide a checked return profile";
+  ASSERT_GT(prepared_return->samples.size(), 1U);
+  const auto return_region = MotionReferenceTestPeer::returnRegionForTest(*reference_);
+  ASSERT_TRUE(return_region);
+  const auto & joint_names = group_->getVariableNames();
+  const auto joint1 = std::find(joint_names.begin(), joint_names.end(), "joint1");
+  const auto joint3 = std::find(joint_names.begin(), joint_names.end(), "joint3");
+  ASSERT_NE(joint1, joint_names.end());
+  ASSERT_NE(joint3, joint_names.end());
+  const Eigen::Index joint1_index = std::distance(joint_names.begin(), joint1);
+  const Eigen::Index joint3_index = std::distance(joint_names.begin(), joint3);
+  EXPECT_NEAR(return_region->radius_m, 0.10, 1.0e-12);
+  EXPECT_NEAR(return_region->direction_tolerance_rad, 15.0 * M_PI / 180.0, 1.0e-12);
+  EXPECT_NEAR(std::abs(return_region->target_joint1_rad -
+      return_region->reference_positions[joint1_index]), 2.0 * M_PI, 1.0e-6);
+  const Eigen::VectorXd return_endpoint = prepared_return->samples.back().position;
+  EXPECT_NEAR(return_endpoint[joint1_index], return_region->target_joint1_rad, 0.025);
+  EXPECT_GE(return_endpoint[joint3_index], return_region->comfortable_joint3_lower - 1.0e-9);
+  EXPECT_LE(return_endpoint[joint3_index], return_region->comfortable_joint3_upper + 1.0e-9);
+  EXPECT_TRUE(MotionReferenceTestPeer::validateReturnEndpointForTest(
+      *reference_, return_endpoint, *return_region));
+  Eigen::VectorXd goal = profile->samples.back().position;
+  EXPECT_NEAR(goal[joint1_index] - start.position[joint1_index], 0.5, 1.0e-6);
+  CompactGeometryValidator geometry(model_, "link_base");
+  for (std::size_t index = 0U; index < profile->samples.size(); ++index) {
+    auto sample_state = start_state;
+    sample_state.setJointGroupPositions(group_, profile->samples[index].position);
+    sample_state.update(true);
+    ASSERT_LE(geometry.maximumAssemblyRadius(sample_state), 0.40 + 1.0e-6)
+      << "compact geometry at profile sample " << index;
+  }
+  MotionReferenceTestPeer::setActiveSceneRevisionForTest(*reference_, kSceneRevision);
+  ASSERT_GT(profile->samples.size(), 3U);
+  const auto fastest = std::max_element(
+    profile->samples.begin(), profile->samples.end(),
+    [](const auto & left, const auto & right) {
+      return left.velocity.norm() < right.velocity.norm();
+    });
+  ASSERT_NE(fastest, profile->samples.end());
+  const std::size_t cursor = static_cast<std::size_t>(
+    std::distance(profile->samples.begin(), fastest));
+  ASSERT_GT(cursor, 0U);
+  ASSERT_LT(cursor + 1U, profile->samples.size());
+  EXPECT_EQ(MotionReferenceTestPeer::profileCursorForTest(*reference_), 0U);
+
+  // The fastest point has near-zero acceleration, so a scalar-brake tick
+  // immediately differs from the next nominal profile sample.
+  MotionReferenceTestPeer::setProfileCursorForTest(*reference_, cursor);
+  const auto & branch = profile->samples[cursor];
+  const Eigen::VectorXd path_direction = goal - start.position;
+  const auto brake = generateCompactProfileBrakeTail(
+    branch, path_direction, MotionReferenceTestPeer::compactMotionLimitsForTest(*reference_),
+    EmergencyBrakeTailConfig{parameters_.control_period_sec});
+  ASSERT_TRUE(brake.command_available()) << brake.failure_reason;
+  ASSERT_GT(brake.points.size(), 1U);
+  const JointMotionState scalar_brake_queue = brake.points[1U];
+  const Eigen::VectorXd published_brake_endpoint =
+    brake.points[brake.first_stationary_point].position;
+  EXPECT_GT((published_brake_endpoint - scalar_brake_queue.position).dot(
+      goal - start.position), 0.0);
+  EXPECT_GT((scalar_brake_queue.position - profile->samples[cursor + 1U].position).norm(),
+    1.0e-10);
+  const Eigen::VectorXd leg_direction = goal - start.position;
+  const double leg_length_squared = leg_direction.squaredNorm();
+  const double queue_fraction =
+    (scalar_brake_queue.position - start.position).dot(leg_direction) / leg_length_squared;
+  const double expected_fraction =
+    (profile->samples[cursor].position - start.position).dot(leg_direction) /
+    leg_length_squared;
+  const double off_line_error = (scalar_brake_queue.position -
+    (start.position + queue_fraction * leg_direction)).lpNorm<Eigen::Infinity>();
+  std::string retime_probe_failure;
+  const auto retime_probe = buildCompactJointProfile(
+    {scalar_brake_queue.position, goal}, scalar_brake_queue,
+    MotionReferenceTestPeer::compactMotionLimitsForTest(*reference_),
+    parameters_.control_period_sec,
+    MotionReferenceTestPeer::compactSpeedScaleForTest(*reference_), {1.0},
+    &retime_probe_failure);
+  EXPECT_GE(queue_fraction, expected_fraction);
+  EXPECT_LT(queue_fraction, 1.0);
+  EXPECT_NEAR(off_line_error, 0.0, 1.0e-12);
+  ASSERT_TRUE(retime_probe) << retime_probe_failure;
+  ASSERT_FALSE(retime_probe->samples.empty());
+  EXPECT_TRUE(retime_probe->samples.front().position.isApprox(
+      scalar_brake_queue.position, 1.0e-12));
+  EXPECT_TRUE(retime_probe->samples.back().position.isApprox(goal, 1.0e-6));
+
+  auto queued_state = start_state;
+  queued_state.setJointGroupPositions(group_, scalar_brake_queue.position);
+  queued_state.setJointGroupVelocities(group_, scalar_brake_queue.velocity);
+  queued_state.setJointGroupAccelerations(group_, scalar_brake_queue.acceleration);
+  queued_state.update(true);
+  const double now = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count();
+  PublishedTrajectoryRecord published_brake;
+  published_brake.id = 91U;
+  for (std::size_t index = 1U; index < brake.points.size(); ++index) {
+    moveit_servo::KinematicState sample(static_cast<int>(group_->getVariableCount()));
+    sample.joint_names = parameters_.joint_names;
+    sample.positions = brake.points[index].position;
+    sample.velocities = brake.points[index].velocity;
+    sample.accelerations = brake.points[index].acceleration;
+    sample.time_stamp = rclcpp::Time(
+      static_cast<std::int64_t>(std::llround(
+        (now + 0.5 + static_cast<double>(index - 1U) * parameters_.control_period_sec) *
+        1.0e9)), RCL_ROS_TIME);
+    published_brake.execution_queue.push_back(std::move(sample));
+  }
+  ASSERT_FALSE(published_brake.execution_queue.empty());
+  published_brake.stationary_time = published_brake.execution_queue.back().time_stamp;
+  const auto plans_requested_before = reference_->diagnostics().plans_requested;
+  const auto paths_abandoned_before = reference_->diagnostics().paths_abandoned;
+  const auto result = update(
+    queued_state, target(msg::TrackingTarget::FACE), &published_brake, &published_brake,
+    scalar_brake_queue, kSceneRevision, now);
+
+  EXPECT_TRUE(reference_->compactManeuverActive());
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "PATH")
+    << reference_->diagnostics().last_plan_message;
+  EXPECT_EQ(reference_->diagnostics().paths_abandoned, paths_abandoned_before);
+  EXPECT_EQ(reference_->diagnostics().plans_requested, plans_requested_before);
+  ASSERT_TRUE(result.compact_profile_command);
+  auto retimed = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(retimed) << reference_->diagnostics().last_plan_message;
+  ASSERT_EQ(retimed->samples.size(), published_brake.execution_queue.size());
+  ASSERT_GT(retimed->prefix_endpoint_sample_index, 0U);
+  for (std::size_t index = 0U; index < retimed->prefix_endpoint_sample_index; ++index) {
+    reference_->recordCompactProfileCommandPublished(true);
+  }
+  ASSERT_TRUE(MotionReferenceTestPeer::finishTorqueProfileWorkForTest(
+      *reference_, now, kSceneRevision));
+  retimed = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(retimed) << reference_->diagnostics().last_plan_message;
+  ASSERT_FALSE(retimed->samples.empty());
+  ASSERT_LT(retimed->prefix_endpoint_sample_index, retimed->samples.size());
+  EXPECT_TRUE(retimed->samples[retimed->prefix_endpoint_sample_index].position.isApprox(
+      published_brake_endpoint, 1.0e-12));
+  ASSERT_GT(retimed->samples.size(), retimed->prefix_endpoint_sample_index + 1U);
+  EXPECT_GE((retimed->samples[retimed->prefix_endpoint_sample_index + 1U].position -
+    published_brake_endpoint).dot(goal - start.position), -1.0e-12);
+  EXPECT_TRUE(retimed->samples.front().position.isApprox(scalar_brake_queue.position, 1.0e-12));
+  EXPECT_TRUE(retimed->samples.front().velocity.isApprox(scalar_brake_queue.velocity, 1.0e-12));
+  EXPECT_TRUE(retimed->samples.front().acceleration.isApprox(
+      scalar_brake_queue.acceleration, 1.0e-12));
+  EXPECT_TRUE(retimed->samples.back().position.isApprox(goal, 1.0e-6));
+
+  const auto requests_before_missing_publication = reference_->diagnostics().plans_requested;
+  const auto abandoned_before_missing_publication = reference_->diagnostics().paths_abandoned;
+  const auto missing_publication = update(
+    queued_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, scalar_brake_queue,
+    kSceneRevision, now + 0.01);
+  EXPECT_FALSE(missing_publication.compact_profile_command);
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "REPLANNING");
+  EXPECT_EQ(reference_->diagnostics().plans_requested, requests_before_missing_publication);
+  EXPECT_EQ(reference_->diagnostics().paths_abandoned,
+    abandoned_before_missing_publication + 1U);
+}
+
+TEST_F(MotionReferenceTest, ScalarBrakeQueueRetimingRejectsShortEndpointOvershoot)
+{
+  const auto start_state = state();
+  JointMotionState start;
+  start_state.copyJointGroupPositions(group_, start.position);
+  start_state.copyJointGroupVelocities(group_, start.velocity);
+  start_state.copyJointGroupAccelerations(group_, start.acceleration);
+  Eigen::VectorXd goal = start.position;
+  goal[1] += 0.05;
+  const auto limits = MotionReferenceTestPeer::compactMotionLimitsForTest(*reference_);
+  const auto profile = buildCompactJointProfile(
+    {start.position, goal}, start, limits, parameters_.control_period_sec,
+    MotionReferenceTestPeer::compactSpeedScaleForTest(*reference_), {1.0});
+  ASSERT_TRUE(profile);
+  const auto fastest = std::max_element(
+    profile->samples.begin(), profile->samples.end(),
+    [](const auto & left, const auto & right) {
+      return left.velocity.norm() < right.velocity.norm();
+    });
+  ASSERT_NE(fastest, profile->samples.end());
+  const auto brake = generateCompactProfileBrakeTail(
+    *fastest, goal - start.position, limits,
+    EmergencyBrakeTailConfig{parameters_.control_period_sec});
+  ASSERT_TRUE(brake.command_available()) << brake.failure_reason;
+  ASSERT_GT(brake.points.size(), 1U);
+  const JointMotionState scalar_brake_queue = brake.points[1U];
+  std::string failure_reason;
+  const auto retimed = buildCompactJointProfile(
+    {scalar_brake_queue.position, goal}, scalar_brake_queue, limits,
+    parameters_.control_period_sec,
+    MotionReferenceTestPeer::compactSpeedScaleForTest(*reference_), {1.0},
+    &failure_reason);
+  EXPECT_FALSE(retimed);
+  EXPECT_NE(failure_reason.find("scalar position passes segment endpoint"),
+    std::string::npos) << failure_reason;
+}
+
+TEST_F(MotionReferenceTest, NearSampleQueueBrakesFromIntegratedCandidateWithoutRetiming)
+{
+  const auto start_state = state();
+  JointMotionState start;
+  start_state.copyJointGroupPositions(group_, start.position);
+  start_state.copyJointGroupVelocities(group_, start.velocity);
+  start_state.copyJointGroupAccelerations(group_, start.acceleration);
+  Eigen::VectorXd goal = start.position;
+  goal[1] += 0.05;
+  const auto profile = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *reference_, start, goal);
+  ASSERT_TRUE(profile);
+  MotionReferenceTestPeer::setActiveSceneRevisionForTest(*reference_, kSceneRevision);
+  ASSERT_GT(profile->samples.size(), 3U);
+  const auto limits = MotionReferenceTestPeer::compactMotionLimitsForTest(*reference_);
+  ASSERT_TRUE(limits.numerical_policy);
+  const auto & policy = *limits.numerical_policy;
+  const auto fastest = std::max_element(
+    profile->samples.begin(), profile->samples.end(),
+    [](const auto & left, const auto & right) {
+      return left.velocity.norm() < right.velocity.norm();
+    });
+  ASSERT_NE(fastest, profile->samples.end());
+  const std::size_t cursor = static_cast<std::size_t>(
+    std::distance(profile->samples.begin(), fastest));
+  ASSERT_GT(cursor, 0U);
+  ASSERT_LT(cursor + 1U, profile->samples.size());
+
+  const auto & expected = profile->samples[cursor];
+  const auto & expected_next = profile->samples[cursor + 1U];
+  ASSERT_GE(cursor, profile->prefix_endpoint_sample_index);
+  JointMotionState queue = expected;
+  Eigen::VectorXd path_direction = goal - start.position;
+  path_direction.normalize();
+  ASSERT_GT(policy.velocity_error.value, 0.0);
+  queue.velocity += 2.0 * policy.acceleration_error.value *
+    parameters_.control_period_sec * path_direction;
+  ASSERT_LE((queue.velocity - expected.velocity).lpNorm<Eigen::Infinity>(), 1.0e-6);
+
+  const double period = parameters_.control_period_sec;
+  const JointMotionState old_match_candidate{
+    queue.position + expected_next.velocity * period,
+    expected_next.velocity,
+    (expected_next.velocity - queue.velocity) / period};
+  EXPECT_GT((old_match_candidate.acceleration - expected_next.acceleration).
+    lpNorm<Eigen::Infinity>(), policy.acceleration_error.value)
+    << "the loose current-sample match must not certify its next discrete integration";
+
+  auto queued_state = start_state;
+  queued_state.setJointGroupPositions(group_, queue.position);
+  queued_state.setJointGroupVelocities(group_, queue.velocity);
+  queued_state.setJointGroupAccelerations(group_, queue.acceleration);
+  queued_state.update(true);
+  const auto paths_abandoned_before = reference_->diagnostics().paths_abandoned;
+  const auto result = update(
+    queued_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, queue);
+
+  EXPECT_EQ(reference_->diagnostics().paths_abandoned, paths_abandoned_before);
+  ASSERT_TRUE(result.compact_profile_command);
+  ASSERT_TRUE(result.compact_profile_velocity);
+  EXPECT_EQ(MotionReferenceTestPeer::profileCursorForTest(*reference_), cursor);
+  EXPECT_TRUE(result.compact_profile_velocity->isApprox(expected_next.velocity, 0.0));
+
+  const JointMotionState candidate{
+    queue.position + *result.compact_profile_velocity * period,
+    *result.compact_profile_velocity,
+    (*result.compact_profile_velocity - queue.velocity) / period};
+  const EmergencyBrakeTail tail = reference_->compactProfileBrakingTail(
+    candidate, EmergencyBrakeTailConfig{period});
+  ASSERT_TRUE(tail.command_available()) << tail.failure_reason;
+  ASSERT_FALSE(tail.points.empty());
+  EXPECT_TRUE(tail.points.front().position.isApprox(candidate.position, 0.0));
+  EXPECT_TRUE(tail.points.front().velocity.isApprox(candidate.velocity, 0.0));
+  EXPECT_TRUE(tail.points.front().acceleration.isApprox(candidate.acceleration, 0.0));
+  EXPECT_GT((candidate.acceleration - expected_next.acceleration).
+    lpNorm<Eigen::Infinity>(), policy.acceleration_error.value);
+
+  const JointMotionLimits active_limits = reference_->activeCommandLimits();
+  const Eigen::VectorXd transition_jerk =
+    (candidate.acceleration - queue.acceleration) / period;
+  EXPECT_LE((transition_jerk.cwiseAbs() - active_limits.max_jerk).
+    maxCoeff(), policy.jerk_error.value);
+  for (std::size_t index = 1U; index < tail.points.size(); ++index) {
+    const auto & previous = tail.points[index - 1U];
+    const auto & next = tail.points[index];
+    EXPECT_LE((next.position - previous.position - next.velocity * period).norm(), 1.0e-9);
+    EXPECT_LE((next.acceleration - (next.velocity - previous.velocity) / period).norm(),
+      1.0e-8);
+    EXPECT_LE(((next.acceleration - previous.acceleration) / period).
+      cwiseAbs().maxCoeff(), active_limits.max_jerk.maxCoeff() + policy.jerk_error.value);
+  }
+
+  JointMotionState wrong_velocity_candidate = candidate;
+  wrong_velocity_candidate.velocity[1] += 0.01;
+  const EmergencyBrakeTail wrong_velocity_tail = reference_->compactProfileBrakingTail(
+    wrong_velocity_candidate, EmergencyBrakeTailConfig{period});
+  EXPECT_FALSE(wrong_velocity_tail.command_available());
+  EXPECT_NE(wrong_velocity_tail.failure_reason.find(
+      "candidate velocity does not match the next committed profile sample"),
+    std::string::npos);
+}
+
+TEST_F(MotionReferenceTest, ExactLaterProfileQueueSampleResynchronizesCursor)
+{
+  const auto start_state = state();
+  JointMotionState start;
+  start_state.copyJointGroupPositions(group_, start.position);
+  start_state.copyJointGroupVelocities(group_, start.velocity);
+  start_state.copyJointGroupAccelerations(group_, start.acceleration);
+  Eigen::VectorXd goal = start.position;
+  goal[1] += 0.05;
+  const auto profile = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *reference_, start, goal, 2U);
+  ASSERT_TRUE(profile);
+  MotionReferenceTestPeer::setActiveSceneRevisionForTest(*reference_, kSceneRevision);
+  constexpr std::size_t kLaterIndex = 7U;
+  ASSERT_LT(kLaterIndex + 1U, profile->samples.size());
+  const auto & queued = profile->samples[kLaterIndex];
+  auto queued_state = start_state;
+  queued_state.setJointGroupPositions(group_, queued.position);
+  queued_state.setJointGroupVelocities(group_, queued.velocity);
+  queued_state.setJointGroupAccelerations(group_, queued.acceleration);
+  queued_state.update(true);
+
+  const auto paths_abandoned_before = reference_->diagnostics().paths_abandoned;
+  const auto result = update(
+    queued_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, queued);
+
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "PATH");
+  EXPECT_EQ(reference_->diagnostics().paths_abandoned, paths_abandoned_before);
+  ASSERT_TRUE(result.compact_profile_command);
+  ASSERT_TRUE(result.compact_profile_velocity);
+  EXPECT_TRUE(result.compact_profile_velocity->isApprox(
+      profile->samples[kLaterIndex + 1U].velocity, 1.0e-12));
+  EXPECT_EQ(MotionReferenceTestPeer::profileCursorForTest(*reference_), kLaterIndex);
+  const auto retained = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(retained);
+  EXPECT_TRUE(retained->samples.back().position.isApprox(goal, 1.0e-6));
+}
+
+TEST_F(MotionReferenceTest, OffRouteQueueStateStillAbandonsCheckedProfile)
+{
+  const auto start_state = state();
+  JointMotionState start;
+  start_state.copyJointGroupPositions(group_, start.position);
+  start_state.copyJointGroupVelocities(group_, start.velocity);
+  start_state.copyJointGroupAccelerations(group_, start.acceleration);
+  Eigen::VectorXd goal = start.position;
+  goal[1] += 0.05;
+  const auto profile = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *reference_, start, goal, 4U);
+  ASSERT_TRUE(profile);
+  MotionReferenceTestPeer::setActiveSceneRevisionForTest(*reference_, kSceneRevision);
+
+  JointMotionState off_route = profile->samples[4U];
+  off_route.position[2] += 0.1;
+  off_route.velocity.setZero();
+  off_route.acceleration.setZero();
+  auto off_route_state = start_state;
+  off_route_state.setJointGroupPositions(group_, off_route.position);
+  off_route_state.setJointGroupVelocities(group_, off_route.velocity);
+  off_route_state.setJointGroupAccelerations(group_, off_route.acceleration);
+  off_route_state.update(true);
+  const auto paths_abandoned_before = reference_->diagnostics().paths_abandoned;
+  const auto result = update(
+    off_route_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, off_route);
+
+  EXPECT_FALSE(result.compact_profile_command);
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "REPLANNING");
+  EXPECT_EQ(reference_->diagnostics().paths_abandoned, paths_abandoned_before + 1U);
+  const auto events = reference_->drainCompactEvents();
+  const auto mismatch = std::find_if(events.begin(), events.end(), [](const CompactEvent & event) {
+        return event.event == "queue_mismatch_resync";
+    });
+  ASSERT_NE(mismatch, events.end());
+  EXPECT_EQ(mismatch->reason, "no_match");
+  EXPECT_EQ(mismatch->generation_id, reference_->diagnostics().compact_generation);
+  for (const std::string_view field : {
+        "\"cursor\":", "\"profile_size\":", "\"prefix_endpoint_index\":",
+        "\"expected_current_position_rad\":", "\"expected_current_velocity_radps\":",
+        "\"expected_current_acceleration_radps2\":", "\"command_queue_position_rad\":",
+        "\"command_queue_velocity_radps\":", "\"command_queue_acceleration_radps2\":",
+        "\"joint_names\":", "\"time_sec\":", "\"scene_revision\":",
+        "\"active_publication\":", "\"latest_publication\":"})
+  {
+    EXPECT_NE(mismatch->details_json.find(field), std::string::npos) << field;
+  }
+  EXPECT_NE(mismatch->details_json.find("\"active_publication\":{\"id\":null"),
+    std::string::npos);
+}
+
+TEST_F(MotionReferenceTest, BackwardQueueStateDoesNotResumeCheckedLeg)
+{
+  const auto start_state = state();
+  JointMotionState start;
+  start_state.copyJointGroupPositions(group_, start.position);
+  start_state.copyJointGroupVelocities(group_, start.velocity);
+  start_state.copyJointGroupAccelerations(group_, start.acceleration);
+  Eigen::VectorXd goal = start.position;
+  goal[1] += 0.05;
+  constexpr std::size_t kCursor = 8U;
+  const auto profile = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *reference_, start, goal, kCursor);
+  ASSERT_TRUE(profile);
+  MotionReferenceTestPeer::setActiveSceneRevisionForTest(*reference_, kSceneRevision);
+  ASSERT_GT(kCursor, 0U);
+  const JointMotionState behind = profile->samples[kCursor - 1U];
+  auto behind_state = start_state;
+  behind_state.setJointGroupPositions(group_, behind.position);
+  behind_state.setJointGroupVelocities(group_, behind.velocity);
+  behind_state.setJointGroupAccelerations(group_, behind.acceleration);
+  behind_state.update(true);
+  const auto paths_abandoned_before = reference_->diagnostics().paths_abandoned;
+  const auto result = update(
+    behind_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, behind);
+
+  EXPECT_FALSE(result.compact_profile_command);
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "REPLANNING");
+  EXPECT_EQ(reference_->diagnostics().paths_abandoned, paths_abandoned_before + 1U);
+}
+
+TEST_F(MotionReferenceTest, ChangedSceneDoesNotResynchronizeProfileQueue)
+{
+  const auto start_state = state();
+  JointMotionState start;
+  start_state.copyJointGroupPositions(group_, start.position);
+  start_state.copyJointGroupVelocities(group_, start.velocity);
+  start_state.copyJointGroupAccelerations(group_, start.acceleration);
+  Eigen::VectorXd goal = start.position;
+  goal[1] += 0.05;
+  const auto profile = MotionReferenceTestPeer::installAcceptedProfileForTest(
+    *reference_, start, goal, 2U);
+  ASSERT_TRUE(profile);
+  MotionReferenceTestPeer::setActiveSceneRevisionForTest(*reference_, kSceneRevision);
+  constexpr std::size_t kLaterIndex = 7U;
+  ASSERT_LT(kLaterIndex + 1U, profile->samples.size());
+  const auto & queued = profile->samples[kLaterIndex];
+  auto queued_state = start_state;
+  queued_state.setJointGroupPositions(group_, queued.position);
+  queued_state.setJointGroupVelocities(group_, queued.velocity);
+  queued_state.setJointGroupAccelerations(group_, queued.acceleration);
+  queued_state.update(true);
+  const auto paths_abandoned_before = reference_->diagnostics().paths_abandoned;
+  const auto result = update(
+    queued_state, target(msg::TrackingTarget::FACE), nullptr, nullptr, queued,
+    kSceneRevision + 1U);
+
+  EXPECT_FALSE(result.compact_profile_command);
+  EXPECT_EQ(reference_->diagnostics().compact_phase, "REPLANNING");
+  EXPECT_EQ(reference_->diagnostics().paths_abandoned, paths_abandoned_before + 1U);
+}
+
+TEST_F(MotionReferenceTest, CompactPlanningDoesNotAddGravityRollAdmission)
 {
   auto start = compactGoalState(0.05);
   auto start_upright = evaluateCompactUprightPose(
@@ -10568,19 +12393,18 @@ TEST_F(MotionReferenceTest, CompactPlanningKeepsUprightCorrectionOutsideRollAdmi
   const planning_scene::PlanningSceneConstPtr planning_scene = scene;
   const double now = std::chrono::duration<double>(
     std::chrono::steady_clock::now() - clock_origin_).count();
-  const auto correction = MotionReferenceTestPeer::handleQualifiedPreparationForTest(
+  const auto preparing = MotionReferenceTestPeer::handleQualifiedPreparationForTest(
     *reference_, start, target(msg::TrackingTarget::FACE), *planning_scene,
     now, kSceneRevision, actual_feedback, moving_queue);
 
   EXPECT_FALSE(reference_->compactManeuverActive());
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "UPRIGHT_START");
-  EXPECT_EQ(reference_->diagnostics().state, "COMPACT_UPRIGHT_START");
+  EXPECT_NE(reference_->diagnostics().compact_phase, "UPRIGHT_START");
+  EXPECT_NE(reference_->diagnostics().state, "COMPACT_UPRIGHT_START");
+  EXPECT_EQ(reference_->diagnostics().last_plan_message.find("compact gravity roll "),
+    std::string::npos);
   EXPECT_FALSE(reference_->diagnostics().upright_roll_guard_armed);
   EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
-  ASSERT_TRUE(correction.task);
-  EXPECT_EQ(correction.task->primary_matrix.rows(), 1);
-  EXPECT_EQ(correction.task->secondary_matrix.rows(), 6);
-  EXPECT_GT(correction.task->primary_reference.norm(), 1.0e-6);
+  EXPECT_TRUE(preparing.task);
 
   // Once feedback and the command queue have recovered inside the roll
   // admission envelope and are settled, the same pending policy may commit.
@@ -10606,9 +12430,274 @@ TEST_F(MotionReferenceTest, CompactPlanningKeepsUprightCorrectionOutsideRollAdmi
   EXPECT_FALSE(recovered_update.follows_path);
 }
 
+TEST_F(MotionReferenceTest, SimTimeUprightGuardAcceptsFutureFeedbackWithinEpsilon)
+{
+  const auto parameter_result = node_->set_parameter(rclcpp::Parameter("use_sim_time", true));
+  ASSERT_TRUE(parameter_result.successful) << parameter_result.reason;
+  auto * clock = node_->get_clock()->get_clock_handle();
+  ASSERT_EQ(rcl_enable_ros_time_override(clock), RCL_RET_OK);
+  ASSERT_EQ(rcl_set_ros_time_override(clock, 10'010'000'000LL), RCL_RET_OK);
+  ASSERT_TRUE(node_->get_clock()->ros_time_is_active());
+
+  const auto recovered = compactGoalState(0.05);
+  Eigen::VectorXd recovered_position;
+  recovered.copyJointGroupPositions(group_, recovered_position);
+  const JointMotionState recovered_queue{
+    recovered_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const JointMotionState recovered_feedback{
+    recovered_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+
+  rclcpp::NodeOptions component_options;
+  component_options.parameter_overrides({rclcpp::Parameter("use_sim_time", true)});
+  auto component = std::make_shared<CollisionAwareServoComponent>(component_options);
+  ASSERT_TRUE(CollisionAwareServoComponentTestPeer::setRosTimeForTest(
+      *component, 10'010'000'000LL));
+  std::vector<PositionBoundSet> bounds;
+  for (const auto & name : parameters_.joint_names) {
+    const auto & variable_bounds = model_->getVariableBounds(name);
+    const PositionInterval physical{
+      variable_bounds.min_position_, variable_bounds.max_position_};
+    bounds.push_back(PositionBoundSet{physical, physical, physical, physical});
+  }
+  CollisionAwareServoComponentTestPeer::configure(
+    *component, monitor_, group_, parameters_.joint_names, limits_, collision_config_, bounds);
+  CollisionAwareServoComponentTestPeer::setGazeboFeedbackForTest(*component);
+  CollisionAwareServoComponentTestPeer::setStateFeedbackTimeoutForTest(*component, 0.030);
+  CollisionAwareServoComponentTestPeer::setControllerState(*component, recovered_position);
+  CollisionAwareServoComponentTestPeer::setControllerStateStampForTest(
+    *component, rclcpp::Time(10'012'000'000LL, RCL_ROS_TIME));
+  EXPECT_TRUE(CollisionAwareServoComponentTestPeer::currentControllerStateAvailableForTest(
+      *component));
+
+  MotionReferenceTestPeer::setExplicitSystemClockForTest(*reference_);
+  EXPECT_FALSE(MotionReferenceTestPeer::armFaceUprightRollGuardAtFeedbackStampForTest(
+      *reference_, recovered, 10.000, 10.001, recovered_feedback, recovered_queue));
+  MotionReferenceTestPeer::setClockForTest(*reference_, node_->get_clock());
+  EXPECT_FALSE(MotionReferenceTestPeer::armFaceUprightRollGuardAtFeedbackStampForTest(
+      *reference_, recovered, 10.000, 10.012, recovered_feedback, recovered_queue));
+
+  const auto accepts_at = [&](const double tick_sec, const double feedback_sec) {
+      auto timing_parameters = parameters_;
+      timing_parameters.state_feedback_timeout_sec = 0.030;
+      MotionReference fresh_reference(
+        node_, monitor_, timing_parameters, limits_, collision_config_);
+      return MotionReferenceTestPeer::armFaceUprightRollGuardAtFeedbackStampForTest(
+        fresh_reference, recovered, tick_sec, feedback_sec,
+        recovered_feedback, recovered_queue);
+    };
+  ASSERT_EQ(rcl_set_ros_time_override(clock, 10'100'000'000LL), RCL_RET_OK);
+  EXPECT_TRUE(accepts_at(10.000, 10.002));
+  EXPECT_TRUE(accepts_at(10.010, 10.012));
+
+  ASSERT_EQ(rcl_set_ros_time_override(clock, 10'000'000'000LL), RCL_RET_OK);
+  for (const double offset_sec : {0.001, 0.002, 0.003}) {
+    EXPECT_TRUE(accepts_at(10.000, 10.000 + offset_sec)) << offset_sec;
+  }
+  EXPECT_FALSE(accepts_at(10.000, 10.003000003));
+  EXPECT_TRUE(accepts_at(10.000, 9.970));
+  EXPECT_FALSE(accepts_at(10.000, 9.969999997));
+  EXPECT_FALSE(accepts_at(10.000, 9.968));
+  EXPECT_FALSE(accepts_at(10.000, 9.963));
+
+  ASSERT_FALSE(node_->has_parameter("require_hardware_io_status"));
+  ASSERT_TRUE(node_->declare_parameter<bool>("require_hardware_io_status", true));
+  auto timing_parameters = parameters_;
+  timing_parameters.state_feedback_timeout_sec = 0.030;
+  MotionReference hardware_reference(
+    node_, monitor_, timing_parameters, limits_, collision_config_);
+  EXPECT_FALSE(MotionReferenceTestPeer::armFaceUprightRollGuardAtFeedbackStampForTest(
+      hardware_reference, recovered, 10.000, 10.012, recovered_feedback, recovered_queue));
+}
+
+TEST_F(MotionReferenceTest, SimTimePreparedPlanUsesTickFreshnessAfterClockAdvance)
+{
+  const auto parameter_result = node_->set_parameter(rclcpp::Parameter("use_sim_time", true));
+  ASSERT_TRUE(parameter_result.successful) << parameter_result.reason;
+  auto * clock = node_->get_clock()->get_clock_handle();
+  ASSERT_EQ(rcl_enable_ros_time_override(clock), RCL_RET_OK);
+  ASSERT_EQ(rcl_set_ros_time_override(clock, 10'004'000'000LL), RCL_RET_OK);
+  ASSERT_TRUE(node_->get_clock()->ros_time_is_active());
+
+  auto timing_parameters = parameters_;
+  timing_parameters.state_feedback_timeout_sec = 0.030;
+  MotionReference reference(
+    node_, monitor_, timing_parameters, limits_, collision_config_);
+
+  const auto start = compactGoalState();
+  Eigen::VectorXd start_position;
+  start.copyJointGroupPositions(group_, start_position);
+  const JointMotionState feedback{
+    start_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const JointMotionState queue = feedback;
+  EXPECT_TRUE(MotionReferenceTestPeer::armFaceUprightRollGuardAtFeedbackStampForTest(
+      reference, start, 10.000, 9.975, feedback, queue));
+
+  MotionReferenceTestPeer::qualifyCompactPhaseForIsolatedPreparationTest(reference);
+  planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
+  const planning_scene::PlanningSceneConstPtr planning_scene = scene;
+  MotionReferenceTestPeer::beginPreparation(
+    reference, start, 10.000, *planning_scene, kSceneRevision, feedback, queue,
+    nullptr, nullptr);
+  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(reference));
+  static_cast<void>(
+    MotionReferenceTestPeer::installValidWorkingReturnRegionForTest(reference));
+  MotionReferenceTestPeer::cancelPlannerForTest(reference);
+  MotionReferenceTestPeer::activateResultGeneration(
+    reference, reference.diagnostics().compact_generation + 100U);
+  ASSERT_TRUE(MotionReferenceTestPeer::pendingGeneration(reference));
+  const auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(reference, true);
+  ASSERT_TRUE(plan.success);
+
+  ASSERT_EQ(rcl_set_ros_time_override(clock, 10'006'000'000LL), RCL_RET_OK);
+  MotionReferenceTestPeer::consume(
+    reference, plan, start, 10.000, *planning_scene, kSceneRevision,
+    feedback, 9.975, queue, nullptr, nullptr);
+  EXPECT_EQ(reference.diagnostics().plans_accepted, 1U)
+    << reference.diagnostics().state << ": " << reference.diagnostics().last_plan_message;
+  EXPECT_EQ(reference.diagnostics().compact_phase, "PATH");
+  EXPECT_TRUE(reference.compactManeuverActive());
+  EXPECT_FALSE(MotionReferenceTestPeer::hasPreparation(reference));
+}
+
+TEST_F(MotionReferenceTest, CompactEntryRollMetricDoesNotBlockWhenFaceEdgeIsSafe)
+{
+  // Settled actual joint sample at sim 18.38 s from
+  // phase_boundary_fixed_turn/run01/capture/joint_source.jsonl.
+  constexpr std::array<double, 6> kCapturedSettledActualPosition{
+    6.242596652382804, -0.9801394158392429, -0.3702498176461788,
+    -0.08792369139474158, -0.7601816998716786, 6.283185307179565};
+  auto actual_state = state();
+  Eigen::VectorXd actual_position(6);
+  for (std::size_t index = 0U; index < kCapturedSettledActualPosition.size(); ++index) {
+    actual_position[static_cast<Eigen::Index>(index)] =
+      kCapturedSettledActualPosition[index];
+    actual_state.setVariablePosition(
+      parameters_.joint_names[index], kCapturedSettledActualPosition[index]);
+  }
+  actual_state.update(true);
+  const auto actual_upright = evaluateCompactUprightPose(
+    actual_state.getGlobalLinkTransform("monitor_control_frame").linear());
+  ASSERT_TRUE(actual_upright);
+  ASSERT_GT(actual_upright->signed_roll_error_rad, kCompactRollCapTestRad);
+  ASSERT_TRUE(evaluateHorizontalEdgeUpright(
+    actual_state.getGlobalLinkTransform("monitor_control_frame").linear(),
+    kCompactRollCapTestRad));
+
+  auto control_state = actual_state;
+  Eigen::VectorXd control_position = actual_position;
+  std::optional<CompactUprightPose> control_upright;
+  bool found_control_pose = false;
+  for (int offset_millirad = 1; offset_millirad <= 20 && !found_control_pose;
+    ++offset_millirad)
+  {
+    for (const int sign : {-1, 1}) {
+      for (const std::size_t joint_index : {3U, 5U}) {
+        control_position = actual_position;
+        control_position[static_cast<Eigen::Index>(joint_index)] +=
+          static_cast<double>(sign * offset_millirad) * 1.0e-3;
+        bool within_bounds = true;
+        for (Eigen::Index index = 0; index < control_position.size(); ++index) {
+          within_bounds = within_bounds &&
+            control_position[index] >= limits_.lower_position[index] &&
+            control_position[index] <= limits_.upper_position[index];
+        }
+        if (!within_bounds ||
+          (actual_position - control_position).lpNorm<Eigen::Infinity>() > 0.02)
+        {
+          continue;
+        }
+        control_state = actual_state;
+        control_state.setJointGroupPositions(group_, control_position);
+        control_state.update(true);
+        control_upright = evaluateCompactUprightPose(
+          control_state.getGlobalLinkTransform("monitor_control_frame").linear());
+        const auto control_edge = evaluateHorizontalEdgeUpright(
+          control_state.getGlobalLinkTransform("monitor_control_frame").linear(),
+          kCompactRollCapTestRad);
+        if (control_upright && control_edge &&
+          control_upright->signed_roll_error_rad > 0.005 &&
+          control_upright->signed_roll_error_rad < kCompactRollCapTestRad)
+        {
+          found_control_pose = true;
+          break;
+        }
+      }
+      if (found_control_pose) {
+        break;
+      }
+    }
+  }
+  ASSERT_TRUE(found_control_pose);
+  ASSERT_TRUE(control_upright);
+  EXPECT_GT(control_upright->signed_roll_error_rad, 0.0);
+  EXPECT_LT(control_upright->signed_roll_error_rad, kCompactRollCapTestRad);
+  EXPECT_LE((actual_position - control_position).lpNorm<Eigen::Infinity>(), 0.02);
+  for (Eigen::Index index = 0; index < actual_position.size(); ++index) {
+    EXPECT_GE(actual_position[index], limits_.lower_position[index]);
+    EXPECT_LE(actual_position[index], limits_.upper_position[index]);
+    EXPECT_GE(control_position[index], limits_.lower_position[index]);
+    EXPECT_LE(control_position[index], limits_.upper_position[index]);
+  }
+
+  const JointMotionState queued{
+    control_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const JointMotionState actual_feedback{
+    actual_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+
+  const double now = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count();
+  const auto sample = [this](const Eigen::VectorXd & position, const double seconds) {
+      moveit_servo::KinematicState point(static_cast<int>(group_->getVariableCount()));
+      point.joint_names = parameters_.joint_names;
+      point.positions = position;
+      point.velocities.setZero(position.size());
+      point.accelerations.setZero(position.size());
+      point.time_stamp = rclcpp::Time(
+        static_cast<std::int64_t>(std::llround(seconds * 1.0e9)), RCL_ROS_TIME);
+      return point;
+    };
+  PublishedTrajectoryRecord publication;
+  publication.id = 1U;
+  publication.execution_queue.push_back(sample(control_position, now - 0.02));
+  publication.execution_queue.push_back(sample(control_position, now + 0.02));
+  publication.execution_queue.push_back(sample(control_position, now + 0.20));
+  publication.stationary_time = rclcpp::Time(
+    static_cast<std::int64_t>(std::llround((now + 0.20) * 1.0e9)), RCL_ROS_TIME);
+  PublishedTrajectoryRecord latest_publication = publication;
+  latest_publication.id = 2U;
+
+  planning_scene_monitor::LockedPlanningSceneRO scene(monitor_);
+  const planning_scene::PlanningSceneConstPtr planning_scene = scene;
+  MotionReferenceTestPeer::qualifyCompactPhaseForIsolatedPreparationTest(*reference_);
+  MotionReferenceTestPeer::beginPreparation(
+    *reference_, control_state, now, *planning_scene, kSceneRevision,
+    queued, queued, &publication, &latest_publication);
+  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  ASSERT_FALSE(MotionReferenceTestPeer::pendingGeneration(*reference_));
+
+  const auto result = MotionReferenceTestPeer::handleQualifiedPreparationForTest(
+    *reference_, control_state, target(msg::TrackingTarget::FACE), *planning_scene,
+    now + parameters_.control_period_sec, kSceneRevision, actual_feedback, queued, true);
+
+  EXPECT_EQ(reference_->diagnostics().state, "FACE_COMPACT_PREPARING");
+  EXPECT_EQ(reference_->diagnostics().plans_requested, 1U);
+  EXPECT_EQ(reference_->diagnostics().last_plan_message.find("roll_cap_rad="),
+    std::string::npos);
+  EXPECT_TRUE(reference_->diagnostics().upright_roll_guard_armed);
+  EXPECT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  EXPECT_TRUE(MotionReferenceTestPeer::pendingGeneration(*reference_));
+  EXPECT_FALSE(reference_->compactManeuverActive());
+  ASSERT_TRUE(result.tracking);
+  ASSERT_TRUE(result.task);
+  EXPECT_TRUE(result.task->primary_matrix.isApprox(result.tracking->task.primary_matrix));
+  EXPECT_TRUE(result.task->secondary_matrix.isApprox(result.tracking->task.secondary_matrix));
+  EXPECT_GT(result.task->primary_reference.norm(), 1.0e-6);
+  EXPECT_FALSE(result.compact_roll_constraints.empty());
+}
+
 TEST_F(
   MotionReferenceTest,
-  ExhaustedCompactPreparationUsesOldRollRecoveryWithArmedEdgeGuard)
+  CompactPreparationKeepsFaceEdgeGuardWithoutGravityRollRecovery)
 {
   auto start = state();
   constexpr std::array<double, 6> kRuntimeFailurePositionRad{
@@ -10655,19 +12744,23 @@ TEST_F(
   const double now = std::chrono::duration<double>(
     std::chrono::steady_clock::now() - clock_origin_).count();
 
-  // Keep the independently armed B edge guard while proving compact admission
-  // still uses its original gravity-roll envelope.
-  MotionReferenceTestPeer::qualifyPairYawForIsolatedAdmissionTest(*reference_);
+  // Keep the independently armed FACE edge guard while proving that compact
+  // gravity roll does not block a stationary queue from starting planning.
+  MotionReferenceTestPeer::qualifyCompactPhaseForIsolatedPreparationTest(*reference_);
   const auto recovery = MotionReferenceTestPeer::handleQualifiedPreparationForTest(
     *reference_, start, target(msg::TrackingTarget::FACE), *planning_scene,
     now, kSceneRevision, feedback, command_queue, true);
 
   EXPECT_TRUE(reference_->diagnostics().upright_roll_guard_armed);
-  EXPECT_EQ(reference_->diagnostics().state, "COMPACT_UPRIGHT_START");
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "UPRIGHT_START");
-  EXPECT_EQ(reference_->diagnostics().plans_requested, 0U);
+  EXPECT_EQ(reference_->diagnostics().state, "FACE_COMPACT_PREPARING");
+  EXPECT_NE(reference_->diagnostics().compact_phase, "UPRIGHT_START");
+  EXPECT_EQ(reference_->diagnostics().plans_requested, 1U);
+  EXPECT_TRUE(MotionReferenceTestPeer::pendingGeneration(*reference_));
   EXPECT_FALSE(reference_->compactManeuverActive());
+  ASSERT_TRUE(recovery.tracking);
   ASSERT_TRUE(recovery.task);
+  EXPECT_TRUE(recovery.task->primary_matrix.isApprox(recovery.tracking->task.primary_matrix));
+  EXPECT_TRUE(recovery.task->secondary_matrix.isApprox(recovery.tracking->task.secondary_matrix));
   EXPECT_GT(recovery.task->primary_reference.norm(), 1.0e-6);
   EXPECT_FALSE(recovery.motion_reference_support_unavailable);
   EXPECT_FALSE(recovery.compact_roll_constraints.empty());
@@ -10721,7 +12814,7 @@ TEST_F(
 
 TEST_F(MotionReferenceTest, CompactPreparationKeepsFaceActiveWhilePlanRuns)
 {
-  const auto [start, face_target] = criticalPairExhaustedCase();
+  const auto [start, face_target] = j1WorkingEdgeFaceCase();
 
   Eigen::VectorXd position;
   start.copyJointGroupPositions(group_, position);
@@ -10776,19 +12869,238 @@ TEST_F(MotionReferenceTest, CompactPreparationKeepsFaceActiveWhilePlanRuns)
   EXPECT_FALSE(settled.follows_path);
 }
 
-TEST_F(MotionReferenceCameraTest, CompactLifecycleCompletesAndShortfallAloneDoesNotRestart)
+TEST_F(MotionReferenceTest, CompactPreparationPlansFromPublishedStationaryEndpoint)
 {
-  auto start = compactGoalState(0.05);
-  start.setVariablePosition("joint6", start.getVariablePosition("joint6") + 0.04);
+  const auto [start, face_target] = j1WorkingEdgeFaceCase();
+  (void)face_target;
+  Eigen::VectorXd actual_position;
+  start.copyJointGroupPositions(group_, actual_position);
+  Eigen::VectorXd queue_velocity = Eigen::VectorXd::Zero(6);
+  queue_velocity[0] = 0.01;
+  const Eigen::VectorXd queue_acceleration = Eigen::VectorXd::Zero(6);
+  Eigen::VectorXd stopped_position = actual_position;
+  stopped_position[0] += 1.0e-4;
+  const JointMotionState actual_feedback{
+    actual_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6)};
+  const JointMotionState queue_state{
+    actual_position, queue_velocity, queue_acceleration};
+
+  const double publication_start = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count();
+  const auto make_sample = [this](
+    const Eigen::VectorXd & position, const Eigen::VectorXd & velocity,
+    const Eigen::VectorXd & acceleration, const double seconds) {
+      moveit_servo::KinematicState sample(static_cast<int>(group_->getVariableCount()));
+      sample.joint_names = parameters_.joint_names;
+      sample.positions = position;
+      sample.velocities = velocity;
+      sample.accelerations = acceleration;
+      sample.time_stamp = rclcpp::Time(
+        static_cast<std::int64_t>(std::llround(seconds * 1.0e9)), RCL_ROS_TIME);
+      return sample;
+    };
+  PublishedTrajectoryRecord publication;
+  publication.id = 51U;
+  publication.execution_queue.push_back(make_sample(
+      actual_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6),
+      publication_start - 0.01));
+  publication.execution_queue.push_back(make_sample(
+      actual_position, queue_velocity, queue_acceleration, publication_start + 0.01));
+  publication.execution_queue.push_back(make_sample(
+      stopped_position, Eigen::VectorXd::Zero(6), queue_acceleration,
+      publication_start + 0.02));
+  publication.execution_queue.push_back(make_sample(
+      stopped_position, Eigen::VectorXd::Zero(6), Eigen::VectorXd::Zero(6),
+      publication_start + 0.03));
+  publication.stationary_time = publication.execution_queue.back().time_stamp;
+  PublishedTrajectoryRecord latest_publication = publication;
+  latest_publication.id = 52U;
+
+  primeFaceTracking(start);
+  beginPreparationForResultTest(
+    start, queue_state, &publication, &latest_publication);
+  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  MotionReferenceTestPeer::keepOnlyFirstCandidateForTest(*reference_);
+  MotionReferenceTestPeer::clearPendingPlannerForSubmissionTest(*reference_);
+  const double submit_time = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count();
+  ASSERT_TRUE(MotionReferenceTestPeer::submitPreparationForTest(
+      *reference_, start, submit_time, kSceneRevision, actual_feedback,
+      queue_state, &publication, &latest_publication))
+    << reference_->diagnostics().state << ": "
+    << reference_->diagnostics().last_plan_message;
+
+  const auto submitted_start = MotionReferenceTestPeer::submittedStartForTest(*reference_);
+  ASSERT_EQ(submitted_start.size(), stopped_position.size());
+  EXPECT_TRUE(submitted_start.isApprox(stopped_position, 1.0e-12));
+  EXPECT_FALSE(submitted_start.isApprox(actual_position, 1.0e-6));
+  const auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, false);
+  EXPECT_TRUE(plan.start_positions.isApprox(stopped_position, 1.0e-12));
+  MotionReferenceTestPeer::cancelPlannerForTest(*reference_);
+  consumePreparationResult(
+    start, plan, queue_state, &publication, &latest_publication,
+    kSceneRevision, actual_feedback);
+  const auto exhausted_start = MotionReferenceTestPeer::exhaustedStartForTest(*reference_);
+  ASSERT_EQ(exhausted_start.size(), actual_position.size());
+  EXPECT_TRUE(exhausted_start.isApprox(actual_position, 1.0e-12));
+}
+
+TEST_F(MotionReferenceTest, CompactAdmissionUsesPublishedStopBeforeActualAttachmentWindow)
+{
+  auto start = j1WorkingEdgeFaceCase().first;
+  Eigen::VectorXd actual_position;
+  start.copyJointGroupPositions(group_, actual_position);
+  Eigen::VectorXd queue_velocity = Eigen::VectorXd::Zero(6);
+  queue_velocity[0] = -1.0;
+  start.setJointGroupVelocities(group_, queue_velocity);
+  start.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
   start.update(true);
-  const auto start_upright = evaluateCompactUprightPose(
-    start.getGlobalLinkTransform("monitor_control_frame").linear());
-  ASSERT_TRUE(start_upright);
-  ASSERT_GT(std::abs(start_upright->signed_roll_error_rad), 0.03);
-  ASSERT_LT(std::abs(start_upright->signed_roll_error_rad), kCompactRollCapTestRad);
+  const JointMotionState queue_state{
+    actual_position, queue_velocity, Eigen::VectorXd::Zero(6)};
+  const JointMotionState actual_feedback{
+    actual_position, queue_velocity, Eigen::VectorXd::Zero(6)};
+
+  constexpr std::size_t kBrakeSteps{60U};
+  const double start_time = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count() + 0.5;
+  const double period = parameters_.control_period_sec;
+  const auto make_sample = [this](
+    const JointMotionState & motion, const double seconds) {
+      moveit_servo::KinematicState sample(static_cast<int>(group_->getVariableCount()));
+      sample.joint_names = parameters_.joint_names;
+      sample.positions = motion.position;
+      sample.velocities = motion.velocity;
+      sample.accelerations = motion.acceleration;
+      sample.time_stamp = rclcpp::Time(
+        static_cast<std::int64_t>(std::llround(seconds * 1.0e9)), RCL_ROS_TIME);
+      return sample;
+    };
+  PublishedTrajectoryRecord publication;
+  publication.id = 71U;
+  JointMotionState prefix_sample = queue_state;
+  publication.execution_queue.push_back(make_sample(prefix_sample, start_time));
+  for (std::size_t step = 1U; step <= kBrakeSteps; ++step) {
+    const double magnitude = step <= 10U ? 0.2 * static_cast<double>(step) :
+      (step <= 50U ? 2.0 : 2.0 - 0.2 * static_cast<double>(step - 50U));
+    const double next_acceleration = magnitude;
+    const double next_velocity = prefix_sample.velocity[0] +
+      0.5 * (prefix_sample.acceleration[0] + next_acceleration) * period;
+    prefix_sample.position[0] += 0.5 * (prefix_sample.velocity[0] + next_velocity) * period;
+    prefix_sample.velocity[0] = next_velocity;
+    prefix_sample.acceleration[0] = next_acceleration;
+    publication.execution_queue.push_back(make_sample(
+        prefix_sample, start_time + static_cast<double>(step) * period));
+  }
+  publication.stationary_time = publication.execution_queue.back().time_stamp;
+  PublishedTrajectoryRecord latest_publication = publication;
+  latest_publication.id = 72U;
+
+  const Eigen::VectorXd stopped_position = prefix_sample.position;
+  ASSERT_NEAR(prefix_sample.velocity.norm(), 0.0, 1.0e-12);
+  ASSERT_NEAR(prefix_sample.acceleration.norm(), 0.0, 1.0e-12);
+  ASSERT_NEAR((stopped_position - actual_position).norm(), 0.30, 1.0e-9);
+  ASSERT_GT((stopped_position - actual_position).norm(), 0.20);
+  ASSERT_TRUE(publication.execution_queue.front().positions.isApprox(queue_state.position, 0.0));
+  ASSERT_TRUE(publication.execution_queue.front().velocities.isApprox(queue_state.velocity, 0.0));
+  ASSERT_TRUE(publication.execution_queue.back().positions.isApprox(stopped_position, 0.0));
+  auto stopped_state = start;
+  stopped_state.setJointGroupPositions(group_, stopped_position);
+  stopped_state.update(true);
+  CompactGeometryValidator geometry(model_, "link_base");
+  EXPECT_NEAR(geometry.maximumAssemblyRadius(start),
+    geometry.maximumAssemblyRadius(stopped_state), 1.0e-9);
+
+  primeFaceTracking(start);
+  beginPreparationForResultTest(
+    start, queue_state, &publication, &latest_publication);
+  ASSERT_TRUE(MotionReferenceTestPeer::hasPreparation(*reference_));
+  MotionReferenceTestPeer::keepOnlyFirstCandidateForTest(*reference_);
+  MotionReferenceTestPeer::clearPendingPlannerForSubmissionTest(*reference_);
+  const double submit_time = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - clock_origin_).count();
+  ASSERT_TRUE(MotionReferenceTestPeer::submitPreparationForTest(
+      *reference_, start, submit_time, kSceneRevision, actual_feedback,
+      queue_state, &publication, &latest_publication))
+    << reference_->diagnostics().state << ": "
+    << reference_->diagnostics().last_plan_message;
+  static_cast<void>(
+    MotionReferenceTestPeer::installValidWorkingReturnRegionForTest(*reference_));
+  const auto submitted_start = MotionReferenceTestPeer::submittedStartForTest(*reference_);
+  ASSERT_TRUE(submitted_start.isApprox(stopped_position, 1.0e-12));
+  auto plan = MotionReferenceTestPeer::resultForCurrentCandidate(*reference_, true);
+  ASSERT_TRUE(plan.path.front().isApprox(stopped_position, 1.0e-12));
+  installSyntheticCompactCertificate(
+    plan, [](std::size_t, double) {return safeSyntheticCompactMetrics();});
+  ASSERT_TRUE(plan.compact_path_samples.front().positions.isApprox(stopped_position, 1.0e-12));
+  const auto nearest_sample = std::min_element(
+    plan.compact_path_samples.begin(), plan.compact_path_samples.end(),
+    [&actual_position](const auto & left, const auto & right) {
+      return (left.positions - actual_position).norm() <
+             (right.positions - actual_position).norm();
+    });
+  ASSERT_NE(nearest_sample, plan.compact_path_samples.end());
+  const double nearest_actual_sample =
+    (nearest_sample->positions - actual_position).norm();
+  ASSERT_GT(nearest_actual_sample, 0.20);
+
+  const auto rejected_before = reference_->diagnostics().plans_rejected;
+  MotionReferenceTestPeer::cancelPlannerForTest(*reference_);
+  consumePreparationResult(start, plan, queue_state, &publication, &latest_publication,
+    kSceneRevision, actual_feedback);
+
+  ASSERT_TRUE(reference_->compactManeuverActive())
+    << reference_->diagnostics().last_plan_message;
+  EXPECT_EQ(reference_->diagnostics().plans_rejected, rejected_before)
+    << reference_->diagnostics().last_plan_message;
+  auto accepted_profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(accepted_profile) << reference_->diagnostics().last_plan_message;
+  ASSERT_EQ(
+    accepted_profile->prefix_endpoint_sample_index, publication.execution_queue.size() - 1U)
+    << reference_->diagnostics().last_plan_message;
+  ASSERT_EQ(accepted_profile->samples.size(), publication.execution_queue.size())
+    << reference_->diagnostics().last_plan_message;
+  for (std::size_t sample_index = 0U;
+    sample_index < publication.execution_queue.size(); ++sample_index)
+  {
+    const auto & published = publication.execution_queue[sample_index];
+    const auto & profiled = accepted_profile->samples[sample_index];
+    EXPECT_TRUE(profiled.position.isApprox(published.positions, 0.0))
+      << "published prefix q mismatch at sample " << sample_index;
+    EXPECT_TRUE(profiled.velocity.isApprox(published.velocities, 0.0))
+      << "published prefix v mismatch at sample " << sample_index;
+    EXPECT_TRUE(profiled.acceleration.isApprox(published.accelerations, 0.0))
+      << "published prefix a mismatch at sample " << sample_index;
+  }
+  for (std::size_t index = 0U;
+    index < accepted_profile->prefix_endpoint_sample_index; ++index)
+  {
+    reference_->recordCompactProfileCommandPublished(true);
+  }
+  ASSERT_TRUE(MotionReferenceTestPeer::finishTorqueProfileWorkForTest(
+      *reference_, submit_time, kSceneRevision));
+  accepted_profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(accepted_profile) << reference_->diagnostics().last_plan_message;
+  ASSERT_GT(accepted_profile->samples.size(), publication.execution_queue.size())
+    << reference_->diagnostics().last_plan_message;
+  for (std::size_t sample_index = 0U;
+    sample_index < publication.execution_queue.size(); ++sample_index)
+  {
+    const auto & published = publication.execution_queue[sample_index];
+    const auto & profiled = accepted_profile->samples[sample_index];
+    EXPECT_TRUE(profiled.position.isApprox(published.positions, 0.0));
+    EXPECT_TRUE(profiled.velocity.isApprox(published.velocities, 0.0));
+    EXPECT_TRUE(profiled.acceleration.isApprox(published.accelerations, 0.0));
+  }
+}
+
+TEST_F(MotionReferenceCameraReturnScaleTest,
+  CompactLifecycleCompletesAndShortfallAloneDoesNotRestart)
+{
+  auto start = j1WorkingEdgeFaceCase().first;
   // This lifecycle test starts after pair-gate qualification; the real FK gate
   // is exercised by dedicated public-update cases above.
-  admitCurrentPreparationWithLifecycleFixturePath(start);
+  admitCurrentPreparationWithLifecycleFixturePath(
+    start, std::nullopt, nullptr, nullptr, kSceneRevision, std::nullopt, true);
   const auto plan_requests_before_lifecycle = reference_->diagnostics().plans_requested;
   const auto committed_generation = reference_->diagnostics().compact_generation;
 
@@ -10853,33 +13165,14 @@ TEST_F(MotionReferenceCameraTest, CompactLifecycleCompletesAndShortfallAloneDoes
         state, command, *planning_scene, simulated_time, kSceneRevision,
         actual, simulated_time, current);
     };
-  const auto solved_qp = []() {
-      QpResult result;
-      result.status = QpStatus::kSolved;
-      result.achieved_primary_velocity = Eigen::VectorXd::Zero(1);
-      return result;
-    };
-  const auto solved_full_face_qp = []() {
-      QpResult result;
-      result.status = QpStatus::kSolved;
-      result.achieved_primary_velocity = Eigen::VectorXd::Zero(3);
-      return result;
-    };
-  const auto record_aligned_full_face = [this, &solved_full_face_qp](
-    const MotionReferenceResult & measured, const double time_sec) {
-      ASSERT_TRUE(measured.tracking);
-      auto stable = *measured.tracking;
-      stable.signed_face_primary_error_rad.setZero();
-      stable.face_primary_feedforward_radps.setZero();
-      reference_->recordFaceCommand(
-        stable, solved_full_face_qp(), time_sec, true, measured.actual_face_alignment);
-    };
 
   MotionReferenceResult first_path;
   const auto first_plan_deadline = std::chrono::steady_clock::now() + 3s;
   do {
     first_path = update_at(start, aligned_face(start));
-    if (reference_->diagnostics().plans_accepted >= 1U) {
+    if (reference_->diagnostics().plans_accepted >= 1U && first_path.follows_path &&
+      (first_path.task || first_path.compact_profile_command))
+    {
       break;
     }
     std::this_thread::sleep_for(2ms);
@@ -10887,47 +13180,58 @@ TEST_F(MotionReferenceCameraTest, CompactLifecycleCompletesAndShortfallAloneDoes
   ASSERT_EQ(reference_->diagnostics().compact_generation, 1U);
   ASSERT_EQ(reference_->diagnostics().plans_accepted, 1U)
     << reference_->diagnostics().last_plan_message;
-  ASSERT_TRUE(first_path.follows_path);
-  ASSERT_TRUE(first_path.task);
-  EXPECT_EQ(first_path.task->primary_matrix.rows(), 6);
-  EXPECT_TRUE(first_path.task->primary_matrix.isApprox(Eigen::MatrixXd::Identity(6, 6)));
-  ASSERT_GE(
-    reference_->diagnostics().planned_path_max_roll_error_rad,
-    std::abs(start_upright->signed_roll_error_rad));
-  EXPECT_LE(
-    reference_->diagnostics().planned_path_max_roll_error_rad,
-    kCompactRollCapTestRad + kCompactPitchValidationToleranceRad);
-  ASSERT_EQ(first_path.compact_roll_constraints.size(), 2U);
-  ASSERT_EQ(first_path.compact_pitch_constraints.size(), 2U);
-  const auto joint6 = std::find(
-    group_->getVariableNames().begin(), group_->getVariableNames().end(), "joint6");
-  ASSERT_NE(joint6, group_->getVariableNames().end());
-  const auto joint6_index = std::distance(group_->getVariableNames().begin(), joint6);
-  Eigen::VectorXd start_position;
-  start.copyJointGroupPositions(group_, start_position);
-  auto roll_probe = start;
-  roll_probe.setVariablePosition("joint6", roll_probe.getVariablePosition("joint6") + 1.0e-4);
-  roll_probe.update(true);
-  const auto probe_upright = evaluateCompactUprightPose(
-    roll_probe.getGlobalLinkTransform("monitor_control_frame").linear());
-  ASSERT_TRUE(probe_upright);
-  const double q6_direction =
-    std::abs(probe_upright->signed_roll_error_rad) >
-    std::abs(start_upright->signed_roll_error_rad) ? 1.0 : -1.0;
-  Eigen::VectorXd beyond_roll_cap = start_position;
-  beyond_roll_cap[joint6_index] += q6_direction * 0.06;
-  auto beyond_roll_state = start;
-  beyond_roll_state.setJointGroupPositions(group_, beyond_roll_cap);
-  beyond_roll_state.update(true);
-  const auto beyond_roll_pose = evaluateCompactUprightPose(
-    beyond_roll_state.getGlobalLinkTransform("monitor_control_frame").linear());
-  ASSERT_TRUE(beyond_roll_pose);
-  ASSERT_GT(std::abs(beyond_roll_pose->signed_roll_error_rad), kCompactRollCapTestRad);
-  std::string compact_violation;
-  EXPECT_FALSE(reference_->validateCompactPathPosition(
-      start, beyond_roll_cap, &compact_violation));
-  EXPECT_EQ(compact_violation, "screen roll");
-
+  ASSERT_TRUE(first_path.follows_path)
+    << "state=" << reference_->diagnostics().state
+    << ", phase=" << reference_->diagnostics().compact_phase
+    << ", plan='" << reference_->diagnostics().last_plan_message << "'";
+  ASSERT_TRUE(first_path.task || first_path.compact_profile_command);
+  if (first_path.compact_profile_command) {
+    ASSERT_TRUE(first_path.compact_profile_velocity);
+    EXPECT_EQ(first_path.compact_profile_velocity->size(), 6);
+  } else {
+    ASSERT_EQ(first_path.task->primary_matrix.rows(), 6);
+    EXPECT_TRUE(first_path.task->primary_matrix.isApprox(Eigen::MatrixXd::Identity(6, 6)));
+  }
+  ASSERT_TRUE(first_path.compact_profile_command);
+  ASSERT_TRUE(first_path.compact_profile_velocity);
+  EXPECT_TRUE(first_path.compact_roll_constraints.empty());
+  EXPECT_TRUE(first_path.compact_pitch_constraints.empty());
+  const auto checked_profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+  ASSERT_TRUE(checked_profile);
+  ASSERT_FALSE(checked_profile->samples.empty());
+  const auto prepared_return_profile =
+    MotionReferenceTestPeer::preparedReturnProfileForTest(*reference_);
+  ASSERT_TRUE(prepared_return_profile)
+    << "accepted staged plan's checked return leg was not timed for execution: "
+    << reference_->diagnostics().last_plan_message;
+  EXPECT_FALSE(MotionReferenceTestPeer::returnProfileActiveForTest(*reference_));
+  const auto return_profile_full_speed = buildCompactJointProfile(
+    prepared_return_profile->checked_path_vertices,
+    prepared_return_profile->samples.front(),
+    MotionReferenceTestPeer::compactLimitsForTest(*reference_),
+    parameters_.control_period_sec,
+    MotionReferenceTestPeer::compactSpeedScaleForTest(*reference_),
+    prepared_return_profile->checked_path_segment_scales);
+  ASSERT_TRUE(return_profile_full_speed);
+  EXPECT_GT(prepared_return_profile->duration_sec, return_profile_full_speed->duration_sec);
+  const auto return_profile_half_speed = buildCompactJointProfile(
+    prepared_return_profile->checked_path_vertices,
+    prepared_return_profile->samples.front(),
+    MotionReferenceTestPeer::compactLimitsForTest(*reference_),
+    parameters_.control_period_sec,
+    0.5 * MotionReferenceTestPeer::compactSpeedScaleForTest(*reference_),
+    prepared_return_profile->checked_path_segment_scales);
+  ASSERT_TRUE(return_profile_half_speed);
+  EXPECT_NEAR(
+    prepared_return_profile->duration_sec,
+    return_profile_half_speed->duration_sec,
+    1.0e-9);
+  for (std::size_t index = 0U; index < checked_profile->samples.size(); ++index) {
+    std::string profile_violation;
+    EXPECT_TRUE(reference_->validateCompactPathPosition(
+        start, checked_profile->samples[index].position, &profile_violation))
+      << "profile sample " << index << " violates " << profile_violation;
+  }
   auto commit_events = reference_->drainCompactEvents();
   const auto trigger = std::find_if(
     commit_events.begin(), commit_events.end(), [](const auto & event) {
@@ -10940,15 +13244,16 @@ TEST_F(MotionReferenceCameraTest, CompactLifecycleCompletesAndShortfallAloneDoes
   EXPECT_TRUE(reference_->validateCompactPathPosition(start, *committed_goal, &endpoint_violation))
     << endpoint_violation;
 
-  // Advance synthetic feedback in small steps along the follower's checked-path
-  // reference. This exercises lifecycle policy without simulating the QP or a
-  // physical controller, and respects the follower's bounded projection window.
+  // Advance synthetic feedback from each accepted profile command (or task
+  // reference). This exercises lifecycle policy without simulating the QP or a
+  // physical controller and keeps the feedback on the checked path.
   moveit::core::RobotState current(start);
   MotionReferenceResult return_step;
   constexpr double kSyntheticFeedbackStepRad{0.005};
-  for (int tick = 0; tick < 100; ++tick) {
+  bool saw_fast_return_profile = false;
+  for (int tick = 0; tick < 1200; ++tick) {
     return_step = update_at(current, misaligned_face(current));
-    if (reference_->diagnostics().compact_phase == "RETURN_FACE") {
+    if (!reference_->compactManeuverActive()) {
       break;
     }
     EXPECT_EQ(reference_->diagnostics().paths_abandoned, 0U)
@@ -10956,18 +13261,51 @@ TEST_F(MotionReferenceCameraTest, CompactLifecycleCompletesAndShortfallAloneDoes
       << ", state=" << reference_->diagnostics().state
       << ", progress=" << reference_->diagnostics().path_progress_rad
       << ", distance=" << reference_->diagnostics().path_distance_rad;
-    ASSERT_TRUE(return_step.task);
-    ASSERT_EQ(return_step.task->primary_matrix.rows(), 6);
-    ASSERT_TRUE(return_step.task->primary_matrix.isApprox(
-        Eigen::MatrixXd::Identity(6, 6)));
-
-    Eigen::VectorXd feedback_step = return_step.task->primary_reference;
-    ASSERT_EQ(feedback_step.size(), 6);
+    if (MotionReferenceTestPeer::returnProfileActiveForTest(*reference_)) {
+      saw_fast_return_profile = true;
+      EXPECT_TRUE(reference_->activeCommandLimits().max_velocity.isApprox(
+        MotionReferenceTestPeer::compactLimitsForTest(*reference_).max_velocity));
+      EXPECT_TRUE(return_step.compact_radius_constraints.empty());
+      EXPECT_TRUE(return_step.compact_pitch_constraints.empty());
+    }
+    Eigen::VectorXd feedback_step(6);
+    std::optional<JointMotionState> accepted_profile_feedback;
+    if (return_step.compact_profile_command) {
+      ASSERT_TRUE(return_step.compact_profile_velocity);
+      const auto profile = MotionReferenceTestPeer::profileSnapshotForTest(*reference_);
+      ASSERT_TRUE(profile);
+      const std::size_t cursor = MotionReferenceTestPeer::profileCursorForTest(*reference_);
+      ASSERT_LT(cursor + 1U, profile->samples.size());
+      const auto & previous_sample = profile->samples[cursor];
+      const auto & next_sample = profile->samples[cursor + 1U];
+      if (MotionReferenceTestPeer::returnProfileActiveForTest(*reference_)) {
+        EmergencyBrakeTailConfig brake_config;
+        brake_config.period_sec = parameters_.control_period_sec;
+        EXPECT_TRUE(reference_->compactProfileBrakingTail(
+          next_sample, brake_config).command_available());
+      }
+      EXPECT_TRUE(return_step.compact_profile_velocity->isApprox(
+          next_sample.velocity, 1.0e-12));
+      feedback_step = next_sample.position - previous_sample.position;
+      EXPECT_TRUE(feedback_step.isApprox(
+          *return_step.compact_profile_velocity * parameters_.control_period_sec, 1.0e-9));
+      accepted_profile_feedback = next_sample;
+      reference_->recordCompactProfileCommandPublished(true);
+      EXPECT_EQ(MotionReferenceTestPeer::profileCursorForTest(*reference_), cursor + 1U);
+    } else {
+      ASSERT_TRUE(return_step.task);
+      ASSERT_EQ(return_step.task->primary_matrix.rows(), 6);
+      ASSERT_TRUE(return_step.task->primary_matrix.isApprox(
+          Eigen::MatrixXd::Identity(6, 6)));
+      feedback_step = return_step.task->primary_reference;
+      ASSERT_EQ(feedback_step.size(), 6);
+      ASSERT_TRUE(feedback_step.allFinite());
+      const double largest_step = feedback_step.cwiseAbs().maxCoeff();
+      ASSERT_GT(largest_step, 1.0e-9)
+        << "profile/task produced no reference step before lifecycle completion";
+      feedback_step *= std::min(1.0, kSyntheticFeedbackStepRad / largest_step);
+    }
     ASSERT_TRUE(feedback_step.allFinite());
-    const double largest_step = feedback_step.cwiseAbs().maxCoeff();
-    ASSERT_GT(largest_step, 1.0e-9)
-      << "follower produced no reference step before lifecycle completion";
-    feedback_step *= std::min(1.0, kSyntheticFeedbackStepRad / largest_step);
     Eigen::VectorXd current_position;
     current.copyJointGroupPositions(group_, current_position);
     Eigen::VectorXd next_position = current_position + feedback_step;
@@ -10976,8 +13314,13 @@ TEST_F(MotionReferenceCameraTest, CompactLifecycleCompletesAndShortfallAloneDoes
         start, next_position, &feedback_violation))
       << feedback_violation;
     current.setJointGroupPositions(group_, next_position);
-    current.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
-    current.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+    if (accepted_profile_feedback) {
+      current.setJointGroupVelocities(group_, accepted_profile_feedback->velocity);
+      current.setJointGroupAccelerations(group_, accepted_profile_feedback->acceleration);
+    } else {
+      current.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
+      current.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
+    }
     current.update(true);
     if (reference_->diagnostics().compact_phase == "SETTLING" &&
       (next_position - *committed_goal).lpNorm<Eigen::Infinity>() <= kSyntheticFeedbackStepRad)
@@ -10986,271 +13329,31 @@ TEST_F(MotionReferenceCameraTest, CompactLifecycleCompletesAndShortfallAloneDoes
       current.update(true);
     }
   }
-  ASSERT_EQ(reference_->diagnostics().compact_phase, "RETURN_FACE")
+  ASSERT_EQ(reference_->diagnostics().compact_phase, "COMPLETE")
     << "state=" << reference_->diagnostics().state
     << ", plan='" << reference_->diagnostics().last_plan_message
     << "', paths_abandoned=" << reference_->diagnostics().paths_abandoned
     << ", path_progress=" << reference_->diagnostics().path_progress_rad
     << ", path_distance=" << reference_->diagnostics().path_distance_rad;
-  EXPECT_EQ(reference_->diagnostics().paths_completed, 1U);
+  EXPECT_EQ(reference_->diagnostics().paths_completed, 2U);
+  EXPECT_TRUE(saw_fast_return_profile);
   EXPECT_EQ(reference_->diagnostics().paths_abandoned, 0U);
-  EXPECT_TRUE(return_step.compact_pitch_constraints.empty());
-  EXPECT_EQ(return_step.compact_roll_constraints.size(), 2U);
-  EXPECT_FALSE(return_step.compact_radius_constraints.empty());
-  EXPECT_TRUE(std::isfinite(reference_->diagnostics().compact_pitch_cap_rad));
-  auto actual_misaligned = current;
-  actual_misaligned.setVariablePosition(
-    "joint1", actual_misaligned.getVariablePosition("joint1") + 0.25);
-  actual_misaligned.update(true);
-  const auto command_aligned_actual_misaligned = update_at(
-    current, aligned_face(current), &actual_misaligned);
-  ASSERT_TRUE(command_aligned_actual_misaligned.tracking);
-  ASSERT_TRUE(command_aligned_actual_misaligned.task);
-  EXPECT_EQ(command_aligned_actual_misaligned.task->primary_matrix.rows(), 1);
-  EXPECT_LE(command_aligned_actual_misaligned.tracking->pointing_error_rad,
-    kFaceTrackingErrorGuardRad);
-  ASSERT_TRUE(command_aligned_actual_misaligned.actual_face_alignment);
-  EXPECT_GT(command_aligned_actual_misaligned.actual_face_alignment->pointing_error_rad,
-    kFaceTrackingErrorGuardRad);
-  EXPECT_FALSE(reference_->diagnostics().compact_return_full_face_active);
-  reference_->recordFaceCommand(
-    *command_aligned_actual_misaligned.tracking, solved_full_face_qp(), simulated_time,
-    true, command_aligned_actual_misaligned.actual_face_alignment);
-  EXPECT_FALSE(reference_->diagnostics().compact_return_face_qualified);
-
-  const auto first_goal = update_at(current, misaligned_face(current));
-  ASSERT_EQ(reference_->diagnostics().compact_phase, "RETURN_FACE");
-  ASSERT_TRUE(reference_->compactManeuverActive());
-  EXPECT_TRUE(reference_->diagnostics().compact_actual_settled);
-  EXPECT_TRUE(std::isfinite(reference_->diagnostics().compact_effective_radius_cap_m));
-  ASSERT_TRUE(first_goal.tracking);
-  ASSERT_TRUE(first_goal.task);
-  EXPECT_EQ(first_goal.task->primary_matrix.rows(), 1);
-  EXPECT_EQ(first_goal.task->secondary_matrix.rows(), 2);
-  EXPECT_TRUE(first_goal.task->primary_matrix.isApprox(
-      first_goal.tracking->task.primary_matrix.row(2), 1.0e-12));
-  EXPECT_GT(first_goal.tracking->pointing_error_rad, kFaceTrackingErrorGuardRad);
-  EXPECT_LE(first_goal.tracking->roll_error_rad, kFaceTrackingErrorGuardRad);
-  EXPECT_FALSE(reference_->diagnostics().compact_return_full_face_active);
-
-  Eigen::MatrixXd screen_jacobian;
-  ASSERT_TRUE(current.getJacobian(
-      group_, model_->getLinkModel("monitor_control_frame"), Eigen::Vector3d::Zero(),
-      screen_jacobian, false));
-  const auto * root_link = group_->getJointModels().front()->getParentLinkModel();
-  if (root_link) {
-    const Eigen::Matrix3d root_rotation =
-      current.getGlobalLinkTransform(root_link).linear();
-    screen_jacobian.topRows(3) = (root_rotation * screen_jacobian.topRows(3)).eval();
-    screen_jacobian.bottomRows(3) =
-      (root_rotation * screen_jacobian.bottomRows(3)).eval();
-  }
-  TrackingVelocityTaskConfig upright_config;
-  upright_config.orientation_gain = parameters_.orientation_gain;
-  upright_config.maximum_angular_reference_radps =
-    parameters_.maximum_angular_reference_radps;
-  const auto gravity_upright = makeUprightRollPathTask(
-    current.getGlobalLinkTransform("monitor_control_frame"), screen_jacobian,
-    Eigen::VectorXd::Zero(6), upright_config);
-  ASSERT_TRUE(gravity_upright);
-  const auto * gaze_link = model_->getLinkModel(parameters_.gaze_frame);
-  ASSERT_NE(gaze_link, nullptr);
-  GazeKinematics gaze;
-  gaze.pose = current.getGlobalLinkTransform(gaze_link);
-  gaze.pose.linear() *= face_tracking_arm::opticalToPointingRotation();
-  ASSERT_TRUE(current.getJacobian(
-      group_, gaze_link, Eigen::Vector3d::Zero(), gaze.jacobian, false));
-  if (root_link) {
-    const Eigen::Matrix3d root_rotation =
-      current.getGlobalLinkTransform(root_link).linear();
-    gaze.jacobian.topRows(3) = (root_rotation * gaze.jacobian.topRows(3)).eval();
-    gaze.jacobian.bottomRows(3) =
-      (root_rotation * gaze.jacobian.bottomRows(3)).eval();
-  }
-  const auto first_goal_command = misaligned_face(current);
-  const auto expected_return_pointing = makeFaceReturnPointingTask(
-    current.getGlobalLinkTransform("monitor_control_frame"), screen_jacobian,
-    Eigen::Vector3d(first_goal_command.face.x, first_goal_command.face.y,
-      first_goal_command.face.z), Eigen::Vector3d::Zero(), upright_config,
-    first_goal.tracking->task.primary_matrix.topRows(2),
-    first_goal.tracking->task.primary_reference.head(2), gaze);
-  ASSERT_TRUE(expected_return_pointing);
-  EXPECT_FALSE(expected_return_pointing->used_normal_fallback);
-  EXPECT_TRUE(first_goal.task->secondary_matrix.isApprox(
-      expected_return_pointing->matrix, 1.0e-12));
-  const auto horizontal_edge = makeHorizontalEdgePathTask(
-    current.getGlobalLinkTransform("monitor_control_frame"), screen_jacobian,
-    Eigen::VectorXd::Zero(6), upright_config);
-  ASSERT_TRUE(horizontal_edge);
-  EXPECT_TRUE(first_goal.task->primary_matrix.row(0).isApprox(
-      horizontal_edge->task.primary_matrix.row(0), 1.0e-12));
-  EXPECT_NEAR(first_goal.tracking->roll_error_rad,
-    std::abs(horizontal_edge->edge_tilt_error_rad), 1.0e-12);
-  EXPECT_TRUE(first_goal.tracking->task.primary_matrix.row(2).isApprox(
-      horizontal_edge->task.primary_matrix.row(0), 1.0e-12));
-
-  constexpr double kOldPoleCutoffRad{84.26 * 3.14159265358979323846 / 180.0};
-  // Reuse a measured intermediate from the recorded NO_FACE→REST_PATH run
-  // compact_v9_path_no_face_2s_v2 (stamp 39.65 s). Its xArm6 FK is 85.015°
-  // compact pitch, while the horizontal edge remains within the 5.1° cap and
-  // the assembly radius remains below the committed 0.40 m limit.
-  auto return_pitch_state = current;
-  const Eigen::VectorXd recorded_high_pitch_position = (Eigen::VectorXd(6) <<
-    -0.0014021878365071967, -0.24328809639189844, -1.8555171377707995,
-    -0.09275389103830937, -1.0749213995985931, 2.185574412337391).finished();
-  return_pitch_state.setJointGroupPositions(group_, recorded_high_pitch_position);
-  return_pitch_state.setJointGroupVelocities(group_, Eigen::VectorXd::Zero(6));
-  return_pitch_state.setJointGroupAccelerations(group_, Eigen::VectorXd::Zero(6));
-  return_pitch_state.update(true);
-  const Eigen::Vector3d return_normal =
-    return_pitch_state.getGlobalLinkTransform("monitor_control_frame").linear().col(0);
-  const double return_abs_pitch = std::atan2(
-    std::abs(return_normal.z()), std::hypot(return_normal.x(), return_normal.y()));
-  EXPECT_GT(return_abs_pitch, kOldPoleCutoffRad);
-  const double committed_pitch_cap = reference_->diagnostics().compact_pitch_cap_rad;
-  const double committed_radius_cap = reference_->diagnostics().compact_entry_radius_cap_m;
-  ASSERT_GT(return_abs_pitch, committed_pitch_cap + 0.05);
-  Eigen::VectorXd return_position;
-  return_pitch_state.copyJointGroupPositions(group_, return_position);
-  std::string return_radius_violation;
-  ASSERT_TRUE(reference_->validateCompactPathPosition(
-    return_pitch_state, return_position, &return_radius_violation)) <<
-    return_radius_violation;
-  ASSERT_TRUE(reference_->validateCommandPosition(
-    return_pitch_state, return_position, &return_radius_violation)) <<
-    return_radius_violation;
-
-  const auto return_before_rearm = update_at(
-    return_pitch_state, misaligned_face(return_pitch_state));
-  ASSERT_EQ(reference_->diagnostics().compact_phase, "RETURN_FACE");
-  ASSERT_TRUE(return_before_rearm.tracking);
-  ASSERT_TRUE(return_before_rearm.task);
-  EXPECT_TRUE(return_before_rearm.compact_pitch_constraints.empty());
-  EXPECT_EQ(return_before_rearm.compact_roll_constraints.size(), 3U);
-  EXPECT_FALSE(return_before_rearm.compact_radius_constraints.empty());
-  const std::uint64_t plans_before_return_rearm =
-    reference_->diagnostics().plans_requested;
-
-  reference_->reset(true);
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_FACE");
-  EXPECT_DOUBLE_EQ(reference_->diagnostics().compact_goal_reached, 1.0);
-  EXPECT_FALSE(reference_->diagnostics().compact_actual_settled);
-  EXPECT_FALSE(reference_->diagnostics().compact_return_full_face_active);
-  EXPECT_DOUBLE_EQ(reference_->diagnostics().compact_return_face_dwell_sec, 0.0);
-  EXPECT_DOUBLE_EQ(
-    reference_->diagnostics().compact_pitch_cap_rad, committed_pitch_cap);
-  EXPECT_DOUBLE_EQ(
-    reference_->diagnostics().compact_entry_radius_cap_m, committed_radius_cap);
-  const auto return_after_rearm = update_at(
-    return_pitch_state, misaligned_face(return_pitch_state));
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_FACE");
-  EXPECT_EQ(reference_->diagnostics().plans_requested, plans_before_return_rearm);
-  EXPECT_TRUE(reference_->compactManeuverActive());
-  ASSERT_TRUE(return_after_rearm.tracking);
-  ASSERT_TRUE(return_after_rearm.task);
-  EXPECT_EQ(return_after_rearm.task->primary_matrix.rows(), 1);
-  EXPECT_TRUE(return_after_rearm.compact_pitch_constraints.empty());
-  EXPECT_EQ(return_after_rearm.compact_roll_constraints.size(), 3U);
-  EXPECT_FALSE(return_after_rearm.compact_radius_constraints.empty());
-
-  reference_->recordFaceCommand(
-    *first_goal.tracking, solved_qp(), simulated_time, true,
-    first_goal.actual_face_alignment);
-  auto lost_reacquisition = *first_goal.tracking;
-  lost_reacquisition.pointing_error_rad = kFaceTrackingErrorGuardRad + 0.01;
-  reference_->recordFaceCommand(
-    lost_reacquisition, solved_qp(), simulated_time, true,
-    first_goal.actual_face_alignment);
-  const auto first_aligned_after_gap = update_at(current, aligned_face(current));
-  ASSERT_TRUE(first_aligned_after_gap.tracking);
-  ASSERT_TRUE(first_aligned_after_gap.task);
-  EXPECT_EQ(first_aligned_after_gap.task->primary_matrix.rows(), 3);
-  EXPECT_TRUE(reference_->diagnostics().compact_return_full_face_active);
-  record_aligned_full_face(first_aligned_after_gap, simulated_time);
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_FACE");
-  for (int tick = 0; tick < 5; ++tick) {
-    const auto returned_face = update_at(current, aligned_face(current));
-    ASSERT_TRUE(returned_face.tracking);
-    ASSERT_TRUE(returned_face.task);
-    EXPECT_EQ(returned_face.task->primary_matrix.rows(), 3);
-    EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_FACE");
-    record_aligned_full_face(returned_face, simulated_time);
-  }
-  EXPECT_NEAR(
-    reference_->diagnostics().compact_return_face_dwell_sec,
-    5.0 * parameters_.control_period_sec, 1.0e-9);
-
-  const auto failed_publication = update_at(current, aligned_face(current));
-  ASSERT_TRUE(failed_publication.tracking);
-  reference_->recordFaceCommand(
-    *failed_publication.tracking, solved_full_face_qp(), simulated_time, false,
-    failed_publication.actual_face_alignment);
-  EXPECT_DOUBLE_EQ(reference_->diagnostics().compact_return_face_dwell_sec, 0.0);
-
-  const auto forecast_crossing = update_at(current, aligned_face(current));
-  ASSERT_TRUE(forecast_crossing.tracking);
-  auto crossing_tracking = *forecast_crossing.tracking;
-  crossing_tracking.pointing_error_rad = 0.06;
-  crossing_tracking.signed_face_primary_error_rad = Eigen::Vector3d(0.06, 0.0, 0.0);
-  crossing_tracking.face_primary_feedforward_radps = Eigen::Vector3d(0.2, 0.0, 0.0);
-  reference_->recordFaceCommand(
-    crossing_tracking, solved_full_face_qp(), simulated_time, true,
-    forecast_crossing.actual_face_alignment);
-  EXPECT_FALSE(reference_->diagnostics().compact_return_face_qualified);
-  EXPECT_DOUBLE_EQ(reference_->diagnostics().compact_return_face_dwell_sec, 0.0);
-
-  record_aligned_full_face(forecast_crossing, simulated_time);
-  const int dwell_samples = static_cast<int>(std::ceil(
-      0.30 / parameters_.control_period_sec));
-  for (int tick = 0; tick < dwell_samples - 1; ++tick) {
-    const auto returned_face = update_at(current, aligned_face(current));
-    ASSERT_TRUE(returned_face.tracking);
-    ASSERT_TRUE(returned_face.task);
-    EXPECT_EQ(returned_face.task->primary_matrix.rows(), 3);
-    EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_FACE");
-    record_aligned_full_face(returned_face, simulated_time);
-  }
-  EXPECT_TRUE(reference_->compactManeuverActive());
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "RETURN_FACE");
-  EXPECT_NEAR(
-    reference_->diagnostics().compact_return_face_dwell_sec,
-    0.30 - parameters_.control_period_sec, 1.0e-9);
-  const auto settled_face = update_at(current, aligned_face(current));
-  ASSERT_TRUE(settled_face.tracking);
-  record_aligned_full_face(settled_face, simulated_time);
   EXPECT_FALSE(reference_->compactManeuverActive());
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "COMPLETE");
-  EXPECT_DOUBLE_EQ(reference_->diagnostics().compact_goal_reached, 0.0);
-  EXPECT_FALSE(reference_->diagnostics().compact_return_full_face_active);
+  EXPECT_FALSE(return_step.task);
+  EXPECT_FALSE(return_step.compact_profile_command);
+  EXPECT_TRUE(return_step.compact_roll_constraints.empty());
+  EXPECT_TRUE(return_step.compact_pitch_constraints.empty());
+  EXPECT_TRUE(return_step.compact_radius_constraints.empty());
+  EXPECT_FALSE(MotionReferenceTestPeer::returnProfileActiveForTest(*reference_));
   EXPECT_FALSE(reference_->diagnostics().compact_radius_floor_latched);
   EXPECT_TRUE(std::isnan(reference_->diagnostics().compact_effective_radius_cap_m));
 
-  const auto face_again = update_at(current, misaligned_face(current));
-  ASSERT_TRUE(face_again.tracking);
-  EXPECT_FALSE(face_again.j1_hold_position_rad);
-  EXPECT_EQ(reference_->diagnostics().j1_hold_direction, 0);
-  auto shortfall = *face_again.tracking;
-  shortfall.has_face_primary_roll = true;
-  shortfall.signed_face_primary_error_rad = Eigen::Vector3d(0.06, 0.0, 0.0);
-  shortfall.face_primary_feedforward_radps.setZero();
-  QpResult shortfall_qp;
-  shortfall_qp.status = QpStatus::kSolved;
-  shortfall_qp.achieved_primary_velocity = Eigen::Vector3d(-0.20, 0.0, 0.0);
-  reference_->recordFaceCommand(shortfall, shortfall_qp, simulated_time, true);
-  for (int tick = 0; tick < 8; ++tick) {
-    const auto shortfall_sample = update_at(current, misaligned_face(current));
-    ASSERT_TRUE(shortfall_sample.tracking);
-    reference_->recordFaceCommand(
-      shortfall, shortfall_qp,
-      simulated_time, true);
-  }
+  const auto ordinary_face = update_at(current, misaligned_face(current));
+  ASSERT_TRUE(ordinary_face.tracking);
+  ASSERT_TRUE(ordinary_face.task);
   EXPECT_FALSE(reference_->compactManeuverActive());
-  EXPECT_EQ(reference_->diagnostics().compact_generation, 1U);
-  EXPECT_EQ(reference_->diagnostics().plans_requested, plan_requests_before_lifecycle);
-  EXPECT_EQ(reference_->diagnostics().plans_accepted, 1U);
-  EXPECT_EQ(reference_->diagnostics().compact_phase, "COMPLETE");
-  EXPECT_EQ(reference_->diagnostics().paths_completed, 1U);
-  EXPECT_EQ(reference_->diagnostics().compact_generation, committed_generation);
+  EXPECT_EQ(reference_->diagnostics().state, "FACE");
+  EXPECT_EQ(ordinary_face.task->primary_matrix.rows(), 3);
 
   const auto events = reference_->drainCompactEvents();
   EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
@@ -11260,10 +13363,13 @@ TEST_F(MotionReferenceCameraTest, CompactLifecycleCompletesAndShortfallAloneDoes
       return event.event == "compact_goal_settled" && event.generation_id == 1U;
   }));
   EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
-      return event.event == "face_return_full_face_started" && event.generation_id == 1U;
+      return event.event == "return_profile_started" && event.generation_id == 1U;
+  }));
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
+      return event.event == "return_profile_completed" && event.generation_id == 1U;
   }));
   EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const CompactEvent & event) {
-      return event.event == "pair_resource_exhausted" && event.generation_id == 2U;
+      return event.event == "triggered" && event.generation_id == 2U;
   }));
 }
 

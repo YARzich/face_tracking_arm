@@ -410,7 +410,87 @@ def test_compact_speed_scale_loads_from_an_external_controller_yaml(tmp_path):
     configured = _config(controller_config_file=external_config)
 
     assert configured.controller['compact_maneuver']['speed_scale'] == pytest.approx(.4)
+    assert configured.controller['compact_maneuver']['fold_speed_scale'] == pytest.approx(1.0)
+    assert configured.controller['compact_maneuver']['max_velocity_rad_s'] == pytest.approx(
+        [3.1] * 6)
     assert _config().controller['compact_maneuver']['speed_scale'] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize('model', ['xarm6', 'lite6'])
+def test_simulation_and_gazebo_use_shared_joint_torque_override(tmp_path, model):
+    servo = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    servo['compact_maneuver']['joint_torque_limits_nm'] = {'joint2': 40.0}
+    servo_path = tmp_path / 'collision_aware_servo.yaml'
+    servo_path.write_text(yaml.safe_dump(servo), encoding='utf-8')
+
+    config = _config(robot_model=model, controller_config_file=servo_path)
+    description = config.robot_parameters[0]['robot_description']
+    robot = ET.fromstring(description)
+    efforts = [float(robot.find(f"joint[@name='joint{i}']/limit").get('effort'))
+               for i in range(1, 7)]
+    assert efforts == [50.0, 40.0, 32.0, 32.0, 32.0, 20.0]
+    gazebo_robot = ET.fromstring(_gazebo_physics_robot_description(description))
+    assert float(gazebo_robot.find("joint[@name='joint2']/limit").get('effort')) == 40.0
+
+
+def test_simulation_empty_joint_torque_map_preserves_urdf_defaults():
+    description = _config().robot_parameters[0]['robot_description']
+    robot = ET.fromstring(description)
+    assert [float(robot.find(f"joint[@name='joint{i}']/limit").get('effort'))
+            for i in range(1, 7)] == [50.0, 50.0, 32.0, 32.0, 32.0, 20.0]
+
+
+@pytest.mark.parametrize('overrides,match', [
+    ({'joint7': 1.0}, 'unknown torque-limited robot joint'),
+    ({'joint2': float('nan')}, 'joint2.*finite positive'),
+    ({'joint2': 0.0}, 'joint2.*finite positive'),
+    ({'joint2': True}, 'joint2.*finite positive'),
+    (None, 'expected a joint-name to Nm mapping'),
+])
+def test_simulation_rejects_invalid_shared_torque_limits(tmp_path, overrides, match):
+    servo = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    servo['compact_maneuver']['joint_torque_limits_nm'] = overrides
+    servo_path = tmp_path / 'collision_aware_servo.yaml'
+    servo_path.write_text(yaml.safe_dump(servo), encoding='utf-8')
+
+    with pytest.raises(ValueError, match=match):
+        _config(controller_config_file=servo_path)
+
+
+def test_legacy_controller_compact_settings_default_phase_scales_and_working_caps(tmp_path):
+    config = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    config['compact_maneuver'] = {'speed_scale': .6}
+    external_config = tmp_path / 'legacy_collision_aware_servo.yaml'
+    external_config.write_text(yaml.safe_dump(config), encoding='utf-8')
+    compact = _config(controller_config_file=external_config).controller['compact_maneuver']
+    assert compact['fold_speed_scale'] == pytest.approx(1.0)
+    assert compact['turn_speed_scale'] == pytest.approx(1.0)
+    assert compact['return_speed_scale'] == pytest.approx(1.0)
+    assert compact['max_velocity_rad_s'] == pytest.approx([3.1] * 6)
+    assert compact['max_acceleration_rad_s2'] == pytest.approx([19.0] * 6)
+    assert compact['max_jerk_rad_s3'] == pytest.approx([400.0] * 6)
+
+
+@pytest.mark.parametrize('key', ['fold_speed_scale', 'turn_speed_scale', 'return_speed_scale'])
+@pytest.mark.parametrize('value', [0, -0.1, float('nan'), float('inf'), True])
+def test_simulation_rejects_invalid_compact_phase_scales(tmp_path, key, value):
+    external_config = tmp_path / 'collision_aware_servo.yaml'
+    config = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    config['compact_maneuver'][key] = value
+    external_config.write_text(yaml.safe_dump(config), encoding='utf-8')
+    with pytest.raises(ValueError, match=f'compact_maneuver.{key}'):
+        _config(controller_config_file=external_config)
+
+
+@pytest.mark.parametrize('key', ['max_velocity_rad_s', 'max_acceleration_rad_s2',
+                                 'max_jerk_rad_s3'])
+def test_simulation_rejects_malformed_compact_working_limits(tmp_path, key):
+    external_config = tmp_path / 'collision_aware_servo.yaml'
+    config = yaml.safe_load((ROOT / 'config/moveit/collision_aware_servo.yaml').read_text())
+    config['compact_maneuver'][key] = [1.0] * 5
+    external_config.write_text(yaml.safe_dump(config), encoding='utf-8')
+    with pytest.raises(ValueError, match=f'compact_maneuver.{key}'):
+        _config(controller_config_file=external_config)
 
 
 @pytest.mark.parametrize('mode', ['compact', 'disabled'])
@@ -559,7 +639,8 @@ def test_exactly_one_gazebo_process_is_selected(headless):
     assert gui.condition.evaluate(context) is (headless == 'false')
 
 
-@pytest.mark.parametrize('scenario', ['disabled', 'people', 'walk_around'])
+@pytest.mark.parametrize(
+    'scenario', ['disabled', 'people', 'walk_around', 'walk_around_reverse'])
 @pytest.mark.parametrize('visible', ['true', 'false'])
 def test_target_source_and_marker_switch_independently(scenario, visible):
     context = LaunchContext()

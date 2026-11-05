@@ -67,9 +67,8 @@ struct JointCenteringGuidance
 /// posture preferences occupy explicit lower ranks; GOOD comfort rows are preferred
 /// hard rows for primary and lower ranks, with an unguarded primary fallback only when
 /// the preferred rows conflict with physical constraints or the guarded solve fails.
-/// compact PATH tracks the checked joint-space path as primary and enforces upright roll,
-/// pitch, and radius through hard velocity constraints. RETURN_FACE retains the roll-primary
-/// reacquisition task. Optional gaze and fixed-orientation tasks retain their own two-axis
+/// Compact PATH and RETURN_PATH track their checked joint-space paths as primary; their
+/// orientations remain free. Optional gaze and fixed-orientation tasks retain their own two-axis
 /// pointing primary and may place translation and screen roll in secondary.
 /// Each weight is a positive residual multiplier (the solver minimizes ||W(Ax-b)||^2).
 struct HierarchicalVelocityTask

@@ -17,7 +17,10 @@ PROFILE_FIELDS = frozenset((
 FINGERPRINT_FIELDS = frozenset((
     'robot_model model_num firmware_version reduced_mode reduced_joint_limits_rad '
     'reduced_max_joint_speed_rad_s speed_scale max_velocity_rad_s '
-    'max_acceleration_rad_s2 max_jerk_rad_s3 payload_kg payload_load_status mount_geometry '
+    'max_acceleration_rad_s2 max_jerk_rad_s3 compact_speed_scale '
+    'compact_fold_speed_scale compact_turn_speed_scale compact_return_speed_scale '
+    'compact_max_velocity_rad_s compact_max_acceleration_rad_s2 compact_max_jerk_rad_s3 '
+    'payload_kg payload_load_status mount_geometry '
     'controller_mode controller_configuration_sha256 robot_description_sha256 '
     'semantic_description_sha256 '
     'control_period_sec servo_publish_period_sec state_feedback_timeout_sec '
@@ -58,6 +61,14 @@ def execution_conditions_from_launch(config, probe, robot_profile, servo, motion
         'max_velocity_rad_s': list(motion['max_joint_velocity_rad_s']),
         'max_acceleration_rad_s2': list(motion['max_joint_acceleration_rad_s2']),
         'max_jerk_rad_s3': list(motion['max_joint_jerk_rad_s3']),
+        'compact_speed_scale': float(motion['compact_maneuver.speed_scale']),
+        'compact_fold_speed_scale': float(motion['compact_maneuver.fold_speed_scale']),
+        'compact_turn_speed_scale': float(motion['compact_maneuver.turn_speed_scale']),
+        'compact_return_speed_scale': float(motion['compact_maneuver.return_speed_scale']),
+        'compact_max_velocity_rad_s': list(motion['compact_maneuver.max_velocity_rad_s']),
+        'compact_max_acceleration_rad_s2': list(
+            motion['compact_maneuver.max_acceleration_rad_s2']),
+        'compact_max_jerk_rad_s3': list(motion['compact_maneuver.max_jerk_rad_s3']),
         # These are configured attached masses, not a live controller load
         # measurement. The profile fingerprint binds the assumption explicitly.
         'payload_kg': float(config['monitor']['mass_kg']) +

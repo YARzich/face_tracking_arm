@@ -921,6 +921,12 @@ TEST(CollisionConstraints, RejectsContradictorySafetyProfile)
   config = CollisionConstraintConfig{};
   config.separation_lookahead_sec = -0.1;
   EXPECT_THROW(static_cast<void>(CollisionConstraintBuilder{config}), std::invalid_argument);
+
+  config = sliderConfig();
+  config.tracking_position_error_bound_rad = 0.05;
+  EXPECT_NO_THROW(static_cast<void>(CollisionConstraintBuilder{config}));
+  config.tracking_position_error_bound_rad += 0.01;
+  EXPECT_THROW(static_cast<void>(CollisionConstraintBuilder{config}), std::invalid_argument);
 }
 
 TEST(CollisionConstraints, SeparationGuidanceActsBeforeHardBrakingAndKeepsHardRows)

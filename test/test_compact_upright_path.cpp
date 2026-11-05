@@ -36,7 +36,6 @@ using namespace std::chrono_literals;
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kPitchLimitRad = 30.0 * kPi / 180.0;
-constexpr double kV7PositivePitchLimitRad = 37.7124 * kPi / 180.0;
 constexpr double kRollLimitRad = 5.1 * kPi / 180.0;
 constexpr double kCompactRadiusLimitM = 0.40;
 constexpr double kPathTolerance = 1.0e-9;
@@ -165,11 +164,30 @@ protected:
     return result;
   }
 
-  CompactStagedProjectionConfig projectionConfig() const
+  CompactReturnRegion returnRegion(
+    const moveit::core::RobotState & reference, const double turn_direction) const
   {
-    CompactStagedProjectionConfig config;
-    config.maximum_abs_pitch_rad = kPitchLimitRad;
-    config.maximum_roll_error_rad = kRollLimitRad;
+    CompactReturnRegion region;
+    reference.copyJointGroupPositions(group_, region.reference_positions);
+    const auto & screen = reference.getGlobalLinkTransform("monitor_control_frame");
+    region.center_world = screen.translation();
+    region.outward_x_world = screen.linear().col(0);
+    region.outward_x_world.z() = 0.0;
+    region.outward_x_world.normalize();
+    region.radius_m = 0.10;
+    region.direction_tolerance_rad = 15.0 * kPi / 180.0;
+    region.target_joint1_rad = region.reference_positions[0] + turn_direction * 2.0 * kPi;
+    region.joint1_tolerance_rad = 0.025;
+    region.comfortable_joint3_lower = -1.955;
+    region.comfortable_joint3_upper = -0.3696;
+    region.minimum_elbow_height_m = 0.0;
+    return region;
+  }
+
+  CompactStagedPathConfig stagedPathConfig() const
+  {
+    CompactStagedPathConfig config;
+    config.maximum_early_yaw_shift_rad = 0.35;
     config.maximum_joint_step_rad = 0.01;
     config.maximum_samples = 8192U;
     return config;
@@ -178,7 +196,7 @@ protected:
   void expectPathContract(
     const moveit::core::RobotState & start, const Eigen::VectorXd & goal,
     const std::vector<Eigen::VectorXd> & path,
-    const CompactStagedProjectionConfig & config) const
+    const CompactStagedPathConfig & config) const
   {
     ASSERT_GE(path.size(), 2U);
     Eigen::VectorXd start_positions;
@@ -193,14 +211,6 @@ protected:
       sample.setJointGroupPositions(group_, path[index]);
       sample.update();
       ASSERT_TRUE(sample.satisfiesBounds(group_)) << "sample=" << index;
-      const auto pose = evaluateCompactUprightPose(
-        sample.getGlobalLinkTransform("monitor_control_frame").linear());
-      ASSERT_TRUE(pose) << "screen pole at sample=" << index;
-      EXPECT_LE(std::abs(pose->signed_pitch_rad),
-        config.maximum_abs_pitch_rad + kCompactPitchValidationToleranceRad)
-        << "sample=" << index;
-      EXPECT_LE(std::abs(pose->signed_roll_error_rad),
-        config.maximum_roll_error_rad + kPathTolerance) << "sample=" << index;
       if (index > 0U) {
         const double max_step = (path[index] - path[index - 1U]).lpNorm<Eigen::Infinity>();
         EXPECT_LE(max_step, config.maximum_joint_step_rad + kPathTolerance)
@@ -228,15 +238,14 @@ protected:
   BackgroundPathPlannerConfig planner_config_;
 };
 
-TEST_F(CompactUprightPathTest, ProjectsExactV9NegativeGoalAndMirroredYawWithinDenseLimits)
+TEST_F(CompactUprightPathTest, BuildsBoundedStagedPathWithoutScreenOrientationGates)
 {
   auto start = v9BrakedStart();
   const auto goal = namedGoal("compact_turn_negative_wrist");
-  const auto config = projectionConfig();
+  const auto config = stagedPathConfig();
   ASSERT_TRUE(start.satisfiesBounds(group_));
 
-  const auto projected = projectCompactStagedPath(
-    start, goal, group_, "monitor_control_frame", config);
+  const auto projected = makeCompactStagedPath(start, goal, group_, config);
   ASSERT_TRUE(projected);
   expectPathContract(start, goal, projected->waypoints, config);
   ASSERT_LT(projected->fold_end_index + 1U, projected->waypoints.size());
@@ -251,45 +260,37 @@ TEST_F(CompactUprightPathTest, ProjectsExactV9NegativeGoalAndMirroredYawWithinDe
   mirrored.setVariablePosition("joint1", -mirrored.getVariablePosition("joint1"));
   mirrored.update();
   ASSERT_TRUE(mirrored.satisfiesBounds(group_));
-  const auto mirrored_path = projectCompactStagedPath(
-    mirrored, goal, group_, "monitor_control_frame", config);
+  const auto mirrored_path = makeCompactStagedPath(mirrored, goal, group_, config);
   ASSERT_TRUE(mirrored_path);
   expectPathContract(mirrored, goal, mirrored_path->waypoints, config);
 }
 
-TEST_F(CompactUprightPathTest, ProjectsKnownV7PositiveUpperRouteAtItsRecordedPitchCap)
+TEST_F(CompactUprightPathTest, BuildsPathWithoutEvaluatingScreenOrientationMetrics)
 {
   const auto start = v7PositiveBrakedStart();
   const Eigen::VectorXd goal = v7PositiveUpperGoal();
-  const auto config = projectionConfig();
-  auto positive_config = config;
-  positive_config.maximum_abs_pitch_rad = kV7PositivePitchLimitRad;
-
-  const auto projected = projectCompactStagedPath(
-    start, goal, group_, "monitor_control_frame", positive_config);
+  const auto config = stagedPathConfig();
+  const auto projected = makeCompactStagedPath(start, goal, group_, config);
   ASSERT_TRUE(projected);
-  expectPathContract(start, goal, projected->waypoints, positive_config);
+  expectPathContract(start, goal, projected->waypoints, config);
 }
 
 TEST_F(CompactUprightPathTest, RejectsCancelledBudgetAndOutOfBoundsRequests)
 {
   const auto start = v9BrakedStart();
   const auto goal = namedGoal("compact_turn_negative_wrist");
-  auto config = projectionConfig();
+  auto config = stagedPathConfig();
 
-  EXPECT_FALSE(projectCompactStagedPath(
-      start, goal, group_, "monitor_control_frame", config, []() {return true;}));
+  EXPECT_FALSE(makeCompactStagedPath(start, goal, group_, config, []() {return true;}));
 
   config.maximum_samples = 2U;
-  EXPECT_FALSE(projectCompactStagedPath(
-      start, goal, group_, "monitor_control_frame", config));
+  EXPECT_FALSE(makeCompactStagedPath(start, goal, group_, config));
 
-  config = projectionConfig();
+  config = stagedPathConfig();
   Eigen::VectorXd outside_goal = goal;
   const auto & bounds = model_->getVariableBounds("joint2");
   outside_goal[1] = bounds.max_position_ + 0.1;
-  EXPECT_FALSE(projectCompactStagedPath(
-      start, outside_goal, group_, "monitor_control_frame", config));
+  EXPECT_FALSE(makeCompactStagedPath(start, outside_goal, group_, config));
 }
 
 TEST_F(CompactUprightPathTest, BackgroundPlannerReturnsCollisionAndRadiusValidatedRoute)
@@ -301,11 +302,12 @@ TEST_F(CompactUprightPathTest, BackgroundPlannerReturnsCollisionAndRadiusValidat
   goal.bounded_positions = goal_positions;
   goal.path_requirements.base_link_name = "link_base";
   goal.path_requirements.screen_link_name = "monitor_control_frame";
-  goal.path_requirements.maximum_roll_error_rad = kRollLimitRad;
+  goal.path_requirements.maximum_roll_error_rad = kPi;
   goal.path_requirements.maximum_abs_screen_pitch_rad = kPitchLimitRad;
   goal.path_requirements.maximum_assembly_radius_m = kCompactRadiusLimitM;
   goal.path_requirements.staged_route = CompactStagedRouteRequirements{
     0.35, kCompactRadiusLimitM};
+  goal.return_region = returnRegion(start, -1.0);
 
   // Match the production geometric validator: the robot collision model is the
   // CMake-expanded xarm6_table xacro used by runtime, with the runtime-only
@@ -370,7 +372,8 @@ TEST_F(CompactUprightPathTest, BackgroundPlannerReturnsCollisionAndRadiusValidat
   const auto result = waitForResult(planner);
   ASSERT_TRUE(result);
   ASSERT_TRUE(result->success) << result->message;
-  EXPECT_EQ(result->message, "Projected upright staged compact route validated");
+  ASSERT_TRUE(result->compact_return_path) << result->message;
+  EXPECT_TRUE(result->compact_return_path->goal_positions.allFinite());
   EXPECT_EQ(result->generation, generation);
   EXPECT_EQ(result->scene_revision, 7130U);
   EXPECT_EQ(result->profile_id, goal.profile_id);
@@ -379,9 +382,6 @@ TEST_F(CompactUprightPathTest, BackgroundPlannerReturnsCollisionAndRadiusValidat
   EXPECT_TRUE(result->path.back().isApprox(goal_positions, 0.0));
   EXPECT_TRUE(result->goal_positions.isApprox(goal_positions, 0.0));
   ASSERT_TRUE(result->validation_metrics);
-  EXPECT_LE(result->validation_metrics->maximum_roll_error_rad, kRollLimitRad + kPathTolerance);
-  EXPECT_LE(result->validation_metrics->maximum_abs_screen_pitch_rad,
-    kPitchLimitRad + kCompactPitchValidationToleranceRad);
   EXPECT_LE(result->validation_metrics->maximum_assembly_radius_m,
     kCompactRadiusLimitM + kPathTolerance);
   EXPECT_DOUBLE_EQ(
@@ -424,17 +424,25 @@ TEST_F(CompactUprightPathTest, ProjectionAndOmplShareOneCompactPlanningBudget)
   goal.path_requirements.maximum_assembly_radius_m = kCompactRadiusLimitM;
   goal.path_requirements.staged_route = CompactStagedRouteRequirements{
     0.35, kCompactRadiusLimitM};
+  goal.return_region = returnRegion(start, -1.0);
 
   auto short_budget = planner_config_;
   short_budget.compact_planning_time_s = 1.0e-9;
   BackgroundPathPlanner planner(node_, model_, monitor_, short_budget);
-  static_cast<void>(planner.submit(start, goal, 7131U));
+  const auto generation = planner.submit(start, goal, 7131U);
   const auto result = waitForResult(planner);
   ASSERT_TRUE(result);
+  EXPECT_EQ(result->generation, generation);
+  EXPECT_EQ(result->scene_revision, 7131U);
+  EXPECT_EQ(result->profile_id, goal.profile_id);
   EXPECT_FALSE(result->success);
   EXPECT_EQ(result->error_code, moveit_msgs::msg::MoveItErrorCodes::TIMED_OUT);
-  EXPECT_EQ(result->message, "Compact planning time budget exhausted");
+  EXPECT_FALSE(result->message.empty());
+  EXPECT_GT(result->elapsed_time_s, 0.0);
   EXPECT_TRUE(result->path.empty());
+  EXPECT_TRUE(result->compact_path_samples.empty());
+  EXPECT_FALSE(result->compact_goal_metrics.has_value());
+  EXPECT_FALSE(result->compact_return_path.has_value());
 }
 
 }  // namespace

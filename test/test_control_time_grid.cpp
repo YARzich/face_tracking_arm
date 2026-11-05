@@ -190,6 +190,25 @@ TEST(ControlTimeGrid, RecoveredAnchorRetainsComputeLeadAcrossNearBoundaryDelay)
   EXPECT_EQ(grid.commandStamp(114, 50, 20), 140);
 }
 
+TEST(ControlTimeGrid, CompactRecoveryHysteresisLeavesThirtyMillisecondSendMargin)
+{
+  constexpr std::int64_t period_ns = 10'000'000;
+  constexpr std::int64_t callback_ns = 437'127'000'000LL;
+  ControlTimeGrid grid{period_ns};
+  ASSERT_TRUE(grid.commandStamp(callback_ns + 40'000'000 - period_ns, 0, 0));
+
+  // One complete calculation period consumes the hysteresis reserve, leaving
+  // the unchanged residual latency minimum at send time.
+  EXPECT_EQ(grid.commandStamp(
+      callback_ns + period_ns, 50'000'000, 30'000'000),
+    callback_ns + 40'000'000);
+
+  ControlTimeGrid late_grid{period_ns};
+  ASSERT_TRUE(late_grid.commandStamp(callback_ns + 40'000'000 - period_ns, 0, 0));
+  EXPECT_FALSE(late_grid.commandStamp(
+      callback_ns + period_ns + 1, 50'000'000, 30'000'000).has_value());
+}
+
 TEST(ControlTimeGrid, AdoptsOnlyAFutureStampOnTheActiveCommandGrid)
 {
   ControlTimeGrid grid{10};
@@ -306,6 +325,52 @@ TEST(SnapshotTiming, KeepsFutureStaleAndRewoundFeedbackInvalid)
   EXPECT_FALSE(isInSameClockEpoch(2'000, rewound_snapshot_time_ns));
   EXPECT_FALSE(isFreshSnapshotTimestamp(
       rewound_stamp_ns, rewound_snapshot_time_ns, 20));
+}
+
+TEST(SnapshotTiming, KeepsInclusiveAgeBoundaryAndRejectsInvalidOrReplayedStamps)
+{
+  constexpr std::int64_t now_ns = 10'000'000'000LL;
+  constexpr std::int64_t timeout_ns = 30'000'000LL;
+  for (const std::int64_t age_ns : {0LL, 29'000'000LL, 30'000'000LL}) {
+    EXPECT_TRUE(isFreshSnapshotTimestamp(now_ns - age_ns, now_ns, timeout_ns))
+      << "age_ns=" << age_ns;
+  }
+  for (const std::int64_t age_ns : {
+        30'000'001LL, 31'000'000LL, 37'000'000LL})
+  {
+    EXPECT_FALSE(isFreshSnapshotTimestamp(now_ns - age_ns, now_ns, timeout_ns))
+      << "age_ns=" << age_ns;
+  }
+
+  EXPECT_FALSE(isFreshSnapshotTimestamp(0, now_ns, timeout_ns));
+  EXPECT_FALSE(isFreshSnapshotTimestamp(-1, now_ns, timeout_ns));
+  EXPECT_FALSE(isFreshSnapshotTimestamp(now_ns, 0, timeout_ns));
+  EXPECT_FALSE(isFreshSnapshotTimestamp(now_ns, -1, timeout_ns));
+  EXPECT_FALSE(isFreshSnapshotTimestamp(now_ns, now_ns, -1));
+
+  // A repeated receipt does not change the original sample time or make it fresh.
+  constexpr std::int64_t replayed_stamp_ns = now_ns - 29'000'000LL;
+  EXPECT_TRUE(isFreshSnapshotTimestamp(replayed_stamp_ns, now_ns, timeout_ns));
+  EXPECT_FALSE(isFreshSnapshotTimestamp(
+      replayed_stamp_ns, now_ns + 2'000'000LL, timeout_ns));
+  EXPECT_FALSE(isInSameClockEpoch(now_ns, now_ns - 1));
+}
+
+TEST(SnapshotTiming, FutureToleranceIsExplicitAndIndependentOfTheAgeLimit)
+{
+  constexpr std::int64_t now_ns = 10'000'000'000LL;
+  constexpr std::int64_t age_limit_ns = 30'000'000LL;
+  constexpr std::int64_t future_limit_ns = 3'000'000LL;
+  EXPECT_FALSE(isFreshSnapshotTimestamp(now_ns + 1, now_ns, age_limit_ns));
+  EXPECT_TRUE(isFreshSnapshotTimestamp(now_ns + 1, now_ns, age_limit_ns, future_limit_ns));
+  EXPECT_TRUE(isFreshSnapshotTimestamp(
+      now_ns + future_limit_ns, now_ns, age_limit_ns, future_limit_ns));
+  EXPECT_FALSE(isFreshSnapshotTimestamp(
+      now_ns + future_limit_ns + 1, now_ns, age_limit_ns, future_limit_ns));
+  EXPECT_FALSE(isFreshSnapshotTimestamp(
+      now_ns - age_limit_ns - 1, now_ns, age_limit_ns, future_limit_ns));
+  EXPECT_FALSE(isFreshSnapshotTimestamp(
+      4'790'000'000LL, 4'827'000'000LL, age_limit_ns, future_limit_ns));
 }
 
 }  // namespace

@@ -19,7 +19,9 @@
 #include "face_tracking_arm/compact_geometry_validator.hpp"
 #include "face_tracking_arm/compact_upright_path.hpp"
 #include "face_tracking_arm/horizontal_edge_upright.hpp"
+#include "face_tracking_arm/posture_geometry.hpp"
 
+#include <moveit/constraint_samplers/default_constraint_samplers.hpp>
 #include <moveit/kinematic_constraints/utils.hpp>
 #include <moveit/planning_interface/planning_interface.hpp>
 #include <moveit/planning_pipeline/planning_pipeline.hpp>
@@ -28,6 +30,7 @@
 #include <moveit_msgs/msg/orientation_constraint.hpp>
 #include <rclcpp/logging.hpp>
 #include <tf2_eigen/tf2_eigen.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 
 namespace face_tracking_arm::control
 {
@@ -47,6 +50,27 @@ constexpr double kStagedProfileQ6ToleranceRad = 0.0201;
 bool positiveFinite(double value)
 {
   return std::isfinite(value) && value > 0.0;
+}
+
+bool insidePositionBounds(
+  const Eigen::VectorXd & positions, const std::vector<std::string> & variable_names,
+  const moveit::core::RobotModelConstPtr & model)
+{
+  if (!model || positions.size() != static_cast<Eigen::Index>(variable_names.size()) ||
+    !positions.allFinite())
+  {
+    return false;
+  }
+  for (Eigen::Index index = 0; index < positions.size(); ++index) {
+    const auto & bounds = model->getVariableBounds(
+      variable_names[static_cast<std::size_t>(index)]);
+    if (bounds.position_bounded_ &&
+      (positions[index] < bounds.min_position_ || positions[index] > bounds.max_position_))
+    {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool normalizeStartWithinBounds(
@@ -102,6 +126,41 @@ bool horizontalEdgePathValid(
     rotation, requirement.maximum_abs_edge_sine).has_value();
 }
 
+moveit_msgs::msg::Constraints makeReturnGoalConstraints(
+  const CompactReturnRegion & region, const std::string & screen_link_name,
+  const std::string & model_frame)
+{
+  const Eigen::Vector3d x_axis = region.outward_x_world.normalized();
+  const Eigen::Vector3d z_axis = Eigen::Vector3d::UnitZ();
+  const Eigen::Vector3d y_axis = z_axis.cross(x_axis).normalized();
+  const Eigen::Vector3d orthogonal_z = x_axis.cross(y_axis).normalized();
+  Eigen::Matrix3d target_rotation;
+  target_rotation.col(0) = x_axis;
+  target_rotation.col(1) = y_axis;
+  target_rotation.col(2) = orthogonal_z;
+
+  geometry_msgs::msg::PoseStamped target_pose;
+  target_pose.header.frame_id = model_frame;
+  target_pose.pose.position.x = region.center_world.x();
+  target_pose.pose.position.y = region.center_world.y();
+  target_pose.pose.position.z = region.center_world.z();
+  target_pose.pose.orientation = tf2::toMsg(Eigen::Quaterniond(target_rotation));
+  auto constraints = kinematic_constraints::constructGoalConstraints(
+    screen_link_name, target_pose, region.radius_m, region.direction_tolerance_rad);
+  if (constraints.orientation_constraints.empty()) {
+    return moveit_msgs::msg::Constraints();
+  }
+  auto & orientation = constraints.orientation_constraints.front();
+  // Keep the screen normal in the outward cone and constrain roll through the
+  // horizontal screen edge. The same axes are checked again by the endpoint filter.
+  orientation.parameterization =
+    moveit_msgs::msg::OrientationConstraint::XYZ_EULER_ANGLES;
+  orientation.absolute_x_axis_tolerance = region.horizontal_edge_tolerance_rad;
+  orientation.absolute_y_axis_tolerance = region.direction_tolerance_rad;
+  orientation.absolute_z_axis_tolerance = region.direction_tolerance_rad;
+  return constraints;
+}
+
 std::optional<double> screenPitch(
   const moveit::core::RobotState & state, const std::string & screen_link_name)
 {
@@ -110,46 +169,118 @@ std::optional<double> screenPitch(
   return pose ? std::optional<double>(pose->signed_pitch_rad) : std::nullopt;
 }
 
-bool addCompactOrientationGuide(
-  moveit::core::RobotState const & start, const PathRequirements & requirements,
-  planning_interface::MotionPlanRequest & motion_request)
+void recordMetricMaximum(double & destination, const std::optional<double> & value)
 {
-  if (!requirements.maximum_abs_screen_pitch_rad) {
-    return true;
+  if (value && std::isfinite(*value)) {
+    const double absolute_value = std::abs(*value);
+    destination = std::isfinite(destination) ?
+      std::max(destination, absolute_value) : absolute_value;
   }
-  const auto guide_bounds = compactOrientationGuideBounds(
-    *requirements.maximum_abs_screen_pitch_rad, requirements.maximum_roll_error_rad);
-  if (!guide_bounds) {
-    return false;
-  }
+}
 
-  const auto pose = evaluateCompactUprightPose(
-    start.getGlobalLinkTransform(requirements.screen_link_name).linear());
-  if (!pose) {
+void recordMetricMaximum(double & destination, const double value)
+{
+  if (std::isfinite(value)) {
+    destination = std::isfinite(destination) ?
+      std::max(destination, value) : value;
+  }
+}
+
+bool validCompactReturnRegion(
+  const CompactReturnRegion & region, const moveit::core::RobotModelConstPtr & model,
+  const moveit::core::JointModelGroup * group)
+{
+  if (!model || !group ||
+    region.reference_positions.size() != static_cast<Eigen::Index>(group->getVariableCount()) ||
+    !region.reference_positions.allFinite() || !region.center_world.allFinite() ||
+    !region.outward_x_world.allFinite() || !std::isfinite(region.radius_m) ||
+    region.radius_m <= 0.0 || !std::isfinite(region.direction_tolerance_rad) ||
+    region.direction_tolerance_rad < 0.0 || region.direction_tolerance_rad > kPi ||
+    !std::isfinite(region.horizontal_edge_tolerance_rad) ||
+    region.horizontal_edge_tolerance_rad < 0.0 ||
+    region.horizontal_edge_tolerance_rad > 0.5 * kPi ||
+    !std::isfinite(region.target_joint1_rad) ||
+    !std::isfinite(region.joint1_tolerance_rad) || region.joint1_tolerance_rad <= 0.0 ||
+    !std::isfinite(region.comfortable_joint3_lower) ||
+    !std::isfinite(region.comfortable_joint3_upper) ||
+    region.comfortable_joint3_upper <= region.comfortable_joint3_lower ||
+    !std::isfinite(region.minimum_elbow_height_m) || region.minimum_elbow_height_m < 0.0)
+  {
     return false;
   }
-  const double yaw = std::atan2(pose->screen_normal.y(), pose->screen_normal.x());
-  const Eigen::Matrix3d target_rotation =
-    Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
-  moveit_msgs::msg::OrientationConstraint constraint;
-  constraint.header.frame_id = start.getRobotModel()->getModelFrame();
-  constraint.link_name = requirements.screen_link_name;
-  constraint.orientation = tf2::toMsg(Eigen::Quaterniond(target_rotation));
-  constexpr double kGuideNumericalMargin = 1.0e-4;
-  constraint.absolute_x_axis_tolerance =
-    guide_bounds->absolute_x_axis_tolerance_rad + kGuideNumericalMargin;
-  constraint.absolute_y_axis_tolerance =
-    guide_bounds->absolute_y_axis_tolerance_rad + kGuideNumericalMargin;
-  // Rotation about world up is free. Exact screen-normal-axis roll is still checked
-  // by evaluateCompactUprightPose on every planner and execution-path sample.
-  constraint.absolute_z_axis_tolerance = kPi;
-  constraint.weight = 1.0;
-  motion_request.path_constraints.orientation_constraints.push_back(constraint);
+  const double direction_norm = region.outward_x_world.norm();
+  if (!std::isfinite(direction_norm) || std::abs(direction_norm - 1.0) > 1.0e-6 ||
+    std::abs(region.outward_x_world.z()) > 1.0e-6)
+  {
+    return false;
+  }
+  const auto & names = group->getVariableNames();
+  const auto joint1 = std::find(names.begin(), names.end(), "joint1");
+  const auto joint3 = std::find(names.begin(), names.end(), "joint3");
+  if (joint1 == names.end() || joint3 == names.end()) {
+    return false;
+  }
+  const Eigen::Index joint1_index = std::distance(names.begin(), joint1);
+  const double turn_delta = region.target_joint1_rad - region.reference_positions[joint1_index];
+  if (std::abs(std::abs(turn_delta) - 2.0 * kPi) > region.joint1_tolerance_rad + 1.0e-6) {
+    return false;
+  }
+  const auto & q1_bounds = model->getVariableBounds(*joint1);
+  if (q1_bounds.position_bounded_ &&
+    (region.target_joint1_rad < q1_bounds.min_position_ ||
+    region.target_joint1_rad > q1_bounds.max_position_))
+  {
+    return false;
+  }
   return true;
 }
 
-
 }  // namespace
+
+bool compactReturnRegionContains(
+  const CompactReturnRegion & region, const Eigen::Vector3d & screen_origin_world,
+  const Eigen::Matrix3d & screen_rotation_world, const Eigen::Vector3d & shoulder_world,
+  const Eigen::Vector3d & elbow_world, const Eigen::Vector3d & wrist_world,
+  const double joint1, const double joint3)
+{
+  if (!region.center_world.allFinite() || !region.outward_x_world.allFinite() ||
+    !screen_origin_world.allFinite() || !validEdgeRotation(screen_rotation_world) ||
+    !std::isfinite(region.radius_m) || region.radius_m <= 0.0 ||
+    !std::isfinite(region.direction_tolerance_rad) || region.direction_tolerance_rad < 0.0 ||
+    region.direction_tolerance_rad > kPi ||
+    !std::isfinite(region.horizontal_edge_tolerance_rad) ||
+    region.horizontal_edge_tolerance_rad < 0.0 ||
+    region.horizontal_edge_tolerance_rad > 0.5 * kPi ||
+    !std::isfinite(region.target_joint1_rad) ||
+    !std::isfinite(region.joint1_tolerance_rad) || region.joint1_tolerance_rad < 0.0 ||
+    !std::isfinite(region.comfortable_joint3_lower) ||
+    !std::isfinite(region.comfortable_joint3_upper) ||
+    region.comfortable_joint3_upper <= region.comfortable_joint3_lower ||
+    !std::isfinite(region.minimum_elbow_height_m) || region.minimum_elbow_height_m < 0.0 ||
+    !std::isfinite(joint1) || !std::isfinite(joint3) ||
+    std::abs(region.outward_x_world.norm() - 1.0) > 1.0e-6 ||
+    std::abs(region.outward_x_world.z()) > 1.0e-6)
+  {
+    return false;
+  }
+  if (!evaluateHorizontalEdgeUpright(
+      screen_rotation_world, region.horizontal_edge_tolerance_rad))
+  {
+    return false;
+  }
+  const double position_error = (screen_origin_world - region.center_world).norm();
+  const Eigen::Vector3d outward = region.outward_x_world.normalized();
+  const Eigen::Vector3d screen_x = screen_rotation_world.col(0).normalized();
+  const double direction_error = std::acos(std::clamp(outward.dot(screen_x), -1.0, 1.0));
+  const auto upward_bend = evaluateUpwardBend(shoulder_world, elbow_world, wrist_world);
+  return std::isfinite(position_error) && position_error <= region.radius_m + 1.0e-9 &&
+         std::isfinite(direction_error) &&
+         direction_error <= region.direction_tolerance_rad + 1.0e-9 &&
+         std::abs(joint1 - region.target_joint1_rad) <= region.joint1_tolerance_rad + 1.0e-9 &&
+         joint3 >= region.comfortable_joint3_lower - 1.0e-9 &&
+         joint3 <= region.comfortable_joint3_upper + 1.0e-9 && upward_bend &&
+         *upward_bend >= region.minimum_elbow_height_m - 1.0e-9;
+}
 
 struct BackgroundPathPlanner::Impl
 {
@@ -181,8 +312,6 @@ struct BackgroundPathPlanner::Impl
     const auto & variable_names = group->getVariableNames();
     const auto yaw_joint = std::find(variable_names.begin(), variable_names.end(), "joint1");
     const auto reset_joint = std::find(variable_names.begin(), variable_names.end(), "joint4");
-    const auto wrist_pitch_joint = std::find(variable_names.begin(), variable_names.end(),
-        "joint5");
     const auto joint6 = std::find(variable_names.begin(), variable_names.end(), "joint6");
     const auto index_of = [&variable_names](const auto iterator) -> std::optional<std::size_t> {
         if (iterator == variable_names.end()) {
@@ -192,7 +321,6 @@ struct BackgroundPathPlanner::Impl
       };
     staged_yaw_index = index_of(yaw_joint);
     staged_reset_index = index_of(reset_joint);
-    staged_wrist_pitch_index = index_of(wrist_pitch_joint);
     staged_joint6_index = index_of(joint6);
     const auto * first_joint_parent = group->getJointModels().front()->getParentLinkModel();
     if (!first_joint_parent) {
@@ -230,8 +358,8 @@ struct BackgroundPathPlanner::Impl
         node->declare_parameter(name, value);
       }
     }
-    // Compact requests add a native orientation guide but keep bounded joint
-    // interpolation. Requests without path constraints remain ordinary joint-space plans.
+    // Keep the planner in bounded joint coordinates so a full turn cannot be
+    // erased by periodic normalization. Compact paths carry no orientation path guide.
     const std::string joint_space_parameter = prefix + config.move_group_name +
       ".enforce_joint_model_state_space";
     if (!node->has_parameter(joint_space_parameter)) {
@@ -322,8 +450,7 @@ struct BackgroundPathPlanner::Impl
         if (compact_certificate_samples.size() >= kMaximumCompactValidationSamples ||
           positions.size() != static_cast<Eigen::Index>(group->getVariableCount()) ||
           !positions.allFinite() || !std::isfinite(fraction) || fraction < 0.0 ||
-          fraction > 1.0 || !std::isfinite(radius) || !std::isfinite(roll) ||
-          !std::isfinite(pitch))
+          fraction > 1.0 || !std::isfinite(radius))
         {
           return false;
         }
@@ -357,15 +484,8 @@ struct BackgroundPathPlanner::Impl
           return true;
         }
         const auto & requirements = request.compact_goal->path_requirements;
-        const auto roll_error = uprightRollError(state, requirements.screen_link_name);
-        const auto pitch = screenPitch(state, requirements.screen_link_name);
         const double radius = compact_geometry->maximumAssemblyRadius(state);
-        const bool pitch_valid = !requirements.maximum_abs_screen_pitch_rad ||
-          (pitch && std::abs(*pitch) <= *requirements.maximum_abs_screen_pitch_rad +
-          kCompactPitchValidationToleranceRad);
-        return roll_error && pitch && std::isfinite(radius) && pitch_valid &&
-               *roll_error <= requirements.maximum_roll_error_rad &&
-               radius <= requirements.maximum_assembly_radius_m;
+        return std::isfinite(radius) && radius <= requirements.maximum_assembly_radius_m;
       };
     const auto edge_valid = [this, &request](
       const moveit::core::RobotState & state) -> bool
@@ -412,22 +532,12 @@ struct BackgroundPathPlanner::Impl
       compact_start_roll_error = roll;
       compact_start_pitch = pitch;
       compact_start_radius = radius;
-      if (roll) {
-        result.validation_metrics->maximum_roll_error_rad = std::abs(*roll);
-      }
-      if (pitch) {
-        result.validation_metrics->maximum_abs_screen_pitch_rad = std::abs(*pitch);
-      }
+      recordMetricMaximum(result.validation_metrics->maximum_roll_error_rad, roll);
+      recordMetricMaximum(result.validation_metrics->maximum_abs_screen_pitch_rad, pitch);
       result.validation_metrics->maximum_assembly_radius_m = radius;
-      if (!roll || !pitch || !std::isfinite(radius) ||
-        std::abs(*roll) > requirements.maximum_roll_error_rad ||
-        (requirements.maximum_abs_screen_pitch_rad &&
-        std::abs(*pitch) > *requirements.maximum_abs_screen_pitch_rad +
-        kCompactPitchValidationToleranceRad) ||
-        radius > requirements.maximum_assembly_radius_m)
-      {
+      if (!std::isfinite(radius) || radius > requirements.maximum_assembly_radius_m) {
         result.error_code = ErrorCode::START_STATE_INVALID;
-        result.message = "Compact path start violates its pitch, roll or radius requirement";
+        result.message = "Compact path start violates its radius requirement";
         return result;
       }
       result.validation_metrics->checked_samples = 1;
@@ -437,10 +547,12 @@ struct BackgroundPathPlanner::Impl
       result.message = "Start violates collision or additional clearance constraints";
       return result;
     }
-    if (request.compact_goal && (!compact_start_roll_error || !compact_start_pitch ||
+    if (request.compact_goal &&
       !append_compact_certificate_sample(
         result.start_positions, 0U, 0.0, compact_start_radius,
-        *compact_start_roll_error, *compact_start_pitch)))
+        compact_start_roll_error.value_or(std::numeric_limits<double>::quiet_NaN()),
+        compact_start_pitch ? std::abs(*compact_start_pitch) :
+        std::numeric_limits<double>::quiet_NaN()))
     {
       result.error_code = ErrorCode::INVALID_MOTION_PLAN;
       result.message = "Compact start certificate is malformed or exceeds its sample budget";
@@ -466,32 +578,20 @@ struct BackgroundPathPlanner::Impl
       const auto roll = uprightRollError(goal, requirements.screen_link_name);
       const auto pitch = screenPitch(goal, requirements.screen_link_name);
       const double radius = compact_geometry->maximumAssemblyRadius(goal);
-      if (roll) {
-        result.validation_metrics->maximum_roll_error_rad = std::max(
-          result.validation_metrics->maximum_roll_error_rad, std::abs(*roll));
-      }
-      if (pitch) {
-        result.validation_metrics->maximum_abs_screen_pitch_rad = std::max(
-          result.validation_metrics->maximum_abs_screen_pitch_rad, std::abs(*pitch));
-      }
+      recordMetricMaximum(result.validation_metrics->maximum_roll_error_rad, roll);
+      recordMetricMaximum(result.validation_metrics->maximum_abs_screen_pitch_rad, pitch);
       if (std::isfinite(radius)) {
         result.validation_metrics->maximum_assembly_radius_m = std::max(
           result.validation_metrics->maximum_assembly_radius_m, radius);
       }
-      if (!roll || !pitch || !std::isfinite(radius) ||
-        std::abs(*roll) > requirements.maximum_roll_error_rad ||
-        (requirements.maximum_abs_screen_pitch_rad &&
-        std::abs(*pitch) > *requirements.maximum_abs_screen_pitch_rad +
-        kCompactPitchValidationToleranceRad) ||
-        radius > requirements.maximum_assembly_radius_m)
-      {
+      if (!std::isfinite(radius) || radius > requirements.maximum_assembly_radius_m) {
         result.error_code = ErrorCode::GOAL_IN_COLLISION;
-        result.message = "Compact goal violates its pitch, roll or radius requirement";
+        result.message = "Compact goal violates its radius requirement";
         return result;
       }
       PathValidationMetrics goal_metrics;
-      goal_metrics.maximum_roll_error_rad = std::abs(*roll);
-      goal_metrics.maximum_abs_screen_pitch_rad = std::abs(*pitch);
+      recordMetricMaximum(goal_metrics.maximum_roll_error_rad, roll);
+      recordMetricMaximum(goal_metrics.maximum_abs_screen_pitch_rad, pitch);
       goal_metrics.maximum_assembly_radius_m = radius;
       goal_metrics.effective_radius_cap_m = requirements.maximum_assembly_radius_m;
       goal_metrics.checked_samples = 1U;
@@ -554,24 +654,15 @@ struct BackgroundPathPlanner::Impl
             sample, request.compact_goal->path_requirements.screen_link_name);
           const auto pitch = screenPitch(
             sample, request.compact_goal->path_requirements.screen_link_name);
-          if (!roll || !pitch ||
-            std::abs(*roll) > request.compact_goal->path_requirements.maximum_roll_error_rad ||
-            (request.compact_goal->path_requirements.maximum_abs_screen_pitch_rad &&
-            std::abs(*pitch) >
-            *request.compact_goal->path_requirements.maximum_abs_screen_pitch_rad +
-            kCompactPitchValidationToleranceRad))
-          {
-            return false;
-          }
-          result.validation_metrics->maximum_roll_error_rad = std::max(
-            result.validation_metrics->maximum_roll_error_rad, std::abs(*roll));
-          result.validation_metrics->maximum_abs_screen_pitch_rad = std::max(
-            result.validation_metrics->maximum_abs_screen_pitch_rad, std::abs(*pitch));
+          recordMetricMaximum(result.validation_metrics->maximum_roll_error_rad, roll);
+          recordMetricMaximum(result.validation_metrics->maximum_abs_screen_pitch_rad, pitch);
           result.validation_metrics->maximum_assembly_radius_m = std::max(
             result.validation_metrics->maximum_assembly_radius_m, radius);
           ++result.validation_metrics->checked_samples;
           if (!append_compact_certificate_sample(
-              positions, segment_index, fraction, radius, std::abs(*roll), std::abs(*pitch)))
+              positions, segment_index, fraction, radius,
+              roll.value_or(std::numeric_limits<double>::quiet_NaN()),
+              pitch ? std::abs(*pitch) : std::numeric_limits<double>::quiet_NaN()))
           {
             return false;
           }
@@ -585,7 +676,7 @@ struct BackgroundPathPlanner::Impl
       request.compact_goal->path_requirements.staged_route.has_value();
     const bool supported_staged_model = staged_profile_requested &&
       robot_model->getName() == "xarm6" && group->getVariableCount() == 6 &&
-      staged_yaw_index && staged_reset_index && staged_wrist_pitch_index && staged_joint6_index;
+      staged_yaw_index && staged_reset_index && staged_joint6_index;
     bool known_staged_profile = false;
     if (supported_staged_model) {
       const Eigen::VectorXd & committed_goal = result.goal_positions;
@@ -611,6 +702,22 @@ struct BackgroundPathPlanner::Impl
       if (!known_staged_profile) {
         result.error_code = ErrorCode::INVALID_MOTION_PLAN;
         result.message = "Staged compact goal does not match its named SRDF posture";
+        return result;
+      }
+    }
+    if (known_staged_profile && !request.compact_goal->return_region) {
+      result.error_code = ErrorCode::INVALID_MOTION_PLAN;
+      result.message = "Staged compact goal is missing its mandatory return region";
+      return result;
+    }
+    if (request.compact_goal && request.compact_goal->return_region) {
+      const auto & return_region = *request.compact_goal->return_region;
+      if (!validCompactReturnRegion(return_region, robot_model, group) ||
+        !insidePositionBounds(
+          return_region.reference_positions, group->getVariableNames(), robot_model))
+      {
+        result.error_code = ErrorCode::INVALID_MOTION_PLAN;
+        result.message = "Compact return region is invalid or outside bounded joint coordinates";
         return result;
       }
     }
@@ -663,42 +770,34 @@ struct BackgroundPathPlanner::Impl
         result.validation_metrics = metrics_before_direct;
         compact_radius_entered = compact_entered_before_direct;
         compact_certificate_samples.resize(certificate_samples_before_direct);
-        const auto projection_cancelled = [&]() {
+        const auto path_cancelled = [&]() {
             return obsolete(request.generation) ||
                    std::chrono::duration<double>(SteadyClock::now() - plan_start).count() >=
                    config.compact_planning_time_s;
           };
-        CompactStagedProjectionConfig projection_config;
-        projection_config.yaw_joint_index = *staged_yaw_index;
-        projection_config.reset_joint_index = *staged_reset_index;
-        projection_config.wrist_pitch_joint_index = *staged_wrist_pitch_index;
-        projection_config.wrist_roll_joint_index = *staged_joint6_index;
-        projection_config.maximum_early_yaw_shift_rad = staged.maximum_early_yaw_shift_rad;
-        projection_config.maximum_abs_pitch_rad =
-          request.compact_goal->path_requirements.maximum_abs_screen_pitch_rad.value_or(0.5 * kPi);
-        projection_config.maximum_roll_error_rad =
-          request.compact_goal->path_requirements.maximum_roll_error_rad;
-        projection_config.maximum_joint_step_rad = kCompactValidationJointStepRad;
-        projection_config.maximum_samples = kMaximumCompactValidationSamples;
-        const auto projected_path = projectCompactStagedPath(
-          start, result.goal_positions, group,
-          request.compact_goal->path_requirements.screen_link_name,
-          projection_config, projection_cancelled);
-        if (projected_path && !obsolete(request.generation)) {
+        CompactStagedPathConfig staged_path_config;
+        staged_path_config.yaw_joint_index = *staged_yaw_index;
+        staged_path_config.reset_joint_index = *staged_reset_index;
+        staged_path_config.maximum_early_yaw_shift_rad = staged.maximum_early_yaw_shift_rad;
+        staged_path_config.maximum_joint_step_rad = kCompactValidationJointStepRad;
+        staged_path_config.maximum_samples = kMaximumCompactValidationSamples;
+        const auto staged_path = makeCompactStagedPath(
+          start, result.goal_positions, group, staged_path_config, path_cancelled);
+        if (staged_path && !obsolete(request.generation)) {
           std::vector<Eigen::VectorXd> validated_path{result.start_positions};
-          bool valid = projected_path->fold_end_index > 0U &&
-            projected_path->fold_end_index < projected_path->waypoints.size();
+          bool valid = staged_path->fold_end_index > 0U &&
+            staged_path->fold_end_index < staged_path->waypoints.size();
           if (valid) {
             moveit::core::RobotState fold_end_state(start);
             fold_end_state.setJointGroupPositions(
-              group, projected_path->waypoints[projected_path->fold_end_index]);
+              group, staged_path->waypoints[staged_path->fold_end_index]);
             fold_end_state.update();
             const double fold_end_radius =
               compact_geometry->maximumAssemblyRadius(fold_end_state);
             valid = std::isfinite(fold_end_radius) &&
               fold_end_radius <= staged.maximum_compact_radius_m + 1.0e-9;
           }
-          for (std::size_t index = 1; valid && index < projected_path->waypoints.size(); ++index) {
+          for (std::size_t index = 1; valid && index < staged_path->waypoints.size(); ++index) {
             if (obsolete(request.generation)) {
               return result;
             }
@@ -706,7 +805,7 @@ struct BackgroundPathPlanner::Impl
               staged.maximum_compact_radius_m :
               request.compact_goal->path_requirements.maximum_assembly_radius_m;
             if (!append_direct_segment(
-                projected_path->waypoints[index - 1U], projected_path->waypoints[index],
+                staged_path->waypoints[index - 1U], staged_path->waypoints[index],
                 segment_cap, staged.maximum_compact_radius_m,
                 compact_radius_entered, validated_path))
             {
@@ -717,7 +816,7 @@ struct BackgroundPathPlanner::Impl
           if (valid && validated_path.back().isApprox(result.goal_positions, 1.0e-12)) {
             staged_route_direct_complete = true;
             result.path = std::move(validated_path);
-            result.message = "Projected upright staged compact route validated";
+            result.message = "Staged compact route validated";
           }
         }
         if (!staged_route_direct_complete) {
@@ -761,16 +860,6 @@ struct BackgroundPathPlanner::Impl
     planning_goal.update();
     motion_request.goal_constraints.push_back(kinematic_constraints::constructGoalConstraints(
         planning_goal, group, config.joint_tolerance_rad, config.joint_tolerance_rad));
-    // This conservative MoveIt orientation box guides constrained sampling.
-    // The worker feasibility predicate and explicit path validator remain the
-    // authority for physical pitch, gravity-upright roll and assembly radius.
-    if (request.compact_goal && !addCompactOrientationGuide(
-        start, request.compact_goal->path_requirements, motion_request))
-    {
-      result.error_code = ErrorCode::FAILURE;
-      result.message = "Compact orientation guide could not be constructed";
-      return result;
-    }
     if (obsolete(request.generation)) {
       return result;
     }
@@ -834,7 +923,8 @@ struct BackgroundPathPlanner::Impl
       if (!planned || !response || !response.trajectory ||
         response.trajectory->getWayPointCount() == 0)
       {
-        result.message = "OMPL did not return a solution";
+        result.message = "OMPL did not return a solution: error_code=" +
+          std::to_string(response.error_code.val);
         return result;
       }
       if (obsolete(request.generation)) {
@@ -906,14 +996,8 @@ struct BackgroundPathPlanner::Impl
             const auto roll = uprightRollError(sample, requirements.screen_link_name);
             const auto pitch = screenPitch(sample, requirements.screen_link_name);
             const double radius = compact_geometry->maximumAssemblyRadius(sample);
-            if (roll) {
-              result.validation_metrics->maximum_roll_error_rad = std::max(
-                result.validation_metrics->maximum_roll_error_rad, std::abs(*roll));
-            }
-            if (pitch) {
-              result.validation_metrics->maximum_abs_screen_pitch_rad = std::max(
-                result.validation_metrics->maximum_abs_screen_pitch_rad, std::abs(*pitch));
-            }
+            recordMetricMaximum(result.validation_metrics->maximum_roll_error_rad, roll);
+            recordMetricMaximum(result.validation_metrics->maximum_abs_screen_pitch_rad, pitch);
             if (std::isfinite(radius)) {
               result.validation_metrics->maximum_assembly_radius_m = std::max(
                 result.validation_metrics->maximum_assembly_radius_m, radius);
@@ -926,14 +1010,11 @@ struct BackgroundPathPlanner::Impl
             }
             const bool compact_radius_exit = staged_route_active && compact_radius_entered &&
               (!std::isfinite(radius) || radius > staged->maximum_compact_radius_m + 1.0e-9);
-            if (!roll || !pitch || !std::isfinite(radius) || compact_radius_exit ||
-              std::abs(*roll) > requirements.maximum_roll_error_rad ||
-              (requirements.maximum_abs_screen_pitch_rad &&
-              std::abs(*pitch) > *requirements.maximum_abs_screen_pitch_rad +
-              kCompactPitchValidationToleranceRad) ||
+            if (!std::isfinite(radius) || compact_radius_exit ||
               radius > requirements.maximum_assembly_radius_m)
             {
-              result.message = "An interpolated compact-path sample violates pitch/roll/radius";
+              result.message =
+                "An interpolated compact-path sample violates its radius requirement";
               result.path.clear();
               result.error_code = ErrorCode::INVALID_MOTION_PLAN;
               return result;
@@ -941,7 +1022,8 @@ struct BackgroundPathPlanner::Impl
             ++result.validation_metrics->checked_samples;
             if (!append_compact_certificate_sample(
                 sampled_positions, original_segment_index, fraction, radius,
-                std::abs(*roll), std::abs(*pitch)))
+                roll.value_or(std::numeric_limits<double>::quiet_NaN()),
+                pitch ? std::abs(*pitch) : std::numeric_limits<double>::quiet_NaN()))
             {
               result.message = "Compact path certificate exceeds its sample budget";
               result.path.clear();
@@ -993,10 +1075,11 @@ struct BackgroundPathPlanner::Impl
     if (request.compact_goal && result.path.size() == 1U) {
       // Keep the planner's established zero-motion success case and represent
       // its single checked state as both endpoints of a degenerate segment.
-      if (!compact_start_roll_error || !compact_start_pitch ||
-        !append_compact_certificate_sample(
+      if (!append_compact_certificate_sample(
           result.path.front(), 0U, 1.0, compact_start_radius,
-          *compact_start_roll_error, *compact_start_pitch))
+          compact_start_roll_error.value_or(std::numeric_limits<double>::quiet_NaN()),
+          compact_start_pitch ? std::abs(*compact_start_pitch) :
+          std::numeric_limits<double>::quiet_NaN()))
       {
         result.error_code = ErrorCode::INVALID_MOTION_PLAN;
         result.message = "Compact zero-motion certificate is malformed";
@@ -1027,9 +1110,7 @@ struct BackgroundPathPlanner::Impl
         certificate_valid = sample.original_segment_index < result.path.size() - 1U &&
           std::isfinite(sample.fraction) && sample.fraction >= 0.0 && sample.fraction <= 1.0 &&
           sample.positions.size() == result.start_positions.size() &&
-          sample.positions.allFinite() && std::isfinite(sample.maximum_assembly_radius_m) &&
-          std::isfinite(sample.maximum_roll_error_rad) &&
-          std::isfinite(sample.maximum_abs_screen_pitch_rad);
+          sample.positions.allFinite() && std::isfinite(sample.maximum_assembly_radius_m);
         if (!certificate_valid) {
           break;
         }
@@ -1054,9 +1135,7 @@ struct BackgroundPathPlanner::Impl
         }
       }
       if (!certificate_valid || !goal_metrics ||
-        !std::isfinite(goal_metrics->maximum_assembly_radius_m) ||
-        !std::isfinite(goal_metrics->maximum_roll_error_rad) ||
-        !std::isfinite(goal_metrics->maximum_abs_screen_pitch_rad))
+        !std::isfinite(goal_metrics->maximum_assembly_radius_m))
       {
         result.error_code = ErrorCode::INVALID_MOTION_PLAN;
         result.message = "Compact path certificate is incomplete or malformed";
@@ -1072,15 +1151,298 @@ struct BackgroundPathPlanner::Impl
       {
         suffix_maximum_radius = std::max(
           suffix_maximum_radius, sample->maximum_assembly_radius_m);
-        suffix_maximum_roll = std::max(suffix_maximum_roll, sample->maximum_roll_error_rad);
-        suffix_maximum_pitch = std::max(
-          suffix_maximum_pitch, sample->maximum_abs_screen_pitch_rad);
+        recordMetricMaximum(suffix_maximum_roll, sample->maximum_roll_error_rad);
+        recordMetricMaximum(suffix_maximum_pitch, sample->maximum_abs_screen_pitch_rad);
         sample->suffix_maximum_assembly_radius_m = suffix_maximum_radius;
         sample->suffix_maximum_roll_error_rad = suffix_maximum_roll;
         sample->suffix_maximum_abs_screen_pitch_rad = suffix_maximum_pitch;
       }
       result.compact_path_samples = std::move(compact_certificate_samples);
       result.compact_goal_metrics = std::move(exact_compact_goal_metrics);
+    }
+    const bool return_required = request.compact_goal &&
+      (request.compact_goal->return_region.has_value() || known_staged_profile);
+    if (return_required) {
+      const auto & requirements = request.compact_goal->path_requirements;
+      const auto & region = *request.compact_goal->return_region;
+      const auto return_budget_exhausted = [this, &plan_start]() {
+          return std::chrono::duration<double>(SteadyClock::now() - plan_start).count() >=
+                 config.compact_planning_time_s;
+        };
+      const auto & variable_names = group->getVariableNames();
+      const auto joint1_name = std::find(variable_names.begin(), variable_names.end(), "joint1");
+      const auto joint3_name = std::find(variable_names.begin(), variable_names.end(), "joint3");
+      const auto * screen_link = robot_model->getLinkModel(requirements.screen_link_name);
+      const auto * shoulder_link = robot_model->getLinkModel("link2");
+      const auto * elbow_link = robot_model->getLinkModel("link3");
+      const auto * wrist_link = robot_model->getLinkModel("link4");
+      if (joint1_name == variable_names.end() || joint3_name == variable_names.end() ||
+        !screen_link || !shoulder_link || !elbow_link || !wrist_link)
+      {
+        result.error_code = ErrorCode::INVALID_MOTION_PLAN;
+        result.message = "Compact return endpoint links or joints are unavailable";
+        return result;
+      }
+      const Eigen::Index joint1_index = std::distance(variable_names.begin(), joint1_name);
+      const Eigen::Index joint3_index = std::distance(variable_names.begin(), joint3_name);
+      auto endpoint_is_valid = [&, this](const Eigen::VectorXd & positions,
+        moveit::core::RobotState & state) {
+          if (!insidePositionBounds(positions, variable_names, robot_model)) {
+            return false;
+          }
+          state.setJointGroupPositions(group, positions);
+          state.update();
+          return scene->isStateValid(state, config.move_group_name) &&
+                 compactReturnRegionContains(
+            region, state.getGlobalLinkTransform(screen_link).translation(),
+            state.getGlobalLinkTransform(screen_link).linear(),
+            state.getGlobalLinkTransform(shoulder_link).translation(),
+            state.getGlobalLinkTransform(elbow_link).translation(),
+            state.getGlobalLinkTransform(wrist_link).translation(),
+            positions[joint1_index], positions[joint3_index]);
+        };
+
+      // The frozen reference is the first return candidate. Its joint1 value is
+      // replaced by the unwrapped one-turn target stored when the maneuver began.
+      Eigen::VectorXd return_goal = region.reference_positions;
+      return_goal[joint1_index] = region.target_joint1_rad;
+      moveit::core::RobotState endpoint(start);
+      bool endpoint_selected = endpoint_is_valid(return_goal, endpoint);
+      std::string return_failure = endpoint_selected ? std::string{} :
+      "frozen reference does not satisfy the return endpoint criteria";
+
+      if (!endpoint_selected) {
+        const auto goal_constraints = makeReturnGoalConstraints(
+          region, requirements.screen_link_name, robot_model->getModelFrame());
+        constraint_samplers::IKConstraintSampler sampler(scene, config.move_group_name);
+        if (sampler.configure(goal_constraints)) {
+          moveit::core::RobotState reference(start);
+          reference.setJointGroupPositions(group, return_goal);
+          reference.update();
+          for (unsigned int attempt = 0U; attempt < 24U && !endpoint_selected; ++attempt) {
+            if (obsolete(request.generation)) {
+              result.error_code = ErrorCode::PREEMPTED;
+              result.message = "Compact return planning was superseded";
+              return result;
+            }
+            if (return_budget_exhausted()) {
+              result.error_code = ErrorCode::TIMED_OUT;
+              result.message =
+                "Compact maneuver rejected: return sampling exhausted the planning budget";
+              return result;
+            }
+            moveit::core::RobotState sampled(reference);
+            if (!sampler.sample(sampled, reference, 1U)) {
+              continue;
+            }
+            sampled.copyJointGroupPositions(group, return_goal);
+            return_goal[joint1_index] = region.target_joint1_rad;
+            endpoint_selected = endpoint_is_valid(return_goal, sampled);
+          }
+        }
+      }
+
+      if (!endpoint_selected) {
+        result.error_code = ErrorCode::PLANNING_FAILED;
+        result.message =
+          "Compact maneuver rejected: no valid endpoint in the frozen return region; " +
+          return_failure;
+        result.path.clear();
+        return result;
+      }
+
+      CompactReturnPath return_path;
+      return_path.goal_positions = return_goal;
+      return_path.validation_metrics.maximum_assembly_radius_m = 0.0;
+      return_path.validation_metrics.effective_radius_cap_m =
+        requirements.maximum_assembly_radius_m;
+      return_path.validation_metrics.minimum_robust_clearance_m =
+        std::numeric_limits<double>::quiet_NaN();
+      std::vector<Eigen::VectorXd> candidate_path{result.goal_positions};
+      bool direct_valid = true;
+      const double direct_distance =
+        (return_goal - result.goal_positions).lpNorm<Eigen::Infinity>();
+      const double direct_subdivision_count = std::max(1.0, std::ceil(
+          direct_distance / kCompactValidationJointStepRad));
+      direct_valid = std::isfinite(direct_subdivision_count) &&
+        direct_subdivision_count <= static_cast<double>(kMaximumCompactValidationSamples - 1U);
+      if (direct_valid) {
+        const std::size_t subdivisions = static_cast<std::size_t>(direct_subdivision_count);
+        moveit::core::RobotState sample(start);
+        for (std::size_t step = 1U; step <= subdivisions; ++step) {
+          if (obsolete(request.generation)) {
+            return result;
+          }
+          if (return_budget_exhausted()) {
+            result.error_code = ErrorCode::TIMED_OUT;
+            result.message =
+              "Compact maneuver rejected: return validation exhausted the planning budget";
+            result.path.clear();
+            return result;
+          }
+          const double fraction = static_cast<double>(step) /
+            static_cast<double>(subdivisions);
+          const Eigen::VectorXd positions = result.goal_positions +
+            fraction * (return_goal - result.goal_positions);
+          sample.setJointGroupPositions(group, positions);
+          sample.update();
+          if (!insidePositionBounds(positions, variable_names, robot_model) ||
+            !scene->isStateValid(sample, config.move_group_name))
+          {
+            direct_valid = false;
+            return_failure = "direct return violates bounds, collision or clearance checks";
+            break;
+          }
+          const double radius = compact_geometry->maximumAssemblyRadius(sample);
+          if (!std::isfinite(radius) || radius > requirements.maximum_assembly_radius_m) {
+            direct_valid = false;
+            return_failure = "direct return violates the assembly-radius cap";
+            break;
+          }
+          return_path.validation_metrics.maximum_assembly_radius_m = std::max(
+            return_path.validation_metrics.maximum_assembly_radius_m, radius);
+          recordMetricMaximum(return_path.validation_metrics.maximum_roll_error_rad,
+            uprightRollError(sample, requirements.screen_link_name));
+          recordMetricMaximum(return_path.validation_metrics.maximum_abs_screen_pitch_rad,
+            screenPitch(sample, requirements.screen_link_name));
+          ++return_path.validation_metrics.checked_samples;
+        }
+      }
+      if (direct_valid) {
+        candidate_path.push_back(return_goal);
+      } else {
+        const double elapsed = std::chrono::duration<double>(SteadyClock::now() -
+            plan_start).count();
+        const double remaining = config.compact_planning_time_s - elapsed;
+        if (!std::isfinite(remaining) || remaining <= 0.0) {
+          result.error_code = ErrorCode::TIMED_OUT;
+          result.message = "Compact maneuver rejected: mandatory return planning timed out";
+          result.path.clear();
+          return result;
+        }
+        moveit::core::RobotState return_start(start);
+        return_start.setJointGroupPositions(group, result.goal_positions);
+        return_start.update();
+        planning_interface::MotionPlanRequest return_request;
+        return_request.group_name = config.move_group_name;
+        return_request.planner_id = config.planner_id;
+        return_request.allowed_planning_time = remaining;
+        return_request.num_planning_attempts = 1;
+        return_request.workspace_parameters = motion_request.workspace_parameters;
+        moveit::core::robotStateToRobotStateMsg(return_start, return_request.start_state);
+        moveit::core::RobotState return_goal_state(return_start);
+        return_goal_state.setJointGroupPositions(group, return_goal);
+        return_goal_state.update();
+        return_request.goal_constraints.push_back(kinematic_constraints::constructGoalConstraints(
+            return_goal_state, group, config.joint_tolerance_rad, config.joint_tolerance_rad));
+        planning_interface::MotionPlanResponse return_response;
+        bool return_planned = false;
+        try {
+          return_planned = pipeline->generatePlan(scene, return_request, return_response, false);
+        } catch (...) {
+          result.error_code = ErrorCode::FAILURE;
+          result.message = "Compact maneuver rejected: mandatory return planner threw an exception";
+          result.path.clear();
+          return result;
+        }
+        if (!return_planned || !return_response || !return_response.trajectory ||
+          return_response.trajectory->getWayPointCount() == 0U)
+        {
+          result.error_code = return_response.error_code.val;
+          result.message = "Compact maneuver rejected: mandatory return path is unavailable";
+          result.path.clear();
+          return result;
+        }
+        candidate_path.clear();
+        candidate_path.push_back(result.goal_positions);
+        for (std::size_t index = 0U;
+          index < return_response.trajectory->getWayPointCount(); ++index)
+        {
+          Eigen::VectorXd positions;
+          return_response.trajectory->getWayPoint(index).copyJointGroupPositions(group, positions);
+          if (!positions.allFinite()) {
+            candidate_path.clear();
+            break;
+          }
+          if ((positions - candidate_path.back()).lpNorm<Eigen::Infinity>() > 1.0e-12) {
+            candidate_path.push_back(std::move(positions));
+          }
+        }
+        if (candidate_path.empty() ||
+          (candidate_path.back() - return_goal).lpNorm<Eigen::Infinity>() >
+          config.joint_tolerance_rad + 1.0e-6)
+        {
+          result.error_code = ErrorCode::INVALID_MOTION_PLAN;
+          result.message = "Compact maneuver rejected: return planner missed its bounded endpoint";
+          result.path.clear();
+          return result;
+        }
+        candidate_path.push_back(return_goal);
+      }
+
+      bool return_path_valid = candidate_path.size() >= 2U;
+      moveit::core::RobotState sample(start);
+      std::size_t checked_samples = 0U;
+      for (std::size_t segment = 0U; return_path_valid && segment + 1U < candidate_path.size();
+        ++segment)
+      {
+        const Eigen::VectorXd & from = candidate_path[segment];
+        const Eigen::VectorXd & to = candidate_path[segment + 1U];
+        const std::size_t subdivisions = std::max<std::size_t>(1U,
+          static_cast<std::size_t>(std::ceil(
+              (to - from).lpNorm<Eigen::Infinity>() / kCompactValidationJointStepRad)));
+        if (subdivisions > kMaximumCompactValidationSamples - checked_samples) {
+          return_path_valid = false;
+          return_failure = "return path exceeds the bounded validation sample budget";
+          break;
+        }
+        for (std::size_t step = 1U; step <= subdivisions; ++step) {
+          if (obsolete(request.generation)) {
+            return result;
+          }
+          if (return_budget_exhausted()) {
+            result.error_code = ErrorCode::TIMED_OUT;
+            result.message =
+              "Compact maneuver rejected: return validation exhausted the planning budget";
+            result.path.clear();
+            return result;
+          }
+          const Eigen::VectorXd positions = from +
+            (static_cast<double>(step) / static_cast<double>(subdivisions)) * (to - from);
+          sample.setJointGroupPositions(group, positions);
+          sample.update();
+          if (!insidePositionBounds(positions, variable_names, robot_model) ||
+            !scene->isStateValid(sample, config.move_group_name))
+          {
+            return_path_valid = false;
+            return_failure = "planned return violates bounds, collision or clearance checks";
+            break;
+          }
+          const double radius = compact_geometry->maximumAssemblyRadius(sample);
+          if (!std::isfinite(radius) || radius > requirements.maximum_assembly_radius_m) {
+            return_path_valid = false;
+            return_failure = "planned return violates the assembly-radius cap";
+            break;
+          }
+          return_path.validation_metrics.maximum_assembly_radius_m = std::max(
+            return_path.validation_metrics.maximum_assembly_radius_m, radius);
+          recordMetricMaximum(return_path.validation_metrics.maximum_roll_error_rad,
+            uprightRollError(sample, requirements.screen_link_name));
+          recordMetricMaximum(return_path.validation_metrics.maximum_abs_screen_pitch_rad,
+            screenPitch(sample, requirements.screen_link_name));
+          ++checked_samples;
+        }
+      }
+      return_path.validation_metrics.checked_samples = checked_samples;
+      if (!return_path_valid || !endpoint_is_valid(return_goal, endpoint)) {
+        result.error_code = ErrorCode::INVALID_MOTION_PLAN;
+        result.message = "Compact maneuver rejected: mandatory return path failed validation; " +
+          return_failure;
+        result.path.clear();
+        return result;
+      }
+      return_path.path = std::move(candidate_path);
+      result.compact_return_path = std::move(return_path);
     }
     result.success = true;
     result.error_code = ErrorCode::SUCCESS;
@@ -1116,6 +1478,12 @@ struct BackgroundPathPlanner::Impl
         result.error_code = ErrorCode::FAILURE;
         result.message = exception.what();
       }
+      if (!result.success && result.error_code == ErrorCode::TIMED_OUT) {
+        result.path.clear();
+        result.compact_path_samples.clear();
+        result.compact_goal_metrics.reset();
+        result.compact_return_path.reset();
+      }
       result.elapsed_time_s = std::chrono::duration<double>(SteadyClock::now() - begin).count();
       {
         const std::lock_guard<std::mutex> lock(mutex);
@@ -1141,7 +1509,6 @@ struct BackgroundPathPlanner::Impl
   std::string base_link_name;
   std::optional<std::size_t> staged_yaw_index;
   std::optional<std::size_t> staged_reset_index;
-  std::optional<std::size_t> staged_wrist_pitch_index;
   std::optional<std::size_t> staged_joint6_index;
   mutable std::mutex mutex;
   std::condition_variable condition;
@@ -1268,6 +1635,9 @@ void BackgroundPathPlanner::cancel()
   ++impl_->latest_generation;
   impl_->pending.reset();
   impl_->completed.reset();
+  if (impl_->active) {
+    impl_->pipeline->terminate();
+  }
 }
 
 bool BackgroundPathPlanner::isBusy() const

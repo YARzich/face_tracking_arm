@@ -24,6 +24,7 @@ TEST(FaceScenarios, ParsesEveryLaunchChoiceAndRejectsUnknownNames)
   EXPECT_EQ(parse_scenario("circle"), Scenario::kCircle);
   EXPECT_EQ(parse_scenario("people"), Scenario::kPeople);
   EXPECT_EQ(parse_scenario("walk_around"), Scenario::kWalkAround);
+  EXPECT_EQ(parse_scenario("walk_around_reverse"), Scenario::kWalkAroundReverse);
   EXPECT_EQ(parse_scenario("approach"), Scenario::kApproach);
   EXPECT_THROW(parse_scenario(""), std::invalid_argument);
   EXPECT_THROW(parse_scenario("unknown"), std::invalid_argument);
@@ -156,6 +157,40 @@ TEST(FaceScenarios, WalkHasNoPositionOrVelocityJumpAtLoopBoundary)
   EXPECT_NEAR((at.z - before.z) / dt, (after.z - at.z) / dt, 0.0001);
 }
 
+TEST(FaceScenarios, ReverseWalkMirrorsOnlyXYAndRepeatsContinuously)
+{
+  constexpr double dt = 0.001;
+  for (double elapsed = 0.0; elapsed <= kWalkDurationSec; elapsed += 0.125) {
+    const auto forward = sample(Scenario::kWalkAround, elapsed).target.value();
+    const auto reverse = sample(Scenario::kWalkAroundReverse, elapsed).target.value();
+    EXPECT_NEAR(reverse.x, forward.x, kTolerance);
+    EXPECT_NEAR(reverse.y, -forward.y, kTolerance);
+    EXPECT_NEAR(reverse.z, forward.z, kTolerance);
+    const auto next_cycle = sample(
+      Scenario::kWalkAroundReverse, elapsed + kWalkDurationSec).target.value();
+    EXPECT_NEAR(reverse.x, next_cycle.x, kTolerance);
+    EXPECT_NEAR(reverse.y, next_cycle.y, kTolerance);
+    EXPECT_NEAR(reverse.z, next_cycle.z, kTolerance);
+  }
+
+  const auto start = sample(Scenario::kWalkAroundReverse, 0.0).target.value();
+  const auto quarter = sample(Scenario::kWalkAroundReverse, 12.0).target.value();
+  EXPECT_NEAR(start.x, 0.85, kTolerance);
+  EXPECT_NEAR(start.y, 0.0, kTolerance);
+  EXPECT_NEAR(quarter.x, 0.0, kTolerance);
+  EXPECT_NEAR(quarter.y, -0.85, kTolerance);
+
+  const auto before = sample(
+    Scenario::kWalkAroundReverse, kWalkDurationSec - dt).target.value();
+  const auto at = sample(
+    Scenario::kWalkAroundReverse, kWalkDurationSec).target.value();
+  const auto after = sample(
+    Scenario::kWalkAroundReverse, kWalkDurationSec + dt).target.value();
+  EXPECT_NEAR((at.x - before.x) / dt, (after.x - at.x) / dt, 0.0001);
+  EXPECT_NEAR((at.y - before.y) / dt, (after.y - at.y) / dt, 0.0001);
+  EXPECT_NEAR((at.z - before.z) / dt, (after.z - at.z) / dt, 0.0001);
+}
+
 TEST(FaceScenarios, PeopleCycleRepeatsTargetsAndLossesExactly)
 {
   for (double elapsed = 0.0; elapsed < kPeopleCycleDurationSec; elapsed += 0.125) {
@@ -174,7 +209,7 @@ TEST(FaceScenarios, PeopleCycleRepeatsTargetsAndLossesExactly)
 TEST(FaceScenarios, AllPublishedTargetsUseFaceHeightAboveFloor)
 {
   for (Scenario scenario : {Scenario::kStationary, Scenario::kCircle, Scenario::kPeople,
-      Scenario::kWalkAround})
+      Scenario::kWalkAround, Scenario::kWalkAroundReverse})
   {
     for (double t = 0.0; t < kPeopleCycleDurationSec; t += 0.1) {
       const auto target = sample(scenario, t).target;

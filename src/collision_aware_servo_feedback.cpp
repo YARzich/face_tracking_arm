@@ -26,28 +26,84 @@ builtin_interfaces::msg::Time to_builtin_time(const rclcpp::Time & time)
   return message;
 }
 
+std::string snapshotTimestampFailureReason(
+  const std::int64_t state_stamp_ns, const std::int64_t validation_ns,
+  const std::int64_t timeout_ns, const std::int64_t epsilon_ns)
+{
+  if (state_stamp_ns <= 0 || validation_ns <= 0 || timeout_ns < 0) {
+    return "Robot state timestamp or validation time is invalid: state_stamp_ns=" +
+           std::to_string(state_stamp_ns) + ", validation_ns=" +
+           std::to_string(validation_ns) + ", timeout_ns=" + std::to_string(timeout_ns) +
+           ", epsilon_ns=" + std::to_string(epsilon_ns);
+  }
+  if (state_stamp_ns > validation_ns) {
+    return "Robot state timestamp is ahead of sampled ROS time: state_stamp_ns=" +
+           std::to_string(state_stamp_ns) + ", validation_ns=" +
+           std::to_string(validation_ns) + ", ahead_ns=" +
+           std::to_string(state_stamp_ns - validation_ns) + ", epsilon_ns=" +
+           std::to_string(epsilon_ns);
+  }
+  return "Robot state snapshot is stale: age_ns=" +
+         std::to_string(validation_ns - state_stamp_ns) + ", timeout_ns=" +
+         std::to_string(timeout_ns) + ", state_stamp_ns=" +
+         std::to_string(state_stamp_ns) + ", validation_ns=" +
+         std::to_string(validation_ns) + ", epsilon_ns=" + std::to_string(epsilon_ns);
+}
+
 }  // namespace
 
 std::optional<control_msgs::msg::JointTrajectoryControllerState> CollisionAwareServoComponent::
-current_controller_state() const
+current_controller_state(std::string * failure_reason)
 {
+  if (failure_reason != nullptr) {
+    failure_reason->clear();
+  }
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
   if (!latest_controller_state_.has_value()) {
+    if (failure_reason != nullptr) {
+      *failure_reason = "no controller state sample is available";
+    }
     return std::nullopt;
   }
   const auto & state = *latest_controller_state_;
   const rclcpp::Time current_time = now();
   const rclcpp::Time stamp(state.header.stamp, current_time.get_clock_type());
-  const rclcpp::Time oldest_allowed = current_time -
-    rclcpp::Duration::from_seconds(parameters_.state_feedback_timeout_sec);
+  const std::int64_t timeout_ns = rclcpp::Duration::from_seconds(
+    parameters_.state_feedback_timeout_sec).nanoseconds();
+  const std::int64_t future_tolerance_ns = !require_hardware_io_status_ &&
+    get_clock()->get_clock_type() == RCL_ROS_TIME && get_clock()->ros_time_is_active() ?
+    control::kSimTimeFeedbackFutureToleranceNs : 0LL;
+  const std::int64_t stamp_ns = stamp.nanoseconds();
+  const std::int64_t validation_ns = current_time.nanoseconds();
+  const auto reject = [&](const std::string & reason) {
+      if (failure_reason != nullptr) {
+        *failure_reason = "stamp_ns=" + std::to_string(stamp_ns) +
+          " validation_ns=" + std::to_string(validation_ns) +
+          " epsilon_ns=" + std::to_string(future_tolerance_ns) +
+          " timeout_ns=" + std::to_string(timeout_ns) + " reason=" + reason;
+      }
+      return std::optional<control_msgs::msg::JointTrajectoryControllerState>{};
+    };
+  if (!control::isFreshSnapshotTimestamp(
+      stamp_ns, validation_ns, timeout_ns, future_tolerance_ns))
+  {
+    std::string reason = "invalid timestamp";
+    if (stamp_ns > validation_ns) {
+      reason = "future timestamp exceeds configured epsilon";
+    } else if (stamp_ns > 0 && validation_ns > 0 && timeout_ns >= 0) {
+      reason = "stale timestamp exceeds feedback timeout";
+    } else if (timeout_ns < 0) {
+      reason = "invalid feedback timeout";
+    }
+    return reject(reason);
+  }
   const std::size_t size = parameters_.joint_names.size();
   const auto finite_vector = [](const std::vector<double> & values) {
       return std::all_of(values.begin(), values.end(), [](const double value) {
                  return std::isfinite(value);
         });
     };
-  if (stamp.nanoseconds() <= 0 || stamp > current_time || stamp < oldest_allowed ||
-    state.joint_names != parameters_.joint_names ||
+  if (state.joint_names != parameters_.joint_names ||
     state.reference.positions.size() != size || state.reference.velocities.size() != size ||
     state.feedback.positions.size() != size || state.feedback.velocities.size() != size ||
     state.output.positions.size() != size ||
@@ -55,7 +111,7 @@ current_controller_state() const
     !finite_vector(state.feedback.positions) || !finite_vector(state.feedback.velocities) ||
     !finite_vector(state.output.positions) || !std::isfinite(state.speed_scaling_factor))
   {
-    return std::nullopt;
+    return reject("joint names, vector lengths, or values are invalid");
   }
   return state;
 }
@@ -138,6 +194,10 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
   const auto & state_time = measured_state.second;
   const auto feedback_timeout = rclcpp::Duration::from_seconds(
     parameters_.state_feedback_timeout_sec);
+  const std::int64_t future_tolerance_ns = !require_hardware_io_status_ &&
+    get_clock()->get_clock_type() == RCL_ROS_TIME &&
+    get_clock()->ros_time_is_active() ?
+    control::kSimTimeFeedbackFutureToleranceNs : 0LL;
   const rclcpp::Time oldest_allowed_state = state_validation_time -
     feedback_timeout;
   if (!measured_state.first ||
@@ -145,7 +205,7 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
       current_time.nanoseconds(), state_validation_time.nanoseconds()) ||
     !control::isFreshSnapshotTimestamp(
       state_time.nanoseconds(), state_validation_time.nanoseconds(),
-      feedback_timeout.nanoseconds()) ||
+      feedback_timeout.nanoseconds(), future_tolerance_ns) ||
     !state_monitor->haveCompleteState(oldest_allowed_state))
   {
     commands_.stable_rearm_samples = 0;
@@ -153,10 +213,12 @@ RearmReadiness CollisionAwareServoComponent::safe_rearm_ready(
     return RearmReadiness::kWaiting;
   }
 
-  const auto state = current_controller_state();
+  std::string controller_state_failure;
+  const auto state = current_controller_state(&controller_state_failure);
   if (!state.has_value()) {
     commands_.stable_rearm_samples = 0;
-    reason = "Safe re-arm is waiting for fresh finite controller feedback";
+    reason = "Safe re-arm is waiting for fresh finite controller feedback: " +
+      controller_state_failure;
     return RearmReadiness::kWaiting;
   }
   auto actual_state = *state;
@@ -441,16 +503,42 @@ predicted_or_measured_state(
   const auto & state_time = measured_state.second;
   const auto feedback_timeout = rclcpp::Duration::from_seconds(
     parameters_.state_feedback_timeout_sec);
+  const std::int64_t future_tolerance_ns = !require_hardware_io_status_ &&
+    get_clock()->get_clock_type() == RCL_ROS_TIME &&
+    get_clock()->ros_time_is_active() ?
+    control::kSimTimeFeedbackFutureToleranceNs : 0LL;
   const rclcpp::Time oldest_allowed_state = state_validation_time -
     feedback_timeout;
-  if (!measured_robot_state ||
-    !control::isInSameClockEpoch(
-      current_time.nanoseconds(), state_validation_time.nanoseconds()) ||
-    !control::isFreshSnapshotTimestamp(
-      state_time.nanoseconds(), state_validation_time.nanoseconds(),
-      feedback_timeout.nanoseconds()) ||
-    !state_monitor->haveCompleteState(oldest_allowed_state))
+  const std::int64_t state_validation_ns = state_validation_time.nanoseconds();
+  const std::int64_t state_stamp_ns = state_time.nanoseconds();
+  const std::int64_t feedback_timeout_ns = feedback_timeout.nanoseconds();
+  if (!measured_robot_state) {
+    failure_reason = "PlanningSceneMonitor state snapshot is missing: tick_ns=" +
+      std::to_string(current_time.nanoseconds()) + ", validation_ns=" +
+      std::to_string(state_validation_ns) + ", state_stamp_ns=" +
+      std::to_string(state_stamp_ns);
+    return std::nullopt;
+  }
+  if (!control::isInSameClockEpoch(
+      current_time.nanoseconds(), state_validation_ns))
   {
+    failure_reason = "ROS clock rewound while reading robot feedback: tick_ns=" +
+      std::to_string(current_time.nanoseconds()) + ", validation_ns=" +
+      std::to_string(state_validation_ns);
+    return std::nullopt;
+  }
+  if (!control::isFreshSnapshotTimestamp(
+      state_stamp_ns, state_validation_ns, feedback_timeout_ns, future_tolerance_ns))
+  {
+    failure_reason = snapshotTimestampFailureReason(
+      state_stamp_ns, state_validation_ns, feedback_timeout_ns, future_tolerance_ns);
+    return std::nullopt;
+  }
+  if (!state_monitor->haveCompleteState(oldest_allowed_state)) {
+    failure_reason = "PlanningSceneMonitor has incomplete joint state at cutoff: cutoff_ns=" +
+      std::to_string(oldest_allowed_state.nanoseconds()) + ", validation_ns=" +
+      std::to_string(state_validation_ns) + ", timeout_ns=" +
+      std::to_string(feedback_timeout_ns);
     return std::nullopt;
   }
   moveit_servo::KinematicState measured(parameters_.joint_names.size());
@@ -458,9 +546,11 @@ predicted_or_measured_state(
   measured_robot_state->copyJointGroupPositions(joint_model_group_, measured.positions);
   measured_robot_state->copyJointGroupVelocities(joint_model_group_, measured.velocities);
   std::optional<hardware::HardwareIoStatusAssessment> hardware_status;
-  auto actual_controller_state = current_controller_state();
+  std::string controller_state_failure;
+  auto actual_controller_state = current_controller_state(&controller_state_failure);
   if (!actual_controller_state.has_value()) {
-    failure_reason = "Fresh finite trajectory controller state is unavailable";
+    failure_reason = "Fresh finite trajectory controller state is unavailable: " +
+      controller_state_failure;
     requires_latched_halt = require_hardware_io_status_ && commands_.epoch_has_published;
     return std::nullopt;
   }
@@ -482,6 +572,17 @@ predicted_or_measured_state(
   }
   measured.accelerations.setZero();
   if (!finite_state(measured, parameters_.joint_names.size())) {
+    failure_reason = "Robot feedback vectors invalid/nonfinite: joint_names=" +
+      std::to_string(measured.joint_names.size()) + ", positions=" +
+      std::to_string(measured.positions.size()) + "/finite=" +
+      std::to_string(measured.positions.allFinite()) + ", velocities=" +
+      std::to_string(measured.velocities.size()) + "/finite=" +
+      std::to_string(measured.velocities.allFinite()) + ", accelerations=" +
+      std::to_string(measured.accelerations.size()) + "/finite=" +
+      std::to_string(measured.accelerations.allFinite()) + ", expected=" +
+      std::to_string(parameters_.joint_names.size()) + ", state_stamp_ns=" +
+      std::to_string(state_stamp_ns) + ", validation_ns=" +
+      std::to_string(state_validation_ns);
     return std::nullopt;
   }
   if (!require_hardware_io_status_) {

@@ -85,13 +85,6 @@ struct HorizontalEdgePathTaskResult
   double edge_tilt_error_rad{0.0};
 };
 
-struct FaceReturnPointingTask
-{
-  Eigen::MatrixXd matrix;
-  Eigen::Vector2d reference{Eigen::Vector2d::Zero()};
-  bool used_normal_fallback{false};
-};
-
 /// Build a pure velocity task in a common world/planning frame.
 ///
 /// The Jacobian maps qdot to [TCP linear velocity; world angular velocity].
@@ -101,8 +94,9 @@ struct FaceReturnPointingTask
 /// adds the desired look-at frame's angular motion; target-position velocity adds
 /// translational feed-forward. Speed caps apply after adding feedback and feed-forward.
 /// Ordinary FACE tracking prioritizes both screen-normal axes and gravity-upright
-/// screen roll. The radial face-distance request is a final soft objective toward
-/// the nearest band edge; it is zero inside the band, leaving radial motion free.
+/// screen roll. Outside the face-distance band, the final soft objective requests
+/// radial motion toward the nearest edge and carries the tangential screen velocity
+/// implied by the effective first-joint pointing command. It is empty inside the band.
 /// An optional gaze frame replaces the two-axis pointing task while physical screen
 /// roll remains primary.
 /// Fixed-orientation tracking without a face keeps roll secondary. The
@@ -128,20 +122,6 @@ struct FaceReturnPointingTask
 /// keeps joint speed small while the hard constraints remain owned by the QP.
 [[nodiscard]] std::optional<HierarchicalVelocityTask> makeFaceEdgeOnlyRecoveryTask(
   const HierarchicalVelocityTask & face_task, bool has_face_primary_roll);
-
-/// Track face azimuth and elevation during compact RETURN_FACE reacquisition.
-/// The returned rows use analytic current-normal and moving-ray Jacobians;
-/// normal_matrix/reference provide the existing pointing rows as a finite
-/// fallback when azimuth/elevation coordinates approach their vertical pole.
-[[nodiscard]] std::optional<FaceReturnPointingTask> makeFaceReturnPointingTask(
-  const Eigen::Isometry3d & current_screen_pose,
-  const Eigen::MatrixXd & screen_jacobian,
-  const Eigen::Vector3d & face_position,
-  const Eigen::Vector3d & face_velocity,
-  const TrackingVelocityTaskConfig & config,
-  const Eigen::MatrixXd & normal_matrix,
-  const Eigen::VectorXd & normal_reference,
-  const std::optional<GazeKinematics> & gaze = std::nullopt);
 
 /// Track a joint-path lookahead point without wrapping bounded revolute joints.
 /// The reference is scaled uniformly to preserve its joint-space direction.

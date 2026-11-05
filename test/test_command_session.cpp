@@ -547,6 +547,57 @@ TEST_F(CommandSessionTest, StartupWithoutCommandGridAnchorUsesObservedSkips)
       3U, stamp().nanoseconds(), 50'000'000).has_value());
 }
 
+TEST_F(CommandSessionTest, CompactTimelineRecoveryUsesFortyMillisecondLeadHysteresis)
+{
+  struct TimingCase
+  {
+    std::int64_t callback_time_ns;
+    std::int64_t last_command_stamp_ns;
+    std::int64_t expected_next_grid_lead_ns;
+  };
+  const TimingCase cases[] = {
+    {437'127'000'000LL, 437'165'000'000LL, 48'000'000LL},
+    {605'295'000'000LL, 605'325'000'000LL, 40'000'000LL},
+  };
+  for (const auto & test_case : cases) {
+    session_.time_grid = std::make_unique<control::ControlTimeGrid>(kPeriodNs);
+    const auto now_ns = test_case.callback_time_ns;
+    ASSERT_EQ(session_.time_grid->commandStamp(test_case.last_command_stamp_ns, 0, 0),
+      test_case.last_command_stamp_ns);
+    EXPECT_EQ(test_case.last_command_stamp_ns + kPeriodNs - now_ns,
+      test_case.expected_next_grid_lead_ns);
+
+    const auto periods = session_.timelineRecoveryPeriods(
+      1U, now_ns, 50'000'000, 40'000'000);
+    ASSERT_TRUE(periods.has_value());
+    EXPECT_EQ(*periods, 0U) << "callback time " << test_case.callback_time_ns;
+    EXPECT_EQ(session_.timelineRecoveryPeriods(
+        1U, now_ns, 50'000'000), 1U);
+  }
+}
+
+TEST_F(CommandSessionTest, CompactTimelineRecoveryBelowHysteresisPreservesRetryToFifty)
+{
+  constexpr std::int64_t callback_time_ns = 605'325'000'000LL;
+  constexpr std::int64_t now_ns = callback_time_ns;
+  session_.time_grid = std::make_unique<control::ControlTimeGrid>(kPeriodNs);
+  ASSERT_TRUE(session_.time_grid->commandStamp(now_ns + 39'000'000 - kPeriodNs, 0, 0));
+
+  ASSERT_EQ(session_.timelineRecoveryPeriods(
+      0U, now_ns, 50'000'000, 40'000'000), 2U);
+  session_.time_grid = std::make_unique<control::ControlTimeGrid>(kPeriodNs);
+  ASSERT_TRUE(session_.time_grid->commandStamp(now_ns + 30'000'000 - kPeriodNs, 0, 0));
+  ASSERT_EQ(session_.timelineRecoveryPeriods(
+      0U, now_ns, 50'000'000, 40'000'000), 2U);
+
+  // A pending deadline retry always retains the existing 50 ms recovery.
+  session_.time_grid = std::make_unique<control::ControlTimeGrid>(kPeriodNs);
+  ASSERT_TRUE(session_.time_grid->commandStamp(now_ns + 48'000'000 - kPeriodNs, 0, 0));
+  session_.command_deadline_retry_pending = true;
+  EXPECT_EQ(session_.timelineRecoveryPeriods(
+      0U, now_ns, 50'000'000, 40'000'000), 1U);
+}
+
 TEST_F(CommandSessionTest, PublishedBrakeContinuationRejectsInactiveEpochAndRearmStates)
 {
   const auto queue_size_before = session_.queue.size();

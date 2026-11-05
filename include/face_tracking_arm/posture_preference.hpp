@@ -6,8 +6,13 @@
 
 #include <Eigen/Core>
 
+#include <cmath>
 #include <cstddef>
 #include <limits>
+#include <optional>
+
+#include "face_tracking_arm/hierarchical_velocity_qp.hpp"
+#include "face_tracking_arm/posture_geometry.hpp"
 
 namespace face_tracking_arm::control
 {
@@ -33,16 +38,24 @@ struct PosturePreferenceConfig
   double control_period_sec{0.01};
 };
 
-struct PosturePreferenceObjective
+struct PostureCorrection
 {
   Eigen::MatrixXd matrix;
   Eigen::VectorXd reference;
   Eigen::VectorXd weights;
+};
+
+struct PosturePreferenceObjective
+{
+  PostureCorrection joint3_correction;
+  PostureCorrection other_corrections;
   bool valid{false};
   /// True when no soft posture correction row is active.
   bool comfortable{false};
   /// True when joint3 lies in the calibrated normal-bend interval.
   bool branch_comfortable{false};
+  /// True when upward geometry is comfortable or its direction is indeterminate.
+  bool geometry_comfortable{false};
 };
 
 struct PostureBendCalibration
@@ -61,13 +74,20 @@ struct PostureBendCalibration
   double rest_joint3, double rest_angle, double search_joint3, double search_angle,
   double physical_joint3_lower, double physical_joint3_upper);
 
-/// Softly return joint3 to the model-calibrated normal-bend interval, then
-/// prefer the face side and avoid physical J5/J6 limits. Positions and
-/// Jacobians use one world frame. No joint-position centering is applied.
+/// Bound a joint-3 command so its braking envelope remains inside the calibrated
+/// comfortable interval.
+[[nodiscard]] std::optional<LinearVelocityConstraint> makeJoint3ComfortBounds(
+  const JointMotionState & motion, const JointMotionLimits & limits,
+  Eigen::Index joint_index, double lower_position, double upper_position,
+  double period_sec, double residual_latency_sec);
+
+/// Softly return joint3 to the model-calibrated normal-bend interval, prefer an
+/// upward elbow bend relative to the shoulder-wrist line, and avoid physical
+/// J5/J6 limits. Positions and Jacobians use one world frame.
 [[nodiscard]] PosturePreferenceObjective makePosturePreferenceObjective(
-  const Eigen::Vector3d & base, const Eigen::Vector3d & elbow,
-  const Eigen::Vector3d & wrist, const Eigen::Vector3d & face,
-  const Eigen::MatrixXd & base_jacobian,
+  const Eigen::Vector3d & shoulder, const Eigen::Vector3d & elbow,
+  const Eigen::Vector3d & wrist,
+  const Eigen::MatrixXd & shoulder_jacobian,
   const Eigen::MatrixXd & elbow_jacobian, const Eigen::MatrixXd & wrist_jacobian,
   const Eigen::VectorXd & joint_position,
   const PosturePreferenceConfig & config = {});

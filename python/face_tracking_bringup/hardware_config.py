@@ -371,10 +371,17 @@ def _validate_robot_settings(config, *, mock):
             raise ValueError(
                 'Fill robot.ip with the robot address from UFACTORY Studio') from error
     profile = get_robot_profile(robot['model'], robot['model_num'])
-    compact_settings = config.get('compact_maneuver', {})
-    if 'speed_scale' in compact_settings:
-        compact_settings['speed_scale'] = positive(
-            compact_settings['speed_scale'], 'compact_maneuver.speed_scale')
+    compact_settings = config.setdefault('compact_maneuver', {})
+    for key in ('speed_scale', 'fold_speed_scale', 'turn_speed_scale',
+                'return_speed_scale'):
+        compact_settings[key] = positive(
+            compact_settings.get(key, 1.0), f'compact_maneuver.{key}')
+    for key, default in (
+            ('max_velocity_rad_s', [3.1] * 6),
+            ('max_acceleration_rad_s2', [19.0] * 6),
+            ('max_jerk_rad_s3', [400.0] * 6)):
+        compact_settings[key] = positive_vector(
+            compact_settings.get(key, default), f'compact_maneuver.{key}', 6)
     if 'goal_joints_rad' in compact_settings:
         goal = vector(compact_settings['goal_joints_rad'],
                       'compact_maneuver.goal_joints_rad', 6)

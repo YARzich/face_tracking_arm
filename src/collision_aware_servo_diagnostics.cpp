@@ -102,6 +102,8 @@ void append_compact_tracking_diagnostics(
   status.values.push_back(key_value("recovery_mode", reference.recovery_mode));
   status.values.push_back(key_value("posture_mode", reference.posture_mode));
   status.values.push_back(key_value(
+      "posture_unavailable_reason", reference.posture_unavailable_reason));
+  status.values.push_back(key_value(
       "disabled_limit_hold_latched",
       reference.disabled_limit_hold_latched ? "true" : "false"));
   status.values.push_back(key_value("compact_phase", reference.compact_phase));
@@ -110,9 +112,6 @@ void append_compact_tracking_diagnostics(
   status.values.push_back(key_value("compact_reason", reference.compact_reason));
   status.values.push_back(key_value(
       "compact_goal_reached", std::to_string(reference.compact_goal_reached)));
-  status.values.push_back(key_value(
-      "j1_hold_direction", std::to_string(reference.j1_hold_direction)));
-  status.values.push_back(key_value("j1_hold_q", std::to_string(reference.j1_hold_q)));
   status.values.push_back(key_value(
       "compact_entry_radius_cap_m", std::to_string(reference.compact_entry_radius_cap_m)));
   status.values.push_back(key_value(
@@ -126,14 +125,6 @@ void append_compact_tracking_diagnostics(
       "upright_roll_guard_armed", reference.upright_roll_guard_armed ? "true" : "false"));
   status.values.push_back(key_value(
       "compact_actual_settled", reference.compact_actual_settled ? "true" : "false"));
-  status.values.push_back(key_value(
-      "compact_return_full_face_active",
-      reference.compact_return_full_face_active ? "true" : "false"));
-  status.values.push_back(key_value(
-      "compact_return_face_qualified",
-      reference.compact_return_face_qualified ? "true" : "false"));
-  status.values.push_back(key_value(
-      "compact_return_face_dwell_sec", std::to_string(reference.compact_return_face_dwell_sec)));
   status.values.push_back(key_value(
       "planned_path_max_radius_m", std::to_string(reference.planned_path_max_radius_m)));
   status.values.push_back(key_value(
@@ -269,6 +260,10 @@ void CollisionAwareServoComponent::publish_runtime_diagnostics()
   status.values.push_back(key_value("paths_abandoned", std::to_string(reference.paths_abandoned)));
   status.values.push_back(key_value("last_plan_wall_ms",
       std::to_string(reference.last_plan_wall_ms)));
+  status.values.push_back(key_value("compact_profile_duration_sec",
+      std::to_string(reference.compact_profile_duration_sec)));
+  status.values.push_back(key_value("compact_profile_tempo_limited",
+      reference.compact_profile_tempo_limited ? "true" : "false"));
   status.values.push_back(key_value("path_progress_rad",
       std::to_string(reference.path_progress_rad)));
   status.values.push_back(key_value("path_distance_rad",
@@ -987,11 +982,12 @@ void CollisionAwareServoComponent::log_qp_failure(
     parameters_.residual_command_latency_sec, qp_config.solver_absolute_tolerance,
     qp_config.solver_relative_tolerance, qp_config.solver_time_limit_sec,
     qp_config.solver_max_iterations, qp_config.solution_feasibility_tolerance);
-  log_limit_vector("lower_position", motion_limits_.lower_position);
-  log_limit_vector("upper_position", motion_limits_.upper_position);
-  log_limit_vector("max_velocity", motion_limits_.max_velocity);
-  log_limit_vector("max_acceleration", motion_limits_.max_acceleration);
-  log_limit_vector("max_jerk", motion_limits_.max_jerk);
+  const auto & selected_limits = active_motion_limits();
+  log_limit_vector("lower_position", selected_limits.lower_position);
+  log_limit_vector("upper_position", selected_limits.upper_position);
+  log_limit_vector("max_velocity", selected_limits.max_velocity);
+  log_limit_vector("max_acceleration", selected_limits.max_acceleration);
+  log_limit_vector("max_jerk", selected_limits.max_jerk);
   for (Eigen::Index index = 0; index < motion_state.position.size(); ++index) {
     RCLCPP_WARN(
       get_logger(), "QP state %s: q=%.17g, qdot=%.17g, qddot=%.17g",

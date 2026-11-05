@@ -397,13 +397,44 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
       result.task.secondary_reference.resize(0);
       result.task.secondary_weights.resize(0);
       if (result.face_distance_outside_band) {
-        // Keep the face distance objective soft and strictly below pose tasks.
-        // A full Cartesian screen-velocity objective follows the face ray while
-        // suppressing nullspace tangential motion near the reach limit.
-        result.task.distance_matrix = linear_jacobian;
         const Eigen::Vector3d face_radial =
           (current.translation() - *face_position).normalized();
-        result.task.distance_reference = face_radial * result.face_distance_reference[0];
+        Eigen::Vector3d follow_velocity = Eigen::Vector3d::Zero();
+        const Eigen::Vector2d first_joint_pointing_jacobian =
+          primary_geometry->primary_matrix.topRows(2).col(0);
+        const Eigen::Vector2d pointing_reference =
+          primary_geometry->primary_reference.head<2>();
+        const Eigen::Vector3d first_joint_angular_jacobian =
+          jacobian.bottomRows(3).col(0);
+        const double first_joint_angular_speed = first_joint_angular_jacobian.norm();
+        const double pointing_authority_squared =
+          first_joint_pointing_jacobian.squaredNorm();
+        if (!pointing_reference.isZero(0.0) &&
+          std::isfinite(first_joint_angular_speed) &&
+          first_joint_angular_speed > std::sqrt(std::numeric_limits<double>::epsilon()) &&
+          std::isfinite(pointing_authority_squared) &&
+          pointing_authority_squared > std::numeric_limits<double>::epsilon())
+        {
+          const double least_squares_rate =
+            first_joint_pointing_jacobian.dot(pointing_reference) /
+            pointing_authority_squared;
+          const double maximum_joint_rate =
+            config.maximum_angular_reference_radps / first_joint_angular_speed;
+          if (std::isfinite(least_squares_rate) && std::isfinite(maximum_joint_rate)) {
+            const double follow_joint_rate = std::clamp(
+              least_squares_rate, -maximum_joint_rate, maximum_joint_rate);
+            const Eigen::Vector3d candidate = linear_jacobian.col(0) * follow_joint_rate;
+            if (candidate.allFinite()) {
+              follow_velocity = candidate;
+            }
+          }
+        }
+
+        const Eigen::Matrix3d tangent_projection =
+          Eigen::Matrix3d::Identity() - face_radial * face_radial.transpose();
+        result.task.distance_matrix = linear_jacobian;
+        result.task.distance_reference = face_radial * result.face_distance_reference[0] +
+          tangent_projection * follow_velocity;
         result.task.distance_weights = Eigen::VectorXd::Ones(3);
       } else {
         result.task.distance_matrix.resize(0, jacobian.cols());
@@ -439,124 +470,6 @@ std::optional<TrackingVelocityTaskResult> makeTrackingVelocityTask(
     (!roll_is_observable || result.roll_error_rad <= config.roll_deadband_rad) &&
     result.task.primary_reference.isZero(0.0) && result.task.secondary_reference.isZero(0.0) &&
     result.task.distance_reference.isZero(0.0);
-  return result;
-}
-
-std::optional<FaceReturnPointingTask> makeFaceReturnPointingTask(
-  const Eigen::Isometry3d & current_screen_pose,
-  const Eigen::MatrixXd & screen_jacobian,
-  const Eigen::Vector3d & face_position,
-  const Eigen::Vector3d & face_velocity,
-  const TrackingVelocityTaskConfig & config,
-  const Eigen::MatrixXd & normal_matrix,
-  const Eigen::VectorXd & normal_reference,
-  const std::optional<GazeKinematics> & gaze)
-{
-  if (!valid_config(config) || !current_screen_pose.matrix().allFinite() ||
-    !valid_rotation(current_screen_pose.rotation()) || screen_jacobian.rows() != 6 ||
-    screen_jacobian.cols() == 0 || !screen_jacobian.allFinite() ||
-    !face_position.allFinite() || !face_velocity.allFinite() ||
-    normal_matrix.rows() != 2 || normal_matrix.cols() != screen_jacobian.cols() ||
-    normal_reference.size() != 2 || !normal_matrix.allFinite() ||
-    !normal_reference.allFinite())
-  {
-    return std::nullopt;
-  }
-
-  const Eigen::Isometry3d * pointing_pose = &current_screen_pose;
-  const Eigen::MatrixXd * pointing_jacobian = &screen_jacobian;
-  if (gaze) {
-    if (!gaze->pose.matrix().allFinite() || !valid_rotation(gaze->pose.rotation()) ||
-      gaze->jacobian.rows() != 6 ||
-      gaze->jacobian.cols() != screen_jacobian.cols() || !gaze->jacobian.allFinite())
-    {
-      return std::nullopt;
-    }
-    pointing_pose = &gaze->pose;
-    pointing_jacobian = &gaze->jacobian;
-  }
-
-  FaceReturnPointingTask result;
-  const auto use_normal_fallback = [&]() {
-      result.matrix = normal_matrix;
-      result.reference = normal_reference;
-      result.used_normal_fallback = true;
-    };
-
-  const Eigen::Vector3d normal = pointing_pose->linear().col(0);
-  const Eigen::Vector3d ray = face_position - pointing_pose->translation();
-  const double ray_norm = ray.norm();
-  const double normal_horizontal = normal.head<2>().norm();
-  const double ray_horizontal = ray.head<2>().norm();
-  if (!std::isfinite(ray_norm) || ray_norm <= kGeometryEpsilon) {
-    return std::nullopt;
-  }
-  if (!std::isfinite(normal_horizontal) || !std::isfinite(ray_horizontal)) {
-    return std::nullopt;
-  }
-  if (normal_horizontal < 0.10 || ray_horizontal < 0.10 * ray_norm) {
-    use_normal_fallback();
-    return result;
-  }
-
-  const double normal_azimuth = std::atan2(normal.y(), normal.x());
-  const double normal_elevation = std::atan2(normal.z(), normal_horizontal);
-  const double target_azimuth = std::atan2(ray.y(), ray.x());
-  const double target_elevation = std::atan2(ray.z(), ray_horizontal);
-  constexpr double kPi = 3.14159265358979323846;
-  constexpr double kTwoPi = 2.0 * kPi;
-  double azimuth_error = std::remainder(target_azimuth - normal_azimuth, kTwoPi);
-  // Pick +pi deterministically for the unavoidable exact antipodal tie.
-  if (std::abs(std::abs(azimuth_error) - kPi) <= 1.0e-12) {
-    azimuth_error = kPi;
-  }
-  Eigen::Vector2d pointing_error(azimuth_error, target_elevation - normal_elevation);
-
-  const double tan_elevation = std::tan(normal_elevation);
-  Eigen::RowVector3d current_azimuth_gradient(
-    -tan_elevation * std::cos(normal_azimuth),
-    -tan_elevation * std::sin(normal_azimuth), 1.0);
-  Eigen::RowVector3d current_elevation_gradient(
-    std::sin(normal_azimuth), -std::cos(normal_azimuth), 0.0);
-  const double ray_horizontal_squared = ray_horizontal * ray_horizontal;
-  const double ray_norm_squared = ray.squaredNorm();
-  Eigen::RowVector3d target_azimuth_gradient(
-    -ray.y() / ray_horizontal_squared, ray.x() / ray_horizontal_squared, 0.0);
-  Eigen::RowVector3d target_elevation_gradient(
-    -ray.z() * ray.x() / (ray_horizontal * ray_norm_squared),
-    -ray.z() * ray.y() / (ray_horizontal * ray_norm_squared),
-    ray_horizontal / ray_norm_squared);
-  if (!pointing_error.allFinite() || !current_azimuth_gradient.allFinite() ||
-    !current_elevation_gradient.allFinite() || !target_azimuth_gradient.allFinite() ||
-    !target_elevation_gradient.allFinite())
-  {
-    return std::nullopt;
-  }
-
-  const Eigen::MatrixXd angular_jacobian = pointing_jacobian->bottomRows(3);
-  const Eigen::MatrixXd linear_jacobian = pointing_jacobian->topRows(3);
-  result.matrix.resize(2, screen_jacobian.cols());
-  result.matrix.row(0) = current_azimuth_gradient * angular_jacobian +
-    target_azimuth_gradient * linear_jacobian;
-  result.matrix.row(1) = current_elevation_gradient * angular_jacobian +
-    target_elevation_gradient * linear_jacobian;
-  const Eigen::Vector2d target_feedforward(
-    target_azimuth_gradient.dot(face_velocity),
-    target_elevation_gradient.dot(face_velocity));
-  const double pointing_error_norm = pointing_error.norm();
-  Eigen::Vector2d proportional = Eigen::Vector2d::Zero();
-  if (pointing_error_norm > config.pointing_deadband_rad) {
-    proportional = config.orientation_gain * pointing_error *
-      ((pointing_error_norm - config.pointing_deadband_rad) / pointing_error_norm);
-  }
-  result.reference = proportional + target_feedforward;
-  const double reference_norm = result.reference.norm();
-  if (reference_norm > config.maximum_angular_reference_radps) {
-    result.reference *= config.maximum_angular_reference_radps / reference_norm;
-  }
-  if (!result.matrix.allFinite() || !result.reference.allFinite()) {
-    return std::nullopt;
-  }
   return result;
 }
 

@@ -56,6 +56,7 @@
 #include "servo_types.hpp"
 #include "face_tracking_arm/collision_aware_parameters.hpp"
 #include "face_tracking_arm/collision_constraints.hpp"
+#include "compact_brake_line_proof.hpp"
 #include "face_tracking_arm/msg/tracking_target.hpp"
 #include "face_tracking_arm/control_time_grid.hpp"
 #include "face_tracking_arm/emergency_brake_tail.hpp"
@@ -169,7 +170,8 @@ private:
     const std::uint64_t publication_id, const std::uint8_t publication_kind,
     const rclcpp::Time & stationary_time, const std::uint32_t tail_start_index);
 
-  std::optional<control_msgs::msg::JointTrajectoryControllerState> current_controller_state() const;
+  std::optional<control_msgs::msg::JointTrajectoryControllerState> current_controller_state(
+    std::string * failure_reason = nullptr);
 
   void switch_command_type(
     const moveit_msgs::srv::ServoCommandType::Request & request,
@@ -218,7 +220,10 @@ private:
     const planning_scene::PlanningScene & planning_scene,
     const moveit::core::RobotState & robot_state,
     const control::JointMotionState & motion_state,
+    const control::JointMotionLimits & limits,
     control::CollisionConstraintResult & result);
+
+  [[nodiscard]] const control::JointMotionLimits & active_motion_limits() const noexcept;
 
   void process_startup_cycle(
     const moveit_servo::KinematicState & state,
@@ -309,7 +314,8 @@ private:
     std::string & failure_reason,
     const control::CollisionConstraintDiagnostics & collision_diagnostics,
     CandidateRejectionKind & rejection_kind,
-    control::CollisionValidationBudget * budget = nullptr);
+    control::CollisionValidationBudget * budget = nullptr,
+    bool compact_profile_command = false);
 
   std::optional<control::QpResult> reference_guard_blend(
     const control::QpResult & tracking_result,
@@ -363,9 +369,6 @@ private:
 
   void update_pause_after_publication();
 
-  std::optional<control::LinearVelocityConstraint> j1_hold_constraint(
-    const control::MotionReferenceResult & reference,
-    const control::JointMotionState & motion_state) const;
 
   CommandPublicationStatus enqueue_and_publish(
     const moveit_servo::KinematicState & current_state,
@@ -394,6 +397,7 @@ private:
   std::mutex initialization_mutex_;
   std::optional<rclcpp::PreShutdownCallbackHandle> shutdown_callback_;
   control::JointMotionLimits motion_limits_;
+  control::CollisionConstraintConfig collision_constraint_config_;
   Eigen::VectorXd physical_joint_velocity_limits_;
   servo::Params servo_parameters_;
   planning_scene_monitor::PlanningSceneMonitorPtr planning_scene_monitor_;
@@ -403,6 +407,10 @@ private:
   std::unique_ptr<control::HierarchicalVelocityQp> velocity_qp_;
   std::unique_ptr<control::EmergencyBrakeTailGenerator> emergency_brake_tail_generator_;
   std::unique_ptr<control::CollisionConstraintBuilder> collision_constraint_builder_;
+  std::unique_ptr<control::CollisionConstraintBuilder> compact_brake_line_validator_;
+  control::CompactBrakeLineProof compact_brake_line_proof_;
+  std::uint64_t collision_config_revision_{1U};
+  std::uint64_t compact_brake_line_validator_revision_{0U};
 
   bool use_tracking_target_{false};
   bool require_hardware_io_status_{false};

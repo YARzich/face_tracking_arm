@@ -8,6 +8,8 @@
 #include <limits>
 #include <vector>
 
+#include "face_tracking_arm/collision_constraints.hpp"
+
 namespace face_tracking_arm::control
 {
 PostureBendCalibration calibratePostureBend(
@@ -89,10 +91,89 @@ PostureBendCalibration calibratePostureBend(
   return result;
 }
 
+std::optional<LinearVelocityConstraint> makeJoint3ComfortBounds(
+  const JointMotionState & motion, const JointMotionLimits & limits,
+  const Eigen::Index joint_index, const double lower_position,
+  const double upper_position, const double period_sec,
+  const double residual_latency_sec)
+{
+  const Eigen::Index count = motion.position.size();
+  if (joint_index < 0 || joint_index >= count || motion.velocity.size() != count ||
+    motion.acceleration.size() != count || limits.max_velocity.size() != count ||
+    limits.max_acceleration.size() != count || limits.max_jerk.size() != count ||
+    !motion.position.allFinite() || !motion.velocity.allFinite() ||
+    !motion.acceleration.allFinite() || !std::isfinite(lower_position) ||
+    !std::isfinite(upper_position) || upper_position <= lower_position ||
+    !std::isfinite(period_sec) || period_sec <= 0.0 ||
+    !std::isfinite(residual_latency_sec) || residual_latency_sec < 0.0)
+  {
+    return std::nullopt;
+  }
+
+  const double position = motion.position[joint_index];
+  const double velocity = motion.velocity[joint_index];
+  const double acceleration = motion.acceleration[joint_index];
+  const double max_velocity = limits.max_velocity[joint_index];
+  const double max_acceleration = limits.max_acceleration[joint_index];
+  const double max_jerk = limits.max_jerk[joint_index];
+  if (!std::isfinite(max_velocity) || max_velocity <= 0.0 ||
+    !std::isfinite(max_acceleration) || max_acceleration <= 0.0 ||
+    !std::isfinite(max_jerk) || max_jerk <= 0.0 ||
+    position < lower_position || position > upper_position ||
+    !limits.numerical_policy || !limits.numerical_policy->valid() ||
+    classifyVelocity(RadiansPerSecond{velocity}, RadiansPerSecond{max_velocity},
+      limits.numerical_policy->velocity_error) == BoundaryClass::kOutside ||
+    classifyAcceleration(RadiansPerSecondSquared{acceleration},
+      RadiansPerSecondSquared{max_acceleration},
+      limits.numerical_policy->acceleration_error) == BoundaryClass::kOutside)
+  {
+    return std::nullopt;
+  }
+
+  const double bounded_acceleration = std::clamp(
+    acceleration, -max_acceleration, max_acceleration);
+  const double jerk_step = max_jerk * period_sec;
+  const double minimum_acceleration = std::max(
+    -max_acceleration, bounded_acceleration - jerk_step);
+  const double maximum_acceleration = std::min(
+    max_acceleration, bounded_acceleration + jerk_step);
+  const double minimum_reachable_velocity = std::max(
+    -max_velocity, velocity + minimum_acceleration * period_sec);
+  const double maximum_reachable_velocity = std::min(
+    max_velocity, velocity + maximum_acceleration * period_sec);
+  if (!std::isfinite(minimum_reachable_velocity) ||
+    !std::isfinite(maximum_reachable_velocity) ||
+    minimum_reachable_velocity > maximum_reachable_velocity)
+  {
+    return std::nullopt;
+  }
+
+  const double upper_velocity = maximumSafeVelocityTowardBoundary(
+    upper_position - position, velocity, minimum_reachable_velocity,
+    maximum_reachable_velocity, max_acceleration, max_jerk,
+    period_sec, residual_latency_sec);
+  const double lower_velocity = -maximumSafeVelocityTowardBoundary(
+    position - lower_position, -velocity, -maximum_reachable_velocity,
+    -minimum_reachable_velocity, max_acceleration, max_jerk,
+    period_sec, residual_latency_sec);
+  if (!std::isfinite(lower_velocity) || !std::isfinite(upper_velocity) ||
+    lower_velocity > upper_velocity)
+  {
+    return std::nullopt;
+  }
+
+  LinearVelocityConstraint constraint;
+  constraint.coefficients = Eigen::VectorXd::Zero(count);
+  constraint.coefficients[joint_index] = 1.0;
+  constraint.lower_bound = lower_velocity;
+  constraint.upper_bound = upper_velocity;
+  return constraint;
+}
+
 PosturePreferenceObjective makePosturePreferenceObjective(
-  const Eigen::Vector3d & base, const Eigen::Vector3d & elbow,
-  const Eigen::Vector3d & wrist, const Eigen::Vector3d & face,
-  const Eigen::MatrixXd & base_jacobian, const Eigen::MatrixXd & elbow_jacobian,
+  const Eigen::Vector3d & shoulder, const Eigen::Vector3d & elbow,
+  const Eigen::Vector3d & wrist,
+  const Eigen::MatrixXd & shoulder_jacobian, const Eigen::MatrixXd & elbow_jacobian,
   const Eigen::MatrixXd & wrist_jacobian, const Eigen::VectorXd & joint_position,
   const PosturePreferenceConfig & config)
 {
@@ -122,6 +203,9 @@ PosturePreferenceObjective makePosturePreferenceObjective(
 
   std::vector<Eigen::RowVectorXd> rows;
   std::vector<double> references;
+  result.joint3_correction.matrix.resize(0, count);
+  result.joint3_correction.reference.resize(0);
+  result.joint3_correction.weights.resize(0);
   const Eigen::Index j3 = static_cast<Eigen::Index>(config.j3_index);
   const double q3 = joint_position[j3];
   const bool comfortable = q3 >= config.comfortable_joint3_lower &&
@@ -130,7 +214,6 @@ PosturePreferenceObjective makePosturePreferenceObjective(
   const double one_step_reserve = std::min(
     config.maximum_angular_reference_radps * config.control_period_sec,
     0.5 * (config.comfortable_joint3_upper - config.comfortable_joint3_lower));
-  double face_side_scale = 0.0;
   if (!comfortable) {
     const bool below_interval = q3 < config.comfortable_joint3_lower;
     const double boundary = below_interval ?
@@ -142,105 +225,65 @@ PosturePreferenceObjective makePosturePreferenceObjective(
       config.position_gain * (branch_target - q3),
       -config.maximum_angular_reference_radps,
       config.maximum_angular_reference_radps);
-    rows.push_back(std::move(branch_row));
-    references.push_back(q3_rate);
-  } else {
-    const double distance_to_lower = q3 - config.comfortable_joint3_lower;
-    const double distance_to_upper = config.comfortable_joint3_upper - q3;
-    const bool near_lower = distance_to_lower <= distance_to_upper;
-    const double distance_to_boundary = near_lower ? distance_to_lower : distance_to_upper;
-    face_side_scale = one_step_reserve > 0.0 ?
-      std::clamp(distance_to_boundary / one_step_reserve, 0.0, 1.0) : 1.0;
+    result.joint3_correction.matrix = branch_row;
+    result.joint3_correction.reference = Eigen::VectorXd::Constant(1, q3_rate);
+    result.joint3_correction.weights = Eigen::VectorXd::Ones(1);
   }
 
-  const auto add_elbow_geometry = [&]() {
-      if (!base.allFinite() || !elbow.allFinite() || !wrist.allFinite() ||
-        !face.allFinite() || base_jacobian.rows() != 3 || elbow_jacobian.rows() != 3 ||
-        wrist_jacobian.rows() != 3 || base_jacobian.cols() != count ||
-        elbow_jacobian.cols() != count || wrist_jacobian.cols() != count ||
-        !base_jacobian.allFinite() || !elbow_jacobian.allFinite() ||
-        !wrist_jacobian.allFinite())
-      {
-        return;
-      }
-      const Eigen::Vector3d e = elbow - base;
-      const Eigen::Vector3d w = wrist - base;
-      const Eigen::Vector3d f = face - base;
-      const double d = w.squaredNorm();
-      const double forearm_length = (wrist - elbow).stableNorm();
-      if (!std::isfinite(d) || d <= 0.0 || !std::isfinite(forearm_length) ||
-        forearm_length <= std::numeric_limits<double>::epsilon())
-      {
-        return;
-      }
-
-      const double a = e.dot(w);
-      const double b = f.dot(w);
-      if (!std::isfinite(a) || !std::isfinite(b)) {
-        return;
-      }
-      const double c = e.dot(f) - (a * b) / d;
-      const Eigen::Vector3d f_perp = f - w * (b / d);
-      const double r_squared = f_perp.squaredNorm();
-      if (!std::isfinite(c) || !f_perp.allFinite() || !std::isfinite(r_squared) ||
-        r_squared <= 0.0)
-      {
-        return;
-      }
-
+  constexpr double kIndeterminateActivation{std::numeric_limits<double>::epsilon()};
+  const Eigen::Vector3d line = wrist - shoulder;
+  const Eigen::Vector3d upper = Eigen::Vector3d::UnitZ();
+  const double line_squared = line.squaredNorm();
+  if (shoulder.allFinite() && elbow.allFinite() && wrist.allFinite() &&
+    shoulder_jacobian.rows() == 3 && elbow_jacobian.rows() == 3 &&
+    wrist_jacobian.rows() == 3 && shoulder_jacobian.cols() == count &&
+    elbow_jacobian.cols() == count && wrist_jacobian.cols() == count &&
+    shoulder_jacobian.allFinite() && elbow_jacobian.allFinite() &&
+    wrist_jacobian.allFinite() && std::isfinite(line_squared))
+  {
+    if (line_squared <= std::numeric_limits<double>::epsilon()) {
+      result.geometry_comfortable = true;
+    } else {
+      const Eigen::Vector3d offset = elbow - shoulder;
+      const double along = offset.dot(line);
+      const double up_along = upper.dot(line);
+      const auto h = evaluateUpwardBend(shoulder, elbow, wrist);
       const double reserve = config.maximum_linear_reference_mps * config.control_period_sec;
-      const double r = std::sqrt(r_squared);
-      const double denominator = std::sqrt(r_squared + forearm_length * forearm_length);
-      const double clearance_residual = (-c - reserve * r) / denominator;
-      if (!std::isfinite(reserve) || !std::isfinite(denominator) || denominator <= 0.0 ||
-        !std::isfinite(clearance_residual) || clearance_residual >= 0.0)
+      const double horizontal_squared = line.head<2>().squaredNorm();
+      const double forearm_squared = (wrist - elbow).squaredNorm();
+      // The horizontal lever arm naturally fades near a vertical or collapsed line.
+      const double activation = horizontal_squared / (line_squared + forearm_squared);
+      if (std::isfinite(along) && std::isfinite(up_along) && h &&
+        std::isfinite(reserve) && std::isfinite(horizontal_squared) &&
+        std::isfinite(forearm_squared) && std::isfinite(activation))
       {
-        return;
+        result.geometry_comfortable =
+          *h >= reserve || activation <= kIndeterminateActivation;
+        if (comfortable && !result.geometry_comfortable && activation > 0.0) {
+          const double squared = line_squared;
+          const double product = along * up_along;
+          const Eigen::Vector3d gradient_offset = upper - line * (up_along / squared);
+          const Eigen::Vector3d gradient_line =
+            -(offset * up_along + upper * along) / squared +
+            line * (2.0 * product / (squared * squared));
+          const Eigen::Vector3d gradient_shoulder = -gradient_offset - gradient_line;
+          Eigen::RowVectorXd clearance_row(count);
+          for (Eigen::Index index = 0; index < count; ++index) {
+            clearance_row[index] = activation * (
+              gradient_shoulder.dot(shoulder_jacobian.col(index)) +
+              gradient_offset.dot(elbow_jacobian.col(index)) +
+              gradient_line.dot(wrist_jacobian.col(index)));
+          }
+          if (clearance_row.allFinite()) {
+            const double desired_rate = std::clamp(
+              config.position_gain * (reserve - *h),
+              0.0, config.maximum_linear_reference_mps);
+            rows.push_back(std::move(clearance_row));
+            references.push_back(activation * desired_rate);
+          }
+        }
       }
-
-      const double line_activation = d / (d + forearm_length * forearm_length);
-      const double face_activation = r_squared / (r_squared + forearm_length * forearm_length);
-      const double activation = line_activation * face_activation;
-      if (!std::isfinite(activation) || activation <= 0.0) {
-        return;
-      }
-
-      Eigen::RowVectorXd clearance_row(count);
-      const double squared_forearm_length = forearm_length * forearm_length;
-      for (Eigen::Index index = 0; index < count; ++index) {
-        const Eigen::Vector3d de = elbow_jacobian.col(index) - base_jacobian.col(index);
-        const Eigen::Vector3d dw = wrist_jacobian.col(index) - base_jacobian.col(index);
-        const Eigen::Vector3d forearm_derivative = dw - de;
-        const Eigen::Vector3d df = -base_jacobian.col(index);
-        const double da = de.dot(w) + e.dot(dw);
-        const double db = df.dot(w) + f.dot(dw);
-        const double dd = 2.0 * w.dot(dw);
-        const double dc = de.dot(f) + e.dot(df) - (da * b + a * db) / d +
-          (a * b * dd) / (d * d);
-        const Eigen::Vector3d df_perp = df - dw * (b / d) - w * (db / d - b * dd / (d * d));
-        const double dr = f_perp.dot(df_perp) / r;
-        const double d_forearm_length =
-          (wrist - elbow).dot(forearm_derivative) / forearm_length;
-        const double d_residual = -dc / denominator +
-          (c * r - reserve * squared_forearm_length) * dr /
-          (denominator * denominator * denominator) +
-          (c + reserve * r) * forearm_length * d_forearm_length /
-          (denominator * denominator * denominator);
-        clearance_row[index] = d_residual / forearm_length -
-          clearance_residual * d_forearm_length / squared_forearm_length;
-      }
-      if (!clearance_row.allFinite()) {
-        return;
-      }
-
-      const double desired_rate = std::clamp(
-        -config.position_gain * clearance_residual,
-        0.0, config.maximum_linear_reference_mps);
-      rows.push_back(face_side_scale * activation * clearance_row);
-      references.push_back(face_side_scale * activation * desired_rate / forearm_length);
-    };
-  if (comfortable) {
-    add_elbow_geometry();
+    }
   }
 
   const auto add_limit_margin = [&](const std::size_t index, const double lower,
@@ -270,14 +313,15 @@ PosturePreferenceObjective makePosturePreferenceObjective(
     config.position_margin_j6_rad);
 
   result.valid = true;
-  result.matrix.resize(static_cast<Eigen::Index>(rows.size()), count);
-  result.reference.resize(static_cast<Eigen::Index>(references.size()));
-  result.weights = Eigen::VectorXd::Ones(static_cast<Eigen::Index>(rows.size()));
+  result.other_corrections.matrix.resize(static_cast<Eigen::Index>(rows.size()), count);
+  result.other_corrections.reference.resize(static_cast<Eigen::Index>(references.size()));
+  result.other_corrections.weights = Eigen::VectorXd::Ones(
+    static_cast<Eigen::Index>(rows.size()));
   for (std::size_t index = 0; index < rows.size(); ++index) {
-    result.matrix.row(static_cast<Eigen::Index>(index)) = rows[index];
-    result.reference[static_cast<Eigen::Index>(index)] = references[index];
+    result.other_corrections.matrix.row(static_cast<Eigen::Index>(index)) = rows[index];
+    result.other_corrections.reference[static_cast<Eigen::Index>(index)] = references[index];
   }
-  result.comfortable = rows.empty();
+  result.comfortable = rows.empty() && result.joint3_correction.matrix.rows() == 0;
   return result;
 }
 }  // namespace face_tracking_arm::control

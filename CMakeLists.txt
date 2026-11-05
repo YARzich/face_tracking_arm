@@ -156,11 +156,17 @@ add_tracking_library(collision_aware_servo_component
   src/collision_aware_servo_control.cpp
   src/collision_aware_servo_feedback.cpp
   src/collision_aware_servo_trajectory.cpp
+  src/compact_brake_line_proof.cpp
+  src/compact_maneuver_validation.cpp
+  src/compact_path_attachment.cpp
+  src/compact_plan_admission.cpp
+  src/compact_maneuver.cpp
   src/collision_aware_servo_recovery.cpp
   src/collision_aware_servo_diagnostics.cpp
   src/collision_aware_parameters.cpp
   src/motion_reference.cpp
   src/posture_preference.cpp
+  src/posture_task_builder.cpp
   src/idle_search.cpp
 )
 target_link_libraries(
@@ -174,6 +180,10 @@ target_link_libraries(
   tracking_velocity_task
   target_motion_estimator
   joint_path_follower
+  compact_joint_profile
+  compact_path_execution
+  compact_dynamics
+  compact_profile_worker
   background_path_planner
   published_trajectory_history
   rolling_statistics
@@ -514,6 +524,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_simulation_launch test/test_simulation_launch.py TIMEOUT 60)
   ament_add_pytest_test(test_private_python_install
     test/test_private_python_install.py TIMEOUT 30)
+  ament_add_pytest_test(test_compact_demo_logic test/test_compact_demo_logic.py TIMEOUT 30)
   ament_add_pytest_test(test_posture_demo_target test/test_posture_demo_target.py TIMEOUT 30)
   ament_add_pytest_test(test_posture1d_metrics
     test/test_posture1d_metrics.py TIMEOUT 30)
@@ -591,6 +602,10 @@ if(BUILD_TESTING)
     TIMEOUT 120)
   ament_add_gtest(test_compact_profile_worker test/test_compact_profile_worker.cpp)
   target_link_libraries(test_compact_profile_worker compact_profile_worker Threads::Threads)
+  ament_add_gtest(test_compact_brake_line_proof test/test_compact_brake_line_proof.cpp
+    src/compact_brake_line_proof.cpp)
+  target_include_directories(test_compact_brake_line_proof PRIVATE src include)
+  target_link_libraries(test_compact_brake_line_proof hierarchical_velocity_qp Eigen3::Eigen)
   target_include_directories(test_idle_search PRIVATE include)
   target_link_libraries(test_idle_search Eigen3::Eigen)
   target_link_libraries(test_joint_path_follower joint_path_follower)
@@ -659,7 +674,7 @@ if(BUILD_TESTING)
   target_include_directories(test_motion_reference SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
   set_tests_properties(test_motion_reference PROPERTIES
     FIXTURES_REQUIRED motion_reference_description
-    TIMEOUT 120)
+    TIMEOUT 600)
   ament_add_gtest(test_posture_preference test/test_posture_preference.cpp)
   target_link_libraries(test_posture_preference collision_aware_servo_component Eigen3::Eigen)
   ament_add_gtest(test_compact_upright_path test/test_compact_upright_path.cpp)

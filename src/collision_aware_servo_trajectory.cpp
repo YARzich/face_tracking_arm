@@ -3,10 +3,15 @@
 
 #include "collision_aware_servo_component.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 
 #include <builtin_interfaces/msg/duration.hpp>
 #include <builtin_interfaces/msg/time.hpp>
+
+#include "face_tracking_arm/compact_joint_profile.hpp"
 
 namespace face_tracking_arm
 {
@@ -53,6 +58,35 @@ control::JointMotionState to_motion_state(const moveit_servo::KinematicState & s
   result.position = state.positions;
   result.velocity = state.velocities;
   result.acceleration = state.accelerations;
+  return result;
+}
+
+control::CompactBrakeLineProofContext compact_brake_proof_context(
+  const moveit::core::RobotState & state, const moveit::core::JointModelGroup & group,
+  const std::uint64_t scene_revision, const std::uint64_t config_revision)
+{
+  control::CompactBrakeLineProofContext result;
+  result.scene_revision = scene_revision;
+  result.config_revision = config_revision;
+  result.model_identity = state.getRobotModel().get();
+  result.group_identity = &group;
+  const auto & variables = state.getRobotModel()->getVariableNames();
+  const auto & group_variables = group.getVariableNames();
+  const double * const positions = state.getVariablePositions();
+  std::size_t fixed_count = 0U;
+  for (const auto & variable : variables) {
+    fixed_count += std::find(group_variables.begin(), group_variables.end(), variable) ==
+      group_variables.end() ? 1U : 0U;
+  }
+  result.fixed_positions.resize(static_cast<Eigen::Index>(fixed_count));
+  Eigen::Index fixed_index = 0;
+  for (std::size_t index = 0U; index < variables.size(); ++index) {
+    if (std::find(group_variables.begin(), group_variables.end(), variables[index]) ==
+      group_variables.end())
+    {
+      result.fixed_positions[fixed_index++] = positions[index];
+    }
+  }
   return result;
 }
 
@@ -222,9 +256,15 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
   std::string & failure_reason,
   const control::CollisionConstraintDiagnostics & collision_diagnostics,
   CandidateRejectionKind & rejection_kind,
-  control::CollisionValidationBudget * const budget)
+  control::CollisionValidationBudget * const budget,
+  const bool compact_profile_command)
 {
   rejection_kind = CandidateRejectionKind::kOther;
+  if (!compact_profile_command) {
+    compact_brake_line_proof_.clear();
+    compact_brake_line_validator_.reset();
+    compact_brake_line_validator_revision_ = 0U;
+  }
   if (budget != nullptr && budget->expired()) {
     failure_reason = "collision validation budget exhausted; keeping the published trajectory";
     return std::nullopt;
@@ -296,13 +336,24 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
     return std::nullopt;
   }
 
-  control::EmergencyBrakeTail braking_tail =
-    emergency_brake_tail_generator_->generate(candidate_motion_state, motion_limits_);
+  control::EmergencyBrakeTail braking_tail;
+  if (compact_profile_command) {
+    if (!motion_reference_) {
+      braking_tail.failure_reason = "compact profile braking requires a motion reference";
+    } else {
+      braking_tail = motion_reference_->compactProfileBrakingTail(
+        candidate_motion_state, emergency_brake_tail_generator_->config());
+    }
+  } else {
+    braking_tail = emergency_brake_tail_generator_->generate(
+      candidate_motion_state, active_motion_limits());
+  }
   if (budget != nullptr && budget->expired()) {
     failure_reason = "collision validation budget exhausted; keeping the published trajectory";
     return std::nullopt;
   }
   if (!braking_tail.command_available()) {
+    compact_brake_line_proof_.clear();
     ++telemetry_.braking_tail_generation_failure_count;
     RCLCPP_WARN(
       get_logger(), "%s braking-tail candidate rejected: %s",
@@ -314,8 +365,10 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
         "limits=[qdot %.9f, qddot %.9f, jerk %.9f]",
         parameters_.joint_names[static_cast<std::size_t>(index)].c_str(),
         candidate_motion_state.position[index], candidate_motion_state.velocity[index],
-        candidate_motion_state.acceleration[index], motion_limits_.max_velocity[index],
-        motion_limits_.max_acceleration[index], motion_limits_.max_jerk[index]);
+        candidate_motion_state.acceleration[index],
+        active_motion_limits().max_velocity[index],
+        active_motion_limits().max_acceleration[index],
+        active_motion_limits().max_jerk[index]);
     }
     failure_reason = "pre-published braking tail is unavailable: " +
       braking_tail.failure_reason;
@@ -347,6 +400,35 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
             "FACE emergency-braking suffix violates its armed " +
             motion_reference_violation + " guard";
           if (motion_reference_->compactManeuverActive()) {
+            std::ostringstream details;
+            details << std::setprecision(17)
+                    << "; compact_brake_failure={\"tail_index_zero_based\":"
+                    << tail_index << ",\"branch_q_rad\":[";
+            const auto append_vector = [&details](const Eigen::VectorXd & vector) {
+                for (Eigen::Index index = 0; index < vector.size(); ++index) {
+                  if (index != 0) {
+                    details << ',';
+                  }
+                  details << vector[index];
+                }
+              };
+            append_vector(candidate_motion_state.position);
+            details << "],\"branch_qdot_rad_s\":[";
+            append_vector(candidate_motion_state.velocity);
+            details << "],\"branch_qddot_rad_s2\":[";
+            append_vector(candidate_motion_state.acceleration);
+            details << "],\"tail_q_rad\":[";
+            append_vector(point.position);
+            details << "],\"effective_radius_cap_m\":";
+            const double radius_cap =
+              motion_reference_->diagnostics().compact_effective_radius_cap_m;
+            if (std::isfinite(radius_cap)) {
+              details << radius_cap;
+            } else {
+              details << "null";
+            }
+            details << '}';
+            failure_reason += details.str();
             rejection_kind = CandidateRejectionKind::kCompactStopEnvelope;
           } else {
             rejection_kind = CandidateRejectionKind::kReferenceGuard;
@@ -360,6 +442,34 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
     }
   }
 
+  control::CompactBrakeLinePlan compact_brake_line_plan;
+  bool compact_brake_line_plan_ready = false;
+  if (compact_profile_command && robot_state && joint_model_group_ != nullptr &&
+    collision_constraint_config_.numerical_policy && last_validated_scene_revision_ ==
+    planning_scene_collision_revision_.load(std::memory_order_acquire))
+  {
+    const auto & group_names = joint_model_group_->getVariableNames();
+    const auto protected_joint = std::find(
+      group_names.begin(), group_names.end(), collision_constraint_config_.protected_joint_name);
+    if (protected_joint != group_names.end()) {
+      compact_brake_line_plan = compact_brake_line_proof_.plan(
+        braking_tail.points,
+        compact_brake_proof_context(
+          *robot_state, *joint_model_group_, last_validated_scene_revision_,
+          collision_config_revision_),
+        std::max(
+          collision_constraint_config_.numerical_policy->position_error.value,
+          control::kCompactProfilePositionToleranceRad),
+        static_cast<std::size_t>(std::distance(group_names.begin(), protected_joint)),
+        control::PositionInterval{
+          collision_constraint_config_.protected_joint_lower_rad,
+          collision_constraint_config_.protected_joint_upper_rad},
+        collision_constraint_config_.numerical_policy->position_error);
+      compact_brake_line_plan_ready = true;
+    } else {
+      compact_brake_line_proof_.clear();
+    }
+  }
   bool braking_tail_certified = collision_constraint_builder_->canCertifyPath(
     collision_diagnostics, braking_tail.points);
   if (!braking_tail_certified && budget != nullptr && budget->expired()) {
@@ -382,7 +492,90 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
       }
     }
   }
-  if (!braking_tail_certified) {
+  bool reused_compact_brake_proof = false;
+  if (!braking_tail_certified && compact_brake_line_plan_ready &&
+    collision_constraint_builder_)
+  {
+    const double tube_error = compact_brake_line_plan.tube_error_rad;
+    if (compact_brake_line_plan.result == control::CompactBrakeLinePlan::Result::kCovered) {
+      reused_compact_brake_proof = true;
+    } else {
+      if (compact_brake_line_plan.result ==
+        control::CompactBrakeLinePlan::Result::kValidate &&
+        std::isfinite(tube_error) && tube_error >= 0.0)
+      {
+        if (compact_brake_line_validator_revision_ != collision_config_revision_) {
+          control::CollisionConstraintConfig proof_config = collision_constraint_config_;
+          proof_config.tracking_position_error_bound_rad += tube_error;
+          compact_brake_line_validator_revision_ = collision_config_revision_;
+          if (std::isfinite(proof_config.tracking_position_error_bound_rad)) {
+            try {
+              compact_brake_line_validator_ =
+                std::make_unique<control::CollisionConstraintBuilder>(std::move(proof_config));
+            } catch (const std::invalid_argument &) {
+              compact_brake_line_validator_.reset();
+              compact_brake_line_proof_.clear();
+            }
+          }
+        }
+        if (compact_brake_line_validator_ &&
+          compact_brake_line_validator_revision_ == collision_config_revision_)
+        {
+          const auto & plan = compact_brake_line_plan;
+          control::JointMotionState start;
+          start.position = plan.start_position;
+          start.velocity = Eigen::VectorXd::Zero(plan.start_position.size());
+          start.acceleration = Eigen::VectorXd::Zero(plan.start_position.size());
+          control::JointMotionState end;
+          end.position = plan.end_position;
+          end.velocity = Eigen::VectorXd::Zero(plan.end_position.size());
+          end.acceleration = Eigen::VectorXd::Zero(plan.end_position.size());
+          moveit::core::RobotState proof_robot_state(*robot_state);
+          proof_robot_state.setJointGroupPositions(joint_model_group_, start.position);
+          proof_robot_state.setJointGroupVelocities(joint_model_group_, start.velocity);
+          proof_robot_state.setJointGroupAccelerations(joint_model_group_, start.acceleration);
+          proof_robot_state.update();
+          const auto proof_validation_start = std::chrono::steady_clock::now();
+          const control::CollisionSegmentValidationResult proof_result =
+            compact_brake_line_validator_->validatePathWithRefinement(
+          planning_scene, proof_robot_state, *joint_model_group_, {start, end},
+          static_cast<std::size_t>(parameters_.segment_validation_substeps), 3U, budget);
+          telemetry_.braking_tail_distance_query_count += proof_result.distance_query_count;
+          telemetry_.braking_tail_certified_path_block_count +=
+            proof_result.certified_path_block_count;
+          telemetry_.braking_tail_inconclusive_path_block_count +=
+            proof_result.inconclusive_path_block_count;
+          (void)telemetry_.path_validation_statistics.add(
+          std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - proof_validation_start).count());
+          telemetry_.observeClearances(
+          proof_result.minimum_self_distance_m, proof_result.minimum_world_distance_m);
+          if (proof_result.budget_exhausted || (budget != nullptr && budget->expired())) {
+            compact_brake_line_proof_.clear();
+            failure_reason =
+              "collision validation budget exhausted; keeping the published trajectory";
+            return std::nullopt;
+          }
+          const bool proof_valid = proof_result.input_valid && !proof_result.unsafe &&
+            planning_scene_collision_revision_.load(std::memory_order_acquire) ==
+            compact_brake_line_plan.context.scene_revision;
+          if (proof_valid) {
+            compact_brake_line_proof_.commit(plan);
+            reused_compact_brake_proof = true;
+            ++telemetry_.segment_validation_count;
+            ++telemetry_.braking_tail_segment_validation_count;
+          } else {
+            compact_brake_line_proof_.clear();
+          }
+        }
+      }
+    }
+  }
+  if (braking_tail_certified || reused_compact_brake_proof) {
+    telemetry_.last_braking_tail_certified_segment_count = braking_tail.points.size() - 1U;
+    telemetry_.last_braking_tail_uncertified_segment_count = 0U;
+  }
+  if (!braking_tail_certified && !reused_compact_brake_proof) {
     moveit::core::RobotState tail_robot_state(*robot_state);
     const auto & tail_start = braking_tail.points.front();
     tail_robot_state.setJointGroupPositions(joint_model_group_, tail_start.position);
@@ -408,10 +601,12 @@ std::optional<ValidatedCommand> CollisionAwareServoComponent::validated_candidat
     telemetry_.observeClearances(tail_path.minimum_self_distance_m,
         tail_path.minimum_world_distance_m);
     if (tail_path.budget_exhausted || (budget != nullptr && budget->expired())) {
+      compact_brake_line_proof_.clear();
       failure_reason = "collision validation budget exhausted; keeping the published trajectory";
       return std::nullopt;
     }
     if (!tail_path.input_valid || tail_path.unsafe) {
+      compact_brake_line_proof_.clear();
       ++telemetry_.braking_tail_collision_rejection_count;
       record_segment_rejection(attempt, tail_path);
       failure_reason = "pre-published braking tail rejected: " +
@@ -455,34 +650,40 @@ std::optional<moveit_servo::KinematicState> CollisionAwareServoComponent::make_n
     return std::nullopt;
   }
 
-  if (!motion_limits_.numerical_policy.has_value()) {
+  const control::JointMotionLimits & limits = active_motion_limits();
+  if (!limits.numerical_policy.has_value()) {
     failure_reason = "Direct integration has no shared numerical policy";
     return std::nullopt;
   }
-  const auto & numerical = *motion_limits_.numerical_policy;
+  const auto & numerical = *limits.numerical_policy;
   const double dt = parameters_.control_period_sec;
   for (std::size_t index = 0; index < parameters_.joint_names.size(); ++index) {
     const Eigen::Index axis = static_cast<Eigen::Index>(index);
     const control::PositionInterval position_interval{
-      motion_limits_.lower_position[axis], motion_limits_.upper_position[axis]};
+      limits.lower_position[axis], limits.upper_position[axis]};
     const double jerk =
       (next_state.accelerations[axis] - current_state.accelerations[axis]) / dt;
     const auto acceleration_class = control::classifyMagnitude(
       control::RadiansPerSecondSquared{next_state.accelerations[axis]},
-      control::RadiansPerSecondSquared{motion_limits_.max_acceleration[axis]},
+      control::RadiansPerSecondSquared{limits.max_acceleration[axis]},
       numerical.acceleration_error);
+    const auto velocity_class = control::classifyVelocity(
+      control::RadiansPerSecond{next_state.velocities[axis]},
+      control::RadiansPerSecond{limits.max_velocity[axis]},
+      numerical.velocity_error);
     const auto jerk_class = control::classifyMagnitude(
       control::RadiansPerSecondCubed{jerk},
-      control::RadiansPerSecondCubed{motion_limits_.max_jerk[axis]},
+      control::RadiansPerSecondCubed{limits.max_jerk[axis]},
       numerical.jerk_error);
     if (!control::isNominalPosition(next_state.positions[axis], position_interval) ||
-      std::abs(next_state.velocities[axis]) > motion_limits_.max_velocity[axis] ||
+      velocity_class == control::BoundaryClass::kOutside ||
+      velocity_class == control::BoundaryClass::kInvalid ||
       acceleration_class == control::BoundaryClass::kOutside ||
       acceleration_class == control::BoundaryClass::kInvalid ||
       jerk_class == control::BoundaryClass::kOutside ||
       jerk_class == control::BoundaryClass::kInvalid)
     {
-      failure_reason = "Direct fixed-period integration is outside the shared q/v/a/j "
+      failure_reason = "Direct fixed-period integration is outside the active q/v/a/j "
         "command policy for " + parameters_.joint_names[index];
       return std::nullopt;
     }
@@ -490,9 +691,14 @@ std::optional<moveit_servo::KinematicState> CollisionAwareServoComponent::make_n
 
   moveit::core::RobotState bound_check(*robot_state);
   bound_check.setJointGroupPositions(joint_model_group_, next_state.positions);
-  if (!bound_check.satisfiesBounds(joint_model_group_, 0.0)) {
-    failure_reason = "integrated state violates the MoveIt robot model bounds";
-    return std::nullopt;
+  for (const moveit::core::JointModel * joint_model :
+    joint_model_group_->getActiveJointModels())
+  {
+    if (!bound_check.satisfiesPositionBounds(joint_model, 0.0)) {
+      failure_reason = "integrated state violates the MoveIt robot model position bounds for " +
+        joint_model->getName();
+      return std::nullopt;
+    }
   }
   return next_state;
 }
@@ -576,6 +782,7 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
   }
   command.next_state.time_stamp = *next_stamp;
   staged_queue.push_back(std::move(command.next_state));
+  const std::size_t new_branch_index = staged_queue.size() - 1U;
 
   if (command.braking_tail.points.size() < 3U ||
     command.braking_tail.first_stationary_point >= command.braking_tail.points.size() ||
@@ -640,6 +847,21 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
     publication_queue.push_back(std::move(state));
   }
 
+  const control::JointMotionLimits & limits = active_motion_limits();
+  if (!limits.numerical_policy.has_value() || new_branch_index == 0U) {
+    failure_reason = "Published branch has no active motion-limit policy";
+    return CommandPublicationStatus::kInvariantFailure;
+  }
+  const auto & numerical = *limits.numerical_policy;
+  Eigen::VectorXd previous_acceleration =
+    publication_queue[new_branch_index - 1U].accelerations;
+  if (previous_acceleration.size() != static_cast<Eigen::Index>(parameters_.joint_names.size()) ||
+    !previous_acceleration.allFinite())
+  {
+    failure_reason = "Published branch predecessor has invalid acceleration state";
+    return CommandPublicationStatus::kInvariantFailure;
+  }
+
   for (std::size_t point_index = 0; point_index < publication_queue.size(); ++point_index) {
     const auto & point = publication_queue[point_index];
     if (point.positions.size() != static_cast<Eigen::Index>(position_bound_sets_.size())) {
@@ -655,6 +877,43 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
         failure_reason = "Published point " + std::to_string(point_index) +
           " leaves nominal q bounds for " + parameters_.joint_names[joint_index];
         return CommandPublicationStatus::kInvariantFailure;
+      }
+      if (point_index >= new_branch_index) {
+        if (point.velocities.size() != static_cast<Eigen::Index>(parameters_.joint_names.size()) ||
+          point.accelerations.size() !=
+          static_cast<Eigen::Index>(parameters_.joint_names.size()) ||
+          !point.velocities.allFinite() || !point.accelerations.allFinite())
+        {
+          failure_reason = "Published point " + std::to_string(point_index) +
+            " has invalid qdot/qddot dimensions or values";
+          return CommandPublicationStatus::kInvariantFailure;
+        }
+        const double jerk = (point.accelerations[axis] - previous_acceleration[axis]) /
+          parameters_.control_period_sec;
+        const auto velocity_class = control::classifyVelocity(
+          control::RadiansPerSecond{point.velocities[axis]},
+          control::RadiansPerSecond{limits.max_velocity[axis]},
+          numerical.velocity_error);
+        const auto acceleration_class = control::classifyAcceleration(
+          control::RadiansPerSecondSquared{point.accelerations[axis]},
+          control::RadiansPerSecondSquared{limits.max_acceleration[axis]},
+          numerical.acceleration_error);
+        const auto jerk_class = control::classifyJerk(
+          control::RadiansPerSecondCubed{jerk},
+          control::RadiansPerSecondCubed{limits.max_jerk[axis]},
+          numerical.jerk_error);
+        if (velocity_class == control::BoundaryClass::kOutside ||
+          velocity_class == control::BoundaryClass::kInvalid ||
+          acceleration_class == control::BoundaryClass::kOutside ||
+          acceleration_class == control::BoundaryClass::kInvalid ||
+          jerk_class == control::BoundaryClass::kOutside ||
+          jerk_class == control::BoundaryClass::kInvalid)
+        {
+          failure_reason = "Published point " + std::to_string(point_index) +
+            " violates active compact/ordinary qdot/qddot/jerk limits for " +
+            parameters_.joint_names[joint_index];
+          return CommandPublicationStatus::kInvariantFailure;
+        }
       }
       if (!require_hardware_io_status_) {
         continue;
@@ -673,6 +932,9 @@ CommandPublicationStatus CollisionAwareServoComponent::enqueue_and_publish(
           parameters_.joint_names[joint_index];
         return CommandPublicationStatus::kInvariantFailure;
       }
+    }
+    if (point_index >= new_branch_index) {
+      previous_acceleration = point.accelerations;
     }
   }
 

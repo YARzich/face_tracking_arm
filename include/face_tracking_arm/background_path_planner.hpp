@@ -66,12 +66,24 @@ struct CompactPathSampleCertificate
   double suffix_maximum_assembly_radius_m{std::numeric_limits<double>::quiet_NaN()};
 };
 
+/// Checked path from the committed compact goal to a selected bounded endpoint
+/// in the maneuver's frozen return region.
+struct CompactReturnPath
+{
+  /// Selected endpoint in the same bounded joint coordinates as path.back().
+  Eigen::VectorXd goal_positions;
+  std::vector<Eigen::VectorXd> path;
+  PathValidationMetrics validation_metrics;
+};
+
 struct BackgroundPathResult
 {
   std::uint64_t generation{0};
   std::uint64_t scene_revision{0};
   Eigen::VectorXd start_positions;
   Eigen::VectorXd goal_positions;
+  /// TIMED_OUT results retain diagnostics but never expose a partial path,
+  /// compact path certificates, compact goal metrics or return path.
   std::vector<Eigen::VectorXd> path;
   bool success{false};
   int error_code{0};
@@ -85,6 +97,9 @@ struct BackgroundPathResult
   std::vector<CompactPathSampleCertificate> compact_path_samples;
   /// Exact requested compact goal metrics, distinct from a tolerant path endpoint.
   std::optional<PathValidationMetrics> compact_goal_metrics;
+  /// Present when the compact request specified a checked return region.
+  /// Such a request is successful only when this complete exit path exists.
+  std::optional<CompactReturnPath> compact_return_path;
 };
 
 /// Opt-in staged route for the known folded xArm6 compact preset. The planner
@@ -96,16 +111,43 @@ struct CompactStagedRouteRequirements
   double maximum_compact_radius_m{0.40};
 };
 
-/// Request-specific constraints for a committed compact maneuver. The effective
-/// radius and optional pitch caps are fixed by the caller at commitment.
+/// Frozen return goal area for a committed compact maneuver. All vectors use the
+/// robot model frame. Joint positions stay in bounded, unwrapped coordinates.
+struct CompactReturnRegion
+{
+  static constexpr double kDefaultAngleToleranceRad{15.0 * 3.14159265358979323846 / 180.0};
+  /// Joint state before the outbound maneuver, retained in bounded coordinates.
+  Eigen::VectorXd reference_positions;
+  Eigen::Vector3d center_world{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d outward_x_world{Eigen::Vector3d::Zero()};
+  double radius_m{0.10};
+  double direction_tolerance_rad{kDefaultAngleToleranceRad};
+  double horizontal_edge_tolerance_rad{kDefaultAngleToleranceRad};
+  double target_joint1_rad{0.0};
+  double joint1_tolerance_rad{0.0};
+  double comfortable_joint3_lower{0.0};
+  double comfortable_joint3_upper{0.0};
+  double minimum_elbow_height_m{0.0};
+};
+
+/// Tests the frozen return area, bounded turn target and final posture criteria.
+[[nodiscard]] bool compactReturnRegionContains(
+  const CompactReturnRegion & region, const Eigen::Vector3d & screen_origin_world,
+  const Eigen::Matrix3d & screen_rotation_world, const Eigen::Vector3d & shoulder_world,
+  const Eigen::Vector3d & elbow_world, const Eigen::Vector3d & wrist_world,
+  double joint1, double joint3);
+
+/// Request-specific constraints for a committed compact maneuver. Roll and
+/// pitch are recorded as path metrics; neither constrains the intermediate path.
 struct PathRequirements
 {
   std::string base_link_name;
   std::string screen_link_name;
+  /// Legacy-compatible field; compact trajectory validation records roll without capping it.
   double maximum_roll_error_rad{5.1 * 3.14159265358979323846 / 180.0};
-  double maximum_assembly_radius_m{0.40};
-  /// Optional committed compact-path pitch envelope; FACE remains pitch-unbounded.
+  /// Legacy-compatible diagnostic setting. It does not constrain compact paths.
   std::optional<double> maximum_abs_screen_pitch_rad;
+  double maximum_assembly_radius_m{0.40};
   /// Internal opt-in, set only for the prevalidated positive-wrist compact goal.
   /// An absent value preserves ordinary planning and explicit-goal behavior.
   std::optional<CompactStagedRouteRequirements> staged_route;
@@ -116,6 +158,8 @@ struct CompactGoal
   std::string profile_id;
   Eigen::VectorXd bounded_positions;
   PathRequirements path_requirements;
+  /// Frozen when this maneuver is accepted; reused for every plan retry/resync.
+  std::optional<CompactReturnRegion> return_region;
 };
 
 /// Request-local geometric guard for REST paths. The sine cap is
@@ -173,8 +217,8 @@ public:
     const HorizontalEdgePathRequirement & edge_requirement,
     std::uint64_t scene_revision);
 
-  /// Plans to an immutable bounded goal and validates every sampled state
-  /// against the committed compact pitch, upright-roll and radius requirements.
+  /// Plans to an immutable bounded goal and validates physical/path requirements.
+  /// If return_region is present, a checked return to that fixed area is mandatory.
   [[nodiscard]] std::uint64_t submit(
     const moveit::core::RobotState & start,
     const CompactGoal & goal, std::uint64_t scene_revision);

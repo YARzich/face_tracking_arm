@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 import yaml
 
 from .hardware_config import point_filter_parameters
+from .joint_torque_limits import apply_joint_torque_limits
 from .mount_collisions import allow_fixed_mount_collisions
 from .robot_profile import get_robot_profile, validate_joint_positions
 
@@ -40,7 +41,8 @@ def perception_parameters(config, mode, *, camera_only=False):
     return params
 
 
-def robot_parameters(config, mode, share, config_path, mock, probe_result=None):
+def robot_parameters(config, mode, share, config_path, mock, probe_result=None,
+                     collision_aware_servo_config_file=None):
     import xacro
 
     profile = (probe_result['profile'] if probe_result else
@@ -57,6 +59,10 @@ def robot_parameters(config, mode, share, config_path, mock, probe_result=None):
         mappings[f'joint{i}_lower_limit'] = str(low)
         mappings[f'joint{i}_upper_limit'] = str(high)
     xml = xacro.process_file(str(share / profile['urdf_file']), mappings=mappings).toxml()
+    servo_config_path = (Path(collision_aware_servo_config_file).expanduser()
+                         if collision_aware_servo_config_file else
+                         share / 'config/moveit/collision_aware_servo.yaml')
+    xml = apply_joint_torque_limits(xml, load_yaml(servo_config_path))
     robot = ET.fromstring(xml)
     names = [link.get('name') for link in robot.findall('link')]
     if len(names) != len(set(names)):
@@ -78,10 +84,18 @@ def robot_parameters(config, mode, share, config_path, mock, probe_result=None):
     allow_fixed_mount_collisions(robot, semantic)
     limits = {'joint_limits': {}}
     scale = config['motion']['speed_scale']
+    compact = config['compact_maneuver']
+    compact_limits = {
+        'max_velocity_rad_s': [],
+        'max_acceleration_rad_s2': [],
+        'max_jerk_rad_s3': [],
+    }
     for i in range(6):
         joint = f'joint{i + 1}'
+        robot_joint = robot.find(f"joint[@name='{joint}']")
+        model_maximum = float(robot_joint.find('limit').get('velocity'))
         velocity = config['limits']['max_velocity_rad_s'][i] * scale
-        maximum = float(robot.find(f"joint[@name='{joint}']/limit").get('velocity'))
+        maximum = model_maximum
         if probe_result and probe_result.get('reduced_max_joint_speed_rad_s') is not None:
             maximum = min(maximum, probe_result['reduced_max_joint_speed_rad_s'])
         if velocity > maximum:
@@ -94,6 +108,12 @@ def robot_parameters(config, mode, share, config_path, mock, probe_result=None):
             'has_jerk_limits': True,
             'max_jerk': config['limits']['max_jerk_rad_s3'][i] * scale,
         }
+        compact_limits['max_velocity_rad_s'].append(min(
+            compact['max_velocity_rad_s'][i] * scale, maximum))
+        compact_limits['max_acceleration_rad_s2'].append(
+            compact['max_acceleration_rad_s2'][i] * scale)
+        compact_limits['max_jerk_rad_s3'].append(compact['max_jerk_rad_s3'][i] * scale)
+    limits['compact_maneuver'] = compact_limits
     solvers = load_yaml(share / 'config/moveit/kinematics.yaml')
     kinematics = {profile['planning_group']: solvers[profile['planning_group']]}
     return [
@@ -124,6 +144,21 @@ def control_parameters(config, share, limits, mode='mono_cpu'):
     compact_speed_scale = config.get('compact_maneuver', {}).get('speed_scale')
     if compact_speed_scale is not None:
         motion['compact_maneuver.speed_scale'] = float(compact_speed_scale)
+    compact_settings = config['compact_maneuver']
+    for key in ('fold_speed_scale', 'turn_speed_scale', 'return_speed_scale'):
+        motion[f'compact_maneuver.{key}'] = float(compact_settings[key])
+    compact_limits = limits.get('compact_maneuver')
+    if compact_limits is None:
+        compact_limits = {
+            'max_velocity_rad_s': [v * config['motion']['speed_scale']
+                                   for v in compact_settings['max_velocity_rad_s']],
+            'max_acceleration_rad_s2': [v * config['motion']['speed_scale']
+                                        for v in compact_settings['max_acceleration_rad_s2']],
+            'max_jerk_rad_s3': [v * config['motion']['speed_scale']
+                                for v in compact_settings['max_jerk_rad_s3']],
+        }
+    for key in ('max_velocity_rad_s', 'max_acceleration_rad_s2', 'max_jerk_rad_s3'):
+        motion[f'compact_maneuver.{key}'] = list(compact_limits[key])
     compact_goal = config.get('compact_maneuver', {}).get('goal_joints_rad')
     if compact_goal is not None:
         motion['compact_maneuver.goal_joints_rad'] = list(compact_goal)

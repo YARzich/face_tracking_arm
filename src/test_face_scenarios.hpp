@@ -10,7 +10,16 @@
 namespace face_tracking_arm::test_targets
 {
 
-enum class Scenario {kDisabled, kStationary, kCircle, kPeople, kWalkAround, kApproach};
+enum class Scenario
+{
+  kDisabled,
+  kStationary,
+  kCircle,
+  kPeople,
+  kWalkAround,
+  kWalkAroundReverse,
+  kApproach,
+};
 
 struct Point
 {

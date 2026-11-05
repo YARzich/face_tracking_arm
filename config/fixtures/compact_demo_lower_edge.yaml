@@ -1,0 +1,10 @@
+# Joint 1 starts at its lower working boundary: URDF lower limit + 0.10 rad.
+# Joints 2–5 retain the geometry of the upper-edge demo; J6 is shifted by -2π,
+# preserving its physical orientation while keeping the equivalent value central.
+initial_positions:
+  joint1: -6.183185307179587
+  joint2: 0.2622001368495897
+  joint3: -1.674162260805619
+  joint4: 0.11756609848718466
+  joint5: -0.8052146548709522
+  joint6: -0.143214264817

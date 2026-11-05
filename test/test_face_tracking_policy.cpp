@@ -28,22 +28,14 @@ FaceTrackingErrorForecast forecast(
   return result;
 }
 
-BaseJointHandoffInput edgeInput(
-  const double actual_position, const BaseJointDirection edge_direction,
-  const BaseJointDirection tracking_direction)
+J1BoundaryAssessment boundary(
+  const double actual, const double brake_min, const double brake_max,
+  const double lower = -2.0, const double upper = 2.0, const double margin = 0.1,
+  const double position_error = 0.0)
 {
-  BaseJointHandoffInput result;
-  result.working_edge_reached = true;
-  result.actual_base_position_rad = actual_position;
-  result.predicted_hold_position_rad = actual_position;
-  result.edge_direction = edge_direction;
-  result.tracking_yaw_direction = tracking_direction;
-  return result;
+  return assessJ1Boundary(J1BoundaryInput{
+        actual, brake_min, brake_max, lower, upper, margin, position_error});
 }
-
-PairYawResourceInput pairYawInput(
-  double yaw_error, double target_bearing_rate,
-  double j1_position, double j4_position);
 
 TEST(FaceTrackingPolicy, StartsInExactTracking)
 {
@@ -212,13 +204,9 @@ TEST(FaceTrackingPolicy, ForecastShortfallAloneDoesNotQualifyCompactManeuver)
       kFaceTrackingForecastHorizonSec, guard));
   ASSERT_TRUE(shortfall_candidate);
 
-  const auto pair = assessPairYawResource(pairYawInput(0.0, 0.0, 0.0, 0.0));
-  ASSERT_TRUE(pair.valid);
-  EXPECT_FALSE(pair.demand_present);
-  EXPECT_FALSE(pair.exhausted);
   FaceTrackingPolicy policy;
-  EXPECT_EQ(policy.update(FaceTrackingPolicyInput{shortfall_candidate && pair.exhausted, false}),
-    FaceTrackingPhase::kTracking);
+  EXPECT_EQ(policy.update(FaceTrackingPolicyInput{shortfall_candidate, false}),
+    FaceTrackingPhase::kCompactManeuver);
 }
 
 TEST(FaceTrackingPolicy, PersistentUncorrectableStationaryErrorRemainsAQualifiedCandidate)
@@ -361,282 +349,81 @@ TEST(FaceTrackingPolicy, RejectsInvalidForecastInputs)
   EXPECT_FALSE(trackingErrorWillCrossGuard(invalid_forecast));
 }
 
-PairYawResourceInput pairYawInput(
-  const double yaw_error, const double target_bearing_rate,
-  const double j1_position, const double j4_position)
+TEST(J1BoundaryAssessment, StaticActualAtEitherWorkingEdgeTriggers)
 {
-  PairYawResourceInput input;
-  input.signed_yaw_error_rad = yaw_error;
-  input.target_bearing_rate_radps = target_bearing_rate;
-  input.orientation_gain_per_sec = 2.0;
-  input.pointing_deadband_rad = 0.01;
-  input.target_rate_deadband_radps = 0.01;
-  input.j1 = PairYawJointResourceInput{
-    -1.0, j1_position, j1_position, -2.0, 2.0, 0.10, BaseJointDirection::kNone};
-  input.j4 = PairYawJointResourceInput{
-    -1.0, j4_position, j4_position, -2.0, 2.0, 0.10, BaseJointDirection::kNone};
-  return input;
+  const auto lower = boundary(-1.9, -1.9, -1.9);
+  ASSERT_TRUE(lower.valid);
+  EXPECT_EQ(lower.edge_direction, BaseJointDirection::kNegative);
+  EXPECT_DOUBLE_EQ(lower.working_lower_rad, -1.9);
+  EXPECT_DOUBLE_EQ(lower.working_upper_rad, 1.9);
+
+  const auto upper = boundary(1.9, 1.9, 1.9);
+  ASSERT_TRUE(upper.valid);
+  EXPECT_EQ(upper.edge_direction, BaseJointDirection::kPositive);
 }
 
-TEST(PairYawResource, NeedsYawDemandAndPhysicalDirectionalExhaustion)
+TEST(J1BoundaryAssessment, BrakeExtremaTriggerEitherEdge)
 {
-  auto input = pairYawInput(0.0, 0.0, 1.9, 1.9);
-  auto assessment = assessPairYawResource(input);
-  ASSERT_TRUE(assessment.valid);
-  EXPECT_FALSE(assessment.demand_present);
-  EXPECT_FALSE(assessment.exhausted);
+  const auto lower = boundary(0.0, -1.9, 0.2);
+  ASSERT_TRUE(lower.valid);
+  EXPECT_EQ(lower.edge_direction, BaseJointDirection::kNegative);
 
-  // Near the yaw edge alone is not a reason to compact; an aligned target has
-  // no yaw demand to exhaust the pair against.
-  input.signed_yaw_error_rad = 0.2;
-  input.j1.yaw_error_derivative_per_rad = 0.0;
-  input.j4.yaw_error_derivative_per_rad = 0.0;
-  input.j1.actual_position_rad = input.j1.predicted_hold_position_rad = 0.0;
-  input.j4.actual_position_rad = input.j4.predicted_hold_position_rad = 0.0;
-  assessment = assessPairYawResource(input);
-  EXPECT_TRUE(assessment.demand_present);
-  EXPECT_FALSE(assessment.pair_bound_candidate);
-  EXPECT_FALSE(assessment.exhausted);
+  const auto upper = boundary(0.0, -0.2, 1.9);
+  ASSERT_TRUE(upper.valid);
+  EXPECT_EQ(upper.edge_direction, BaseJointDirection::kPositive);
 }
 
-TEST(PairYawResource, OneBoundDirectionIsOnlyACandidateWhenTheOtherSwivelIsFree)
+TEST(J1BoundaryAssessment, PositionErrorCountsRoundoffAtEitherEdge)
 {
-  auto input = pairYawInput(0.0, 0.4, 1.9, 0.0);
-  const auto assessment = assessPairYawResource(input);
+  constexpr double position_error = 1.0e-12;
+  const double lower_position = -1.9 + 0.5 * position_error;
+  const auto lower = boundary(
+    lower_position, lower_position, lower_position, -2.0, 2.0, 0.1, position_error);
+  ASSERT_TRUE(lower.valid);
+  EXPECT_EQ(lower.edge_direction, BaseJointDirection::kNegative);
 
-  ASSERT_TRUE(assessment.valid);
-  EXPECT_TRUE(assessment.demand_present);
-  EXPECT_TRUE(assessment.pair_bound_candidate);
-  EXPECT_FALSE(assessment.exhausted);
+  const double upper_position = 1.9 - 0.5 * position_error;
+  const auto upper = boundary(
+    upper_position, upper_position, upper_position, -2.0, 2.0, 0.1, position_error);
+  ASSERT_TRUE(upper.valid);
+  EXPECT_EQ(upper.edge_direction, BaseJointDirection::kPositive);
 }
 
-TEST(PairYawResource, IdentifiesDirectionalPairCandidatesInEitherYawDirection)
+TEST(J1BoundaryAssessment, PositionErrorDoesNotTriggerFromInterior)
 {
-  auto positive = pairYawInput(0.0, 0.4, 1.9, 1.9);
-  auto assessment = assessPairYawResource(positive);
-  ASSERT_TRUE(assessment.valid);
-  EXPECT_TRUE(assessment.demand_present);
-  EXPECT_TRUE(assessment.pair_bound_candidate);
-  EXPECT_FALSE(assessment.exhausted);
+  constexpr double position_error = 1.0e-12;
+  const double lower_position = -1.9 + 2.0 * position_error;
+  const auto lower = boundary(
+    lower_position, lower_position, lower_position, -2.0, 2.0, 0.1, position_error);
+  ASSERT_TRUE(lower.valid);
+  EXPECT_EQ(lower.edge_direction, BaseJointDirection::kNone);
 
-  auto negative = pairYawInput(0.0, -0.4, -1.9, -1.9);
-  assessment = assessPairYawResource(negative);
-  ASSERT_TRUE(assessment.valid);
-  EXPECT_TRUE(assessment.demand_present);
-  EXPECT_TRUE(assessment.pair_bound_candidate);
-  EXPECT_FALSE(assessment.exhausted);
+  const double upper_position = 1.9 - 2.0 * position_error;
+  const auto upper = boundary(
+    upper_position, upper_position, upper_position, -2.0, 2.0, 0.1, position_error);
+  ASSERT_TRUE(upper.valid);
+  EXPECT_EQ(upper.edge_direction, BaseJointDirection::kNone);
 }
 
-TEST(PairYawResource, ReversingDemandAwayFromAnEdgeDoesNotTrigger)
+TEST(J1BoundaryAssessment, InteriorDoesNotTriggerAndBothEdgesAreInvalid)
 {
-  const auto assessment = assessPairYawResource(pairYawInput(-0.2, 0.0, 1.9, 1.9));
+  const auto interior = boundary(0.0, -0.2, 0.2);
+  ASSERT_TRUE(interior.valid);
+  EXPECT_EQ(interior.edge_direction, BaseJointDirection::kNone);
 
-  ASSERT_TRUE(assessment.valid);
-  EXPECT_TRUE(assessment.demand_present);
-  EXPECT_FALSE(assessment.pair_bound_candidate);
-  EXPECT_FALSE(assessment.exhausted);
+  EXPECT_FALSE(boundary(0.0, -2.0, 2.0).valid);
 }
 
-TEST(PairYawResource, ZeroJacobianWithoutARealJointBoundDoesNotLookExhausted)
+TEST(J1BoundaryAssessment, RejectsInvalidLimitsAndNonfiniteExtrema)
 {
-  auto input = pairYawInput(0.0, 0.4, 0.0, 0.0);
-  input.j1.yaw_error_derivative_per_rad = 0.0;
-  input.j4.yaw_error_derivative_per_rad = 0.0;
-  const auto assessment = assessPairYawResource(input);
-
-  ASSERT_TRUE(assessment.valid);
-  EXPECT_TRUE(assessment.demand_present);
-  EXPECT_FALSE(assessment.pair_bound_candidate);
-  EXPECT_FALSE(assessment.exhausted);
-}
-
-TEST(PairYawResource, BrakingEndpointPastHardBoundConsumesDirectionalReserve)
-{
-  auto input = pairYawInput(0.0, 0.4, 1.8, 1.8);
-  input.j1.predicted_hold_position_rad = 2.02;
-  input.j4.predicted_hold_position_rad = 2.03;
-  const auto assessment = assessPairYawResource(input);
-
-  ASSERT_TRUE(assessment.valid);
-  EXPECT_TRUE(assessment.demand_present);
-  EXPECT_TRUE(assessment.pair_bound_candidate);
-  EXPECT_FALSE(assessment.exhausted);
-  EXPECT_DOUBLE_EQ(assessment.j1.remaining_joint_travel_rad, 0.0);
-  EXPECT_DOUBLE_EQ(assessment.j4.remaining_joint_travel_rad, 0.0);
-}
-
-TEST(PairYawResource, HeldJ1DirectionConsumesItsLatchedYawResource)
-{
-  auto input = pairYawInput(0.0, 0.4, 0.0, 1.9);
-  input.j1.held_direction = BaseJointDirection::kPositive;
-  const auto assessment = assessPairYawResource(input);
-
-  ASSERT_TRUE(assessment.valid);
-  EXPECT_TRUE(assessment.j1.held_for_required_direction);
-  ASSERT_TRUE(assessment.j1.directionally_bound);
-  EXPECT_TRUE(assessment.pair_bound_candidate);
-  EXPECT_FALSE(assessment.exhausted);
-}
-
-TEST(PairYawResource, RequiresSolvedCausalProbeAndUprightRelaxedPose)
-{
-  PairYawResourceAssessment assessment;
-  assessment.valid = true;
-  assessment.demand_present = true;
-  assessment.pair_bound_candidate = true;
-  assessment.probe_valid = true;
-  assessment.actual_probe_solved = true;
-  assessment.relaxed_probe_solved = true;
-  assessment.actual_available_yaw_rad = 0.0;
-  assessment.pair_relaxed_available_yaw_rad = kPairYawProbeDisplacementRad;
-  assessment.actual_roll_residual_rad = 0.0;
-  assessment.relaxed_roll_residual_rad = 0.0;
-  assessment.actual_elevation_residual_rad = 0.0;
-  assessment.relaxed_elevation_residual_rad = 0.0;
-  assessment.probe_horizon_sec = kPairYawProbeHorizonSec;
-
-  EXPECT_TRUE(pairYawProbeShowsPairBoundCause(assessment));
-  assessment.actual_probe_solved = false;
-  assessment.actual_probe_infeasible = true;
-  EXPECT_FALSE(pairYawProbeShowsPairBoundCause(assessment));
-  assessment.actual_probe_infeasible = false;
-  EXPECT_FALSE(pairYawProbeShowsPairBoundCause(assessment));
-  assessment.actual_probe_solved = true;
-  EXPECT_TRUE(pairYawProbeShowsPairBoundCause(assessment));
-  assessment.relaxed_probe_solved = false;
-  EXPECT_FALSE(pairYawProbeShowsPairBoundCause(assessment));
-  assessment.relaxed_probe_solved = true;
-  assessment.relaxed_roll_residual_rad = 2.0 * kPi / 180.0;
-  EXPECT_FALSE(pairYawProbeShowsPairBoundCause(assessment));
-  assessment.relaxed_roll_residual_rad = 0.0;
-  assessment.relaxed_elevation_residual_rad = 2.0 * kPi / 180.0;
-  EXPECT_FALSE(pairYawProbeShowsPairBoundCause(assessment));
-}
-
-TEST(PairYawResource, RequiresAUsefulCausalImprovement)
-{
-  PairYawResourceAssessment assessment;
-  assessment.valid = true;
-  assessment.demand_present = true;
-  assessment.pair_bound_candidate = true;
-  assessment.probe_valid = true;
-  assessment.actual_probe_solved = true;
-  assessment.relaxed_probe_solved = true;
-  assessment.actual_available_yaw_rad =
-    0.79 * kPairYawProbeDisplacementRad;
-  assessment.pair_relaxed_available_yaw_rad =
-    0.80 * kPairYawProbeDisplacementRad;
-  assessment.probe_horizon_sec = kPairYawProbeHorizonSec;
-
-  EXPECT_FALSE(pairYawProbeShowsPairBoundCause(assessment));
-  assessment.actual_available_yaw_rad = 0.0;
-  assessment.pair_relaxed_available_yaw_rad =
-    0.79 * kPairYawProbeDisplacementRad;
-  EXPECT_FALSE(pairYawProbeShowsPairBoundCause(assessment));
-}
-
-TEST(PairYawResource, DistinguishesUnknownAvailableAndExhaustedEvidence)
-{
-  PairYawResourceAssessment assessment;
-  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kUnknown);
-
-  assessment.valid = true;
-  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kAvailable);
-
-  assessment.demand_present = true;
-  assessment.pair_bound_candidate = true;
-  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kUnknown);
-  assessment.probe_valid = true;
-  assessment.actual_probe_solved = true;
-  assessment.actual_available_yaw_rad = 0.80 * kPairYawProbeDisplacementRad;
-  EXPECT_FALSE(assessment.relaxed_probe_solved);
-  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kAvailable);
-
-  assessment.actual_available_yaw_rad = 0.79 * kPairYawProbeDisplacementRad;
-  assessment.relaxed_probe_solved = false;
-  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kUnknown);
-  assessment.exhausted = true;
-  EXPECT_EQ(pairYawResourceState(assessment), PairYawResourceState::kExhausted);
-}
-
-TEST(BaseJointHandoffPolicy, LatchesTheJerkLimitedEndpointAtTheOutwardEdge)
-{
-  BaseJointHandoffPolicy policy;
-  EXPECT_FALSE(policy.update(edgeInput(
-      6.1, BaseJointDirection::kPositive, BaseJointDirection::kNone)).has_value());
-  EXPECT_FALSE(policy.update(edgeInput(
-      6.1, BaseJointDirection::kPositive, BaseJointDirection::kNegative)).has_value());
-
-  auto approaching = edgeInput(
-    6.05, BaseJointDirection::kPositive, BaseJointDirection::kPositive);
-  approaching.predicted_hold_position_rad = 6.1;
-  const auto hold = policy.update(approaching);
-  ASSERT_TRUE(hold.has_value());
-  EXPECT_DOUBLE_EQ(*hold, 6.1);
-}
-
-TEST(BaseJointHandoffPolicy, StaticTargetKeepsTheCapturedEdgePositionWithoutCentering)
-{
-  BaseJointHandoffPolicy policy;
-  ASSERT_TRUE(policy.update(edgeInput(
-      6.1, BaseJointDirection::kPositive, BaseJointDirection::kPositive)).has_value());
-
-  auto static_face = edgeInput(
-    5.95, BaseJointDirection::kPositive, BaseJointDirection::kPositive);
-  static_face.predicted_hold_position_rad = 6.1;
-  static_face.target_bearing_motion_direction = BaseJointDirection::kNone;
-  const auto hold = policy.update(static_face);
-  ASSERT_TRUE(hold.has_value());
-  EXPECT_DOUBLE_EQ(*hold, 6.1);
-  EXPECT_NE(*hold, static_face.actual_base_position_rad);
-}
-
-TEST(BaseJointHandoffPolicy, ReverseTargetBearingReleasesJ1ForOrdinaryTracking)
-{
-  BaseJointHandoffPolicy policy;
-  ASSERT_TRUE(policy.update(edgeInput(
-      6.1, BaseJointDirection::kPositive, BaseJointDirection::kPositive)).has_value());
-
-  auto reverse_face = edgeInput(
-    6.1, BaseJointDirection::kPositive, BaseJointDirection::kNegative);
-  reverse_face.target_bearing_motion_direction = BaseJointDirection::kNegative;
-  EXPECT_FALSE(policy.update(reverse_face).has_value());
-  EXPECT_FALSE(policy.heldPositionRad().has_value());
-}
-
-TEST(BaseJointHandoffPolicy, UnqualifiedBearingNoiseDoesNotReleaseTheHold)
-{
-  BaseJointHandoffPolicy policy;
-  ASSERT_TRUE(policy.update(edgeInput(
-      6.1, BaseJointDirection::kPositive, BaseJointDirection::kPositive)).has_value());
-
-  auto noisy_static_face = edgeInput(
-    6.1, BaseJointDirection::kPositive, BaseJointDirection::kPositive);
-  noisy_static_face.target_bearing_motion_direction = BaseJointDirection::kNone;
-  const auto hold = policy.update(noisy_static_face);
-  ASSERT_TRUE(hold.has_value());
-  EXPECT_DOUBLE_EQ(*hold, 6.1);
-}
-
-TEST(BaseJointHandoffPolicy, ValidTargetChangeReleasesTheOldHold)
-{
-  BaseJointHandoffPolicy policy;
-  ASSERT_TRUE(policy.update(edgeInput(
-      6.1, BaseJointDirection::kPositive, BaseJointDirection::kPositive)).has_value());
-
-  auto changed_target = edgeInput(
-    6.1, BaseJointDirection::kPositive, BaseJointDirection::kNegative);
-  changed_target.valid_target_changed = true;
-  EXPECT_FALSE(policy.update(changed_target).has_value());
-}
-
-TEST(BaseJointHandoffPolicy, TargetBearingDeltaIsContinuousAcrossAngleWrap)
-{
-  constexpr double wrap_epsilon = 1.0e-3;
-  const auto delta = targetBearingDeltaRad(kPi - wrap_epsilon, -kPi + wrap_epsilon);
-
-  ASSERT_TRUE(delta.has_value());
-  EXPECT_NEAR(*delta, 2.0 * wrap_epsilon, 1.0e-12);
+  EXPECT_FALSE(boundary(0.0, 0.2, -0.2).valid);
+  EXPECT_FALSE(boundary(0.0, -0.2, 0.2, -0.1, 0.1, 0.1).valid);
+  EXPECT_FALSE(boundary(0.0, -0.2, 0.2, -2.0, 2.0, 0.1, -1.0e-12).valid);
+  EXPECT_FALSE(boundary(
+      std::numeric_limits<double>::quiet_NaN(), -0.2, 0.2).valid);
+  EXPECT_FALSE(boundary(
+      0.0, -0.2, 0.2, -2.0, 2.0, 0.1,
+      std::numeric_limits<double>::infinity()).valid);
 }
 
 }  // namespace

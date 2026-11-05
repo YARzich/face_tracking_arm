@@ -30,7 +30,15 @@ class ExecutionBudgetProfileTest(unittest.TestCase):
             'reduced_max_joint_speed_rad_s': None, 'speed_scale': 1.0,
             'max_velocity_rad_s': [1.0] * 6,
             'max_acceleration_rad_s2': [2.0] * 6,
-            'max_jerk_rad_s3': [20.0] * 6, 'payload_kg': 5.7,
+            'max_jerk_rad_s3': [20.0] * 6,
+            'compact_speed_scale': 1.0,
+            'compact_fold_speed_scale': 1.0,
+            'compact_turn_speed_scale': 1.0,
+            'compact_return_speed_scale': 1.0,
+            'compact_max_velocity_rad_s': [.75] * 6,
+            'compact_max_acceleration_rad_s2': [2.0] * 6,
+            'compact_max_jerk_rad_s3': [20.0] * 6,
+            'payload_kg': 5.7,
             'mount_geometry': {'version': 2, 'monitor_mass_kg': 0.7},
             'controller_mode': 'position_servoj',
             'controller_configuration_sha256': '0' * 64,
@@ -163,6 +171,13 @@ class ExecutionBudgetProfileTest(unittest.TestCase):
             'max_joint_velocity_rad_s': [1.0] * 6,
             'max_joint_acceleration_rad_s2': [2.0] * 6,
             'max_joint_jerk_rad_s3': [20.0] * 6,
+            'compact_maneuver.speed_scale': 1.0,
+            'compact_maneuver.fold_speed_scale': .8,
+            'compact_maneuver.turn_speed_scale': 1.2,
+            'compact_maneuver.return_speed_scale': .9,
+            'compact_maneuver.max_velocity_rad_s': [.75] * 6,
+            'compact_maneuver.max_acceleration_rad_s2': [2.0] * 6,
+            'compact_maneuver.max_jerk_rad_s3': [20.0] * 6,
             'residual_command_latency_sec': 0.0,
         }
         controllers = {'arm_controller': {'ros__parameters': {
@@ -175,6 +190,10 @@ class ExecutionBudgetProfileTest(unittest.TestCase):
             'arm_controller:position:splines', 'bench-stop-contract-v1',
             robot_description, semantic_description, controllers)
         fingerprint = execution_conditions_fingerprint(conditions)
+        self.assertEqual(conditions['compact_fold_speed_scale'], .8)
+        self.assertEqual(conditions['compact_turn_speed_scale'], 1.2)
+        changed_compact = {**conditions, 'compact_max_velocity_rad_s': [1.0] * 6}
+        self.assertNotEqual(execution_conditions_fingerprint(changed_compact), fingerprint)
         config['execution_error_budget'].update(
             controller_mode='arm_controller:position:splines',
             conditions_fingerprint=fingerprint)

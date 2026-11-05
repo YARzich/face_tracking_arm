@@ -12,6 +12,7 @@ import xacro
 import yaml
 
 from .face_distance_config import resolve_face_distance_band
+from .joint_torque_limits import apply_joint_torque_limits
 from .mount_collisions import allow_fixed_mount_collisions
 from .robot_profile import get_robot_profile
 from .simulation_start import resolve_simulation_start
@@ -109,7 +110,8 @@ def _load_yaml(path):
     return yaml.safe_load(path.read_text(encoding='utf-8'))
 
 
-def _robot_parameters(share, profile, initial_positions_path, camera):
+def _robot_parameters(share, profile, initial_positions_path, camera,
+                      controller_config_file=None):
     mappings = {
         **camera, 'enable_ros2_control': 'true',
         'initial_positions_file': str(initial_positions_path),
@@ -118,6 +120,10 @@ def _robot_parameters(share, profile, initial_positions_path, camera):
     xml = xacro.process_file(
         str(share / 'description' / f'{profile["model"]}_table.urdf.xacro'),
         mappings=mappings).toxml()
+    servo_config_path = (Path(controller_config_file).expanduser()
+                         if controller_config_file else
+                         share / 'config/moveit/collision_aware_servo.yaml')
+    xml = apply_joint_torque_limits(xml, _load_yaml(servo_config_path))
     semantic = ET.parse(share / profile['srdf_file']).getroot()
     allow_fixed_mount_collisions(ET.fromstring(xml), semantic)
     return [
@@ -174,6 +180,22 @@ def _controller_parameters(
             not math.isfinite(compact_scale) or compact_scale <= 0):
         raise ValueError('compact_maneuver.speed_scale must be finite and positive')
     compact['speed_scale'] = float(compact_scale)
+    for key in ('fold_speed_scale', 'turn_speed_scale', 'return_speed_scale'):
+        value = compact.get(key, 1.0)
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                not math.isfinite(value) or value <= 0):
+            raise ValueError(f'compact_maneuver.{key} must be finite and positive')
+        compact[key] = float(value)
+    for key, default in (
+            ('max_velocity_rad_s', [3.1] * 6),
+            ('max_acceleration_rad_s2', [19.0] * 6),
+            ('max_jerk_rad_s3', [400.0] * 6)):
+        values = compact.get(key, default)
+        if (not isinstance(values, list) or len(values) != 6 or
+                any(isinstance(value, bool) or not isinstance(value, (int, float)) or
+                    not math.isfinite(value) or value <= 0 for value in values)):
+            raise ValueError(f'compact_maneuver.{key} must contain six finite positive values')
+        compact[key] = [float(value) for value in values]
     controller['planning_group_name'] = planning_group
     planner = controller['recovery_planner']
     planner[planning_group] = planner.pop('xarm6')
@@ -202,7 +224,9 @@ def load_simulation_config(share, *, robot_model, start_pose, initial_positions_
     initial_positions = resolve_simulation_start(
         share, robot_model=robot_model, start_pose=start_pose,
         initial_positions_file=initial_positions_file)
-    robot = _robot_parameters(share, profile, initial_positions, camera)
+    robot = _robot_parameters(
+        share, profile, initial_positions, camera,
+        controller_config_file=controller_config_file)
     standard, collision_aware = _servo_parameters(
         share, profile['planning_group'], smoothing_plugin)
     controller = _controller_parameters(

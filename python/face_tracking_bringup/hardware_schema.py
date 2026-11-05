@@ -28,7 +28,9 @@ SECTIONS = {
 ROOT_FIELDS = frozenset((
     'mount_geometry_version', 'mount_setup', 'compact_maneuver', 'recovery',
     'execution_error_budget'))
-COMPACT_MANEUVER_FIELDS = frozenset(('goal_joints_rad speed_scale').split())
+COMPACT_MANEUVER_FIELDS = frozenset((
+    'goal_joints_rad speed_scale fold_speed_scale turn_speed_scale return_speed_scale '
+    'max_velocity_rad_s max_acceleration_rad_s2 max_jerk_rad_s3').split())
 RECOVERY_FIELDS = frozenset(('mode',))
 MOUNT_SETUP_FIELDS = frozenset(('preferred_top_flange',
                                 'remembered_joint_positions_deg'))

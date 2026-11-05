@@ -387,6 +387,7 @@ void CollisionAwareServoComponent::initialize()
   collision_config.residual_latency_sec = parameters_.residual_command_latency_sec;
   collision_config.numerical_policy = motion_limits_.numerical_policy;
   control::configureGeometryBounds(collision_config, *robot_model, *joint_model_group_);
+  collision_constraint_config_ = collision_config;
   collision_constraint_builder_ =
     std::make_unique<control::CollisionConstraintBuilder>(collision_config);
 
@@ -439,6 +440,10 @@ void CollisionAwareServoComponent::complete_initialization_when_ready()
   const auto & state_time = measured_state.second;
   const auto feedback_timeout = rclcpp::Duration::from_seconds(
     parameters_.state_feedback_timeout_sec);
+  const std::int64_t future_tolerance_ns = !require_hardware_io_status_ &&
+    get_clock()->get_clock_type() == RCL_ROS_TIME &&
+    get_clock()->ros_time_is_active() ?
+    control::kSimTimeFeedbackFutureToleranceNs : 0LL;
   const rclcpp::Time oldest_allowed_state = state_validation_time -
     feedback_timeout;
   if (!measured_state.first ||
@@ -446,7 +451,7 @@ void CollisionAwareServoComponent::complete_initialization_when_ready()
       current_time.nanoseconds(), state_validation_time.nanoseconds()) ||
     !control::isFreshSnapshotTimestamp(
       state_time.nanoseconds(), state_validation_time.nanoseconds(),
-      feedback_timeout.nanoseconds()) ||
+      feedback_timeout.nanoseconds(), future_tolerance_ns) ||
     !state_monitor->haveCompleteState(oldest_allowed_state))
   {
     return;

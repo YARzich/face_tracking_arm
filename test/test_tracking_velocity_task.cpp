@@ -9,7 +9,6 @@
 #include <cmath>
 #include <limits>
 #include <optional>
-#include <tuple>
 
 #include "face_tracking_arm/horizontal_edge_upright.hpp"
 #include "face_tracking_arm/pointing_geometry.hpp"
@@ -40,17 +39,14 @@ TrackingVelocityTaskConfig zero_deadbands()
   return config;
 }
 
-Eigen::Isometry3d azimuth_elevation_pose(
-  const double azimuth, const double elevation,
-  const Eigen::Vector3d & translation = Eigen::Vector3d::Zero())
+Eigen::MatrixXd revolute_z_jacobian(
+  const Eigen::Vector3d & point, const Eigen::Vector3d & axis_origin)
 {
-  const Eigen::Vector3d normal(
-    std::cos(elevation) * std::cos(azimuth),
-    std::cos(elevation) * std::sin(azimuth), std::sin(elevation));
-  Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
-  pose.translation() = translation;
-  pose.linear() = upright_rotation(normal);
-  return pose;
+  Eigen::MatrixXd jacobian = Eigen::MatrixXd::Identity(6, 6);
+  jacobian.block<3, 1>(0, 0) =
+    Eigen::Vector3d::UnitZ().cross(point - axis_origin);
+  jacobian.block<3, 1>(3, 0) = Eigen::Vector3d::UnitZ();
+  return jacobian;
 }
 
 TEST(TrackingVelocityTask, AcceptedStaticPoseHasNoBackgroundMotionPreference)
@@ -136,7 +132,7 @@ TEST(TrackingVelocityTask, FaceDistanceBandUsesControlFrameAndHasNoPointTargetIn
       Eigen::Vector3d(1.0, 0.0, 0.0), Eigen::Matrix3d::Identity(), config));
 }
 
-TEST(TrackingVelocityTask, FarDistanceRemainsSeparateSoftCartesianObjectiveAlongFaceRay)
+TEST(TrackingVelocityTask, FarDistanceUsesFullCartesianObjectiveAlongFaceRayWhenStationary)
 {
   Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
   current.translation() = Eigen::Vector3d::Zero();
@@ -259,6 +255,215 @@ TEST(TrackingVelocityTask, ToleranceShellRetainsConfiguredIntervalAndAcceptance)
     EXPECT_EQ(at_configured_edge->task.distance_matrix.rows(), 0);
     EXPECT_EQ(at_configured_edge->task.secondary_matrix.rows(), 0);
   }
+}
+
+TEST(TrackingVelocityTask, J1CircleFollowsScreenTangentInEitherDirection)
+{
+  constexpr double omega = 0.13;
+  const Eigen::Vector3d axis_origin(0.0, 0.0, 1.68);
+  const Eigen::Vector3d screen = axis_origin + Eigen::Vector3d(0.5, 0.0, 0.0);
+  const Eigen::Vector3d face = axis_origin + Eigen::Vector3d(0.85, 0.0, 0.0);
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  current.translation() = screen;
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+  const Eigen::MatrixXd jacobian = revolute_z_jacobian(screen, axis_origin);
+
+  for (const double direction : {-1.0, 1.0}) {
+    const double signed_omega = direction * omega;
+    const Eigen::Vector3d face_velocity(0.0, signed_omega * 0.85, 0.0);
+    const auto result = makeTrackingVelocityTask(
+      current, jacobian, screen, face, Eigen::Matrix3d::Identity(), config, face_velocity);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->face_distance_outside_band);
+    ASSERT_EQ(result->task.distance_matrix.rows(), 3);
+    EXPECT_TRUE(result->task.distance_matrix.isApprox(jacobian.topRows(3), kTolerance));
+    EXPECT_TRUE(result->task.distance_weights.isApprox(Eigen::Vector3d::Ones(), kTolerance));
+    EXPECT_NEAR(result->task.distance_reference[0], -0.075, kTolerance);
+    EXPECT_NEAR(result->task.distance_reference[1], signed_omega * 0.5, kTolerance);
+    EXPECT_NEAR(result->task.distance_reference[2], 0.0, kTolerance);
+    EXPECT_NE(result->task.distance_reference[1], face_velocity.y())
+      << "The carry follows the screen's own orbit radius, not the face velocity";
+
+    Eigen::VectorXd j1_only = Eigen::VectorXd::Zero(6);
+    j1_only[0] = signed_omega;
+    const Eigen::Vector3d screen_velocity = jacobian.topRows(3) * j1_only;
+    EXPECT_NEAR(screen_velocity.y(), result->task.distance_reference[1], kTolerance);
+    EXPECT_NEAR((screen_velocity - result->task.distance_reference).dot(
+        (screen - face).normalized()), -0.075, kTolerance);
+
+    GazeKinematics gaze;
+    gaze.pose = current;
+    gaze.pose.translation() += Eigen::Vector3d(0.1, 0.0, 0.0);
+    gaze.jacobian = revolute_z_jacobian(gaze.pose.translation(), axis_origin);
+    const auto gaze_primary = makeTrackingVelocityTask(
+      current, jacobian, screen, face, Eigen::Matrix3d::Identity(), config, face_velocity,
+      Eigen::Vector3d::Zero(), gaze);
+    ASSERT_TRUE(gaze_primary.has_value());
+    EXPECT_NEAR(gaze_primary->task.distance_reference[1], signed_omega * 0.5, kTolerance);
+  }
+}
+
+TEST(TrackingVelocityTask, StationaryAlignedFarDistanceWithPhysicalJ1IsRadialFullCartesian)
+{
+  const Eigen::Vector3d axis_origin(0.0, 0.0, 1.68);
+  const Eigen::Vector3d screen = axis_origin + Eigen::Vector3d(0.5, 0.0, 0.0);
+  const Eigen::Vector3d face = axis_origin + Eigen::Vector3d(4.0, 0.0, 0.0);
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  current.translation() = screen;
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+  const Eigen::MatrixXd jacobian = revolute_z_jacobian(screen, axis_origin);
+  const auto result = makeTrackingVelocityTask(
+    current, jacobian, screen, face, Eigen::Matrix3d::Identity(), config);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->task.primary_reference.head<2>().isZero(0.0));
+  ASSERT_EQ(result->task.distance_matrix.rows(), 3);
+  EXPECT_TRUE(result->task.distance_matrix.isApprox(jacobian.topRows(3), kTolerance));
+  EXPECT_TRUE(result->task.distance_weights.isApprox(Eigen::Vector3d::Ones(), kTolerance));
+  EXPECT_NEAR(result->face_distance_reference[0], -config.maximum_linear_reference_mps, kTolerance);
+  EXPECT_TRUE(result->task.distance_reference.isApprox(
+      Eigen::Vector3d(config.maximum_linear_reference_mps, 0.0, 0.0), kTolerance));
+}
+
+TEST(TrackingVelocityTask, RadialRequestIsUnchangedWhenSaturatedAndTangentialCarryIsAdded)
+{
+  constexpr double omega = 0.13;
+  const Eigen::Vector3d axis_origin(0.0, 0.0, 1.68);
+  const Eigen::Vector3d screen = axis_origin + Eigen::Vector3d(0.5, 0.0, 0.0);
+  const Eigen::Vector3d face = axis_origin + Eigen::Vector3d(4.0, 0.0, 0.0);
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  current.translation() = screen;
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+  const auto result = makeTrackingVelocityTask(
+    current, revolute_z_jacobian(screen, axis_origin), screen, face,
+    Eigen::Matrix3d::Identity(), config, Eigen::Vector3d(0.0, omega * 4.0, 0.0));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->face_distance_outside_band);
+  EXPECT_NEAR(result->face_distance_reference[0], -config.maximum_linear_reference_mps,
+    kTolerance);
+  EXPECT_NEAR(result->task.distance_reference[0], config.maximum_linear_reference_mps,
+    kTolerance);
+  EXPECT_NEAR(result->task.distance_reference[1], omega * 0.5, kTolerance);
+  EXPECT_NEAR(result->task.distance_reference[2], 0.0, kTolerance);
+}
+
+TEST(TrackingVelocityTask, FollowVelocityUsesEffectivePointingReferenceAndIsContinuous)
+{
+  const Eigen::Vector3d axis_origin(0.0, 0.0, 1.68);
+  const Eigen::Vector3d screen = axis_origin + Eigen::Vector3d(0.5, 0.0, 0.0);
+  const Eigen::Vector3d face = axis_origin + Eigen::Vector3d(0.85, 0.0, 0.0);
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  current.translation() = screen;
+  const Eigen::MatrixXd jacobian = revolute_z_jacobian(screen, axis_origin);
+  TrackingVelocityTaskConfig config;
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+
+  const auto quiet = makeTrackingVelocityTask(
+    current, jacobian, screen, face, Eigen::Matrix3d::Identity(), config,
+    Eigen::Vector3d(0.0, 0.001, 0.0));
+  ASSERT_TRUE(quiet.has_value());
+  EXPECT_TRUE(quiet->task.primary_reference.head<2>().isZero(0.0));
+  EXPECT_NEAR(quiet->task.distance_reference[1], 0.0, 0.0);
+
+  config.pointing_deadband_rad = 0.01;
+  constexpr double boundary_face_speed = 0.014;
+  const auto below = makeTrackingVelocityTask(
+    current, jacobian, screen, face, Eigen::Matrix3d::Identity(), config,
+    Eigen::Vector3d(0.0, boundary_face_speed - 1.0e-9, 0.0));
+  const auto above = makeTrackingVelocityTask(
+    current, jacobian, screen, face, Eigen::Matrix3d::Identity(), config,
+    Eigen::Vector3d(0.0, boundary_face_speed + 1.0e-9, 0.0));
+  ASSERT_TRUE(below.has_value());
+  ASSERT_TRUE(above.has_value());
+  EXPECT_NEAR(below->task.distance_reference[1], 0.0, 0.0);
+  EXPECT_GT(above->task.distance_reference[1], 0.0);
+  EXPECT_LT(above->task.distance_reference[1] - below->task.distance_reference[1], 1.0e-8);
+}
+
+TEST(TrackingVelocityTask, FollowVelocityUsesShiftedAndRotatedJ1Axis)
+{
+  constexpr double omega = 0.13;
+  const Eigen::Vector3d axis_origin(0.3, -0.2, 1.68);
+  const Eigen::Matrix3d base_rotation = Eigen::AngleAxisd(
+    0.5 * std::acos(-1.0), Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  const Eigen::Vector3d screen = axis_origin + base_rotation * Eigen::Vector3d(0.5, 0.0, 0.0);
+  const Eigen::Vector3d face = axis_origin + base_rotation * Eigen::Vector3d(0.85, 0.0, 0.0);
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  current.translation() = screen;
+  current.linear() = base_rotation;
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+  const Eigen::Vector3d face_velocity =
+    omega * Eigen::Vector3d::UnitZ().cross(face - axis_origin);
+  const auto result = makeTrackingVelocityTask(
+    current, revolute_z_jacobian(screen, axis_origin), screen, face,
+    Eigen::Matrix3d::Identity(), config, face_velocity);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_NEAR(result->task.distance_reference[0], -omega * 0.5, kTolerance);
+  EXPECT_NEAR(result->task.distance_reference[1], -0.075, kTolerance);
+  EXPECT_NEAR(result->task.distance_reference[2], 0.0, kTolerance);
+}
+
+TEST(TrackingVelocityTask, FollowRateUsesExistingAngularSpeedCapAtLowPointingAuthority)
+{
+  const Eigen::Vector3d screen(0.5, 0.0, 1.68);
+  const Eigen::Vector3d face(0.85, 0.0, 1.68);
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  current.translation() = screen;
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+  Eigen::MatrixXd jacobian = Eigen::MatrixXd::Identity(6, 6);
+  jacobian.block<3, 1>(0, 0) = Eigen::Vector3d(0.0, -0.315, 0.0);
+  jacobian.block<3, 1>(3, 0) = Eigen::Vector3d::UnitZ();
+  const auto result = makeTrackingVelocityTask(
+    current, jacobian, screen, face, Eigen::Matrix3d::Identity(), config,
+    Eigen::Vector3d(0.0, 100.0, 0.0));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_NEAR(result->task.primary_reference.head<2>().norm(),
+    config.maximum_angular_reference_radps, kTolerance);
+  EXPECT_NEAR(result->task.distance_reference[0], -0.075, kTolerance);
+  EXPECT_NEAR(result->task.distance_reference[1], -0.315 *
+    config.maximum_angular_reference_radps, kTolerance);
+  EXPECT_NEAR(result->task.distance_reference[2], 0.0, kTolerance);
+}
+
+TEST(TrackingVelocityTask, PrismaticOrPointingDegenerateJ1FallsBackToRadialReference)
+{
+  const Eigen::Vector3d screen(0.5, 0.0, 1.68);
+  const Eigen::Vector3d face(0.85, 0.0, 1.68);
+  Eigen::Isometry3d current = Eigen::Isometry3d::Identity();
+  current.translation() = screen;
+  TrackingVelocityTaskConfig config = zero_deadbands();
+  config.face_distance_min_m = 0.4;
+  config.face_distance_max_m = 0.6;
+  Eigen::MatrixXd jacobian = Eigen::MatrixXd::Identity(6, 6);
+  jacobian.block<3, 1>(0, 0) = Eigen::Vector3d(0.0, 0.5, 0.0);
+  jacobian.block<3, 1>(3, 0).setZero();
+  auto result = makeTrackingVelocityTask(
+    current, jacobian, screen, face, Eigen::Matrix3d::Identity(), config,
+    Eigen::Vector3d(0.0, 0.85 * 0.13, 0.0));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->task.distance_reference.isApprox(
+      Eigen::Vector3d(-0.075, 0.0, 0.0), kTolerance));
+  EXPECT_TRUE(result->task.distance_reference.allFinite());
+
+  jacobian.block<3, 1>(0, 0) = Eigen::Vector3d(0.0, -0.35, 0.0);
+  jacobian.block<3, 1>(3, 0) = Eigen::Vector3d::UnitZ();
+  result = makeTrackingVelocityTask(
+    current, jacobian, screen, face, Eigen::Matrix3d::Identity(), config,
+    Eigen::Vector3d(0.0, 0.85 * 0.13, 0.0));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->task.distance_reference.isApprox(
+      Eigen::Vector3d(-0.075, 0.0, 0.0), kTolerance));
+  EXPECT_TRUE(result->task.distance_reference.allFinite());
 }
 
 TEST(TrackingVelocityTask, FaceEdgeRecoveryKeepsOnlyPrimaryEdgeRowAndZeroSecondary)
@@ -1034,234 +1239,6 @@ TEST(HorizontalEdgeUpright, EnforcesCapAndRejectsInvalidGeometry)
   EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(edge_rotation, 1.01));
   EXPECT_FALSE(evaluateHorizontalEdgeUprightWithSineCap(
       edge_rotation, std::numeric_limits<double>::infinity()));
-}
-
-TEST(FaceReturnPointingTask, AzimuthGapKeepsPitchPerturbationsRestoringWithRollPrimary)
-{
-  constexpr double kYawGap = 136.0 * 3.14159265358979323846 / 180.0;
-  TrackingVelocityTaskConfig config = zero_deadbands();
-  config.orientation_gain = 1.0;
-  config.maximum_angular_reference_radps = 10.0;
-  const Eigen::MatrixXd jacobian = Eigen::MatrixXd::Identity(6, 6);
-  for (const double pitch : {0.01, -0.01}) {
-    const Eigen::Isometry3d current = azimuth_elevation_pose(0.0, pitch);
-    const Eigen::Vector3d target(
-      2.0 * std::cos(kYawGap), 2.0 * std::sin(kYawGap), 0.0);
-    const auto pointing = makeFaceReturnPointingTask(
-      current, jacobian, target, Eigen::Vector3d::Zero(), config,
-      Eigen::MatrixXd::Zero(2, 6), Eigen::Vector2d::Zero());
-    ASSERT_TRUE(pointing.has_value());
-    EXPECT_FALSE(pointing->used_normal_fallback);
-    ASSERT_EQ(pointing->matrix.rows(), 2);
-    ASSERT_EQ(pointing->matrix.cols(), 6);
-
-    const auto roll = makeUprightRollPathTask(
-      current, jacobian, Eigen::VectorXd::Zero(6), config);
-    ASSERT_TRUE(roll.has_value());
-    const Eigen::RowVector3d roll_angular_row =
-      roll->task.primary_matrix.row(0).tail<3>();
-    EXPECT_NEAR(roll_angular_row.y(), 0.0, 1.0e-8);
-    EXPECT_NEAR(roll_angular_row.z(), 0.0, 1.0e-8);
-
-    // Solve the actual hierarchy rows together: physical roll stays primary,
-    // while azimuth/elevation are the two return rows.
-    Eigen::Matrix3d rows;
-    rows.row(0) = roll->task.primary_matrix.row(0).tail<3>();
-    rows.bottomRows(2) = pointing->matrix.rightCols(3);
-    Eigen::Vector3d references;
-    references << 0.0, pointing->reference;
-    const Eigen::Vector3d angular_velocity = rows.colPivHouseholderQr().solve(references);
-    ASSERT_TRUE(angular_velocity.allFinite());
-    EXPECT_TRUE((rows * angular_velocity).isApprox(references, 1.0e-8));
-
-    Eigen::Isometry3d moved = current;
-    constexpr double kDelta = 1.0e-6;
-    moved.linear() = Eigen::AngleAxisd(
-      kDelta * angular_velocity.norm(), angular_velocity.normalized()).toRotationMatrix() *
-      current.rotation();
-    const Eigen::Vector3d moved_normal = moved.linear().col(0);
-    const double moved_pitch = std::atan2(
-      moved_normal.z(), moved_normal.head<2>().norm());
-    EXPECT_LT((moved_pitch - pitch) / kDelta * pitch, 0.0);
-  }
-}
-
-TEST(FaceReturnPointingTask, AzimuthWrapIsContinuousAndAntipodalTieIsDeterministic)
-{
-  constexpr double kPi = 3.14159265358979323846;
-  constexpr double kDegreesToRadians = kPi / 180.0;
-  TrackingVelocityTaskConfig config = zero_deadbands();
-  config.orientation_gain = 1.0;
-  config.maximum_angular_reference_radps = 10.0;
-  const Eigen::MatrixXd jacobian = Eigen::MatrixXd::Identity(6, 6);
-  for (const auto & [current_azimuth, target_azimuth, expected] : {
-        std::tuple<double, double, double>{179.0, -179.0, 2.0},
-        std::tuple<double, double, double>{-179.0, 179.0, -2.0}})
-  {
-    const Eigen::Isometry3d current = azimuth_elevation_pose(
-      current_azimuth * kDegreesToRadians, 0.0);
-    const Eigen::Vector3d target(
-      std::cos(target_azimuth * kDegreesToRadians),
-      std::sin(target_azimuth * kDegreesToRadians), 0.0);
-    const auto result = makeFaceReturnPointingTask(
-      current, jacobian, target, Eigen::Vector3d::Zero(), config,
-      Eigen::MatrixXd::Zero(2, 6), Eigen::Vector2d::Zero());
-    ASSERT_TRUE(result.has_value());
-    EXPECT_NEAR(result->reference[0], expected * kDegreesToRadians, 1.0e-8);
-  }
-
-  for (const double current_azimuth : {0.0, kPi}) {
-    const Eigen::Isometry3d current = azimuth_elevation_pose(current_azimuth, 0.0);
-    const Eigen::Vector3d target(std::cos(current_azimuth + kPi),
-      std::sin(current_azimuth + kPi), 0.0);
-    const auto result = makeFaceReturnPointingTask(
-      current, jacobian, target, Eigen::Vector3d::Zero(), config,
-      Eigen::MatrixXd::Zero(2, 6), Eigen::Vector2d::Zero());
-    ASSERT_TRUE(result.has_value());
-    EXPECT_NEAR(result->reference[0], kPi, 1.0e-8);
-  }
-}
-
-TEST(FaceReturnPointingTask, SmallErrorsAndCombinedReferenceRespectAngularLimit)
-{
-  TrackingVelocityTaskConfig config = zero_deadbands();
-  config.orientation_gain = 4.0;
-  config.maximum_angular_reference_radps = 0.2;
-  const Eigen::MatrixXd jacobian = Eigen::MatrixXd::Identity(6, 6);
-  const Eigen::Isometry3d current = azimuth_elevation_pose(0.0, 0.0);
-  const Eigen::Vector3d near_target(
-    2.0 * std::cos(0.01), 2.0 * std::sin(0.01), 2.0 * std::tan(0.015));
-  auto result = makeFaceReturnPointingTask(
-    current, jacobian, near_target, Eigen::Vector3d::Zero(), config,
-    Eigen::MatrixXd::Zero(2, 6), Eigen::Vector2d::Zero());
-  ASSERT_TRUE(result.has_value());
-  EXPECT_NEAR(result->reference[0], 0.04, 1.0e-8);
-  EXPECT_NEAR(result->reference[1], 0.06, 1.0e-8);
-
-  config.maximum_angular_reference_radps = 0.05;
-  result = makeFaceReturnPointingTask(
-    current, jacobian, near_target, Eigen::Vector3d(0.0, 0.2, 0.1), config,
-    Eigen::MatrixXd::Zero(2, 6), Eigen::Vector2d::Zero());
-  ASSERT_TRUE(result.has_value());
-  EXPECT_NEAR(result->reference.norm(), config.maximum_angular_reference_radps, 1.0e-8);
-}
-
-TEST(FaceReturnPointingTask, MovingTargetAndPointingOriginMatchFiniteDifference)
-{
-  TrackingVelocityTaskConfig config = zero_deadbands();
-  config.orientation_gain = 1.0;
-  config.maximum_angular_reference_radps = 10.0;
-  const Eigen::Isometry3d current = azimuth_elevation_pose(
-    0.35, -0.20, Eigen::Vector3d(0.2, -0.1, 1.0));
-  Eigen::MatrixXd jacobian(6, 2);
-  jacobian << 0.20, -0.05,
-    -0.10, 0.12,
-    0.03, 0.07,
-    0.04, -0.10,
-    0.08, 0.03,
-    -0.03, 0.05;
-  const Eigen::Vector2d qdot(0.3, -0.2);
-  const Eigen::Vector3d face_velocity(0.03, 0.05, -0.02);
-  const Eigen::Vector3d face = current.translation() +
-    1.2 * current.rotation().col(0);
-  const auto result = makeFaceReturnPointingTask(
-    current, jacobian, face, face_velocity, config,
-    Eigen::MatrixXd::Zero(2, 2), Eigen::Vector2d::Zero());
-  ASSERT_TRUE(result.has_value());
-  ASSERT_FALSE(result->used_normal_fallback);
-
-  constexpr double kDelta = 1.0e-6;
-  const Eigen::Vector3d linear_velocity = jacobian.topRows(3) * qdot;
-  const Eigen::Vector3d angular_velocity = jacobian.bottomRows(3) * qdot;
-  Eigen::Isometry3d moved = current;
-  moved.translation() += kDelta * linear_velocity;
-  moved.linear() = Eigen::AngleAxisd(
-    kDelta * angular_velocity.norm(), angular_velocity.normalized()).toRotationMatrix() *
-    current.rotation();
-  const Eigen::Vector3d moved_face = face + kDelta * face_velocity;
-  const Eigen::Vector3d moved_ray = moved_face - moved.translation();
-  const Eigen::Vector3d moved_normal = moved.rotation().col(0);
-  const Eigen::Vector2d initial_error(0.0, 0.0);
-  const Eigen::Vector2d moved_error(
-    std::remainder(std::atan2(moved_ray.y(), moved_ray.x()) -
-    std::atan2(moved_normal.y(), moved_normal.x()), 2.0 * std::acos(-1.0)),
-    std::atan2(moved_ray.z(), moved_ray.head<2>().norm()) -
-    std::atan2(moved_normal.z(), moved_normal.head<2>().norm()));
-  const Eigen::Vector2d error_rate = (moved_error - initial_error) / kDelta;
-  EXPECT_TRUE((result->matrix * qdot - result->reference).isApprox(-error_rate, 2.0e-5));
-
-  // A translated, rotated gaze frame must use its own origin and Jacobian.
-  GazeKinematics gaze;
-  gaze.pose = azimuth_elevation_pose(-0.25, 0.16, Eigen::Vector3d(0.15, 0.22, 1.1));
-  gaze.jacobian = jacobian;
-  const Eigen::Vector3d gaze_face = gaze.pose.translation() +
-    1.2 * gaze.pose.rotation().col(0);
-  const auto gaze_result = makeFaceReturnPointingTask(
-    current, jacobian, gaze_face, face_velocity, config,
-    Eigen::MatrixXd::Zero(2, 2), Eigen::Vector2d::Zero(), gaze);
-  ASSERT_TRUE(gaze_result.has_value());
-  ASSERT_FALSE(gaze_result->used_normal_fallback);
-  Eigen::Isometry3d moved_gaze = gaze.pose;
-  moved_gaze.translation() += kDelta * linear_velocity;
-  moved_gaze.linear() = Eigen::AngleAxisd(
-    kDelta * angular_velocity.norm(), angular_velocity.normalized()).toRotationMatrix() *
-    gaze.pose.rotation();
-  const Eigen::Vector3d moved_gaze_ray =
-    gaze_face + kDelta * face_velocity - moved_gaze.translation();
-  const Eigen::Vector3d moved_gaze_normal = moved_gaze.rotation().col(0);
-  const Eigen::Vector2d gaze_error_rate(
-    std::remainder(std::atan2(moved_gaze_ray.y(), moved_gaze_ray.x()) -
-    std::atan2(moved_gaze_normal.y(), moved_gaze_normal.x()), 2.0 * std::acos(-1.0)) /
-    kDelta,
-    (std::atan2(moved_gaze_ray.z(), moved_gaze_ray.head<2>().norm()) -
-    std::atan2(moved_gaze_normal.z(), moved_gaze_normal.head<2>().norm())) / kDelta);
-  EXPECT_TRUE((gaze_result->matrix * qdot - gaze_result->reference).isApprox(
-      -gaze_error_rate, 2.0e-5));
-}
-
-TEST(FaceReturnPointingTask, UsesConvertedOffsetGazeAndFallsBackOnlyAtPole)
-{
-  TrackingVelocityTaskConfig config = zero_deadbands();
-  config.orientation_gain = 1.0;
-  config.maximum_angular_reference_radps = 10.0;
-  const Eigen::MatrixXd jacobian = Eigen::MatrixXd::Identity(6, 6);
-  const Eigen::Isometry3d screen = azimuth_elevation_pose(0.0, 0.0);
-  GazeKinematics gaze;
-  gaze.pose = azimuth_elevation_pose(0.5, 0.0, Eigen::Vector3d(0.0, 0.3, 0.0));
-  gaze.jacobian = jacobian;
-  const Eigen::Vector3d face = gaze.pose.translation() +
-    Eigen::Vector3d(std::cos(1.0), std::sin(1.0), 0.0);
-  const auto result = makeFaceReturnPointingTask(
-    screen, jacobian, face, Eigen::Vector3d::Zero(), config,
-    Eigen::MatrixXd::Zero(2, 6), Eigen::Vector2d::Zero(), gaze);
-  ASSERT_TRUE(result.has_value());
-  EXPECT_FALSE(result->used_normal_fallback);
-  EXPECT_NEAR(result->reference[0], 0.5, 1.0e-8);
-
-  const Eigen::Isometry3d near_pole = azimuth_elevation_pose(0.0, 1.52);
-  Eigen::MatrixXd fallback_matrix = Eigen::MatrixXd::Zero(2, 6);
-  fallback_matrix(0, 0) = 1.0;
-  fallback_matrix(1, 1) = 1.0;
-  const Eigen::Vector2d fallback_reference(0.12, -0.08);
-  const auto fallback = makeFaceReturnPointingTask(
-    near_pole, jacobian, Eigen::Vector3d(0.0, 1.0, 0.0), Eigen::Vector3d::Zero(),
-    config, fallback_matrix, fallback_reference);
-  ASSERT_TRUE(fallback.has_value());
-  EXPECT_TRUE(fallback->used_normal_fallback);
-  EXPECT_TRUE(fallback->matrix.isApprox(fallback_matrix));
-  EXPECT_TRUE(fallback->reference.isApprox(fallback_reference));
-
-  const auto vertical_target = makeFaceReturnPointingTask(
-    screen, jacobian, Eigen::Vector3d(0.0, 0.0, 1.0), Eigen::Vector3d::Zero(),
-    config, fallback_matrix, fallback_reference);
-  ASSERT_TRUE(vertical_target.has_value());
-  EXPECT_TRUE(vertical_target->used_normal_fallback);
-
-  const auto invalid = makeFaceReturnPointingTask(
-    screen, jacobian, Eigen::Vector3d(
-      std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0), Eigen::Vector3d::Zero(),
-    config, fallback_matrix, fallback_reference);
-  EXPECT_FALSE(invalid.has_value());
 }
 
 }  // namespace
