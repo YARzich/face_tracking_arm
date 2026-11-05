@@ -10,6 +10,7 @@ install
 log
 dist
 compile_commands.json
+symlink_install_manifest.txt
 **/__pycache__
 **/.pytest_cache
 **/.mypy_cache
@@ -42,6 +43,7 @@ rosbags
 config/calibration
 config/*.local.yaml
 ROADMAP.md
+ROADMAP_HISTORY_*.md
 validation
 artifacts
 docs/history

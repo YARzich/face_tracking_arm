@@ -2,6 +2,7 @@
 /install/
 /log/
 /compile_commands.json
+/symlink_install_manifest.txt
 *.o
 *.a
 *.so
@@ -62,6 +63,7 @@ __pycache__/
 
 # Local planning and historical measurements are not part of the public sources.
 /ROADMAP.md
+/ROADMAP_HISTORY_*.md
 /validation/
 /artifacts/
 /docs/history/
