@@ -5,12 +5,14 @@
 
 import importlib.util
 import math
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 from launch import LaunchContext
+from launch.actions import SetEnvironmentVariable
 from launch.substitutions import LaunchConfiguration
 import pytest
 import yaml
@@ -220,7 +222,7 @@ def test_spawn_receives_physics_copy_while_state_publisher_keeps_oem_description
     assert captured_nodes[1]['name'] == 'spawn_lite6'
 
 
-def _assemble_with_stub_actions(monkeypatch, *, calibration):
+def _assemble_with_stub_actions(monkeypatch, tmp_path, *, calibration):
     context = LaunchContext()
     context.launch_configurations.update({
         'calibration_mode': 'true' if calibration else 'false',
@@ -238,7 +240,11 @@ def _assemble_with_stub_actions(monkeypatch, *, calibration):
     camera = _camera(mode='rgbd') if calibration else _camera()
     config = _config(camera=camera)
     monkeypatch.setattr(sim, 'get_package_share_directory', lambda _: str(ROOT))
-    monkeypatch.setattr(sim, 'get_package_prefix', lambda _: '/test/prefix')
+    prefix = tmp_path / 'prefix'
+    overlay = prefix / 'lib' / 'fastdds_shm'
+    overlay.mkdir(parents=True)
+    (overlay / sim.FASTDDS_SHM_SONAME).touch()
+    monkeypatch.setattr(sim, 'get_package_prefix', lambda _: str(prefix))
     monkeypatch.setattr(sim, '_configuration', lambda *_: config)
     monkeypatch.setattr(
         sim, '_gazebo_processes',
@@ -275,6 +281,38 @@ def _assemble_with_stub_actions(monkeypatch, *, calibration):
         monkeypatch.setattr(sim, '_target_nodes', lambda *_: (
             SimpleNamespace(tag='face-target-source'), SimpleNamespace(tag='target-marker')))
     return sim.assemble_simulation(context)
+
+
+def test_fastdds_overlay_environment_action_preserves_inherited_environment(
+    monkeypatch, tmp_path,
+):
+    old_library_path = '/existing/first:/existing/second'
+    old_preload = '/diagnostic/libfastdds_probe.so'
+    monkeypatch.setenv('LD_LIBRARY_PATH', old_library_path)
+    monkeypatch.setenv('LD_PRELOAD', old_preload)
+    context = LaunchContext()
+    overlay = tmp_path / 'prefix' / 'lib' / 'fastdds_shm'
+    overlay.mkdir(parents=True)
+    (overlay / sim.FASTDDS_SHM_SONAME).touch()
+    monkeypatch.setattr(sim, 'get_package_prefix', lambda _: str(tmp_path / 'prefix'))
+
+    action = sim._fastdds_shm_environment(context)
+    assert isinstance(action, SetEnvironmentVariable)
+    action.execute(context)
+
+    assert os.environ['LD_LIBRARY_PATH'] == os.pathsep.join(
+        (str(overlay), old_library_path))
+    assert os.environ['LD_PRELOAD'] == old_preload
+
+
+def test_fastdds_overlay_missing_artifact_has_build_instruction(monkeypatch, tmp_path):
+    prefix = tmp_path / 'install' / 'face_tracking_arm'
+    monkeypatch.setattr(sim, 'get_package_prefix', lambda _: str(prefix))
+    build_script = tmp_path / 'src' / 'face_tracking_arm' / 'tools' / \
+        'build_fastdds_shm_overlay.sh'
+
+    with pytest.raises(RuntimeError, match=rf'libfastrtps\.so\.2\.14.*bash {build_script}'):
+        sim._fastdds_shm_environment(LaunchContext())
 
 
 @pytest.mark.parametrize('model', ['xarm6', 'lite6'])
@@ -488,18 +526,20 @@ def test_hand_eye_world_uses_a_static_rendered_marker_and_rgbd_sensor():
     }
 
 
-def test_ordinary_assembly_keeps_face_source_and_servo_container(monkeypatch):
-    actions = _assemble_with_stub_actions(monkeypatch, calibration=False)
+def test_ordinary_assembly_keeps_face_source_and_servo_container(monkeypatch, tmp_path):
+    actions = _assemble_with_stub_actions(monkeypatch, tmp_path, calibration=False)
+    assert isinstance(actions[0], SetEnvironmentVariable)
     tags = {getattr(action, 'tag', None) for action in actions}
     assert {'servo-container', 'target-marker'} <= tags
     assert 'move-group' not in tags
     assert 'rgbd-bridge' not in tags
-    startup = next(action for action in actions if action.tag == 'after:lite6_arm_controller')
+    startup = next(action for action in actions
+                   if getattr(action, 'tag', None) == 'after:lite6_arm_controller')
     assert [action.tag for action in startup.dependants].count('face-target-source') == 1
 
 
-def test_calibration_assembly_uses_rendered_world_and_omits_tracking(monkeypatch):
-    actions = _assemble_with_stub_actions(monkeypatch, calibration=True)
+def test_calibration_assembly_uses_rendered_world_and_omits_tracking(monkeypatch, tmp_path):
+    actions = _assemble_with_stub_actions(monkeypatch, tmp_path, calibration=True)
     tagged = {getattr(action, 'tag', None): action for action in actions}
     assert 'rgbd-bridge' in tagged
     assert 'servo-container' not in tagged

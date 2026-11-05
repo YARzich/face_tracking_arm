@@ -12,6 +12,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 ament_environment_hooks(env-hooks/face_tracking_arm_pythonpath.dsv)
+ament_environment_hooks(env-hooks/face_tracking_arm_fastdds_library_path.dsv)
 find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)

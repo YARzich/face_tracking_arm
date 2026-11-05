@@ -10,7 +10,13 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
-from launch.actions import EmitEvent, ExecuteProcess, OpaqueFunction, RegisterEventHandler
+from launch.actions import (
+    EmitEvent,
+    ExecuteProcess,
+    OpaqueFunction,
+    RegisterEventHandler,
+    SetEnvironmentVariable,
+)
 from launch.conditions import IfCondition, UnlessCondition
 from launch.event_handlers import OnProcessExit, OnShutdown
 from launch.events import Shutdown
@@ -26,6 +32,25 @@ from .simulation_config import (
 
 
 WORLD_NAME = 'lite6_table'
+FASTDDS_SHM_SONAME = 'libfastrtps.so.2.14'
+
+
+def _fastdds_shm_environment(context):
+    """Select the built Fast DDS overlay for child processes in this launch."""
+    prefix = Path(get_package_prefix('face_tracking_arm'))
+    overlay_dir = prefix / 'lib' / 'fastdds_shm'
+    soname_path = overlay_dir / FASTDDS_SHM_SONAME
+    if not soname_path.is_file():
+        build_script = prefix.parents[1].joinpath(
+            'src', 'face_tracking_arm', 'tools', 'build_fastdds_shm_overlay.sh')
+        raise RuntimeError(
+            f'Fast DDS SHM library is missing: {soname_path}. '
+            f'Build it with: bash {build_script}')
+
+    inherited_path = context.environment.get('LD_LIBRARY_PATH', '')
+    library_path = os.pathsep.join(
+        value for value in (str(overlay_dir), inherited_path) if value)
+    return SetEnvironmentVariable('LD_LIBRARY_PATH', library_path)
 
 
 def _actions_after_successful_exit(
@@ -385,6 +410,7 @@ def _configuration(context, share):
 
 def assemble_simulation(context):
     """Start control only after robot creation and both controller activations."""
+    fastdds_environment = _fastdds_shm_environment(context)
     share = Path(get_package_share_directory('face_tracking_arm'))
     config = _configuration(context, share)
     calibration_mode = LaunchConfiguration('calibration_mode').perform(context) == 'true'
@@ -458,6 +484,7 @@ def assemble_simulation(context):
         robot_state_publisher_node, 'robot state publisher'
     )
     actions = [
+        fastdds_environment,
         guard_gazebo_server, guard_gazebo_gui, guard_clock_bridge,
         guard_robot_state_publisher, *guards,
         gazebo_server_process, gazebo_gui_process, clock_bridge_node,

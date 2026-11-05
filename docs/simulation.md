@@ -4,11 +4,12 @@
 камеру и детектор лица. Для проверки изображений откройте
 [сценарии со зрением](tracking_vision.md).
 
-Сначала соберите пакет по [инструкции](../CONTRIBUTING.md). Затем выполните:
+Сначала соберите пакет и локальное исправление Fast DDS по
+[инструкции](../CONTRIBUTING.md#собрать-пакет). После первой сборки откройте новый
+терминал: окружение workspace подключит исправление и для ROS-утилит.
+Затем выполните:
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source ~/ros2_ws/install/setup.bash
 ros2 launch face_tracking_arm tracking_sim.launch.py
 ```
 

@@ -1,0 +1,32 @@
+# Reproducible Fast DDS SHM overlay pin.
+# Source release: eProsima/Fast-DDS v2.14.7, tag commit below.
+# Fix provenance: accepted upstream PR #6559 merge commit below. The applied
+# two-file patch is the behavior/test commit inside that merge; later upstream
+# formatting-only changes are intentionally excluded.
+# Fast DDS is Apache-2.0; Asio is Boost Software License 1.0.
+UPSTREAM_REPO='https://github.com/eProsima/Fast-DDS.git'
+UPSTREAM_TAG='v2.14.7'
+UPSTREAM_VERSION='2.14.7'
+UPSTREAM_COMMIT='010b908dc3bb2b6f2818d61ac8db462d01b79a1f'
+ASIO_REPO='https://github.com/chriskohlhoff/asio.git'
+ASIO_COMMIT='ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963'
+ASIO_VERSION='1.34.2'
+ASIO_LICENSE='BSL-1.0'
+ASIO_ARCHIVE_URL='https://github.com/chriskohlhoff/asio/archive/ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963.tar.gz'
+ASIO_ARCHIVE_SHA256='9d4619e1ea963d3c72c8dc07d5d8c9c4fab67141990b4f8cb10e5d8ad2c83f42'
+ASIO_TREE_SHA256='929dae8a4367d461b0c30b9ed9f1fca92e5d65c076c26450604ba4d7bbbb764c'
+BUILD_TESTING='OFF'
+BUILD_EPROSIMA_TESTS='OFF'
+BUILD_COMPILE_TOOLS='OFF'
+BUILD_SECURITY='ON'
+BUILD_SQLITE3_SUPPORT='ON'
+BUILD_NO_TLS='OFF'
+BUILD_FASTDDS_STATISTICS='ON'
+BUILD_LOG_NO_INFO='ON'
+BUILD_OLD_LOG_MACROS='ON'
+BUILD_STRICT_REALTIME='OFF'
+FIX_PR='6559'
+FIX_MERGE_COMMIT='b9e087308b4ef02f2c8c8982abaf8286166f8457'
+FIX_PATCH_COMMIT='3d2229d8937539761b7980aacd28fa30f911170e'
+PATCH_SHA256='646a57ef4acc19d87fda7688ba6cb42c0eb55cfa35b4ca0e01be8b6cd5df7e83'
+APPLIED_DIFF_SHA256='d9052671f303acf5070c2d2fcaba10c39bd672651c14fe60f8a369283dd9111d'

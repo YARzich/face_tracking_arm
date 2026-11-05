@@ -27,6 +27,19 @@ ROS, MoveIt, OpenCV и остальные системные зависимос�
 менеджером со своими лицензиями. Список прямых зависимостей — [package.xml](package.xml),
 версии Python-библиотек — [perception_requirements.txt](config/perception_requirements.txt).
 
+## Локальная сборка Fast DDS для симуляции
+
+[Скрипт сборки](tools/build_fastdds_shm_overlay.sh) загружает закреплённые
+исходники в cache workspace; исходные архивы и собранная библиотека не включены
+в репозиторий. В репозитории хранится только patch принятого upstream-исправления.
+
+| Компонент | Источник и версия | Лицензия |
+| --- | --- | --- |
+| Fast DDS и patch SHM health check | [v2.14.7](https://github.com/eProsima/Fast-DDS/tree/v2.14.7), commit `010b908dc3bb2b6f2818d61ac8db462d01b79a1f`; [PR #6559](https://github.com/eProsima/Fast-DDS/pull/6559), merge `b9e087308b4ef02f2c8c8982abaf8286166f8457` | [Apache-2.0](https://github.com/eProsima/Fast-DDS/blob/v2.14.7/LICENSE); текст сохранён в загруженном source |
+| Asio, заголовки для сборки | [1.34.2, commit `ed6aa8a`](https://github.com/chriskohlhoff/asio/tree/ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963), закреплённый submodule Fast DDS 2.14.7 | Boost Software License 1.0; `LICENSE_1_0.txt` в загруженных исходниках |
+
+Точные источники и контрольные суммы — в [fastdds_shm.lock](tools/fastdds/fastdds_shm.lock).
+
 ## Ресурсы отдельных экспериментов
 
 Эти файлы не включены в репозиторий или основной Docker-образ.
