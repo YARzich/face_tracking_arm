@@ -35,7 +35,7 @@ def isolated_start(tmp_path):
     launcher = tmp_path / 'start.sh'
     shutil.copy2(ROOT / 'start.sh', launcher)
     stub = tmp_path / 'run'
-    stub.write_text(textwrap.dedent('''\
+    stub.write_text(textwrap.dedent("""\
         #!/usr/bin/env python3
         import argparse
         import json
@@ -67,7 +67,7 @@ def isolated_start(tmp_path):
             with open(path, 'w') as output:
                 json.dump(sys.argv[1:], output)
         sys.exit(int(os.environ.get('STUB_EXIT_CODE', '0')))
-    '''))
+    """))
     stub.chmod(0o755)
     launcher.chmod(0o755)
     return launcher
@@ -192,15 +192,16 @@ def test_public_start_path_reaches_run_and_stops_at_missing_image(tmp_path):
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
     docker = bin_dir / 'docker'
-    docker.write_text(textwrap.dedent('''\
+    docker.write_text(textwrap.dedent("""\
         #!/usr/bin/env bash
         case "$*" in
             *"context inspect"*) echo 'unix:///var/run/docker.sock' ;;
-            *" info "*) echo '{"OSType":"linux","OperatingSystem":"Ubuntu","SecurityOptions":[]}' ;;
+            *" info "*) \
+                echo '{"OSType":"linux","OperatingSystem":"Ubuntu","SecurityOptions":[]}' ;;
             *"image inspect"*) echo 'image absent' >&2; exit 1 ;;
             *) echo "unexpected Docker command: $*" >&2; exit 90 ;;
         esac
-    '''))
+    """))
     docker.chmod(0o755)
     child_env = {**os.environ, 'PATH': str(bin_dir) + os.pathsep + os.environ['PATH']}
     child_env.pop('DOCKER_HOST', None)
